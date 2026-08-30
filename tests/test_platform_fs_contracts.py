@@ -30,6 +30,7 @@ from platform_fs_contracts import (
     ExistingFileDurability,
     ExistingFileRetirement,
     ExistingRetirementSource,
+    RetirementSourceDirectoryAuthority,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -294,6 +295,20 @@ class _FailingExistingRetirementSource(ExistingRetirementSource):
         self.close_calls += 1
 
 
+class _ExistingSourceParent(RetirementSourceDirectoryAuthority):
+    def __init__(self, error: BaseException | None = None) -> None:
+        super().__init__()
+        self.error = error
+        self.close_calls = 0
+
+    def _reprove_parent(self) -> None:
+        if self.error is not None:
+            raise self.error
+
+    def _close_authority(self) -> None:
+        self.close_calls += 1
+
+
 class _ExistingRetirementService(ExistingFileRetirement):
     def __init__(
         self,
@@ -302,25 +317,32 @@ class _ExistingRetirementService(ExistingFileRetirement):
     ) -> None:
         self.source = source
         self.rebound = rebound
+        self.parent = _ExistingSourceParent()
 
-    def _open_existing_retirement_source(
+    def _bind_retirement_source_directory(
         self,
         root: RootedDirectoryAuthority,
         relative: PurePath,
+    ) -> RetirementSourceDirectoryAuthority:
+        del root, relative
+        return self.parent
+
+    def _open_existing_retirement_source(
+        self,
+        source_parent: RetirementSourceDirectoryAuthority,
         expected_content: CandidateContentFacts,
     ) -> ExistingRetirementSource:
-        del root, relative, expected_content
+        del source_parent, expected_content
         return self.source
 
     def _retire_existing_exclusive(
         self,
-        source_parent: BoundDirectoryAuthority,
-        source_name: str,
+        source_parent: RetirementSourceDirectoryAuthority,
         source: ExistingRetirementSource,
         target_parent: RetirementDirectoryAuthority,
         target_name: str,
     ) -> RetainedRetirement:
-        del source_parent, source_name, source, target_parent, target_name
+        del source_parent, source, target_parent, target_name
         raise AssertionError("not used")
 
     def _rebind_existing_retirement(
@@ -1228,9 +1250,12 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
         expected = CandidateContentFacts(7, _DIGEST)
         try:
             with self.assertRaisesRegex(TypeError, "source terminal programmer fault"):
-                service.open_existing_retirement_source(
+                source_parent = service.bind_retirement_source_directory(
                     root,
                     PurePosixPath("stage.sqlite3"),
+                )
+                service.open_existing_retirement_source(
+                    source_parent,
                     expected,
                 )
             self.assertTrue(source.closed)
@@ -1251,7 +1276,55 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             self.assertTrue(rebound.closed)
             self.assertEqual(rebound.close_calls, 1)
         finally:
+            if not service.parent.closed:
+                service.parent.close()
             target.close()
+            root.close()
+
+    def test_source_directory_bind_closes_wrong_and_reprove_fault_authorities_once(self) -> None:
+        class WrongSourceDirectory(_Directory):
+            def __init__(self) -> None:
+                super().__init__()
+                self.close_calls = 0
+
+            def _close_authority(self) -> None:
+                self.close_calls += 1
+
+        source = _FailingExistingRetirementSource(TypeError("not used"))
+        rebound = _RetainedRetirement(_identity())
+        service = _ExistingRetirementService(source, rebound)
+        root = _Directory()
+        try:
+            wrong = WrongSourceDirectory()
+            service.parent = wrong  # type: ignore[assignment]
+            with self.assertRaisesRegex(
+                TypeError,
+                "RetirementSourceDirectoryAuthority",
+            ):
+                service.bind_retirement_source_directory(
+                    root,
+                    PurePosixPath("stage.sqlite3"),
+                )
+            self.assertTrue(wrong.closed)
+            self.assertEqual(wrong.close_calls, 1)
+
+            fault = _ExistingSourceParent(
+                TypeError("source directory terminal programmer fault")
+            )
+            service.parent = fault
+            with self.assertRaisesRegex(
+                TypeError,
+                "source directory terminal programmer fault",
+            ):
+                service.bind_retirement_source_directory(
+                    root,
+                    PurePosixPath("stage.sqlite3"),
+                )
+            self.assertTrue(fault.closed)
+            self.assertEqual(fault.close_calls, 1)
+        finally:
+            if not service.parent.closed:
+                service.parent.close()
             root.close()
 
     def test_transfer_state_fault_keeps_closed_reservation_owned_until_retained_close(self) -> None:

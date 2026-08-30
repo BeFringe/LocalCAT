@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 import os
 from pathlib import Path
 from pathlib import PurePath
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -117,6 +119,30 @@ def _release_portable_test_authorities(
         reservation.release()
 
 
+def _portable_sealed_stage(
+    service: TMMigrationService,
+    coordinator: ResourceStoreCoordinator,
+    identity: CanonicalResourceIdentity,
+) -> tuple[object, object, object]:
+    """Build one real Windows portable stage for process-boundary tests."""
+
+    with mock.patch("tm_sqlite_store._probe_fts5", return_value=True):
+        build = service.build_mutable_stage(identity.configured_jsonl_path)
+    stage = build.mutable_stage
+    if stage is None:
+        raise AssertionError("expected one mutable stage")
+    reservation = service._acquire_initial_reservation()
+    inputs = reservation.stage_seal_inputs()
+    with mock.patch("tm_sqlite_store._probe_fts5", return_value=True):
+        sealed = coordinator._seal_stage(
+            stage,
+            canonical_store_id="store.primary",
+            expected_prior_generation=None,
+            **inputs,
+        )
+    return reservation, sealed, coordinator._sealed_registry
+
+
 @unittest.skipUnless(sys.platform == "win32", "requires real Windows")
 class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
     """Reservation seam evidence; full activation remains a later blocker."""
@@ -127,21 +153,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
         coordinator: ResourceStoreCoordinator,
         identity: CanonicalResourceIdentity,
     ) -> tuple[object, object, object]:
-        with mock.patch("tm_sqlite_store._probe_fts5", return_value=True):
-            build = service.build_mutable_stage(identity.configured_jsonl_path)
-        stage = build.mutable_stage
-        if stage is None:
-            raise AssertionError("expected one mutable stage")
-        reservation = service._acquire_initial_reservation()
-        inputs = reservation.stage_seal_inputs()
-        with mock.patch("tm_sqlite_store._probe_fts5", return_value=True):
-            sealed = coordinator._seal_stage(
-                stage,
-                canonical_store_id="store.primary",
-                expected_prior_generation=None,
-                **inputs,
-            )
-        return reservation, sealed, coordinator._sealed_registry
+        return _portable_sealed_stage(service, coordinator, identity)
 
     def test_real_reservation_spans_seal_two_gate_b_and_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -338,6 +350,110 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     reservation,
                 )
 
+    def test_portable_prepared_cancels_to_terminal_and_exact_quarantine(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            backend = platform_fs_windows.WindowsPlatformAdapter()
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+                platform_backend=backend,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                prepared = coordinator.publish_portable_prepared_activation(
+                    preparation,
+                    **reservation.portable_journal_inputs(),
+                )
+                pending_path = (
+                    root / prepared.private_directory_name / prepared.journal_name
+                )
+                pending_bytes = pending_path.read_bytes()
+                pending_record = (
+                    tm_activation_journal._parse_portable_activation_journal_bytes(
+                        pending_bytes
+                    )
+                )
+
+                report = coordinator.recover_portable_prepared_cancellation(
+                    **reservation.portable_recovery_inputs(),
+                )
+
+                self.assertEqual(report.phase, "PREPARED")
+                self.assertEqual(report.action, "CANCELLED")
+                self.assertIsNone(report.generation)
+                self.assertEqual(coordinator.state, "READY")
+                self.assertIsNone(coordinator.current_generation)
+                self.assertIsNone(coordinator.active_store_path)
+                self.assertFalse(identity.canonical_sidecar_path.exists())
+                private_root = root / prepared.private_directory_name
+                terminal_path = private_root / pending_record.unsigned.terminal_name
+                self.assertFalse(pending_path.exists())
+                terminal_record = (
+                    tm_activation_journal._parse_portable_activation_journal_bytes(
+                        terminal_path.read_bytes()
+                    )
+                )
+                self.assertTrue(
+                    tm_activation_journal._portable_activation_paired_unsigned(
+                        pending_record.unsigned,
+                        terminal_record.unsigned,
+                    )
+                )
+                self.assertEqual(
+                    sorted(path.name for path in private_root.iterdir()),
+                    ["activation-terminal-v3.json", "device.key"],
+                )
+                quarantine = (
+                    root
+                    / ".localcat-activation-quarantine-v1"
+                    / tm_activation_journal._portable_activation_quarantine_name(
+                        terminal_record.unsigned
+                    )
+                )
+                self.assertEqual(
+                    sorted(path.name for path in quarantine.iterdir()),
+                    sorted(
+                        (
+                            pending_record.unsigned.journal_name,
+                            pending_record.unsigned.candidate_stage_db_name,
+                            pending_record.unsigned.candidate_manifest_temp_name,
+                        )
+                    ),
+                )
+                self.assertEqual(
+                    (quarantine / pending_record.unsigned.journal_name).read_bytes(),
+                    pending_bytes,
+                )
+                self.assertEqual(
+                    coordinator._sealed_registry._portable_borrows,
+                    {},
+                )
+                reservation.reprove()
+                preparation = None
+            finally:
+                try:
+                    if (
+                        preparation is not None
+                        and coordinator._preparation is preparation
+                    ):
+                        coordinator._sealed_registry.cancel(preparation._token)
+                finally:
+                    reservation.release()
+                _remove_long_quarantine(root)
+
     def test_existing_private_namespace_requires_fresh_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -397,6 +513,356 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     preparation,
                     reservation,
                 )
+
+    def test_portable_prepared_fresh_process_cancel_and_second_replay_are_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+
+            def run_worker(mode: str) -> dict[str, object]:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-m",
+                        "tests.windows_tm_portable_recovery_worker",
+                        mode,
+                        str(root),
+                    ],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    self.fail(
+                        f"{mode} worker failed ({completed.returncode}):\n"
+                        f"stdout={completed.stdout}\nstderr={completed.stderr}"
+                    )
+                return json.loads(completed.stdout)
+
+            try:
+                creator = run_worker("creator")
+                first = run_worker("recover")
+                second = run_worker("recover")
+
+                self.assertEqual(len({creator["pid"], first["pid"], second["pid"]}), 3)
+                self.assertTrue(creator["canonical_absent"])
+                self.assertEqual(first["input_closure"], "PENDING")
+                self.assertEqual(second["input_closure"], "CANCELLED")
+                for recovery in (first, second):
+                    self.assertEqual(recovery["phase"], "PREPARED")
+                    self.assertEqual(recovery["action"], "CANCELLED")
+                    self.assertIsNone(recovery["generation"])
+                    self.assertEqual(recovery["state"], "READY")
+                    self.assertTrue(recovery["canonical_absent"])
+                    self.assertEqual(
+                        recovery["private_names"],
+                        ["activation-terminal-v3.json", "device.key"],
+                    )
+                self.assertEqual(first["terminal"], second["terminal"])
+                self.assertEqual(first["quarantine"], second["quarantine"])
+                expected = {
+                    item["name"]: item
+                    for item in (
+                        creator["pending"],
+                        creator["stage"],
+                        creator["manifest"],
+                    )
+                }
+                self.assertEqual(first["quarantine"], expected)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_fresh_recovery_accepts_only_exact_terminal_candidate_residue(self) -> None:
+        def run_worker(
+            root: Path,
+            mode: str,
+            *,
+            candidate_state: str = "none",
+            recovery_fault: str | None = None,
+            require_success: bool = True,
+        ) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
+            command = [
+                sys.executable,
+                "-B",
+                "-m",
+                "tests.windows_tm_portable_recovery_worker",
+                mode,
+                str(root),
+                "--candidate-state",
+                candidate_state,
+            ]
+            if recovery_fault is not None:
+                command.extend(("--recovery-fault", recovery_fault))
+            completed = subprocess.run(
+                command,
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if require_success and completed.returncode != 0:
+                self.fail(
+                    f"{mode}/{candidate_state} worker failed "
+                    f"({completed.returncode}):\nstdout={completed.stdout}"
+                    f"\nstderr={completed.stderr}"
+                )
+            parsed = json.loads(completed.stdout) if completed.stdout.strip() else None
+            return completed, parsed
+
+        def namespace_snapshot(root: Path) -> dict[str, dict[str, object]]:
+            snapshot: dict[str, dict[str, object]] = {}
+            for path in sorted(root.rglob("*"), key=lambda item: str(item)):
+                relative = str(path.relative_to(root))
+                if path.is_dir():
+                    snapshot[relative] = {"kind": "directory"}
+                elif path.is_file():
+                    payload = path.read_bytes()
+                    snapshot[relative] = {
+                        "kind": "file",
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                else:
+                    snapshot[relative] = {"kind": "other"}
+            return snapshot
+
+        for candidate_state in ("source", "target"):
+            with self.subTest(candidate_state=candidate_state):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    try:
+                        _created, creator = run_worker(
+                            root,
+                            "creator",
+                            candidate_state=candidate_state,
+                        )
+                        _recovered, recovery = run_worker(root, "recover")
+                        _replayed, replay = run_worker(root, "recover")
+                        if creator is None or recovery is None or replay is None:
+                            raise AssertionError("candidate worker returned no facts")
+                        candidate = creator["terminal_candidate"]
+                        if not isinstance(candidate, dict):
+                            raise AssertionError("candidate facts are missing")
+                        self.assertEqual(recovery["action"], "CANCELLED")
+                        self.assertEqual(
+                            recovery["private_names"],
+                            ["activation-terminal-v3.json", "device.key"],
+                        )
+                        self.assertEqual(
+                            recovery["quarantine"][candidate["name"]],
+                            candidate,
+                        )
+                        self.assertEqual(recovery["terminal"], replay["terminal"])
+                        self.assertEqual(
+                            recovery["quarantine"],
+                            replay["quarantine"],
+                        )
+                        self.assertEqual(replay["input_closure"], "CANCELLED")
+                    finally:
+                        _remove_long_quarantine(root)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            try:
+                _created, creator = run_worker(
+                    root,
+                    "creator",
+                    candidate_state="source",
+                )
+                if creator is None or not isinstance(
+                    creator["terminal_candidate"],
+                    dict,
+                ):
+                    raise AssertionError("candidate creator returned no facts")
+                candidate = creator["terminal_candidate"]
+                failed, failure = run_worker(
+                    root,
+                    "recover",
+                    recovery_fault="publish_before_rename",
+                    require_success=False,
+                )
+                self.assertNotEqual(failed.returncode, 0)
+                if failure is None:
+                    raise AssertionError("fault worker returned no stable code")
+                self.assertEqual(
+                    failure["error_code"],
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                self.assertTrue(failure["retryable"])
+                private_roots = tuple(
+                    root.glob(".localcat-activation-private-v1.*")
+                )
+                self.assertEqual(len(private_roots), 1)
+                private_candidate = private_roots[0] / candidate["name"]
+                quarantine_candidates = tuple(
+                    (
+                        root
+                        / tm_activation_journal._PORTABLE_ACTIVATION_QUARANTINE_ROOT
+                    ).glob(f"*/{candidate['name']}")
+                )
+                self.assertTrue(private_candidate.is_file())
+                self.assertEqual(len(quarantine_candidates), 1)
+                self.assertEqual(
+                    hashlib.sha256(private_candidate.read_bytes()).hexdigest(),
+                    candidate["sha256"],
+                )
+                self.assertEqual(
+                    hashlib.sha256(
+                        quarantine_candidates[0].read_bytes()
+                    ).hexdigest(),
+                    candidate["sha256"],
+                )
+                before = namespace_snapshot(root)
+                replay, replay_failure = run_worker(
+                    root,
+                    "recover",
+                    require_success=False,
+                )
+                self.assertNotEqual(replay.returncode, 0)
+                if replay_failure is None:
+                    raise AssertionError("replay worker returned no stable code")
+                self.assertEqual(
+                    replay_failure["error_code"],
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                self.assertTrue(replay_failure["retryable"])
+                after = namespace_snapshot(root)
+                self.assertEqual(after, before)
+            finally:
+                _remove_long_quarantine(root)
+
+        expected_errors = {
+            "wrong": ("ACTIVATION.RECOVERY_REQUIRED", True),
+            "wrong-target": ("ACTIVATION.RECOVERY_REQUIRED", True),
+            "coexist": ("ACTIVATION.RECOVERY_REQUIRED", True),
+            "unknown": (
+                "ACTIVATION.RECOVERY_PRIVATE_NAMESPACE_INVALID",
+                False,
+            ),
+            "quarantine-unknown": ("ACTIVATION.QUARANTINE_FOREIGN", False),
+        }
+        for candidate_state, (expected_error, expected_retryable) in (
+            expected_errors.items()
+        ):
+            with self.subTest(candidate_state=candidate_state):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    try:
+                        _created, creator = run_worker(
+                            root,
+                            "creator",
+                            candidate_state=candidate_state,
+                        )
+                        if creator is None:
+                            raise AssertionError("candidate creator returned no facts")
+                        before = namespace_snapshot(root)
+                        failed, failure = run_worker(
+                            root,
+                            "recover",
+                            require_success=False,
+                        )
+                        self.assertNotEqual(failed.returncode, 0)
+                        if failure is None:
+                            raise AssertionError("failure worker returned no stable code")
+                        self.assertEqual(failure["error_code"], expected_error)
+                        self.assertIs(
+                            failure["retryable"],
+                            expected_retryable,
+                        )
+                        after = namespace_snapshot(root)
+                        self.assertEqual(after, before)
+                    finally:
+                        _remove_long_quarantine(root)
+
+    def test_terminal_only_fresh_replay_preserves_foreign_quarantine_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+
+            def run_worker(
+                mode: str,
+                *,
+                require_success: bool = True,
+            ) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-m",
+                        "tests.windows_tm_portable_recovery_worker",
+                        mode,
+                        str(root),
+                    ],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                if require_success and completed.returncode != 0:
+                    self.fail(
+                        f"{mode} worker failed ({completed.returncode}):\n"
+                        f"stdout={completed.stdout}\nstderr={completed.stderr}"
+                    )
+                parsed = json.loads(completed.stdout) if completed.stdout.strip() else None
+                return completed, parsed
+
+            try:
+                _created, creator = run_worker("creator")
+                _recovered, recovery = run_worker("recover")
+                if creator is None or recovery is None:
+                    raise AssertionError("portable recovery worker returned no facts")
+                self.assertEqual(recovery["input_closure"], "PENDING")
+                self.assertEqual(recovery["action"], "CANCELLED")
+                private_roots = tuple(root.glob(".localcat-activation-private-v1.*"))
+                quarantine_roots = tuple(
+                    (
+                        root
+                        / tm_activation_journal._PORTABLE_ACTIVATION_QUARANTINE_ROOT
+                    ).iterdir()
+                )
+                self.assertEqual(len(private_roots), 1)
+                self.assertEqual(len(quarantine_roots), 1)
+                self.assertFalse(
+                    (private_roots[0] / "activation-journal-v3.json").exists()
+                )
+                self.assertTrue(
+                    (private_roots[0] / "activation-terminal-v3.json").is_file()
+                )
+                foreign_path = quarantine_roots[0] / "foreign.bin"
+                foreign_path.write_bytes(b"foreign-quarantine-residue")
+                before = {
+                    str(path.relative_to(root)): (
+                        "directory"
+                        if path.is_dir()
+                        else hashlib.sha256(path.read_bytes()).hexdigest()
+                    )
+                    for path in sorted(root.rglob("*"), key=lambda item: str(item))
+                }
+
+                failed, failure = run_worker("recover", require_success=False)
+
+                self.assertNotEqual(failed.returncode, 0)
+                if failure is None:
+                    raise AssertionError("fresh replay returned no stable error")
+                self.assertEqual(
+                    failure["error_code"],
+                    "ACTIVATION.QUARANTINE_FOREIGN",
+                )
+                self.assertFalse(failure["retryable"])
+                after = {
+                    str(path.relative_to(root)): (
+                        "directory"
+                        if path.is_dir()
+                        else hashlib.sha256(path.read_bytes()).hexdigest()
+                    )
+                    for path in sorted(root.rglob("*"), key=lambda item: str(item))
+                }
+                self.assertEqual(after, before)
+            finally:
+                _remove_long_quarantine(root)
 
     def test_w2_narrowing_failure_is_not_reported_as_lock_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

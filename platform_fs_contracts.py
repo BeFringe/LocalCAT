@@ -647,6 +647,19 @@ class MutableFileReservation(OpaqueAuthority, ABC):
     def _reprove_identity(self) -> FileObjectIdentity: ...
 
 
+class RetirementSourceDirectoryAuthority(OpaqueAuthority, ABC):
+    """Rooted, rename-compatible authority for one exact source parent/name."""
+
+    def reprove(self) -> None:
+        self._require_open()
+        result = self._reprove_parent()
+        if result is not None:
+            raise TypeError("backend source-directory reproof must return None")
+
+    @abstractmethod
+    def _reprove_parent(self) -> None: ...
+
+
 class ExistingRetirementSource(OpaqueAuthority, ABC):
     """Live, rooted authority for retiring one already-existing file.
 
@@ -1596,21 +1609,57 @@ class LockedDescendantNamespaceInspection(Protocol):
 class ExistingFileRetirement(Protocol):
     """Retire or freshly rebind one exact existing file without creator state."""
 
-    def open_existing_retirement_source(
+    def bind_retirement_source_directory(
         self,
         root: RootedDirectoryAuthority,
         relative: PurePath,
-        expected_content: CandidateContentFacts,
-    ) -> ExistingRetirementSource:
+    ) -> RetirementSourceDirectoryAuthority:
         if not isinstance(root, RootedDirectoryAuthority):
             raise TypeError("root must be RootedDirectoryAuthority")
         root._require_open()
         checked_relative = validate_relative_path(relative)
+        authority = self._bind_retirement_source_directory(
+            root,
+            checked_relative,
+        )
+        try:
+            if not isinstance(authority, RetirementSourceDirectoryAuthority):
+                raise TypeError(
+                    "backend source-directory bind must return "
+                    "RetirementSourceDirectoryAuthority"
+                )
+            authority._require_open()
+            authority.reprove()
+            return authority
+        except BaseException:
+            if isinstance(authority, OpaqueAuthority):
+                try:
+                    authority.close()
+                except BaseException:
+                    pass
+            raise
+
+    @abstractmethod
+    def _bind_retirement_source_directory(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> RetirementSourceDirectoryAuthority: ...
+
+    def open_existing_retirement_source(
+        self,
+        source_parent: RetirementSourceDirectoryAuthority,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        if not isinstance(source_parent, RetirementSourceDirectoryAuthority):
+            raise TypeError(
+                "source_parent must be RetirementSourceDirectoryAuthority"
+            )
+        source_parent._require_open()
         if type(expected_content) is not CandidateContentFacts:
             raise TypeError("expected_content must be exact CandidateContentFacts")
         authority = self._open_existing_retirement_source(
-            root,
-            checked_relative,
+            source_parent,
             expected_content,
         )
         try:
@@ -1630,21 +1679,21 @@ class ExistingFileRetirement(Protocol):
     @abstractmethod
     def _open_existing_retirement_source(
         self,
-        root: RootedDirectoryAuthority,
-        relative: PurePath,
+        source_parent: RetirementSourceDirectoryAuthority,
         expected_content: CandidateContentFacts,
     ) -> ExistingRetirementSource: ...
 
     def retire_existing_exclusive(
         self,
-        source_parent: BoundDirectoryAuthority,
-        source_name: str,
+        source_parent: RetirementSourceDirectoryAuthority,
         source: ExistingRetirementSource,
         target_parent: RetirementDirectoryAuthority,
         target_name: str,
     ) -> RetainedRetirement:
-        if not isinstance(source_parent, BoundDirectoryAuthority):
-            raise TypeError("source_parent must be BoundDirectoryAuthority")
+        if not isinstance(source_parent, RetirementSourceDirectoryAuthority):
+            raise TypeError(
+                "source_parent must be RetirementSourceDirectoryAuthority"
+            )
         if not isinstance(target_parent, RetirementDirectoryAuthority):
             raise TypeError("target_parent must be RetirementDirectoryAuthority")
         if not isinstance(source, ExistingRetirementSource):
@@ -1652,11 +1701,9 @@ class ExistingFileRetirement(Protocol):
         source_parent._require_open()
         target_parent._require_open()
         source._require_open()
-        checked_source = validate_relative_name(source_name)
         checked_target = validate_relative_name(target_name)
         authority = self._retire_existing_exclusive(
             source_parent,
-            checked_source,
             source,
             target_parent,
             checked_target,
@@ -1672,8 +1719,7 @@ class ExistingFileRetirement(Protocol):
     @abstractmethod
     def _retire_existing_exclusive(
         self,
-        source_parent: BoundDirectoryAuthority,
-        source_name: str,
+        source_parent: RetirementSourceDirectoryAuthority,
         source: ExistingRetirementSource,
         target_parent: RetirementDirectoryAuthority,
         target_name: str,

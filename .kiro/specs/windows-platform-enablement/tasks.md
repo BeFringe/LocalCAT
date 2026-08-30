@@ -240,7 +240,7 @@
 
 - [x] 3.7a 增补 fresh recovery 的锁定descendant闭集与既有文件隔离authority
   - 新增两个不并入`PlatformFileBackend`的runtime-checkable窄能力：ancestor rooted authority + exact W1 lease下的普通bound descendant执行bounded双遍闭集观察；existing exact-parent枚举与`RetirementDirectoryAuthority`能力集保持不变
-  - 从同一Windows backend取得专用live existing-source handle，以regular/single-link/live identity及portable exact size+SHA-256证明对象；对deterministic quarantine执行no-clobber rename并将source close ownership转交retained retirement，fresh process只在source absent+target exact时以新handle重绑
+  - 从同一Windows backend及完整source relative file绑定opaque `RetirementSourceDirectoryAuthority`：root/ancestor保持strict，仅immediate source-parent leaf使用rename-compatible profile，root-level source复用strict root；该authority不具普通目录的枚举、创建、publish或private能力。再取得专用live existing-source handle，以regular/single-link/live identity及portable exact size+SHA-256证明对象；source/source-parent/target须绑定同一exact root与issuer，对deterministic quarantine执行no-clobber rename并将source close ownership转交retained retirement，fresh process只在source absent+target exact时以新handle重绑
   - 覆盖unknown/limit/reparse、issuer/lease/ancestor-descendant mismatch、source+target coexist、target foreign/content drift、rename arm/terminal reproof及程序错误穿透；禁止任意删除、覆盖、pathname接管或持久化Volume/FileId
   - _Requirements: 1.2, 3.3, 4.3, 5.1, 5.3, 8.4_
   - _Boundary: Windows Fresh Recovery Platform Authorities_
