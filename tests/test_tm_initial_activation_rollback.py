@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -28,6 +29,21 @@ SOURCE_BYTES = (
     b'{"source":"same","target":"winner"}\n'
     b'{"source":"other","target":"value"}\n'
 )
+
+
+def _remove_windows_long_quarantine(root: Path) -> None:
+    """Remove the retained exact pair through Win32 extended paths."""
+
+    if os.name != "nt":
+        return
+    quarantine_root = root / ".localcat-activation-quarantine-v1"
+    if not quarantine_root.exists():
+        return
+    for attempt_directory in quarantine_root.iterdir():
+        for path in attempt_directory.iterdir():
+            os.unlink("\\\\?\\" + str(path))
+        os.rmdir("\\\\?\\" + str(attempt_directory))
+    os.rmdir("\\\\?\\" + str(quarantine_root))
 
 
 def _fixture(
@@ -441,23 +457,37 @@ class InitialActivationRollbackTests(unittest.TestCase):
     def test_build_failure_cleans_created_stage_and_returns_legacy_safe_failure(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            identity, coordinator, service = _fixture(Path(temporary))
-            with patch.object(
-                SQLiteTMStore,
-                "append_streamed_batch",
-                side_effect=OSError("sensitive source payload"),
-            ):
-                outcome = service.activate_initial(
-                    identity.configured_jsonl_path,
-                    identity.resource_id,
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.addCleanup(_remove_windows_long_quarantine, root)
+        identity, coordinator, service = _fixture(root)
+        with patch.object(
+            SQLiteTMStore,
+            "append_streamed_batch",
+            side_effect=OSError("sensitive source payload"),
+        ):
+            outcome = service.activate_initial(
+                identity.configured_jsonl_path,
+                identity.resource_id,
+            )
+        _assert_legacy_safe(
+            self,
+            identity=identity,
+            coordinator=coordinator,
+            outcome=outcome,
+            expected_stage="BUILD",
+        )
+        if os.name == "nt":
+            quarantined = tuple(
+                (root / ".localcat-activation-quarantine-v1").glob(
+                    "initial-*/*"
                 )
-            _assert_legacy_safe(
-                self,
-                identity=identity,
-                coordinator=coordinator,
-                outcome=outcome,
-                expected_stage="BUILD",
+            )
+            self.assertEqual(len(quarantined), 2)
+            self.assertEqual(
+                {path.suffix for path in quarantined},
+                {".stage", ".tmp"},
             )
 
     def test_seal_failure_identity_safely_removes_unpublished_pair(self) -> None:

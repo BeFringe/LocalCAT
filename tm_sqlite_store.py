@@ -100,6 +100,7 @@ from platform_fs_contracts import (
     CandidateFile,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
+    LedgerEnumerationLimits,
     LockedDescendantNamespaceInspection,
     MutableFileReservation,
     OpaqueAuthority,
@@ -173,10 +174,13 @@ from tm_activation_journal import (
     _create_recovery_backups,
     _PORTABLE_ACTIVATION_JOURNAL_PHASE,
     _PORTABLE_ACTIVATION_JOURNAL_VERSION,
+    _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
     _PORTABLE_PUBLICATION_VERSION,
     _portable_activation_private_directory_name,
+    _portable_initial_stage_quarantine_name,
     _WindowsPortablePreparedJournalOwner,
     _WindowsPortableCancelledJournalOwner,
+    _WindowsPortableFreshRecoveryOwner,
     _WindowsPortablePublicationPhaseOwner,
     _decode_activation_journal_record,
     _decode_journal_bool,
@@ -273,6 +277,8 @@ from tm_activation_recovery import (
     _recovery_jsonl_winners_digest,
     _recovery_mismatch,
     _recovery_prior_completed_binding,
+    _portable_recovery_activation_digest,
+    _portable_recovery_binding,
     _recovery_receipt_row,
     _recovery_sealed_stage_digest,
     _replace_activation_database,
@@ -1614,6 +1620,398 @@ def _rehydrate_runtime_authority(
     except BaseException:
         port.notify_all()
         raise
+
+
+def _rehydrate_completed_portable_authority(
+    port: _CoordinatorStorePort,
+    *,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> ActivationRecoveryReport | None:
+    """Read-only cold hydration for one complete Windows portable chain.
+
+    This entry cannot advance, cancel, retire, or create any durable fact.  A
+    portable namespace is accepted only when its authenticated publication
+    chain is already the exact three-record prefix ending at
+    ``GENERATION_PUBLISHED``, the stage pair is gone, and the lineage marker
+    and current rooted canonical DB are complete.  The configured JSONL and
+    adjacent manifest are post-publication observations: absence, replacement,
+    or an unsafe shape is classified by ``SourceBindingMonitor`` after the
+    canonical authority has been hydrated, rather than revoking that authority.
+    """
+
+    identity = port.resource_identity
+    snapshot = _WindowsPortableFreshRecoveryOwner.inspect(
+        identity=identity,
+        canonical_store_id=port.canonical_store_id,
+        backend=platform,
+        persistent_private=persistent_private,
+        descendant_inspection=descendant_inspection,
+        caller_borrow=caller_borrow,
+    )
+    if snapshot.state == "NO_FACTS":
+        return None
+    port.state = "ACTIVATING"
+    port.view = None
+    port.notify_all()
+    if (
+        snapshot.state != "PENDING"
+        or snapshot.highest_phase != "GENERATION_PUBLISHED"
+        or type(snapshot.pending_record) is not _PortableActivationJournalRecord
+        or len(snapshot.phase_records) != 3
+        or tuple(
+            record.unsigned.phase for record in snapshot.phase_records
+        )
+        != ("DB_REPLACED", "MANIFEST_PUBLISHED", "GENERATION_PUBLISHED")
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+
+    prepared = snapshot.pending_record
+    db_phase, manifest_phase, generation_phase = snapshot.phase_records
+    unsigned = prepared.unsigned
+    active = generation_phase.unsigned.active_content_attestation
+    sealed = unsigned.sealed_content_attestation
+    if (
+        db_phase.unsigned.active_content_attestation is not None
+        or type(active) is not PortableActiveContentAttestation
+        or manifest_phase.unsigned.active_content_attestation != active
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+
+    root, lease = caller_borrow._fresh_recovery_authorities(
+        platform,
+        persistent_private,
+        identity,
+    )
+    stage_names = (
+        unsigned.candidate_stage_db_name,
+        unsigned.candidate_manifest_temp_name,
+    )
+    marker_path = _activation_lineage_marker_path(identity)
+    marker_name = marker_path.name
+    marker_temp_name = _activation_lineage_marker_temp_path(marker_path).name
+    if (
+        any(root.inspect_entry(name) is not None for name in stage_names)
+        or root.inspect_entry(marker_name) is None
+        or root.inspect_entry(marker_temp_name) is not None
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+
+    authorities: list[object] = []
+    canonical_authorities: dict[str, BoundRegularFile] = {}
+    quarantine_authorities: dict[
+        str,
+        tuple[BoundRegularFile, BoundContentFacts],
+    ] = {}
+    active_error: BaseException | None = None
+    staged_view: _SQLiteGenerationView | None = None
+    try:
+        quarantine_name = _portable_initial_stage_quarantine_name(
+            identity,
+            unsigned,
+        )
+        quarantine_root = platform.bind_parent(
+            root,
+            PurePath(
+                _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                "completed-runtime-placeholder",
+            ),
+        )
+        authorities.append(quarantine_root)
+        quarantine_entry = quarantine_root.inspect_entry(quarantine_name)
+        if (
+            quarantine_entry is None
+            or quarantine_entry.identity.kind != "directory"
+            or not quarantine_entry.reparse_free
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        quarantine_target = platform.bind_parent(
+            root,
+            PurePath(
+                _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                quarantine_name,
+                "completed-runtime-placeholder",
+            ),
+        )
+        authorities.append(quarantine_target)
+        expected_quarantine = {
+            unsigned.candidate_stage_db_name:
+                unsigned.sealed_content_attestation.database,
+            unsigned.candidate_manifest_temp_name:
+                unsigned.sealed_content_attestation.manifest,
+        }
+        entries = descendant_inspection.observe_descendant_entries(
+            root,
+            lease,
+            quarantine_target,
+            LedgerEnumerationLimits(
+                maximum_entries=2,
+                maximum_name_bytes=4096,
+                maximum_total_bytes=sum(
+                    proof.size for proof in expected_quarantine.values()
+                ),
+            ),
+        )
+        if {entry.name for entry in entries} != set(expected_quarantine):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        for name, expected in expected_quarantine.items():
+            opened = platform.open_regular(
+                root,
+                PurePath(
+                    _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                    quarantine_name,
+                    name,
+                ),
+            )
+            authorities.append(opened)
+            facts = opened.content_facts()
+            quarantine_authorities[name] = (opened, facts)
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or not facts.snapshot.reparse_free
+                or port.portable_content_proof(facts) != expected
+                or quarantine_target.inspect_entry(name) != facts.snapshot
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+
+        observed: dict[str, tuple[PortableContentFileProof, BoundContentFacts]] = {}
+        for name in (
+            identity.canonical_sidecar_path.name,
+            marker_name,
+        ):
+            opened = platform.open_regular(root, PurePath(name))
+            authorities.append(opened)
+            canonical_authorities[name] = opened
+            facts = opened.content_facts()
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or not facts.snapshot.reparse_free
+                or root.inspect_entry(name) != facts.snapshot
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            observed[name] = (port.portable_content_proof(facts), facts)
+
+        if (
+            active.manifest != sealed.manifest
+            or active.source != sealed.source
+            or canonical_authorities[marker_name].read_all()
+            != _activation_lineage_marker_payload(identity)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        activation_digest = _portable_recovery_activation_digest(prepared)
+        if (
+            active.sealed_attestation_digest
+            != unsigned.sealed_content_attestation.attestation_digest
+            or active.journal_id != unsigned.journal_id
+            or active.resource_id != identity.resource_id
+            or active.target_identity != identity.target_identity
+            or active.canonical_store_id != port.canonical_store_id
+            or active.snapshot_receipt_digest
+            != unsigned.snapshot_receipt_digest
+            or active.generation != 0
+            or active.activation_digest != activation_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+
+        active_ref = _canonical_activation_ref(
+            identity,
+            journal_id=unsigned.journal_id,
+        )
+        schema = _inspect_completed_active_schema_read_only(
+            active_ref,
+            canonical_store_id=port.canonical_store_id,
+            expected_generation=0,
+            expected_activation_digest=activation_digest,
+        )
+        semantic = active.semantic_facts
+        if (
+            schema.schema_version != semantic.schema_version
+            or schema.fold_version != semantic.fold_version
+            or schema.candidate_index_version != semantic.index_version
+            or schema.candidate_index_kind != semantic.candidate_index_kind
+            or schema.fts5_available != semantic.fts5_available
+            or schema.sqlite_runtime_version != semantic.sqlite_runtime_version
+            or schema.unicode_runtime_version != semantic.unicode_runtime_version
+            or schema.journal_mode != semantic.journal_mode
+            or schema.synchronous != semantic.synchronous
+            or schema.foreign_keys != semantic.foreign_keys
+            or schema.busy_timeout_ms != semantic.busy_timeout_ms
+            or schema.wal_enabled != semantic.wal_enabled
+            or schema.extension_loading_enabled
+            != semantic.extension_loading_enabled
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        staged_view = _SQLiteGenerationView(
+            stage=active_ref,
+            canonical_store_id=port.canonical_store_id,
+            generation=0,
+            fts5_available=schema.fts5_available,
+            active_content_attestation=active,
+        )
+        with _open_completed_authority_read_connection(
+            identity.canonical_sidecar_path
+        ) as connection:
+            connection.execute("BEGIN")
+            try:
+                port.validate_store_identity(
+                    connection,
+                    resource_id=identity.resource_id,
+                    canonical_store_id=port.canonical_store_id,
+                    target_identity=identity.target_identity,
+                )
+                if connection.execute("PRAGMA integrity_check").fetchall() != [
+                    ("ok",)
+                ] or connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise port.store_schema_error("STORE.INTEGRITY_CHECK_FAILED")
+                facts = port.read_source_binding_facts_in_transaction(
+                    connection,
+                    staged_view,
+                )
+                receipt_row, receipt_status = _recovery_receipt_row(
+                    port,
+                    connection,
+                )
+                binding = facts.binding
+                if (
+                    binding is None
+                    or facts.diagnostic_codes
+                    or receipt_status != "completed"
+                    or receipt_row != binding.receipt
+                ):
+                    raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
+                signed_binding = _portable_recovery_binding(
+                    identity,
+                    prepared,
+                    contract_to_json(binding.manifest).encode("utf-8"),
+                )
+                record_count_at_revision = {0: 0}
+                record_count_at_revision.update(
+                    facts.cumulative_record_counts
+                )
+                if (
+                    binding != signed_binding
+                    or binding.receipt.exported_revision
+                    > facts.head_revision
+                    or record_count_at_revision.get(
+                        binding.receipt.exported_revision
+                    )
+                    != binding.receipt.record_count
+                ):
+                    raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
+                port.validate_candidate_proof_index(
+                    connection,
+                    required_sizes=(
+                        (1, 2) if schema.fts5_available else (1, 2, 3)
+                    ),
+                    fts5_available=schema.fts5_available,
+                )
+            finally:
+                connection.rollback()
+
+        caller_borrow.reprove(platform, identity)
+        quarantine_root.reprove()
+        quarantine_target.reprove()
+        if (
+            _WindowsPortableFreshRecoveryOwner.inspect(
+                identity=identity,
+                canonical_store_id=port.canonical_store_id,
+                backend=platform,
+                persistent_private=persistent_private,
+                descendant_inspection=descendant_inspection,
+                caller_borrow=caller_borrow,
+            )
+            != snapshot
+            or any(root.inspect_entry(name) is not None for name in stage_names)
+            or root.inspect_entry(marker_temp_name) is not None
+            or _completed_authority_sqlite_sidecar_present(
+                identity.canonical_sidecar_path
+            )
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        for name, authority in canonical_authorities.items():
+            facts = authority.content_facts()
+            if (
+                facts != observed[name][1]
+                or root.inspect_entry(name) != facts.snapshot
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        for name, (authority, prior_facts) in quarantine_authorities.items():
+            facts = authority.content_facts()
+            if (
+                facts != prior_facts
+                or quarantine_target.inspect_entry(name) != facts.snapshot
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+    except BaseException as error:
+        active_error = error
+    finally:
+        close_error: BaseException | None = None
+        for authority in reversed(authorities):
+            try:
+                authority.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if active_error is None and close_error is not None:
+            active_error = close_error
+    if active_error is not None:
+        port.view = None
+        port.state = "ACTIVATING"
+        port.notify_all()
+        raise active_error
+    if staged_view is None:
+        raise AssertionError("portable completed hydration produced no view")
+    port.view = staged_view
+    port.state = "READY"
+    port.notify_all()
+    return ActivationRecoveryReport(
+        phase="GENERATION_PUBLISHED",
+        action="COMPLETED",
+        generation=0,
+    )
 
 
 @contextmanager
@@ -5445,6 +5843,39 @@ class ResourceStoreCoordinator:
                     self._view = None
                     self._state = "ACTIVATING"
                     self._condition.notify_all()
+                raise
+            except (PlatformFileError, OSError, sqlite3.Error) as error:
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from error
+
+    def rehydrate_completed_portable_activation(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> ActivationRecoveryReport | None:
+        """Read-only hydrate exactly one complete Windows portable chain."""
+
+        with self._condition:
+            try:
+                return _rehydrate_completed_portable_authority(
+                    _CoordinatorStorePort(self),
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    descendant_inspection=descendant_inspection,
+                    caller_borrow=caller_borrow,
+                )
+            except ActivationPreparationError:
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
                 raise
             except (PlatformFileError, OSError, sqlite3.Error) as error:
                 self._view = None

@@ -8,12 +8,14 @@ import time
 import os
 import sqlite3
 import stat
+import sys
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
 from pathlib import Path
 
 from tm_activation_journal import (
     ActivationPreparationError,
+    ActivationRecoveryReport,
     _lstat_any_entry,
     _lstat_activation_journal_identity,
     _parse_activation_journal_bytes,
@@ -235,9 +237,34 @@ def canonical_authority_facts(
     return resource_id, canonical_store_id
 
 
+def _rehydrate_canonical_runtime_authority(
+    coordinator: ResourceStoreCoordinator,
+    identity: CanonicalResourceIdentity,
+) -> ActivationRecoveryReport | None:
+    """Prefer authenticated Windows portable facts before legacy/v2 discovery.
+
+    The portable namespace is inspected only while holding its existing W1
+    reservation.  A recognized pending/completed/corrupt namespace never
+    falls through to generic no-journal discovery; only the owner's exact
+    ``NO_FACTS`` result preserves that legacy/v2 path.
+    """
+
+    if sys.platform != "win32":
+        return coordinator.rehydrate_runtime_authority()
+
+    from tm_migration import TMMigrationService
+
+    return TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id=coordinator.canonical_store_id,
+        coordinator=coordinator,
+    ).rehydrate_completed_portable_activation()
+
+
 def open_canonical_tm_store(
     configured_jsonl: Path,
     *,
+    expected_resource_id: str | None = None,
     drain_timeout_seconds: float = 5.0,
 ) -> SQLiteTMStore | None:
     """Open one activated resource's canonical store, or ``None`` for legacy.
@@ -256,27 +283,65 @@ def open_canonical_tm_store(
     implicit fallback for an activated resource.
     """
 
-    try:
-        facts = _activation_facts(configured_jsonl)
-    except ActivationPreparationError as error:
-        raise ValueError(
-            f"{_CANONICAL_RECOVERY_FAILED_CODE}:{error.code}"
-        ) from error
-    if facts is None:
-        return None
-    resource_id, canonical_store_id = facts
+    path = _configured_jsonl_path(configured_jsonl)
+    if expected_resource_id is not None and type(expected_resource_id) is not str:
+        raise TypeError("expected_resource_id must be a built-in string or None")
+    if type(expected_resource_id) is str and not expected_resource_id.strip():
+        raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+
+    if sys.platform == "win32":
+        sidecar, manifest, journal, terminal, marker = _canonical_artifact_paths(path)
+        has_adjacent_facts = any(
+            _lstat_any_entry(candidate)
+            for candidate in (sidecar, manifest, journal, terminal, marker)
+        )
+        if expected_resource_id is None:
+            if has_adjacent_facts:
+                raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+            return None
+        resource_id = expected_resource_id
+        canonical_store_id = (
+            _sidecar_activation_facts(sidecar)[1]
+            if _lstat_any_entry(sidecar)
+            else f"untrusted-locator.{expected_resource_id}"
+        )
+    else:
+        try:
+            facts = _activation_facts(path)
+        except ActivationPreparationError as error:
+            raise ValueError(
+                f"{_CANONICAL_RECOVERY_FAILED_CODE}:{error.code}"
+            ) from error
+        if facts is None:
+            return None
+        resource_id, canonical_store_id = facts
+
     coordinator: ResourceStoreCoordinator | None = None
     try:
         identity = CanonicalResourceIdentity.from_configured_jsonl(
             resource_id,
-            _configured_jsonl_path(configured_jsonl),
+            path,
         )
         coordinator = ResourceStoreCoordinator(
             resource_identity=identity,
             canonical_store_id=canonical_store_id,
             drain_timeout_seconds=drain_timeout_seconds,
         )
-        report = coordinator.rehydrate_runtime_authority()
+        report = _rehydrate_canonical_runtime_authority(
+            coordinator,
+            identity,
+        )
+        if sys.platform == "win32" and report is None:
+            facts = _activation_facts(path)
+            if facts is None:
+                return None
+            _resource_hint, discovered_store_id = facts
+            coordinator = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id=discovered_store_id,
+                drain_timeout_seconds=drain_timeout_seconds,
+            )
+            report = coordinator.rehydrate_runtime_authority()
         if report is None or (
             report.action == "CANCELLED" and report.generation is None
         ):
@@ -334,6 +399,7 @@ class TMEngine:
         active: bool = True,
         lookup: bool = True,
         update: bool = True,
+        expected_resource_id: str | None = None,
         drain_timeout_seconds: float = 5.0,
     ) -> None:
         for field_name, value in (
@@ -352,6 +418,7 @@ class TMEngine:
         self._exact_index: Dict[str, TMMatch] = {}
         self._store = open_canonical_tm_store(
             self.tm_path,
+            expected_resource_id=expected_resource_id,
             drain_timeout_seconds=drain_timeout_seconds,
         )
         if self._store is None:

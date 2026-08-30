@@ -19,6 +19,7 @@ from typing import Any, cast
 import uuid
 
 from tm_activation_journal import (
+    ActivationRecoveryReport,
     _ActivationPreparation,
     _activation_journal_path,
     _activation_journal_temp_path,
@@ -1001,6 +1002,52 @@ class TMMigrationService:
     @property
     def canonical_store_id(self) -> str:
         return self._canonical_store_id
+
+    def rehydrate_completed_portable_activation(
+        self,
+    ) -> ActivationRecoveryReport | None:
+        """Read-only hydrate one already-complete Windows portable chain.
+
+        The W1 reservation covers portable inspection, canonical hydration,
+        and the first physical health read.  An
+        exact ``NO_FACTS`` returns ``None``; every recognized incomplete or
+        invalid portable namespace fails before the legacy/v2 caller can run.
+        """
+
+        coordinator = self._coordinator
+        if coordinator is None or (
+            coordinator._resource_identity != self._resource_identity
+            or coordinator.canonical_store_id != self._canonical_store_id
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.COORDINATOR_IDENTITY_MISMATCH"
+            )
+        if sys.platform != "win32":
+            return None
+        try:
+            reservation = self._acquire_initial_reservation()
+        except _InitialActivationReservationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
+        try:
+            with reservation:
+                portable = coordinator.rehydrate_completed_portable_activation(
+                    **reservation.portable_runtime_inputs(),
+                )
+                if portable is None:
+                    reservation.reprove()
+                    return None
+                store = SQLiteTMStore.from_coordinator(coordinator)
+                store.health()
+                reservation.reprove()
+                return portable
+        except _InitialActivationReservationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
 
     def _acquire_initial_reservation(
         self,
@@ -5775,6 +5822,66 @@ class _InitialActivationResourceReservation:
             "persistent_private": persistent_private,
             "descendant_inspection": descendant_inspection,
             "existing_retirement": existing_retirement,
+            "caller_borrow": borrow,
+        }
+
+    def portable_runtime_inputs(self) -> dict[str, object]:
+        """Mint one non-mutating completed-runtime borrow from held W1."""
+
+        if (
+            self._backend is None
+            or self._root is None
+            or self._lease is None
+            or self._released
+            or self._recovery_borrow_minted
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        self.reprove()
+        try:
+            probe_root = self._identity.canonical_sidecar_path.parent
+            persistent_private = narrow_windows_persistent_private_proof(
+                self._backend,
+                probe_root,
+            )
+            descendant_inspection = (
+                narrow_windows_locked_descendant_namespace_inspection(
+                    self._backend,
+                    probe_root,
+                )
+            )
+            if not (
+                persistent_private is self._backend
+                and descendant_inspection is self._backend
+                and isinstance(
+                    descendant_inspection,
+                    LockedDescendantNamespaceInspection,
+                )
+            ):
+                raise PlatformFileError(
+                    PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                    retryable=False,
+                )
+            borrow = _create_caller_held_portable_journal_borrow(
+                identity=self._identity,
+                backend=self._backend,
+                root=self._root,
+                lease=self._lease,
+                lock_name=self._lock_name,
+                lock_payload=self._payload(self._identity),
+            )
+            borrow.reprove(self._backend, self._identity)
+        except PlatformFileError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            ) from error
+        self._recovery_borrow_minted = True
+        return {
+            "platform": self._backend,
+            "persistent_private": persistent_private,
+            "descendant_inspection": descendant_inspection,
             "caller_borrow": borrow,
         }
 
