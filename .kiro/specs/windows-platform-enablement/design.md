@@ -243,6 +243,12 @@ class BoundSynchronizedRegularFile(BoundRegularFile, Protocol):
     def content_facts(self) -> BoundContentFacts: ...
     def synchronize_content(self, expected: BoundContentFacts) -> BoundContentFacts: ...
 
+class ExistingFileMutationGuard(Protocol):
+    def guard_existing_for_mutation(self, root: RootedDirectoryAuthority, relative: PurePath) -> BoundExistingFileMutationGuard: ...
+
+class BoundExistingFileMutationGuard(Protocol):
+    def reprove(self) -> FileObjectIdentity: ...
+
 class BoundDirectoryAuthority(Protocol):
     def reprove(self) -> None: ...
     def inspect_entry(self, name: str) -> EntrySnapshot | None: ...
@@ -286,6 +292,7 @@ class PersistentPrivateProof(Protocol):
 - `CandidateFile.write_chunks`是one-shot、每块至多64 KiB且受调用方总字节上限约束的流式写入口；`write_all`只是兼容委托。`observe_ledger_entries`只在同父目录live lease下返回有界、排序的namespace observations；这些observations不是authority或CAS，owner必须逐项rooted reopen并复证后才能读取或提交业务状态。
 - `PendingPublication` 是跨越业务 owner durable commit 的opaque、context-managed低层authority，不是业务receipt。`begin_publish`不得返回success；owner必须使用其retained destination完成readback，自行提交并复证业务state，再调用platform `terminal_reproof`，最后关闭。平台不解释或持久化owner phase/generation/compatibility。
 - `ExistingFileDurability`只同步已由owner写成的既有regular file：同一retained authority先后复证exact identity/content并执行平台文件持久化，不得rename/unlink或改变namespace。POSIX实现执行file fsync后parent directory fsync；Windows实现执行同一file handle的`FlushFileBuffers`并复证parent/root live authority，parent reproof不冒充directory fsync。
+- `ExistingFileMutationGuard`只为必须按pathname打开既有文件的外部writer保留live identity窗口：Windows guard允许READ/WRITE sharing但不允许DELETE sharing，从writer事务前一直存活到owner终端业务复证后，每次都复证root/name仍指向同一regular single-link object。它不读写、flush、publish或解释SQLite状态；平台不能提供该窗口时显式fail closed，不以历史FileId或pathname重开代答。
 - `PrivateStorageProof`只产生当次physical ACL/MIC evidence；独立的`PersistentPrivateProof`拥有device-secret binding、持久proof mint/verify与terminal consume。具体backend只接受由同一composition issuer签发的exact private evidence/secret/verified类型；公开`WindowsPrivateProof`始终是不可信持久值。device-secret authority独立持有binding handle，调用方关闭原`BoundRegularFile`不撤销它；verified authority只能在backend完成exact issuer/context检查后锁内消费一次，terminal reproof成功或失败都关闭其retained authorities。`PersistentPrivateProof`不并入既有`PlatformFileBackend` aggregate。
 - 上层不能取得 raw Windows HANDLE/dirfd；tests 通过专用 fault seam，而不是调用内部 API。
 - factory 只在 backend self-probe/contract gate 成功后返回 capability object；不存在“布尔值为 true 即可信”。
@@ -305,6 +312,7 @@ Task 3.1 的host probe只返回诊断性的`WindowsHostFacts`，不提前铸造�
 | SOURCE | generic read + read attributes | READ，**无 WRITE/DELETE** | OPEN_REPARSE_POINT + SEQUENTIAL_SCAN | sealed copy；阻止并发 overwrite/rename |
 | ENTRY_PROBE | read attributes/synchronize | READ + WRITE + DELETE | OPEN_REPARSE_POINT | 仅提供观察事实；commit 前关闭，不构成 CAS |
 | MUTABLE_RESERVATION | read attributes + synchronize，**无 DELETE/write** | READ + WRITE + DELETE | CREATE_NEW + OPEN_REPARSE_POINT | 保留创建identity与origin parent/name；允许SQLite/普通writer并存，swap后拒绝采纳，不负责publish/retirement |
+| EXISTING_MUTATION_GUARD | read attributes + synchronize，**无 DELETE/write** | READ + WRITE，**无 DELETE** | OPEN_EXISTING + OPEN_REPARSE_POINT | 仅在外部pathname writer期间保留live existing-file lineage；不授权内容或业务提交 |
 | RETIREMENT_TARGET | traverse + read attributes + synchronize | READ + WRITE + DELETE | BACKUP_SEMANTICS + OPEN_REPARSE_POINT | 仅专用target leaf；nested child mutation期间另持share-READ strict pin；不能作为publish/private parent |
 | RETIREMENT_SOURCE_DIRECTORY | traverse + read attributes + synchronize | READ + WRITE + DELETE | BACKUP_SEMANTICS + OPEN_REPARSE_POINT | `ExistingFileRetirement`专用source-parent leaf；root与更高ancestor保持strict，root-level source复用strict root；不能枚举、创建、publish或铸造private proof |
 | RETIREMENT_MOVE | delete + read attributes + synchronize | READ + WRITE，**无 DELETE** | OPEN_REPARSE_POINT | 短生命周期no-clobber move；命名后立即关闭，reservation主handle继续固定creator |
