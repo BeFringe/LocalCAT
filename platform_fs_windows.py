@@ -29,12 +29,15 @@ from platform_fs_contracts import (
     DeviceSecretAuthority,
     EntrySnapshot,
     ExistingFileDurability,
+    ExistingFileRetirement,
+    ExistingRetirementSource,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
     LockLease,
     LockPolicy,
     LockWait,
+    LockedDescendantNamespaceInspection,
     MutableFileReservation,
     MutableFileReservationService,
     OwnedNamespaceRetirement,
@@ -807,6 +810,17 @@ def _duplicate_directory_chain(
         raise
 
 
+def _directory_chain_is_strict_prefix(
+    ancestor: tuple[_WindowsDirectoryRecord, ...],
+    descendant: tuple[_WindowsDirectoryRecord, ...],
+) -> bool:
+    return len(ancestor) < len(descendant) and all(
+        left.expected_final_path == right.expected_final_path
+        and left.identity == right.identity
+        for left, right in zip(ancestor, descendant[: len(ancestor)], strict=True)
+    )
+
+
 def _open_directory_record(
     api: WindowsFileAPI,
     path: str,
@@ -1007,6 +1021,7 @@ def _open_directory_components(
 
 _WINDOWS_DIRECTORY_AUTHORITY_SLOTS = (
     "_api",
+    "_issuer",
     "_records",
     "_maximum_component_units",
     "_fault_injector",
@@ -1019,6 +1034,7 @@ class _WindowsDirectoryAuthorityMixin:
     def __init__(
         self,
         api: WindowsFileAPI,
+        issuer: object,
         records: tuple[_WindowsDirectoryRecord, ...],
         maximum_component_units: int,
         fault_injector: _FaultInjector | None,
@@ -1027,6 +1043,7 @@ class _WindowsDirectoryAuthorityMixin:
         if not records:
             raise ValueError("Windows directory authority requires retained handles")
         self._api = api
+        self._issuer = issuer
         self._records = records
         self._maximum_component_units = maximum_component_units
         self._fault_injector = fault_injector
@@ -1073,9 +1090,26 @@ class _WindowsDirectoryAuthorityMixin:
         lease: LockLease,
         limits: LedgerEnumerationLimits,
     ) -> tuple[LedgerEntryObservation, ...]:
-        if not isinstance(lease, _WindowsLockLease) or not lease._matches_parent(
+        return self._observe_entries_under_lease_records(
+            lease,
             self._api,
+            self._issuer,
             self._records,
+            limits,
+        )
+
+    def _observe_entries_under_lease_records(
+        self,
+        lease: LockLease,
+        lease_api: WindowsFileAPI,
+        lease_issuer: object,
+        lease_records: tuple[_WindowsDirectoryRecord, ...],
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        if not isinstance(lease, _WindowsLockLease) or not lease._matches_parent(
+            lease_api,
+            lease_issuer,
+            lease_records,
         ):
             raise _lock_unavailable()
 
@@ -1216,8 +1250,9 @@ class _WindowsDirectoryAuthorityMixin:
             raise _identity_stale()
         try:
             terminal_lease_match = lease._matches_parent(
-                self._api,
-                self._records,
+                lease_api,
+                lease_issuer,
+                lease_records,
             )
         except Exception:
             raise _lock_unavailable() from None
@@ -1347,7 +1382,11 @@ class _WindowsDirectoryAuthorityMixin:
             if mode is PublishMode.REPLACE_UNDER_LOCK:
                 if (
                     type(lease) is not _WindowsLockLease
-                    or not lease._matches_parent(self._api, self._records)
+                    or not lease._matches_parent(
+                        self._api,
+                        self._issuer,
+                        self._records,
+                    )
                 ):
                     raise _lock_unavailable()
             elif lease is not None:
@@ -2403,6 +2442,7 @@ def _lock_range(
 class _WindowsLockLease(LockLease):
     __slots__ = (
         "_api",
+        "_issuer",
         "_records",
         "_handle",
         "_entry_path",
@@ -2416,6 +2456,7 @@ class _WindowsLockLease(LockLease):
     def __init__(
         self,
         api: WindowsFileAPI,
+        issuer: object,
         records: tuple[_WindowsDirectoryRecord, ...],
         handle: object,
         entry_path: str,
@@ -2427,6 +2468,7 @@ class _WindowsLockLease(LockLease):
     ) -> None:
         super().__init__()
         self._api = api
+        self._issuer = issuer
         self._records = records
         self._handle = handle
         self._entry_path = entry_path
@@ -2458,12 +2500,17 @@ class _WindowsLockLease(LockLease):
     def _matches_parent(
         self,
         api: WindowsFileAPI,
+        issuer: object,
         records: tuple[_WindowsDirectoryRecord, ...],
     ) -> bool:
         self._require_open()
         try:
             self._reprove_lock()
-            if api is not self._api or len(records) != len(self._records):
+            if (
+                api is not self._api
+                or issuer is not self._issuer
+                or len(records) != len(self._records)
+            ):
                 return False
             _reprove_directory_chain(api, records)
             return all(
@@ -2488,7 +2535,7 @@ class _WindowsLockLease(LockLease):
             raise _lock_unavailable()
         if name != self._entry_name or payload != self._payload:
             raise _lock_unavailable()
-        if not self._matches_parent(parent._api, parent._records):
+        if not self._matches_parent(parent._api, parent._issuer, parent._records):
             raise _lock_unavailable()
 
     def _close_authority(self) -> None:
@@ -2722,6 +2769,7 @@ class WindowsProcessFileLock(ProcessFileLock):
             locked = False
             return _WindowsLockLease(
                 api,
+                parent._issuer,
                 transferred_records,
                 transferred_handle,
                 entry_path,
@@ -3010,6 +3058,168 @@ class _WindowsBoundRegularFile(BoundRegularFile):
             raise _capability_unavailable() from None
 
 
+class _WindowsExistingRetirementSource(ExistingRetirementSource):
+    __slots__ = (
+        "_api",
+        "_issuer",
+        "_records",
+        "_handle",
+        "_entry_path",
+        "_entry_identity",
+        "_expected_content",
+        "_read_lock",
+    )
+
+    def __init__(
+        self,
+        api: WindowsFileAPI,
+        issuer: object,
+        records: tuple[_WindowsDirectoryRecord, ...],
+        handle: object,
+        entry_path: str,
+        entry_identity: FileObjectIdentity,
+        expected_content: CandidateContentFacts,
+    ) -> None:
+        super().__init__(entry_identity, expected_content)
+        self._api = api
+        self._issuer = issuer
+        self._records = records
+        self._handle = handle
+        self._entry_path = entry_path
+        self._entry_identity = entry_identity
+        self._expected_content = expected_content
+        self._read_lock = threading.Lock()
+        try:
+            self.reprove()
+        except BaseException:
+            self._close_authority()
+            raise
+
+    def _reprove_source(self) -> BoundContentFacts:
+        with self._read_lock:
+            try:
+                _reprove_directory_chain(self._api, self._records)
+                with self._handle.borrow() as raw:
+                    before = _capture_handle_proof(
+                        self._api,
+                        raw,
+                        expected_final_path=self._entry_path,
+                        expected_kind="regular",
+                        stale=True,
+                    )
+                named = _open_entry_proof(
+                    self._api,
+                    self._entry_path,
+                    self._entry_path,
+                    expected_kind="regular",
+                    expected_volume_id=self._records[0].identity.volume_id,
+                    stale=True,
+                )
+                if named is None or not (
+                    before.identity == self._entry_identity
+                    and named.identity == self._entry_identity
+                    and before.identity.link_count == 1
+                    and named.identity.link_count == 1
+                    and before.snapshot == named.snapshot
+                ):
+                    raise _identity_stale()
+                actual = _read_publish_facts(
+                    self._api,
+                    self._handle,
+                    before.snapshot.byte_count,
+                )
+                with self._handle.borrow() as raw:
+                    after = _capture_handle_proof(
+                        self._api,
+                        raw,
+                        expected_final_path=self._entry_path,
+                        expected_kind="regular",
+                        stale=True,
+                    )
+                _reprove_directory_chain(self._api, self._records)
+                if before.snapshot != after.snapshot:
+                    raise _identity_stale()
+                if actual != self._expected_content:
+                    raise _identity_stale()
+                return BoundContentFacts(after.snapshot, actual.content_sha256)
+            except (TypeError, AssertionError, AttributeError):
+                raise
+            except PlatformFileError:
+                raise
+            except Exception:
+                raise _identity_stale() from None
+
+    def _transfer_live_authority(
+        self,
+        target_path: str,
+    ) -> tuple[
+        WindowsFileAPI,
+        tuple[_WindowsDirectoryRecord, ...],
+        object,
+        str,
+        FileObjectIdentity,
+        CandidateContentFacts,
+    ]:
+        self._require_open()
+        _reprove_directory_chain(self._api, self._records)
+        with self._handle.borrow() as raw:
+            moved = _capture_handle_proof(
+                self._api,
+                raw,
+                expected_final_path=target_path,
+                expected_kind="regular",
+                stale=True,
+            )
+        actual = _read_publish_facts(
+            self._api,
+            self._handle,
+            moved.snapshot.byte_count,
+        )
+        with self._handle.borrow() as raw:
+            terminal = _capture_handle_proof(
+                self._api,
+                raw,
+                expected_final_path=target_path,
+                expected_kind="regular",
+                stale=True,
+            )
+        if (
+            moved.identity != self._entry_identity
+            or moved.snapshot != terminal.snapshot
+            or moved.identity.link_count != 1
+            or actual != self._expected_content
+        ):
+            raise _recovery_required()
+        records = self._records
+        handle = self._handle
+        self._records = ()
+        self._handle = None
+        self._mark_authority_transferred()
+        return (
+            self._api,
+            records,
+            handle,
+            self._entry_path,
+            self._entry_identity,
+            self._expected_content,
+        )
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        handle = self._handle
+        self._handle = None
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException as error:
+                first_error = error
+        records = self._records
+        self._records = ()
+        chain_error = _close_handles_reverse(tuple(record.handle for record in records))
+        if first_error is not None or chain_error is not None:
+            raise _capability_unavailable() from None
+
+
 class _WindowsMutableFileReservation(MutableFileReservation):
     __slots__ = (
         "_api",
@@ -3100,6 +3310,8 @@ class _WindowsRetainedRetirement(RetainedRetirement):
         "_target_name",
         "_handle",
         "_target_path",
+        "_expected_content",
+        "_fault_injector",
     )
 
     def __init__(
@@ -3112,7 +3324,11 @@ class _WindowsRetainedRetirement(RetainedRetirement):
         target_name: str,
         handle: object,
         target_path: str,
+        expected_content: CandidateContentFacts | None = None,
+        fault_injector: _FaultInjector | None = None,
     ) -> None:
+        if expected_content is not None and type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts or None")
         super().__init__(owned_identity)
         self._api = api
         self._source_records = source_records
@@ -3121,6 +3337,8 @@ class _WindowsRetainedRetirement(RetainedRetirement):
         self._target_name = target_name
         self._handle = handle
         self._target_path = target_path
+        self._expected_content = expected_content
+        self._fault_injector = fault_injector
         try:
             self._reprove_retirement()
         except BaseException:
@@ -3204,6 +3422,29 @@ class _WindowsRetainedRetirement(RetainedRetirement):
                 or terminal_retained.identity.link_count != 1
             ):
                 raise _recovery_required()
+            if self._expected_content is not None:
+                actual = _read_publish_facts(
+                    self._api,
+                    self._handle,
+                    terminal_retained.snapshot.byte_count,
+                )
+                with self._handle.borrow() as raw:
+                    after_content = _capture_handle_proof(
+                        self._api,
+                        raw,
+                        expected_final_path=self._target_path,
+                        expected_kind="regular",
+                        stale=True,
+                    )
+                if (
+                    actual != self._expected_content
+                    or after_content.snapshot != terminal_retained.snapshot
+                ):
+                    raise _recovery_required()
+            _hit_fault(
+                self._fault_injector,
+                "existing_retirement_before_terminal_reproof",
+            )
             _reprove_directory_chain(self._api, self._source_records)
             _reprove_directory_chain(self._api, self._target_records)
             return terminal_retained.snapshot
@@ -3597,6 +3838,8 @@ class WindowsRootedFileSystem(
     MutableFileReservationService,
     OwnedNamespaceRetirement,
     ExistingFileDurability,
+    LockedDescendantNamespaceInspection,
+    ExistingFileRetirement,
 ):
     """Windows rooted reads, mutable reservations, and existing-file durability."""
 
@@ -3611,12 +3854,193 @@ class WindowsRootedFileSystem(
         if _fault_injector is not None and not callable(_fault_injector):
             raise TypeError("_fault_injector must be callable")
         self._api = _api
+        self._authority_issuer = object()
         self._fault_injector = _fault_injector
 
     def _native_api(self) -> WindowsFileAPI:
         if self._api is None:
             self._api = WindowsFileAPI.load()
         return self._api
+
+    def _observe_descendant_entries(
+        self,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        descendant: BoundDirectoryAuthority,
+        limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        if (
+            type(root) is not _WindowsRootedDirectory
+            or type(descendant) is not _WindowsBoundDirectory
+            or not isinstance(lease, _WindowsLockLease)
+            or root._api is not descendant._api
+            or root._api is not lease._api
+            or root._issuer is not self._authority_issuer
+            or descendant._issuer is not self._authority_issuer
+            or not _directory_chain_is_strict_prefix(root._records, descendant._records)
+        ):
+            raise _lock_unavailable()
+        try:
+            root._reprove()
+            descendant._reprove()
+            if not lease._matches_parent(
+                root._api,
+                root._issuer,
+                root._records,
+            ):
+                raise _lock_unavailable()
+            observations = descendant._observe_entries_under_lease_records(
+                lease,
+                root._api,
+                root._issuer,
+                root._records,
+                limits,
+            )
+            root._reprove()
+            descendant._reprove()
+            if (
+                not _directory_chain_is_strict_prefix(
+                    root._records,
+                    descendant._records,
+                )
+                or not lease._matches_parent(
+                    root._api,
+                    root._issuer,
+                    root._records,
+                )
+            ):
+                raise _lock_unavailable()
+            return observations
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _lock_unavailable() from None
+
+    def _open_existing_retirement_source(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        if type(root) is not _WindowsRootedDirectory:
+            raise _capability_unavailable()
+        if root._issuer is not self._authority_issuer:
+            raise _capability_unavailable()
+        components = _validated_components(
+            tuple(relative.parts),
+            maximum_units=root._maximum_component_units,
+        )
+        records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        handle = None
+        try:
+            root._reprove()
+            records = _duplicate_directory_chain(root._api, root._records)
+            records = _open_directory_components(
+                root._api,
+                records,
+                components[:-1],
+                maximum_component_units=root._maximum_component_units,
+            )
+            entry_path = _append_component(
+                records[-1].expected_final_path,
+                components[-1],
+                maximum_units=root._maximum_component_units,
+            )
+            probed = _open_entry_proof(
+                root._api,
+                entry_path,
+                entry_path,
+                expected_kind="regular",
+                expected_volume_id=records[0].identity.volume_id,
+                stale=False,
+                entry_unavailable=True,
+                reject_wrong_kind=True,
+            )
+            if probed is None:
+                raise _entry_unavailable()
+            if probed.identity.link_count != 1:
+                raise _identity_stale()
+            handle = root._api.open_handle(
+                entry_path,
+                desired_access=(
+                    GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+                ),
+                share_mode=FILE_SHARE_READ,
+                creation_disposition=OPEN_EXISTING,
+                flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+            )
+            with handle.borrow() as raw:
+                opened = _capture_handle_proof(
+                    root._api,
+                    raw,
+                    expected_final_path=entry_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            actual = _read_publish_facts(
+                root._api,
+                handle,
+                opened.snapshot.byte_count,
+            )
+            with handle.borrow() as raw:
+                terminal = _capture_handle_proof(
+                    root._api,
+                    raw,
+                    expected_final_path=entry_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            named = _open_entry_proof(
+                root._api,
+                entry_path,
+                entry_path,
+                expected_kind="regular",
+                expected_volume_id=records[0].identity.volume_id,
+                stale=True,
+            )
+            root._reprove()
+            if (
+                named is None
+                or probed.snapshot != opened.snapshot
+                or opened.snapshot != terminal.snapshot
+                or terminal.snapshot != named.snapshot
+                or terminal.identity.link_count != 1
+                or actual != expected_content
+            ):
+                raise _identity_stale()
+            transferred_records = records
+            transferred_handle = handle
+            records = None
+            handle = None
+            return _WindowsExistingRetirementSource(
+                root._api,
+                root._issuer,
+                transferred_records,
+                transferred_handle,
+                entry_path,
+                terminal.identity,
+                expected_content,
+            )
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except Win32CallError as error:
+            if error.winerror == ERROR_SHARING_VIOLATION:
+                raise _entry_unavailable() from None
+            raise _capability_unavailable() from None
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _capability_unavailable() from None
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if records is not None:
+                _close_handles_reverse(tuple(record.handle for record in records))
 
     def _bind_root(self, root: Path) -> RootedDirectoryAuthority:
         _validate_probe_root(root)
@@ -3690,6 +4114,7 @@ class WindowsRootedFileSystem(
             records = []
             return _WindowsRootedDirectory(
                 api,
+                self._authority_issuer,
                 transferred,
                 maximum_component_units,
                 self._fault_injector,
@@ -4102,6 +4527,7 @@ class WindowsRootedFileSystem(
             leaf = None
             return _WindowsRetirementTargetDirectory(
                 parent._api,
+                parent._issuer,
                 transferred_records,
                 parent._maximum_component_units,
                 self._fault_injector,
@@ -4320,6 +4746,303 @@ class WindowsRootedFileSystem(
                         tuple(record.handle for record in records_to_close)
                     )
 
+    def _retire_existing_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        source: ExistingRetirementSource,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        if (
+            type(source_parent) is not _WindowsBoundDirectory
+            or type(target_parent) is not _WindowsRetirementTargetDirectory
+            or type(source) is not _WindowsExistingRetirementSource
+            or source_parent._api is not target_parent._api
+            or source._api is not source_parent._api
+            or source_parent._issuer is not self._authority_issuer
+            or target_parent._issuer is not self._authority_issuer
+            or source._issuer is not self._authority_issuer
+        ):
+            raise _capability_unavailable()
+        source_path = _append_component(
+            source_parent._leaf_path,
+            source_name,
+            maximum_units=source_parent._maximum_component_units,
+        )
+        if (
+            source._entry_path != source_path
+            or len(source._records) != len(source_parent._records)
+            or any(
+                left.expected_final_path != right.expected_final_path
+                or left.identity != right.identity
+                for left, right in zip(
+                    source._records,
+                    source_parent._records,
+                    strict=True,
+                )
+            )
+        ):
+            raise _identity_stale()
+        target_path = _append_component(
+            target_parent._leaf_path,
+            target_name,
+            maximum_units=target_parent._maximum_component_units,
+        )
+        armed = False
+        source_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        target_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        transferred_handle = None
+        retained: _WindowsRetainedRetirement | None = None
+        try:
+            expected_content = source._expected_content
+            source_facts = source.reprove()
+            source_parent._reprove()
+            target_parent._reprove()
+            named_source = source_parent.inspect_entry(source_name)
+            named_target = target_parent.inspect_entry(target_name)
+            if (
+                named_source is None
+                or named_source != source_facts.snapshot
+                or named_target is not None
+            ):
+                raise _recovery_required()
+            _hit_fault(self._fault_injector, "existing_retirement_before_arm")
+            armed = True
+            with source._handle.borrow() as raw_source:
+                with target_parent._records[-1].handle.borrow() as raw_target_parent:
+                    source_parent._api.rename_file_to_parent_exclusive(
+                        raw_source,
+                        raw_target_parent,
+                        target_name,
+                    )
+            _hit_fault(self._fault_injector, "existing_retirement_after_arm")
+            terminal_source = source_parent.inspect_entry(source_name)
+            terminal_target = target_parent.inspect_entry(target_name)
+            with source._handle.borrow() as raw_source:
+                moved = _capture_handle_proof(
+                    source_parent._api,
+                    raw_source,
+                    expected_final_path=target_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            if (
+                terminal_source is not None
+                or terminal_target is None
+                or terminal_target.identity != source_facts.snapshot.identity
+                or moved.identity != source_facts.snapshot.identity
+                or terminal_target.identity.link_count != 1
+                or moved.identity.link_count != 1
+            ):
+                raise _recovery_required()
+            target_records = _duplicate_directory_chain(
+                target_parent._api,
+                target_parent._records,
+            )
+            (
+                transferred_api,
+                source_records,
+                transferred_handle,
+                _old_source_path,
+                transferred_identity,
+                transferred_content,
+            ) = source._transfer_live_authority(target_path)
+            if (
+                transferred_api is not source_parent._api
+                or transferred_identity != source_facts.snapshot.identity
+                or transferred_content != expected_content
+            ):
+                raise _recovery_required()
+            adopted_source_records = source_records
+            adopted_target_records = target_records
+            adopted_handle = transferred_handle
+            retained = _WindowsRetainedRetirement(
+                transferred_identity,
+                transferred_api,
+                adopted_source_records,
+                source_name,
+                adopted_target_records,
+                target_name,
+                adopted_handle,
+                target_path,
+                expected_content=expected_content,
+                fault_injector=self._fault_injector,
+            )
+            source_records = None
+            target_records = None
+            transferred_handle = None
+            retained.reprove()
+            result = retained
+            retained = None
+            return result
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except Win32CallError:
+            if armed:
+                raise _recovery_required() from None
+            raise _entry_unavailable() from None
+        except PlatformFileError:
+            if armed:
+                raise _recovery_required() from None
+            raise
+        except Exception:
+            raise (
+                _recovery_required() if armed else _capability_unavailable()
+            ) from None
+        finally:
+            if retained is not None:
+                try:
+                    retained.close()
+                except BaseException:
+                    pass
+            if transferred_handle is not None:
+                try:
+                    transferred_handle.close()
+                except BaseException:
+                    pass
+            for records_to_close in (source_records, target_records):
+                if records_to_close is not None:
+                    _close_handles_reverse(
+                        tuple(record.handle for record in records_to_close)
+                    )
+
+    def _rebind_existing_retirement(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+        expected_content: CandidateContentFacts,
+    ) -> RetainedRetirement:
+        if (
+            type(source_parent) is not _WindowsBoundDirectory
+            or type(target_parent) is not _WindowsRetirementTargetDirectory
+            or source_parent._api is not target_parent._api
+            or source_parent._issuer is not self._authority_issuer
+            or target_parent._issuer is not self._authority_issuer
+        ):
+            raise _capability_unavailable()
+        target_path = _append_component(
+            target_parent._leaf_path,
+            target_name,
+            maximum_units=target_parent._maximum_component_units,
+        )
+        source_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        target_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        handle = None
+        retained: _WindowsRetainedRetirement | None = None
+        try:
+            source_parent._reprove()
+            target_parent._reprove()
+            if source_parent.inspect_entry(source_name) is not None:
+                raise _recovery_required()
+            probed = target_parent.inspect_entry(target_name)
+            if (
+                probed is None
+                or probed.identity.kind != "regular"
+                or probed.identity.link_count != 1
+                or probed.byte_count != expected_content.byte_count
+            ):
+                raise _recovery_required()
+            handle = source_parent._api.open_handle(
+                target_path,
+                desired_access=GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                share_mode=FILE_SHARE_READ,
+                creation_disposition=OPEN_EXISTING,
+                flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+            )
+            with handle.borrow() as raw:
+                opened = _capture_handle_proof(
+                    source_parent._api,
+                    raw,
+                    expected_final_path=target_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            actual = _read_publish_facts(
+                source_parent._api,
+                handle,
+                opened.snapshot.byte_count,
+            )
+            with handle.borrow() as raw:
+                terminal = _capture_handle_proof(
+                    source_parent._api,
+                    raw,
+                    expected_final_path=target_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            terminal_named = target_parent.inspect_entry(target_name)
+            terminal_source = source_parent.inspect_entry(source_name)
+            if (
+                actual != expected_content
+                or probed != opened.snapshot
+                or opened.snapshot != terminal.snapshot
+                or terminal_named != terminal.snapshot
+                or terminal_source is not None
+                or terminal.identity.link_count != 1
+            ):
+                raise _recovery_required()
+            source_parent._reprove()
+            target_parent._reprove()
+            _hit_fault(
+                self._fault_injector,
+                "existing_retirement_rebind_before_terminal",
+            )
+            source_records = _duplicate_directory_chain(
+                source_parent._api,
+                source_parent._records,
+            )
+            target_records = _duplicate_directory_chain(
+                target_parent._api,
+                target_parent._records,
+            )
+            adopted_source_records = source_records
+            adopted_target_records = target_records
+            adopted_handle = handle
+            retained = _WindowsRetainedRetirement(
+                terminal.identity,
+                source_parent._api,
+                adopted_source_records,
+                source_name,
+                adopted_target_records,
+                target_name,
+                adopted_handle,
+                target_path,
+                expected_content=expected_content,
+                fault_injector=self._fault_injector,
+            )
+            source_records = None
+            target_records = None
+            handle = None
+            retained.reprove()
+            result = retained
+            retained = None
+            return result
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise _recovery_required() from None
+        except Exception:
+            raise _recovery_required() from None
+        finally:
+            if retained is not None:
+                try:
+                    retained.close()
+                except BaseException:
+                    pass
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            for records_to_close in (source_records, target_records):
+                if records_to_close is not None:
+                    _close_handles_reverse(
+                        tuple(record.handle for record in records_to_close)
+                    )
+
     def _bind_parent(
         self,
         root: RootedDirectoryAuthority,
@@ -4345,6 +5068,7 @@ class WindowsRootedFileSystem(
                 records = ()
             return _WindowsBoundDirectory(
                 root._api,
+                root._issuer,
                 expanded,
                 root._maximum_component_units,
                 self._fault_injector,
@@ -5131,6 +5855,7 @@ class WindowsPlatformAdapter(
             records = ()
             return _WindowsBoundDirectory(
                 parent._api,
+                parent._issuer,
                 transferred,
                 parent._maximum_component_units,
                 self._fault_injector,
