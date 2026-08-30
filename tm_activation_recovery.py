@@ -34,8 +34,10 @@ from tm_content_attestation import (
     _create_sealed_content_attestation,
 )
 from tm_contracts import (
+    AssetKind,
     CanonicalResourceIdentity,
     MutableStageRef,
+    RecoveryLocator,
     SNAPSHOT_MANIFEST_VERSION,
     SealedStage,
     SnapshotBinding,
@@ -64,8 +66,25 @@ from tm_activation_journal import (
     _PortableFreshRecoverySnapshot,
     _PortablePublicationPhaseRecord,
     _PortablePublicationPhaseUnsigned,
+    _PortableReplacementRecord,
+    _PortableReplacementNamespaceSnapshot,
+    _PortableReplacementUnsigned,
     _CallerHeldPortableJournalBorrow,
     _PORTABLE_PUBLICATION_VERSION,
+    _PORTABLE_PUBLICATION_PHASES,
+    _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+    _create_portable_replacement_record,
+    _parse_portable_activation_journal_bytes,
+    _parse_portable_replacement_record_bytes,
+    _parse_portable_publication_phase_bytes,
+    _parse_portable_replacement_namespace,
+    _portable_activation_owner_context_sha256,
+    _portable_replacement_owner_context_sha256,
+    _portable_replacement_phase_name,
+    _portable_publication_phase_name,
+    _portable_publication_owner_context_sha256,
+    _portable_replacement_namespace_limits,
+    _serialize_portable_replacement_record,
     _portable_record_pair_matches,
     _RecoveryBackupAsset,
     _SQLiteGenerationView,
@@ -111,23 +130,59 @@ from tm_activation_journal import (
     _WindowsPortablePublicationPhaseOwner,
 )
 from platform_fs_contracts import (
+    BoundDirectoryAuthority,
     BoundContentFacts,
     BoundExistingFileMutationGuard,
     BoundRegularFile,
     CandidateContentFacts,
     CandidateFile,
     ExistingFileRetirement,
+    LedgerEnumerationLimits,
+    LockLease,
+    LockPolicy,
+    LockWait,
     LockedDescendantNamespaceInspection,
     PendingPublication,
+    PrivateProofContext,
+    PrivateProofObjectRole,
     PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
     PublishMode,
+    RetainedRetirement,
     RootedDirectoryAuthority,
 )
 
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
 _SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
+
+
+class _PortableReplacementRecoveryRequired(ActivationPreparationError):
+    """Authenticated locator facts for one non-terminal replacement prefix."""
+
+    def __init__(
+        self,
+        *,
+        prior_generation: int,
+        recovery_locator: RecoveryLocator,
+    ) -> None:
+        if (
+            type(prior_generation) is not int
+            or isinstance(prior_generation, bool)
+            or prior_generation < 0
+        ):
+            raise TypeError("portable replacement prior generation is invalid")
+        if (
+            type(recovery_locator) is not RecoveryLocator
+            or recovery_locator.asset_kind is not AssetKind.ACTIVE_STORE
+        ):
+            raise TypeError("portable replacement recovery locator is invalid")
+        self.prior_generation = prior_generation
+        self.recovery_locator = recovery_locator
+        super().__init__(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
 
 
 class _StoreValidationPort(Protocol):
@@ -350,6 +405,767 @@ class _PortableActiveSetAuthority(Protocol):
     def close(self) -> None: ...
 
 
+class _PortableReplacementRecordOwner:
+    """Publish one strict replacement owner phase through PendingPublication.
+
+    The journal module owns the codec and namespace grammar.  This owner only
+    performs the live W1/W2 proof, durable phase callback, business reproof,
+    and platform terminal handshake.  READY is the sole phase allowed to
+    replace the previous ``current`` record, and only while the same W1 lease
+    remains held.
+    """
+
+    @staticmethod
+    def publish(
+        *,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        unsigned: _PortableReplacementUnsigned,
+        predecessor: _PortableReplacementRecord | None,
+        replace_current: bool,
+        owner_reprove: Any,
+        owner_commit: Any,
+        business_reprove: Any,
+    ) -> _PortableReplacementRecord:
+        if type(identity) is not CanonicalResourceIdentity:
+            raise TypeError("portable replacement identity is invalid")
+        if not isinstance(backend, PlatformFileBackend):
+            raise TypeError("portable replacement backend is invalid")
+        if persistent_private is not backend:
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                retryable=False,
+            )
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("portable replacement borrow is invalid")
+        if type(unsigned) is not _PortableReplacementUnsigned:
+            raise TypeError("portable replacement unsigned facts are invalid")
+        if predecessor is not None and type(predecessor) is not _PortableReplacementRecord:
+            raise TypeError("portable replacement predecessor is invalid")
+        if type(replace_current) is not bool:
+            raise TypeError("portable replacement current mode is invalid")
+        for callback, label in (
+            (owner_reprove, "owner reproof"),
+            (owner_commit, "owner commit"),
+            (business_reprove, "business reproof"),
+        ):
+            if not callable(callback):
+                raise TypeError(f"portable replacement {label} is invalid")
+        if (
+            unsigned.resource_id != identity.resource_id
+            or unsigned.target_identity != identity.target_identity
+            or unsigned.canonical_database_name
+            != identity.canonical_sidecar_path.name
+            or unsigned.canonical_manifest_name
+            != identity.snapshot_manifest_path.name
+            or unsigned.device_key_name != "device.key"
+            or (unsigned.phase == "READY") != replace_current
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.REPLACEMENT_CHAIN_INVALID",
+                retryable=False,
+            )
+        if predecessor is not None and unsigned.predecessor_digest != (
+            predecessor.record_digest
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.REPLACEMENT_CHAIN_INVALID",
+                retryable=False,
+            )
+
+        authorities: list[object] = []
+        private_parent: BoundDirectoryAuthority | None = None
+        candidate: CandidateFile | None = None
+        candidate_name: str | None = None
+        candidate_identity: object | None = None
+        pending: PendingPublication | None = None
+        current_lock: LockLease | None = None
+        current_lock_name: str | None = None
+        current_lock_payload: bytes | None = None
+        current_lock_snapshot: object | None = None
+        publication_armed = False
+        owner_committed = False
+        try:
+            root, lease = caller_borrow._publication_authorities(
+                backend,
+                persistent_private,
+                identity,
+            )
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            private_parent = backend.bind_parent(
+                root,
+                PurePath(
+                    unsigned.private_directory_name,
+                    "replacement-owner-placeholder",
+                ),
+            )
+            authorities.append(private_parent)
+            private_evidence = backend.prove_private(private_parent)
+            authorities.append(private_evidence)
+            key_file = backend.open_regular(
+                root,
+                PurePath(
+                    unsigned.private_directory_name,
+                    unsigned.device_key_name,
+                ),
+            )
+            authorities.append(key_file)
+            key_identity = key_file.identity()
+            key_payload = key_file.read_all()
+            if (
+                key_identity.kind != "regular"
+                or key_identity.link_count != 1
+                or len(key_payload) != 32
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                    retryable=False,
+                )
+            key_evidence = backend.prove_private(key_file)
+            authorities.append(key_evidence)
+            secret = persistent_private.bind_device_secret(key_file)
+            authorities.append(secret)
+            secret.reprove()
+
+            if predecessor is not None:
+                predecessor_name = _portable_replacement_phase_name(
+                    predecessor.unsigned.phase
+                )
+                predecessor_file = backend.open_regular(
+                    root,
+                    PurePath(unsigned.private_directory_name, predecessor_name),
+                )
+                authorities.append(predecessor_file)
+                predecessor_payload = predecessor_file.read_all()
+                if (
+                    predecessor_file.identity().kind != "regular"
+                    or predecessor_file.identity().link_count != 1
+                    or predecessor_payload
+                    != _serialize_portable_replacement_record(predecessor)
+                    or _parse_portable_replacement_record_bytes(predecessor_payload)
+                    != predecessor
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                predecessor_evidence = backend.prove_private(predecessor_file)
+                authorities.append(predecessor_evidence)
+                predecessor_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_replacement_owner_context_sha256(
+                        predecessor.unsigned
+                    ),
+                )
+                predecessor_verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    predecessor.private_directory_proof,
+                    predecessor_context,
+                )
+                authorities.append(predecessor_verified)
+
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            context = PrivateProofContext(
+                PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                _portable_replacement_owner_context_sha256(unsigned),
+            )
+            proof = persistent_private.mint(private_evidence, secret, context)
+            record = _create_portable_replacement_record(unsigned, proof)
+            expected_bytes = _serialize_portable_replacement_record(record)
+            phase_name = _portable_replacement_phase_name(unsigned.phase)
+            existing = private_parent.inspect_entry(phase_name)
+            if existing is not None and not replace_current:
+                existing_file = backend.open_regular(
+                    root,
+                    PurePath(unsigned.private_directory_name, phase_name),
+                )
+                authorities.append(existing_file)
+                existing_payload = existing_file.read_all()
+                if (
+                    existing_file.snapshot() != existing
+                    or existing_file.identity().kind != "regular"
+                    or existing_file.identity().link_count != 1
+                    or existing_payload != expected_bytes
+                    or _parse_portable_replacement_record_bytes(existing_payload)
+                    != record
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                existing_evidence = backend.prove_private(existing_file)
+                authorities.append(existing_evidence)
+                verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    record.private_directory_proof,
+                    context,
+                )
+                authorities.append(verified)
+                caller_borrow.reprove(backend, identity)
+                owner_reprove()
+                owner_committed = True
+                if owner_commit(record) is not None:
+                    raise TypeError(
+                        "portable replacement owner commit must return None"
+                    )
+                if business_reprove(record) is not None:
+                    raise TypeError(
+                        "portable replacement business reproof must return None"
+                    )
+                persistent_private.consume_verified(verified, context)
+                authorities.remove(verified)
+                return record
+            if replace_current and existing is None and predecessor is not None:
+                # The first replacement has no current record and is published
+                # with CREATE_IF_ABSENT.  Later replacements must replace the
+                # exact authenticated prior READY record under W1.
+                replace_current = False
+            if replace_current:
+                if existing is None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                current_file = backend.open_regular(
+                    root,
+                    PurePath(unsigned.private_directory_name, phase_name),
+                )
+                authorities.append(current_file)
+                current_payload = current_file.read_all()
+                old_current = _parse_portable_replacement_record_bytes(
+                    current_payload
+                )
+                if (
+                    current_file.snapshot() != existing
+                    or current_file.identity().kind != "regular"
+                    or current_file.identity().link_count != 1
+                    or old_current.unsigned.phase != "READY"
+                    or old_current.record_digest != unsigned.prior_authority_digest
+                    or old_current.unsigned.resource_id != unsigned.resource_id
+                    or old_current.unsigned.target_identity
+                    != unsigned.target_identity
+                    or old_current.unsigned.candidate_canonical_store_id
+                    != unsigned.prior_canonical_store_id
+                    or old_current.unsigned.next_generation
+                    != unsigned.prior_generation
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                current_evidence = backend.prove_private(current_file)
+                authorities.append(current_evidence)
+                old_context = PrivateProofContext(
+                    PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                    _portable_replacement_owner_context_sha256(
+                        old_current.unsigned
+                    ),
+                )
+                old_verified = persistent_private.verify(
+                    private_evidence,
+                    secret,
+                    old_current.private_directory_proof,
+                    old_context,
+                )
+                authorities.append(old_verified)
+                persistent_private.consume_verified(old_verified, old_context)
+                authorities.remove(old_verified)
+                current_evidence.close()
+                authorities.remove(current_evidence)
+                current_file.close()
+                authorities.remove(current_file)
+
+                current_lock_name = (
+                    "activation-replacement-current-owner-"
+                    + hashlib.sha256(
+                        unsigned.preparation_id.encode("utf-8")
+                    ).hexdigest()[:32]
+                    + ".lock"
+                )
+                current_lock_payload = (
+                    "localcat portable replacement current owner v1\n"
+                    + unsigned.preparation_id
+                    + "\n"
+                ).encode("utf-8")
+                if private_parent.inspect_entry(current_lock_name) is not None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                current_lock = backend.acquire(
+                    private_parent,
+                    current_lock_name,
+                    current_lock_payload,
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+                current_lock_snapshot = private_parent.inspect_entry(
+                    current_lock_name
+                )
+                if (
+                    current_lock_snapshot is None
+                    or current_lock_snapshot.identity.kind != "regular"
+                    or current_lock_snapshot.identity.link_count != 1
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+            candidate_name = phase_name + ".candidate"
+            if private_parent.inspect_entry(candidate_name) is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            candidate = private_parent.create_candidate(
+                candidate_name,
+                private=True,
+            )
+            candidate_identity = candidate.identity()
+            candidate.write_all(expected_bytes)
+            candidate.flush_content()
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            if current_lock is not None:
+                assert current_lock_name is not None
+                assert current_lock_payload is not None
+                current_lock.reprove_binding(
+                    private_parent,
+                    current_lock_name,
+                    current_lock_payload,
+                )
+            publication_armed = True
+            pending = private_parent.begin_publish(
+                candidate,
+                phase_name,
+                mode=(
+                    PublishMode.REPLACE_UNDER_LOCK
+                    if replace_current
+                    else PublishMode.CREATE_IF_ABSENT
+                ),
+                lease=current_lock if replace_current else None,
+            )
+            candidate = None
+            retained = pending.retained_destination()
+            retained_payload = retained.read_all()
+            if (
+                retained.identity().kind != "regular"
+                or retained.identity().link_count != 1
+                or retained_payload != expected_bytes
+                or _parse_portable_replacement_record_bytes(retained_payload)
+                != record
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            retained_evidence = backend.prove_private(retained)
+            authorities.append(retained_evidence)
+            verified = persistent_private.verify(
+                private_evidence,
+                secret,
+                record.private_directory_proof,
+                context,
+            )
+            authorities.append(verified)
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            owner_committed = True
+            if owner_commit(record) is not None:
+                raise TypeError("portable replacement owner commit must return None")
+            if business_reprove(record) is not None:
+                raise TypeError(
+                    "portable replacement business reproof must return None"
+                )
+            retained_evidence.close()
+            authorities.remove(retained_evidence)
+            caller_borrow.reprove(backend, identity)
+            owner_reprove()
+            if (
+                retained.read_all() != expected_bytes
+                or pending.terminal_reproof() != pending.preliminary_facts()
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            pending.close()
+            pending = None
+            if current_lock is not None:
+                assert current_lock_name is not None
+                assert current_lock_payload is not None
+                current_lock.reprove_binding(
+                    private_parent,
+                    current_lock_name,
+                    current_lock_payload,
+                )
+                current_lock.close()
+                current_lock = None
+                if private_parent.inspect_entry(
+                    current_lock_name
+                ) != current_lock_snapshot:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                private_parent.unlink_owned(
+                    current_lock_name,
+                    current_lock_snapshot.identity,
+                )
+                if private_parent.inspect_entry(current_lock_name) is not None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+            persistent_private.consume_verified(verified, context)
+            authorities.remove(verified)
+            return record
+        except ActivationPreparationError as error:
+            if publication_armed or owner_committed:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from error
+            raise
+        except (PlatformFileError, OSError) as error:
+            raise ActivationPreparationError(
+                (
+                    "ACTIVATION.RECOVERY_REQUIRED"
+                    if publication_armed or owner_committed
+                    else "ACTIVATION.DURABILITY_UNAVAILABLE"
+                ),
+                retryable=publication_armed or owner_committed,
+            ) from error
+        finally:
+            active_error = sys.exception()
+            close_error: BaseException | None = None
+            if candidate is not None:
+                try:
+                    candidate.close()
+                    if (
+                        not publication_armed
+                        and private_parent is not None
+                        and candidate_name is not None
+                        and candidate_identity is not None
+                    ):
+                        private_parent.unlink_owned(
+                            candidate_name,
+                            candidate_identity,
+                        )
+                except BaseException as error:
+                    close_error = error
+            if pending is not None:
+                try:
+                    pending.close()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+            if current_lock is not None:
+                try:
+                    current_lock.close()
+                    current_lock = None
+                    if (
+                        private_parent is not None
+                        and current_lock_name is not None
+                        and current_lock_snapshot is not None
+                        and private_parent.inspect_entry(current_lock_name)
+                        == current_lock_snapshot
+                    ):
+                        private_parent.unlink_owned(
+                            current_lock_name,
+                            current_lock_snapshot.identity,
+                        )
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+            for authority in reversed(authorities):
+                try:
+                    close = getattr(authority, "close")
+                    close()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+            if active_error is None and close_error is not None:
+                raise close_error
+
+
+def _inspect_portable_replacement_namespace(
+    *,
+    identity: CanonicalResourceIdentity,
+    backend: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> tuple[
+    _PortableReplacementNamespaceSnapshot | None,
+    RootedDirectoryAuthority,
+    _PortablePublicationPhaseRecord,
+]:
+    """Authenticate the base gen0 chain plus the bounded replacement subset."""
+
+    if type(identity) is not CanonicalResourceIdentity:
+        raise TypeError("portable replacement recovery identity is invalid")
+    if not (
+        isinstance(backend, PlatformFileBackend)
+        and persistent_private is backend
+        and descendant_inspection is backend
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+            retryable=False,
+        )
+    if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+        raise TypeError("portable replacement recovery borrow is invalid")
+    root, lease = caller_borrow._fresh_recovery_authorities(
+        backend,
+        persistent_private,
+        identity,
+    )
+    private_name = f".localcat-activation-private-v1.{identity.target_identity}"
+    private_parent: BoundDirectoryAuthority | None = None
+    authorities: list[object] = []
+    try:
+        private_entry = root.inspect_entry(private_name)
+        if (
+            private_entry is None
+            or private_entry.identity.kind != "directory"
+            or not private_entry.reparse_free
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        private_parent = backend.bind_parent(
+            root,
+            PurePath(private_name, "replacement-recovery-placeholder"),
+        )
+        authorities.append(private_parent)
+        private_evidence = backend.prove_private(private_parent)
+        authorities.append(private_evidence)
+        key_file = backend.open_regular(
+            root,
+            PurePath(private_name, "device.key"),
+        )
+        authorities.append(key_file)
+        if (
+            key_file.identity().kind != "regular"
+            or key_file.identity().link_count != 1
+            or len(key_file.read_all()) != 32
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        key_evidence = backend.prove_private(key_file)
+        authorities.append(key_evidence)
+        secret = persistent_private.bind_device_secret(key_file)
+        authorities.append(secret)
+        secret.reprove()
+
+        def verify(
+            name: str,
+            parser: Any,
+            context_digest: Any,
+        ) -> object:
+            opened = backend.open_regular(
+                root,
+                PurePath(private_name, name),
+            )
+            authorities.append(opened)
+            snapshot = opened.snapshot()
+            payload = opened.read_all()
+            if (
+                snapshot.identity.kind != "regular"
+                or snapshot.identity.link_count != 1
+                or private_parent.inspect_entry(name) != snapshot
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            opened_evidence = backend.prove_private(opened)
+            authorities.append(opened_evidence)
+            record = parser(payload)
+            context = PrivateProofContext(
+                PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                context_digest(record.unsigned),
+            )
+            verified = persistent_private.verify(
+                private_evidence,
+                secret,
+                record.private_directory_proof,
+                context,
+            )
+            authorities.append(verified)
+            caller_borrow.reprove(backend, identity)
+            return record
+
+        base_journal = verify(
+            "activation-journal-v3.json",
+            _parse_portable_activation_journal_bytes,
+            _portable_activation_owner_context_sha256,
+        )
+        base_phase_names = tuple(
+            _portable_publication_phase_name(phase)
+            for phase in _PORTABLE_PUBLICATION_PHASES
+        )
+        base_phases = tuple(
+            cast(
+                _PortablePublicationPhaseRecord,
+                verify(
+                    name,
+                    _parse_portable_publication_phase_bytes,
+                    _portable_publication_owner_context_sha256,
+                ),
+            )
+            for name in base_phase_names
+        )
+        # The strict publication parser already verifies each outer digest.
+        # Recompute the exact owner context through the journal's public helper
+        # when available rather than relying on the compact fallback above.
+        for predecessor, phase in zip(
+            (base_journal, *base_phases[:-1]),
+            base_phases,
+            strict=True,
+        ):
+            if phase.unsigned.predecessor_digest != predecessor.record_digest:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        base_generation = base_phases[-1]
+        if (
+            base_generation.unsigned.phase != "GENERATION_PUBLISHED"
+            or base_generation.unsigned.generation != 0
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+
+        replacement_names = tuple(
+            _portable_replacement_phase_name(phase)
+            for phase in (
+                "PREPARED",
+                "DB_REPLACED",
+                "MANIFEST_PUBLISHED",
+                "GENERATION_PUBLISHED",
+                "READY",
+            )
+        )
+        replacement_records: dict[str, _PortableReplacementRecord] = {}
+        for name in replacement_names:
+            if private_parent.inspect_entry(name) is not None:
+                replacement_records[name] = cast(
+                    _PortableReplacementRecord,
+                    verify(
+                        name,
+                        _parse_portable_replacement_record_bytes,
+                        _portable_replacement_owner_context_sha256,
+                    ),
+                )
+        backup_proofs = ()
+        pending_name = _portable_replacement_phase_name("PREPARED")
+        if pending_name in replacement_records:
+            backup_proofs = replacement_records[
+                pending_name
+            ].unsigned.backup_proofs
+        backups: dict[str, PortableContentFileProof] = {}
+        for proof in backup_proofs:
+            opened = backend.open_regular(
+                root,
+                PurePath(private_name, proof.backup_name),
+            )
+            authorities.append(opened)
+            facts = opened.content_facts()
+            observed = PortableContentFileProof(
+                size=facts.snapshot.byte_count,
+                sha256=facts.content_sha256.hex(),
+            )
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or private_parent.inspect_entry(proof.backup_name)
+                != facts.snapshot
+                or observed != proof.content
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            proof_evidence = backend.prove_private(opened)
+            authorities.append(proof_evidence)
+            backups[proof.backup_name] = observed
+
+        expected_names = {
+            "device.key",
+            "activation-journal-v3.json",
+            *base_phase_names,
+            *replacement_records,
+            *backups,
+        }
+        replacement_limit = (
+            _portable_replacement_namespace_limits(backup_proofs)
+            if backup_proofs
+            else LedgerEnumerationLimits(7, 4096, 5 * 1024 * 1024)
+        )
+        observations = descendant_inspection.observe_descendant_entries(
+            root,
+            lease,
+            private_parent,
+            LedgerEnumerationLimits(
+                maximum_entries=16,
+                maximum_name_bytes=4096,
+                maximum_total_bytes=(
+                    replacement_limit.maximum_total_bytes + 8 * 1024 * 1024
+                ),
+            ),
+        )
+        if {item.name for item in observations} != expected_names:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        caller_borrow.reprove(backend, identity)
+        if not replacement_records:
+            return None, root, base_generation
+        try:
+            classified = _parse_portable_replacement_namespace(
+                replacement_records,
+                backups,
+                base_authority_digest=base_generation.record_digest,
+            )
+        except (TypeError, ValueError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
+        return classified, root, base_generation
+    except ActivationPreparationError:
+        raise
+    except (PlatformFileError, OSError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        ) from error
+    finally:
+        active_error = sys.exception()
+        close_error: BaseException | None = None
+        for authority in reversed(authorities):
+            try:
+                getattr(authority, "close")()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if active_error is None and close_error is not None:
+            raise close_error
+
+
 class _PortableRecoveryStorePort(Protocol):
     """Store-owned SQLite facts consumed by portable fresh recovery."""
 
@@ -381,6 +1197,29 @@ class _PortableRecoveryStorePort(Protocol):
     def cleanup_in_progress(self) -> bool: ...
 
     def notify_all(self) -> None: ...
+
+    def adopt_portable_replacement_current(
+        self,
+        record: _PortableReplacementRecord | None,
+    ) -> None: ...
+
+    def cleanup_portable_replacement_ready_namespace(
+        self,
+        snapshot: _PortableReplacementNamespaceSnapshot,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> None: ...
+
+    def cleanup_portable_replacement_prepared_namespace(
+        self,
+        snapshot: _PortableReplacementNamespaceSnapshot,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> None: ...
 
     def portable_content_proof(
         self,
@@ -433,6 +1272,675 @@ class _PortableRecoveryStorePort(Protocol):
         platform: PlatformFileBackend,
         root: RootedDirectoryAuthority,
     ) -> None: ...
+
+    def rehydrate_completed_portable_base(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> ActivationRecoveryReport | None: ...
+
+
+def _retire_portable_replacement_prepared_stage(
+    *,
+    identity: CanonicalResourceIdentity,
+    snapshot: _PortableReplacementNamespaceSnapshot,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    existing_retirement: ExistingFileRetirement,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> None:
+    """Move only the PREPARED-authenticated stage pair out of the live root."""
+
+    if (
+        snapshot.state != "PENDING"
+        or snapshot.highest_pending_phase != "PREPARED"
+        or len(snapshot.pending_records) != 1
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    prepared = snapshot.pending_records[0]
+    unsigned = prepared.unsigned
+    root, lease = caller_borrow._fresh_recovery_authorities(
+        platform,
+        persistent_private,
+        identity,
+    )
+    expected = {
+        unsigned.candidate_stage_db_name: CandidateContentFacts(
+            unsigned.sealed_content_attestation.database.size,
+            bytes.fromhex(unsigned.sealed_content_attestation.database.sha256),
+        ),
+        unsigned.candidate_manifest_temp_name: CandidateContentFacts(
+            unsigned.sealed_content_attestation.manifest.size,
+            bytes.fromhex(unsigned.sealed_content_attestation.manifest.sha256),
+        ),
+    }
+    presence = {name: root.inspect_entry(name) is not None for name in expected}
+    if len(set(presence.values())) != 1:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    sources_present = next(iter(presence.values()))
+    quarantine_name = (
+        "portable-replacement-" + hashlib.sha256(
+            prepared.record_digest.encode("ascii")
+        ).hexdigest()
+    )
+    limits = LedgerEnumerationLimits(
+        maximum_entries=2,
+        maximum_name_bytes=4096,
+        maximum_total_bytes=sum(item.byte_count for item in expected.values()),
+    )
+    authorities: list[object] = []
+    active_error: BaseException | None = None
+
+    def observe_existing_quarantine() -> set[str] | None:
+        quarantine_root_entry = root.inspect_entry(
+            _PORTABLE_ACTIVATION_QUARANTINE_ROOT
+        )
+        if quarantine_root_entry is None:
+            return None
+        if quarantine_root_entry.identity.kind != "directory":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        root_bound = platform.bind_parent(
+            root,
+            PurePath(
+                _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                "replacement-prepared-stage-placeholder",
+            ),
+        )
+        try:
+            target_entry = root_bound.inspect_entry(quarantine_name)
+            if target_entry is None:
+                return None
+            if target_entry.identity.kind != "directory":
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        finally:
+            root_bound.close()
+        observer = platform.bind_parent(
+            root,
+            PurePath(
+                _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                quarantine_name,
+                "replacement-prepared-stage-placeholder",
+            ),
+        )
+        try:
+            return {
+                entry.name
+                for entry in descendant_inspection.observe_descendant_entries(
+                    root,
+                    lease,
+                    observer,
+                    limits,
+                )
+            }
+        finally:
+            observer.close()
+
+    try:
+        before = observe_existing_quarantine()
+        if sources_present:
+            if before is not None and before:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        elif before != set(expected):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+
+        quarantine_root = platform.bind_or_create_child_directory(
+            root,
+            _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+        )
+        authorities.append(quarantine_root)
+        quarantine_target = platform.bind_or_create_child_directory(
+            quarantine_root,
+            quarantine_name,
+        )
+        authorities.append(quarantine_target)
+
+        for name, expected_content in expected.items():
+            source_parent: object | None = None
+            source: object | None = None
+            retained: RetainedRetirement | None = None
+            try:
+                if sources_present:
+                    source_parent = (
+                        existing_retirement.bind_retirement_source_directory(
+                            root,
+                            PurePath(name),
+                        )
+                    )
+                    authorities.append(source_parent)
+                    source = existing_retirement.open_existing_retirement_source(
+                        source_parent,
+                        expected_content,
+                    )
+                    retained = existing_retirement.retire_existing_exclusive(
+                        source_parent,
+                        source,
+                        quarantine_target,
+                        name,
+                    )
+                    source = None
+                else:
+                    source_parent = platform.bind_parent(root, PurePath(name))
+                    authorities.append(source_parent)
+                    retained = existing_retirement.rebind_existing_retirement(
+                        source_parent,
+                        name,
+                        quarantine_target,
+                        name,
+                        expected_content,
+                    )
+                authorities.append(retained)
+            finally:
+                if source is not None:
+                    source.close()
+            if source_parent is not None:
+                source_parent.close()
+                authorities.remove(source_parent)
+            if retained is None:
+                raise AssertionError(
+                    "replacement stage retirement produced no authority"
+                )
+            retained.reprove()
+
+        caller_borrow.reprove(platform, identity)
+        after = observe_existing_quarantine()
+        if (
+            after != set(expected)
+            or any(root.inspect_entry(name) is not None for name in expected)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        for authority in authorities:
+            if isinstance(authority, RetainedRetirement):
+                authority.reprove()
+        caller_borrow.reprove(platform, identity)
+    except ActivationPreparationError as error:
+        active_error = error
+    except (PlatformFileError, OSError) as error:
+        active_error = ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+        active_error.__cause__ = error
+    except BaseException as error:
+        active_error = error
+    finally:
+        close_error: BaseException | None = None
+        for authority in reversed(authorities):
+            try:
+                close = getattr(authority, "close")
+                close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if active_error is None and close_error is not None:
+            active_error = close_error
+    if active_error is not None:
+        raise active_error
+
+
+def recover_portable_replacement_activation(
+    port: _PortableRecoveryStorePort,
+    *,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    existing_retirement: ExistingFileRetirement,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> ActivationRecoveryReport | None:
+    """Freshly classify/adopt one strict replacement namespace.
+
+    PREPARED with an exact untouched prior pair deterministically returns the
+    old READY authority.  A terminal READY record adopts the new authority.
+    Intermediate physical/phase windows remain recovery-only; this function
+    never guesses, rolls a phase backward, overwrites a foreign object, or
+    mutates the configured source.
+    """
+
+    if not (
+        isinstance(platform, PlatformFileBackend)
+        and persistent_private is platform
+        and descendant_inspection is platform
+        and existing_retirement is platform
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+            retryable=False,
+        )
+    if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+        raise TypeError("portable replacement recovery borrow is invalid")
+    identity = port.resource_identity
+    snapshot, root, base_generation = _inspect_portable_replacement_namespace(
+        identity=identity,
+        backend=platform,
+        persistent_private=persistent_private,
+        descendant_inspection=descendant_inspection,
+        caller_borrow=caller_borrow,
+    )
+    if snapshot is None:
+        return port.rehydrate_completed_portable_base(
+            platform=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+        )
+
+    port.state = "ACTIVATING"
+    port.view = None
+    port.notify_all()
+
+    def prove(
+        name: str,
+        expected: PortableContentFileProof,
+    ) -> PortableContentFileProof:
+        opened = platform.open_regular(root, PurePath(name))
+        try:
+            facts = opened.content_facts()
+            observed = port.portable_content_proof(facts)
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or root.inspect_entry(name) != facts.snapshot
+                or observed != expected
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            return observed
+        finally:
+            opened.close()
+
+    def adopt(
+        active: PortableActiveContentAttestation,
+        *,
+        view_active: PortableActiveContentAttestation | None = None,
+        current: _PortableReplacementRecord | None,
+        require_source: PortableContentFileProof,
+        terminal_new: bool,
+        cleanup_snapshot: _PortableReplacementNamespaceSnapshot | None = None,
+    ) -> ActivationRecoveryReport:
+        if type(active) is not PortableActiveContentAttestation:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if view_active is None:
+            view_active = active
+        if type(view_active) is not PortableActiveContentAttestation:
+            raise TypeError("portable replacement recovery view is invalid")
+        prove(identity.canonical_sidecar_path.name, active.database)
+        prove(identity.snapshot_manifest_path.name, active.manifest)
+        prove(identity.configured_jsonl_path.name, require_source)
+        active_ref = _canonical_activation_ref(
+            identity,
+            journal_id=active.journal_id,
+        )
+        schema = port.inspect_stage_schema(
+            active_ref,
+            canonical_store_id=active.canonical_store_id,
+            _allow_diverged_runtime=True,
+            _allow_active=True,
+            _expected_active_generation=active.generation,
+            _expected_activation_digest=active.activation_digest,
+        )
+        if schema.activation_status != "ACTIVE":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if cleanup_snapshot is not None:
+            if cleanup_snapshot.state == "READY_CLEANUP":
+                port.cleanup_portable_replacement_ready_namespace(
+                    cleanup_snapshot,
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    caller_borrow=caller_borrow,
+                )
+            elif (
+                cleanup_snapshot.state == "PENDING"
+                and cleanup_snapshot.highest_pending_phase == "PREPARED"
+            ):
+                _retire_portable_replacement_prepared_stage(
+                    identity=identity,
+                    snapshot=cleanup_snapshot,
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    descendant_inspection=descendant_inspection,
+                    existing_retirement=existing_retirement,
+                    caller_borrow=caller_borrow,
+                )
+                port.cleanup_portable_replacement_prepared_namespace(
+                    cleanup_snapshot,
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    caller_borrow=caller_borrow,
+                )
+            else:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        port._activate_candidate_store_id(active.canonical_store_id)
+        port.adopt_portable_replacement_current(current)
+        port.view = _SQLiteGenerationView(
+            stage=active_ref,
+            canonical_store_id=active.canonical_store_id,
+            generation=active.generation,
+            fts5_available=schema.fts5_available,
+            active_content_attestation=view_active,
+        )
+        port.state = "READY"
+        port.notify_all()
+        return ActivationRecoveryReport(
+            phase="GENERATION_PUBLISHED" if terminal_new else "PREPARED",
+            action="COMPLETED" if terminal_new else "ROLLED_BACK",
+            generation=active.generation,
+        )
+
+    if snapshot.state == "CURRENT":
+        return rehydrate_completed_portable_replacement_activation(
+            port,
+            platform=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+        )
+    if snapshot.state == "READY_CLEANUP":
+        current = snapshot.current_record
+        if (
+            type(current) is not _PortableReplacementRecord
+            or current.unsigned.phase != "READY"
+            or type(current.unsigned.active_content_attestation)
+            is not PortableActiveContentAttestation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        return adopt(
+            current.unsigned.active_content_attestation,
+            current=current,
+            require_source=current.unsigned.sealed_content_attestation.source,
+            terminal_new=True,
+            cleanup_snapshot=snapshot,
+        )
+    if snapshot.state == "PENDING" and snapshot.highest_pending_phase == "PREPARED":
+        prepared = snapshot.pending_records[0]
+        prior = prepared.unsigned.prior_active_content_attestation
+        predecessor_active = (
+            snapshot.current_record.unsigned.active_content_attestation
+            if snapshot.current_record is not None
+            else base_generation.unsigned.active_content_attestation
+        )
+        if (
+            type(predecessor_active) is not PortableActiveContentAttestation
+            or predecessor_active.sealed_attestation_digest
+            != prior.sealed_attestation_digest
+            or predecessor_active.journal_id != prior.journal_id
+            or predecessor_active.resource_id != prior.resource_id
+            or predecessor_active.target_identity != prior.target_identity
+            or predecessor_active.canonical_store_id
+            != prior.canonical_store_id
+            or predecessor_active.snapshot_receipt_digest
+            != prior.snapshot_receipt_digest
+            or predecessor_active.generation != prior.generation
+            or predecessor_active.activation_digest != prior.activation_digest
+            or predecessor_active.manifest != prior.manifest
+            or predecessor_active.semantic_facts != prior.semantic_facts
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        # The selected configured source is intentionally allowed to differ
+        # from the historical prior attestation, but it must remain the exact
+        # source sealed into this replacement attempt.
+        return adopt(
+            prior,
+            view_active=predecessor_active,
+            current=snapshot.current_record,
+            require_source=prepared.unsigned.sealed_content_attestation.source,
+            terminal_new=False,
+            cleanup_snapshot=snapshot,
+        )
+    if snapshot.state == "PENDING" and snapshot.pending_records:
+        prepared = snapshot.pending_records[0]
+        database_backups = tuple(
+            backup
+            for backup in prepared.unsigned.backup_proofs
+            if backup.asset_kind == "DATABASE"
+        )
+        if len(database_backups) != 1:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        database_backup = database_backups[0]
+        locator_path = (
+            identity.canonical_sidecar_path.parent
+            / prepared.unsigned.private_directory_name
+            / database_backup.backup_name
+        )
+        if sys.platform == "win32":
+            locator_path = Path("\\\\?\\" + str(locator_path))
+        raise _PortableReplacementRecoveryRequired(
+            prior_generation=prepared.unsigned.prior_generation,
+            recovery_locator=RecoveryLocator(
+                path=locator_path,
+                asset_kind=AssetKind.ACTIVE_STORE,
+                expected_digest=database_backup.content.sha256,
+            ),
+        )
+    raise ActivationPreparationError(
+        "ACTIVATION.RECOVERY_REQUIRED",
+        retryable=True,
+    )
+
+
+def rehydrate_completed_portable_replacement_activation(
+    port: _PortableRecoveryStorePort,
+    *,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> ActivationRecoveryReport | None:
+    """Read-only hydrate base gen0 or one exact terminal replacement current."""
+
+    if not (
+        isinstance(platform, PlatformFileBackend)
+        and persistent_private is platform
+        and descendant_inspection is platform
+        and isinstance(platform, ExistingFileRetirement)
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+            retryable=False,
+        )
+    if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+        raise TypeError("portable completed hydration borrow is invalid")
+    root, _lease = caller_borrow._fresh_recovery_authorities(
+        platform,
+        persistent_private,
+        port.resource_identity,
+    )
+    private_name = (
+        f".localcat-activation-private-v1."
+        f"{port.resource_identity.target_identity}"
+    )
+    if root.inspect_entry(private_name) is None:
+        return port.rehydrate_completed_portable_base(
+            platform=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+        )
+    snapshot, _root, _base_generation = (
+        _inspect_portable_replacement_namespace(
+            identity=port.resource_identity,
+            backend=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+        )
+    )
+    if snapshot is None:
+        return port.rehydrate_completed_portable_base(
+            platform=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+        )
+    if snapshot.state != "CURRENT":
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    current = snapshot.current_record
+    if (
+        type(current) is not _PortableReplacementRecord
+        or current.unsigned.phase != "READY"
+        or type(current.unsigned.active_content_attestation)
+        is not PortableActiveContentAttestation
+    ):
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    active = current.unsigned.active_content_attestation
+    identity = port.resource_identity
+    authorities: list[BoundRegularFile] = []
+    observed: dict[str, BoundContentFacts] = {}
+    active_error: BaseException | None = None
+    staged_view: _SQLiteGenerationView | None = None
+    try:
+        for name, expected in (
+            (identity.canonical_sidecar_path.name, None),
+            (identity.snapshot_manifest_path.name, active.manifest),
+        ):
+            opened = platform.open_regular(root, PurePath(name))
+            authorities.append(opened)
+            facts = opened.content_facts()
+            observed[name] = facts
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or root.inspect_entry(name) != facts.snapshot
+                or (
+                    expected is not None
+                    and port.portable_content_proof(facts) != expected
+                )
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        active_ref = _canonical_activation_ref(
+            identity,
+            journal_id=active.journal_id,
+        )
+        schema = port.inspect_stage_schema(
+            active_ref,
+            canonical_store_id=active.canonical_store_id,
+            _allow_diverged_runtime=True,
+            _allow_active=True,
+            _expected_active_generation=active.generation,
+            _expected_activation_digest=active.activation_digest,
+        )
+        if schema.activation_status != "ACTIVE":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        staged_view = _SQLiteGenerationView(
+            stage=active_ref,
+            canonical_store_id=active.canonical_store_id,
+            generation=active.generation,
+            fts5_available=schema.fts5_available,
+            active_content_attestation=active,
+        )
+        caller_borrow.reprove(platform, identity)
+        repeated, _repeated_root, _repeated_base = (
+            _inspect_portable_replacement_namespace(
+                identity=identity,
+                backend=platform,
+                persistent_private=persistent_private,
+                descendant_inspection=descendant_inspection,
+                caller_borrow=caller_borrow,
+            )
+        )
+        if repeated != snapshot:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        for name, authority in zip(
+            (
+                identity.canonical_sidecar_path.name,
+                identity.snapshot_manifest_path.name,
+            ),
+            authorities,
+            strict=True,
+        ):
+            facts = authority.content_facts()
+            if facts != observed[name] or root.inspect_entry(name) != facts.snapshot:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        caller_borrow.reprove(platform, identity)
+    except BaseException as error:
+        active_error = error
+    finally:
+        close_error: BaseException | None = None
+        for authority in reversed(authorities):
+            try:
+                authority.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if active_error is None and close_error is not None:
+            active_error = close_error
+    if active_error is not None:
+        raise active_error
+    if staged_view is None:
+        raise AssertionError("portable replacement hydration produced no view")
+    port.state = "ACTIVATING"
+    port.view = None
+    port._activate_candidate_store_id(active.canonical_store_id)
+    port.adopt_portable_replacement_current(current)
+    port.view = staged_view
+    port.state = "READY"
+    port.notify_all()
+    return ActivationRecoveryReport(
+        phase="GENERATION_PUBLISHED",
+        action="COMPLETED",
+        generation=active.generation,
+    )
 
 
 def _portable_recovery_activation_digest(
