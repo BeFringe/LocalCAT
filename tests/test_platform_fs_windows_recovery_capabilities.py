@@ -17,6 +17,7 @@ from platform_fs import (
 )
 from platform_fs_contracts import (
     CandidateContentFacts,
+    DEVICE_SECRET_SIZE_BYTES,
     ExistingFileRetirement,
     LedgerEnumerationLimits,
     LockPolicy,
@@ -24,6 +25,9 @@ from platform_fs_contracts import (
     LockedDescendantNamespaceInspection,
     PlatformFileError,
     PlatformFileErrorCode,
+    PrivateProofContext,
+    PrivateProofObjectRole,
+    PublishMode,
 )
 from platform_fs_windows import WindowsPlatformAdapter, WindowsRootedFileSystem
 from windows_file_api import Win32CallError
@@ -290,7 +294,6 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
     def setUp(self) -> None:
         self._temporary = tempfile.TemporaryDirectory(
             prefix="localcat-existing-retirement-",
-            dir=ROOT.parent,
         )
         self.container = Path(self._temporary.name)
         self.root_path = self.container / "RootCase"
@@ -318,6 +321,30 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
         )
         target = adapter.bind_or_create_child_directory(parent, target_directory)
         return root, parent, target
+
+    def _live_authorities(
+        self,
+        adapter: WindowsPlatformAdapter,
+        *,
+        source_name: str,
+        payload: bytes,
+        target_directory: str = "quarantine",
+    ) -> tuple[object, object, object, object]:
+        root, ordinary_parent, target = self._authorities(
+            adapter,
+            source_name=source_name,
+            target_directory=target_directory,
+        )
+        ordinary_parent.close()
+        source_parent = adapter.bind_retirement_source_directory(
+            root,
+            PureWindowsPath("PrivateCase", source_name),
+        )
+        source = adapter.open_existing_retirement_source(
+            source_parent,
+            self._facts(payload),
+        )
+        return root, source_parent, target, source
 
     def _assert_write_and_delete_access_blocked(
         self,
@@ -362,17 +389,15 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
         capability = narrow_windows_existing_file_retirement(adapter, self.root_path)
         self.assertIs(capability, adapter)
         self.assertIsInstance(capability, ExistingFileRetirement)
-        root, parent, target = self._authorities(adapter, source_name=source_name)
-        source = capability.open_existing_retirement_source(
-            root,
-            PureWindowsPath("PrivateCase", source_name),
-            self._facts(payload),
+        root, parent, target, source = self._live_authorities(
+            adapter,
+            source_name=source_name,
+            payload=payload,
         )
         try:
             self._assert_write_and_delete_access_blocked(adapter, source_path)
             retained = capability.retire_existing_exclusive(
                 parent,
-                source_name,
                 source,
                 target,
                 source_name,
@@ -392,6 +417,265 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
             parent.close()
             root.close()
 
+    def test_live_source_moves_across_root_sibling_and_cousin_topologies(self) -> None:
+        cases = (
+            (
+                "root",
+                PureWindowsPath("root-source.bin"),
+                self.root_path / "root-source.bin",
+                None,
+            ),
+            (
+                "sibling",
+                PureWindowsPath("PrivateCase", "sibling-source.bin"),
+                self.parent_path / "sibling-source.bin",
+                None,
+            ),
+            (
+                "cousin",
+                PureWindowsPath("PrivateCase", "Nested", "cousin-source.bin"),
+                self.parent_path / "Nested" / "cousin-source.bin",
+                "OtherCase",
+            ),
+        )
+        for label, relative, source_path, target_parent_name in cases:
+            with self.subTest(topology=label):
+                payload = f"cross-parent-{label}".encode()
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                source_path.write_bytes(payload)
+                adapter = WindowsPlatformAdapter()
+                root = adapter.bind_root(self.root_path)
+                ordinary_target_parent = quarantine = target = source_parent = None
+                source = retained = None
+                try:
+                    target_base = root
+                    if target_parent_name is not None:
+                        (self.root_path / target_parent_name).mkdir(exist_ok=True)
+                        ordinary_target_parent = adapter.bind_parent(
+                            root,
+                            PureWindowsPath(target_parent_name, "placeholder"),
+                        )
+                        target_base = ordinary_target_parent
+                    quarantine = adapter.bind_or_create_child_directory(
+                        target_base,
+                        f"quarantine-{label}",
+                    )
+                    target = adapter.bind_or_create_child_directory(
+                        quarantine,
+                        "attempt",
+                    )
+                    if ordinary_target_parent is not None:
+                        ordinary_target_parent.close()
+                        ordinary_target_parent = None
+                    source_parent = (
+                        adapter.bind_retirement_source_directory(
+                            root,
+                            relative,
+                        )
+                    )
+                    source = adapter.open_existing_retirement_source(
+                        source_parent,
+                        self._facts(payload),
+                    )
+                    retained = adapter.retire_existing_exclusive(
+                        source_parent,
+                        source,
+                        target,
+                        relative.name,
+                    )
+                    source = None
+                    retained.reprove()
+                    target_path = (
+                        self.root_path
+                        / target_parent_name
+                        if target_parent_name is not None
+                        else self.root_path
+                    ) / f"quarantine-{label}" / "attempt" / relative.name
+                    self.assertFalse(source_path.exists())
+                    retained.close()
+                    retained = None
+                    self.assertEqual(target_path.read_bytes(), payload)
+                finally:
+                    if retained is not None:
+                        retained.close()
+                    if source is not None:
+                        source.close()
+                    if source_parent is not None:
+                        source_parent.close()
+                    if target is not None:
+                        target.close()
+                    if quarantine is not None:
+                        quarantine.close()
+                    if ordinary_target_parent is not None:
+                        ordinary_target_parent.close()
+                    root.close()
+
+    def test_private_pending_and_w2_authorities_close_before_sibling_retirement(self) -> None:
+        payload = b"private-published-retirement"
+        adapter = WindowsPlatformAdapter()
+        root = adapter.bind_root(self.root_path)
+        owner_parent = adapter.bind_parent(root, PureWindowsPath("placeholder.bin"))
+        private = target = source_parent = source = retained = None
+        pending = evidence = private_evidence = key_evidence = secret = None
+        key_pending = None
+        try:
+            private = adapter.create_private_directory(owner_parent, "PrivatePublished")
+            owner_parent.close()
+            owner_parent = None
+            candidate = private.create_candidate("source.candidate", private=True)
+            candidate.write_all(payload)
+            candidate.flush_content()
+            facts = self._facts(payload)
+            pending = private.begin_publish(
+                candidate,
+                "source.bin",
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            destination = pending.retained_destination()
+            evidence = adapter.prove_private(destination)
+            self.assertEqual(destination.read_all(), payload)
+            evidence.close()
+            evidence = None
+            pending.terminal_reproof()
+            pending.close()
+            pending = None
+
+            key_payload = b"k" * DEVICE_SECRET_SIZE_BYTES
+            key_candidate = private.create_candidate("device.key.candidate", private=True)
+            key_candidate.write_all(key_payload)
+            key_candidate.flush_content()
+            key_pending = private.begin_publish(
+                key_candidate,
+                "device.key",
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            key_file = key_pending.retained_destination()
+            key_evidence = adapter.prove_private(key_file)
+            secret = adapter.bind_device_secret(key_file)
+            private_evidence = adapter.prove_private(private)
+            context = PrivateProofContext(
+                PrivateProofObjectRole.PRIVATE_DIRECTORY,
+                hashlib.sha256(b"private-lifecycle").digest(),
+            )
+            proof = adapter.mint(private_evidence, secret, context)
+            verified = adapter.verify(private_evidence, secret, proof, context)
+            adapter.consume_verified(verified, context)
+            key_evidence.close()
+            key_evidence = None
+            secret.close()
+            secret = None
+            private_evidence.close()
+            private_evidence = None
+            key_pending.terminal_reproof()
+            key_pending.close()
+            key_pending = None
+            private.close()
+            private = None
+
+            quarantine = adapter.bind_or_create_child_directory(root, "quarantine-private")
+            try:
+                target = adapter.bind_or_create_child_directory(quarantine, "attempt")
+            finally:
+                quarantine.close()
+            source_parent = adapter.bind_retirement_source_directory(
+                root,
+                PureWindowsPath("PrivatePublished", "source.bin"),
+            )
+            source = adapter.open_existing_retirement_source(source_parent, facts)
+            retained = adapter.retire_existing_exclusive(
+                source_parent,
+                source,
+                target,
+                "source.bin",
+            )
+            source = None
+            retained.reprove()
+            retained.close()
+            retained = None
+            self.assertEqual(
+                (self.root_path / "quarantine-private" / "attempt" / "source.bin").read_bytes(),
+                payload,
+            )
+        finally:
+            if evidence is not None:
+                evidence.close()
+            if pending is not None:
+                pending.close()
+            if key_pending is not None:
+                key_pending.close()
+            if key_evidence is not None:
+                key_evidence.close()
+            if secret is not None:
+                secret.close()
+            if private_evidence is not None:
+                private_evidence.close()
+            if retained is not None:
+                retained.close()
+            if source is not None:
+                source.close()
+            if source_parent is not None:
+                source_parent.close()
+            if target is not None:
+                target.close()
+            if private is not None:
+                private.close()
+            if owner_parent is not None:
+                owner_parent.close()
+            root.close()
+
+    def test_live_retirement_rejects_same_adapter_different_root_before_arm(self) -> None:
+        payload = b"different-root"
+        source_name = "different-root.bin"
+        source_path = self.parent_path / source_name
+        source_path.write_bytes(payload)
+        other_root_path = self.container / "OtherRoot"
+        other_root_path.mkdir()
+        adapter = WindowsPlatformAdapter()
+        source_root = adapter.bind_root(self.root_path)
+        target_root = adapter.bind_root(other_root_path)
+        target_parent = adapter.bind_parent(
+            target_root,
+            PureWindowsPath("placeholder.bin"),
+        )
+        target = adapter.bind_or_create_child_directory(
+            target_parent,
+            "quarantine",
+        )
+        target_parent.close()
+        source_parent = adapter.bind_retirement_source_directory(
+            source_root,
+            PureWindowsPath("PrivateCase", source_name),
+        )
+        source = adapter.open_existing_retirement_source(
+            source_parent,
+            self._facts(payload),
+        )
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                adapter.retire_existing_exclusive(
+                    source_parent,
+                    source,
+                    target,
+                    source_name,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            )
+            self.assertFalse(source.closed)
+            self.assertEqual(source.reprove().snapshot.byte_count, len(payload))
+            self.assertTrue(source_path.exists())
+            self.assertIsNone(target.inspect_entry(source_name))
+        finally:
+            source.close()
+            source_parent.close()
+            target.close()
+            target_root.close()
+            source_root.close()
+
     def test_fresh_backend_rebinds_only_source_absent_exact_target(self) -> None:
         payload = b"fresh-rebind-v3"
         source_name = "activation.journal"
@@ -399,15 +683,13 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
         target_path = self.parent_path / "quarantine" / source_name
         source_path.write_bytes(payload)
         first = WindowsPlatformAdapter()
-        root, parent, target = self._authorities(first, source_name=source_name)
-        source = first.open_existing_retirement_source(
-            root,
-            PureWindowsPath("PrivateCase", source_name),
-            self._facts(payload),
+        root, parent, target, source = self._live_authorities(
+            first,
+            source_name=source_name,
+            payload=payload,
         )
         retained = first.retire_existing_exclusive(
             parent,
-            source_name,
             source,
             target,
             source_name,
@@ -442,6 +724,52 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
             fresh_parent.close()
             fresh_root.close()
 
+    def test_fresh_rebind_rejects_same_adapter_different_root_before_arm(self) -> None:
+        payload = b"different-root-fresh-rebind"
+        source_name = "activation.journal"
+        source_path = self.parent_path / source_name
+        other_root_path = self.container / "OtherFreshRoot"
+        target_path = other_root_path / "quarantine" / source_name
+        target_path.parent.mkdir(parents=True)
+        target_path.write_bytes(payload)
+        adapter = WindowsPlatformAdapter()
+        source_root = adapter.bind_root(self.root_path)
+        source_parent = adapter.bind_parent(
+            source_root,
+            PureWindowsPath("PrivateCase", source_name),
+        )
+        target_root = adapter.bind_root(other_root_path)
+        target_parent = adapter.bind_parent(
+            target_root,
+            PureWindowsPath("placeholder.bin"),
+        )
+        target = adapter.bind_or_create_child_directory(
+            target_parent,
+            "quarantine",
+        )
+        target_parent.close()
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                adapter.rebind_existing_retirement(
+                    source_parent,
+                    source_name,
+                    target,
+                    source_name,
+                    self._facts(payload),
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            )
+            self.assertFalse(source_path.exists())
+            self.assertEqual(target_path.read_bytes(), payload)
+        finally:
+            target.close()
+            target_root.close()
+            source_parent.close()
+            source_root.close()
+
     def test_source_and_target_coexist_never_clobbers_or_consumes_source(self) -> None:
         source_payload = b"source"
         target_payload = b"foreign-target"
@@ -452,17 +780,15 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
         target_path.parent.mkdir()
         target_path.write_bytes(target_payload)
         adapter = WindowsPlatformAdapter()
-        root, parent, target = self._authorities(adapter, source_name=source_name)
-        source = adapter.open_existing_retirement_source(
-            root,
-            PureWindowsPath("PrivateCase", source_name),
-            self._facts(source_payload),
+        root, parent, target, source = self._live_authorities(
+            adapter,
+            source_name=source_name,
+            payload=source_payload,
         )
         try:
             with self.assertRaises(PlatformFileError) as caught:
                 adapter.retire_existing_exclusive(
                     parent,
-                    source_name,
                     source,
                     target,
                     source_name,
@@ -491,10 +817,12 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
         source_path.write_bytes(payload)
         adapter = WindowsPlatformAdapter()
         with adapter.bind_root(self.root_path) as root:
-            with self.assertRaises(PlatformFileError) as wrong_source:
+            with adapter.bind_retirement_source_directory(
+                root,
+                PureWindowsPath("PrivateCase", source_name),
+            ) as source_parent, self.assertRaises(PlatformFileError) as wrong_source:
                 adapter.open_existing_retirement_source(
-                    root,
-                    PureWindowsPath("PrivateCase", source_name),
+                    source_parent,
                     self._facts(b"different"),
                 )
             _assert_platform_error(
@@ -643,17 +971,15 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
         source_path.write_bytes(payload)
         owner = WindowsPlatformAdapter()
         foreign = WindowsPlatformAdapter(_api=owner._native_api())
-        root, parent, target = self._authorities(foreign, source_name=source_name)
-        source = foreign.open_existing_retirement_source(
-            root,
-            PureWindowsPath("PrivateCase", source_name),
-            self._facts(payload),
+        root, parent, target, source = self._live_authorities(
+            foreign,
+            source_name=source_name,
+            payload=payload,
         )
         try:
             with self.assertRaises(PlatformFileError) as caught:
                 owner.retire_existing_exclusive(
                     parent,
-                    source_name,
                     source,
                     target,
                     source_name,
@@ -693,17 +1019,15 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
                 )
 
         adapter = WindowsPlatformAdapter(_fault_injector=after_arm)
-        root, parent, target = self._authorities(adapter, source_name=source_name)
-        source = adapter.open_existing_retirement_source(
-            root,
-            PureWindowsPath("PrivateCase", source_name),
-            self._facts(payload),
+        root, parent, target, source = self._live_authorities(
+            adapter,
+            source_name=source_name,
+            payload=payload,
         )
         try:
             with self.assertRaises(PlatformFileError) as caught:
                 adapter.retire_existing_exclusive(
                     parent,
-                    source_name,
                     source,
                     target,
                     source_name,
@@ -759,15 +1083,11 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
                     raise programming_error
 
             adapter = WindowsPlatformAdapter(_fault_injector=before_arm)
-            root, parent, target = self._authorities(
+            root, parent, target, source = self._live_authorities(
                 adapter,
                 source_name=case_name,
+                payload=payload,
                 target_directory=f"program-quarantine-{index}",
-            )
-            source = adapter.open_existing_retirement_source(
-                root,
-                PureWindowsPath("PrivateCase", case_name),
-                self._facts(payload),
             )
             try:
                 with self.subTest(error=type(programming_error).__name__), self.assertRaises(
@@ -775,7 +1095,6 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
                 ):
                     adapter.retire_existing_exclusive(
                         parent,
-                        case_name,
                         source,
                         target,
                         case_name,
@@ -812,15 +1131,11 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
                     raise failure
 
             adapter = WindowsPlatformAdapter(_fault_injector=prearm_fault)
-            root, parent, target = self._authorities(
+            root, parent, target, source = self._live_authorities(
                 adapter,
                 source_name=source_name,
+                payload=payload,
                 target_directory=f"prearm-quarantine-{index}",
-            )
-            source = adapter.open_existing_retirement_source(
-                root,
-                PureWindowsPath("PrivateCase", source_name),
-                self._facts(payload),
             )
             try:
                 with self.subTest(failure=type(failure).__name__), self.assertRaises(
@@ -828,7 +1143,6 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
                 ) as caught:
                     adapter.retire_existing_exclusive(
                         parent,
-                        source_name,
                         source,
                         target,
                         source_name,
@@ -870,17 +1184,15 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
                 )
 
         adapter = WindowsPlatformAdapter(_fault_injector=terminal_fault)
-        root, parent, target = self._authorities(adapter, source_name=source_name)
-        source = adapter.open_existing_retirement_source(
-            root,
-            PureWindowsPath("PrivateCase", source_name),
-            self._facts(payload),
+        root, parent, target, source = self._live_authorities(
+            adapter,
+            source_name=source_name,
+            payload=payload,
         )
         try:
             with self.assertRaises(PlatformFileError) as caught:
                 adapter.retire_existing_exclusive(
                     parent,
-                    source_name,
                     source,
                     target,
                     source_name,
