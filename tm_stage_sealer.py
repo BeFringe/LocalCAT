@@ -10,7 +10,7 @@ from pathlib import Path, PurePath
 import sqlite3
 import stat
 import threading
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, Iterator, Protocol, cast, runtime_checkable
 import uuid
 
 import tm_contracts as contract_module
@@ -18,6 +18,8 @@ from platform_fs_contracts import (
     BoundContentFacts,
     BoundRegularFile,
     BoundSynchronizedRegularFile,
+    CandidateContentFacts,
+    CandidateFile,
     ExistingFileDurability,
     LockLease,
     MutableFileReservation,
@@ -78,6 +80,8 @@ from text_matcher import fold_text_value_v1
 
 _NATIVE_PATH_TYPE = type(Path())
 _READ_CHUNK_BYTES = 1024 * 1024
+_PORTABLE_CANDIDATE_COPY_CHUNK_BYTES = 64 * 1024
+_PORTABLE_PUBLICATION_ASSETS = frozenset({"database", "manifest"})
 _EXPECTED_PROVENANCE_JSON = (
     '[["source","legacy-jsonl"]]'
 )
@@ -291,6 +295,32 @@ class _CallerHeldSealBorrow:
         self.reprove(platform, stage)
         return self.__root.inspect_entry(name)
 
+    def create_publication_candidate(
+        self,
+        platform: _StageSealerPlatform,
+        stage: MutableStageRef,
+        parent: RootedDirectoryAuthority,
+        name: str,
+    ) -> CandidateFile:
+        """Create one caller-owned candidate only under this exact root."""
+
+        self.reprove(platform, stage)
+        if parent is not self.__root:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        candidate: CandidateFile | None = None
+        try:
+            candidate = self.__root.create_candidate(name, private=False)
+            self.reprove(platform, stage)
+        except PlatformFileError as error:
+            if candidate is not None:
+                candidate.close()
+            raise _portable_stage_error(error) from None
+        except BaseException:
+            if candidate is not None:
+                candidate.close()
+            raise
+        return candidate
+
     def _release(self) -> None:
         self.__released = True
 
@@ -426,6 +456,79 @@ class _PortableStageLiveAuthority(OpaqueAuthority):
             raise StageSealError("SEALER.ARTIFACT_MUTATED")
         return payload
 
+    def copy_asset_to_new_candidate(
+        self,
+        *,
+        platform: _StageSealerPlatform,
+        parent: RootedDirectoryAuthority,
+        asset: str,
+        candidate_name: str,
+    ) -> tuple[CandidateFile, CandidateContentFacts]:
+        """Copy one sealed asset through live authority into a fresh candidate."""
+
+        self._require_open()
+        if type(asset) is not str:
+            raise TypeError("portable publication asset must be exact str")
+        if asset not in _PORTABLE_PUBLICATION_ASSETS:
+            raise ValueError("portable publication asset is unsupported")
+        if platform is not self.__platform:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        if not isinstance(parent, RootedDirectoryAuthority):
+            raise TypeError("publication parent must be rooted authority")
+
+        source, expected_facts = (
+            (self.__database, self.__database_facts)
+            if asset == "database"
+            else (self.__manifest, self.__manifest_facts)
+        )
+        expected_proof = _portable_proof(expected_facts)
+        self.reprove()
+        candidate = self.__caller_borrow.create_publication_candidate(
+            platform,
+            self.__stage,
+            parent,
+            candidate_name,
+        )
+        try:
+            expected_snapshot = expected_facts.snapshot
+
+            def exact_chunks() -> Iterator[bytes]:
+                offset = 0
+                while offset < expected_snapshot.byte_count:
+                    maximum_bytes = min(
+                        _PORTABLE_CANDIDATE_COPY_CHUNK_BYTES,
+                        expected_snapshot.byte_count - offset,
+                    )
+                    chunk = source.read_at(
+                        offset,
+                        maximum_bytes,
+                        expected_snapshot,
+                    )
+                    offset += len(chunk)
+                    yield chunk
+                if source.read_at(offset, 1, expected_snapshot):
+                    raise StageSealError("SEALER.ARTIFACT_MUTATED")
+
+            copied = candidate.write_chunks(
+                exact_chunks(),
+                maximum_bytes=expected_snapshot.byte_count,
+            )
+            if (
+                copied.byte_count != expected_proof.size
+                or copied.content_sha256.hex() != expected_proof.sha256
+            ):
+                raise StageSealError("SEALER.ARTIFACT_MUTATED")
+            self.reprove()
+            if _portable_proof(expected_facts) != expected_proof:
+                raise StageSealError("SEALER.ARTIFACT_MUTATED")
+            return candidate, copied
+        except PlatformFileError as error:
+            candidate.close()
+            raise _portable_stage_error(error) from None
+        except BaseException:
+            candidate.close()
+            raise
+
     def reprove(self) -> None:
         try:
             self._require_open()
@@ -558,6 +661,28 @@ class _PortableAuthorityBorrow:
 
     def reprove(self) -> None:
         self.__registry._reprove_portable_borrow(self)
+
+    def copy_asset_to_new_candidate(
+        self,
+        *,
+        platform: _StageSealerPlatform,
+        parent: RootedDirectoryAuthority,
+        asset: str,
+        candidate_name: str,
+    ) -> tuple[CandidateFile, CandidateContentFacts]:
+        """Consume this borrow to copy one exact sealed asset."""
+
+        if type(asset) is not str:
+            raise TypeError("portable publication asset must be exact str")
+        if asset not in _PORTABLE_PUBLICATION_ASSETS:
+            raise ValueError("portable publication asset is unsupported")
+        return self.__registry._copy_portable_borrow_asset_to_new_candidate(
+            self,
+            platform=platform,
+            parent=parent,
+            asset=asset,
+            candidate_name=candidate_name,
+        )
 
     def _release(self) -> None:
         self.__registry._release_portable_borrow(self)
@@ -3208,20 +3333,9 @@ class _SealedArtifactRegistry:
         borrow: _PortableAuthorityBorrow,
     ) -> None:
         with self._lock:
-            if type(borrow) is not _PortableAuthorityBorrow:
-                raise TypeError("portable authority borrow must be exact")
-            if borrow._PortableAuthorityBorrow__registry is not self:
-                raise StageSealError("SEALER.REGISTRY_MISMATCH")
-            artifact_id = borrow._PortableAuthorityBorrow__artifact_id
-            nonce = borrow._PortableAuthorityBorrow__nonce
-            if self._portable_borrows.pop(nonce, None) != artifact_id:
-                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
-            entry = self._entries.get(artifact_id)
-            if type(entry) is not _PortableRegistryEntry:
-                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
-            live_authority = entry.live_authority
-            if live_authority is None or live_authority.closed:
-                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+            entry, live_authority = self._consume_portable_borrow_locked(
+                borrow
+            )
             live_authority.reprove()
             if live_authority.persisted_proofs() != (
                 entry.sealed_content_attestation.database,
@@ -3229,6 +3343,46 @@ class _SealedArtifactRegistry:
                 entry.sealed_content_attestation.source,
             ):
                 raise StageSealError("SEALER.ATTESTATION_INVALID")
+
+    def _copy_portable_borrow_asset_to_new_candidate(
+        self,
+        borrow: _PortableAuthorityBorrow,
+        *,
+        platform: _StageSealerPlatform,
+        parent: RootedDirectoryAuthority,
+        asset: str,
+        candidate_name: str,
+    ) -> tuple[CandidateFile, CandidateContentFacts]:
+        with self._lock:
+            _entry, live_authority = self._consume_portable_borrow_locked(
+                borrow
+            )
+            return live_authority.copy_asset_to_new_candidate(
+                platform=platform,
+                parent=parent,
+                asset=asset,
+                candidate_name=candidate_name,
+            )
+
+    def _consume_portable_borrow_locked(
+        self,
+        borrow: _PortableAuthorityBorrow,
+    ) -> tuple[_PortableRegistryEntry, _PortableStageLiveAuthority]:
+        if type(borrow) is not _PortableAuthorityBorrow:
+            raise TypeError("portable authority borrow must be exact")
+        if borrow._PortableAuthorityBorrow__registry is not self:
+            raise StageSealError("SEALER.REGISTRY_MISMATCH")
+        artifact_id = borrow._PortableAuthorityBorrow__artifact_id
+        nonce = borrow._PortableAuthorityBorrow__nonce
+        if self._portable_borrows.pop(nonce, None) != artifact_id:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        entry = self._entries.get(artifact_id)
+        if type(entry) is not _PortableRegistryEntry:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        live_authority = entry.live_authority
+        if live_authority is None or live_authority.closed:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        return entry, live_authority
 
     def _release_portable_borrow(
         self,
@@ -3910,6 +4064,34 @@ class _SealedArtifactRegistry:
                 entry,
                 state=ActivationCapabilityState.CONSUMED,
             )
+
+    def release_portable_live_authority_for_recovery(
+        self,
+        token: contract_module._ActivationToken,
+    ) -> bool:
+        """Close process-only portable handles without claiming a terminal."""
+
+        with self._lock:
+            entry = self._token_entry(token)
+            if (
+                type(entry) is not _PortableRegistryEntry
+                or entry.state is not ActivationCapabilityState.TOKEN_ISSUED
+                or entry.live_authority is None
+            ):
+                return False
+            live_authority = entry.live_authority
+            artifact_id = entry.stage.artifact.artifact_id
+            self._entries[artifact_id] = replace(
+                entry,
+                live_authority=None,
+            )
+            self._portable_borrows = {
+                nonce: borrowed_artifact
+                for nonce, borrowed_artifact in self._portable_borrows.items()
+                if borrowed_artifact != artifact_id
+            }
+            live_authority.close()
+            return True
 
     def cancel(self, token: contract_module._ActivationToken) -> None:
         with self._lock:
