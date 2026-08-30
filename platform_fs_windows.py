@@ -31,6 +31,7 @@ from platform_fs_contracts import (
     ExistingFileDurability,
     ExistingFileRetirement,
     ExistingRetirementSource,
+    RetirementSourceDirectoryAuthority,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -1022,6 +1023,7 @@ def _open_directory_components(
 _WINDOWS_DIRECTORY_AUTHORITY_SLOTS = (
     "_api",
     "_issuer",
+    "_root_anchor",
     "_records",
     "_maximum_component_units",
     "_fault_injector",
@@ -1035,6 +1037,7 @@ class _WindowsDirectoryAuthorityMixin:
         self,
         api: WindowsFileAPI,
         issuer: object,
+        root_anchor: object,
         records: tuple[_WindowsDirectoryRecord, ...],
         maximum_component_units: int,
         fault_injector: _FaultInjector | None,
@@ -1044,6 +1047,7 @@ class _WindowsDirectoryAuthorityMixin:
             raise ValueError("Windows directory authority requires retained handles")
         self._api = api
         self._issuer = issuer
+        self._root_anchor = root_anchor
         self._records = records
         self._maximum_component_units = maximum_component_units
         self._fault_injector = fault_injector
@@ -3062,9 +3066,12 @@ class _WindowsExistingRetirementSource(ExistingRetirementSource):
     __slots__ = (
         "_api",
         "_issuer",
+        "_root_anchor",
         "_records",
         "_handle",
         "_entry_path",
+        "_source_name",
+        "_maximum_component_units",
         "_entry_identity",
         "_expected_content",
         "_read_lock",
@@ -3074,18 +3081,24 @@ class _WindowsExistingRetirementSource(ExistingRetirementSource):
         self,
         api: WindowsFileAPI,
         issuer: object,
+        root_anchor: object,
         records: tuple[_WindowsDirectoryRecord, ...],
         handle: object,
         entry_path: str,
+        source_name: str,
+        maximum_component_units: int,
         entry_identity: FileObjectIdentity,
         expected_content: CandidateContentFacts,
     ) -> None:
         super().__init__(entry_identity, expected_content)
         self._api = api
         self._issuer = issuer
+        self._root_anchor = root_anchor
         self._records = records
         self._handle = handle
         self._entry_path = entry_path
+        self._source_name = source_name
+        self._maximum_component_units = maximum_component_units
         self._entry_identity = entry_identity
         self._expected_content = expected_content
         self._read_lock = threading.Lock()
@@ -3217,6 +3230,73 @@ class _WindowsExistingRetirementSource(ExistingRetirementSource):
         self._records = ()
         chain_error = _close_handles_reverse(tuple(record.handle for record in records))
         if first_error is not None or chain_error is not None:
+            raise _capability_unavailable() from None
+
+
+class _WindowsRetirementSourceDirectoryAuthority(RetirementSourceDirectoryAuthority):
+    __slots__ = (
+        "_api",
+        "_issuer",
+        "_root_anchor",
+        "_records",
+        "_entry_path",
+        "_source_name",
+        "_maximum_component_units",
+    )
+
+    def __init__(
+        self,
+        api: WindowsFileAPI,
+        issuer: object,
+        root_anchor: object,
+        records: tuple[_WindowsDirectoryRecord, ...],
+        entry_path: str,
+        source_name: str,
+        maximum_component_units: int,
+    ) -> None:
+        super().__init__()
+        self._api = api
+        self._issuer = issuer
+        self._root_anchor = root_anchor
+        self._records = records
+        self._entry_path = entry_path
+        self._source_name = source_name
+        self._maximum_component_units = maximum_component_units
+        try:
+            self._reprove_parent()
+        except BaseException:
+            self._close_authority()
+            raise
+
+    def _reprove_parent(self) -> None:
+        _reprove_directory_chain(self._api, self._records)
+        expected = _append_component(
+            self._records[-1].expected_final_path,
+            self._source_name,
+            maximum_units=self._maximum_component_units,
+        )
+        if expected != self._entry_path:
+            raise _identity_stale()
+
+    def _inspect_source(self, *, stale: bool) -> EntrySnapshot | None:
+        self._reprove_parent()
+        proof = _open_entry_proof(
+            self._api,
+            self._entry_path,
+            self._entry_path,
+            expected_kind="regular",
+            expected_volume_id=self._records[0].identity.volume_id,
+            stale=stale,
+            allow_missing=True,
+            reject_wrong_kind=True,
+        )
+        return None if proof is None else proof.snapshot
+
+    def _close_authority(self) -> None:
+        error = _close_handles_reverse(
+            tuple(record.handle for record in self._records)
+        )
+        if error is not None:
             raise _capability_unavailable() from None
 
 
@@ -3918,12 +3998,11 @@ class WindowsRootedFileSystem(
         except Exception:
             raise _lock_unavailable() from None
 
-    def _open_existing_retirement_source(
+    def _bind_retirement_source_directory(
         self,
         root: RootedDirectoryAuthority,
         relative: PurePath,
-        expected_content: CandidateContentFacts,
-    ) -> ExistingRetirementSource:
+    ) -> RetirementSourceDirectoryAuthority:
         if type(root) is not _WindowsRootedDirectory:
             raise _capability_unavailable()
         if root._issuer is not self._authority_issuer:
@@ -3933,27 +4012,81 @@ class WindowsRootedFileSystem(
             maximum_units=root._maximum_component_units,
         )
         records: tuple[_WindowsDirectoryRecord, ...] | None = None
-        handle = None
         try:
             root._reprove()
             records = _duplicate_directory_chain(root._api, root._records)
-            records = _open_directory_components(
-                root._api,
-                records,
-                components[:-1],
-                maximum_component_units=root._maximum_component_units,
-            )
+            parent_components = components[:-1]
+            if len(parent_components) > 1:
+                records = _open_directory_components(
+                    root._api,
+                    records,
+                    parent_components[:-1],
+                    maximum_component_units=root._maximum_component_units,
+                )
+            if parent_components:
+                parent_path = _append_component(
+                    records[-1].expected_final_path,
+                    parent_components[-1],
+                    maximum_units=root._maximum_component_units,
+                )
+                compatible_leaf = _open_retirement_target_record(
+                    root._api,
+                    parent_path,
+                    records[0].identity.volume_id,
+                    stale=False,
+                )
+                records = records + (compatible_leaf,)
             entry_path = _append_component(
                 records[-1].expected_final_path,
                 components[-1],
                 maximum_units=root._maximum_component_units,
             )
-            probed = _open_entry_proof(
+            transferred_records = records
+            records = None
+            return _WindowsRetirementSourceDirectoryAuthority(
                 root._api,
+                root._issuer,
+                root._root_anchor,
+                transferred_records,
+                entry_path,
+                components[-1],
+                root._maximum_component_units,
+            )
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _capability_unavailable() from None
+        finally:
+            if records is not None:
+                _close_handles_reverse(tuple(record.handle for record in records))
+
+    def _open_existing_retirement_source(
+        self,
+        source_parent: RetirementSourceDirectoryAuthority,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        if (
+            type(source_parent) is not _WindowsRetirementSourceDirectoryAuthority
+            or source_parent._issuer is not self._authority_issuer
+        ):
+            raise _capability_unavailable()
+        records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        handle = None
+        try:
+            source_parent._reprove_parent()
+            records = _duplicate_directory_chain(
+                source_parent._api,
+                source_parent._records,
+            )
+            entry_path = source_parent._entry_path
+            probed = _open_entry_proof(
+                source_parent._api,
                 entry_path,
                 entry_path,
                 expected_kind="regular",
-                expected_volume_id=records[0].identity.volume_id,
+                expected_volume_id=source_parent._records[0].identity.volume_id,
                 stale=False,
                 entry_unavailable=True,
                 reject_wrong_kind=True,
@@ -3962,7 +4095,7 @@ class WindowsRootedFileSystem(
                 raise _entry_unavailable()
             if probed.identity.link_count != 1:
                 raise _identity_stale()
-            handle = root._api.open_handle(
+            handle = source_parent._api.open_handle(
                 entry_path,
                 desired_access=(
                     GENERIC_READ | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
@@ -3973,34 +4106,34 @@ class WindowsRootedFileSystem(
             )
             with handle.borrow() as raw:
                 opened = _capture_handle_proof(
-                    root._api,
+                    source_parent._api,
                     raw,
                     expected_final_path=entry_path,
                     expected_kind="regular",
                     stale=True,
                 )
             actual = _read_publish_facts(
-                root._api,
+                source_parent._api,
                 handle,
                 opened.snapshot.byte_count,
             )
             with handle.borrow() as raw:
                 terminal = _capture_handle_proof(
-                    root._api,
+                    source_parent._api,
                     raw,
                     expected_final_path=entry_path,
                     expected_kind="regular",
                     stale=True,
                 )
             named = _open_entry_proof(
-                root._api,
+                source_parent._api,
                 entry_path,
                 entry_path,
                 expected_kind="regular",
                 expected_volume_id=records[0].identity.volume_id,
                 stale=True,
             )
-            root._reprove()
+            source_parent._reprove_parent()
             if (
                 named is None
                 or probed.snapshot != opened.snapshot
@@ -4015,11 +4148,14 @@ class WindowsRootedFileSystem(
             records = None
             handle = None
             return _WindowsExistingRetirementSource(
-                root._api,
-                root._issuer,
+                source_parent._api,
+                source_parent._issuer,
+                source_parent._root_anchor,
                 transferred_records,
                 transferred_handle,
                 entry_path,
+                source_parent._source_name,
+                source_parent._maximum_component_units,
                 terminal.identity,
                 expected_content,
             )
@@ -4115,6 +4251,7 @@ class WindowsRootedFileSystem(
             return _WindowsRootedDirectory(
                 api,
                 self._authority_issuer,
+                object(),
                 transferred,
                 maximum_component_units,
                 self._fault_injector,
@@ -4528,6 +4665,7 @@ class WindowsRootedFileSystem(
             return _WindowsRetirementTargetDirectory(
                 parent._api,
                 parent._issuer,
+                parent._root_anchor,
                 transferred_records,
                 parent._maximum_component_units,
                 self._fault_injector,
@@ -4748,14 +4886,13 @@ class WindowsRootedFileSystem(
 
     def _retire_existing_exclusive(
         self,
-        source_parent: BoundDirectoryAuthority,
-        source_name: str,
+        source_parent: RetirementSourceDirectoryAuthority,
         source: ExistingRetirementSource,
         target_parent: RetirementDirectoryAuthority,
         target_name: str,
     ) -> RetainedRetirement:
         if (
-            type(source_parent) is not _WindowsBoundDirectory
+            type(source_parent) is not _WindowsRetirementSourceDirectoryAuthority
             or type(target_parent) is not _WindowsRetirementTargetDirectory
             or type(source) is not _WindowsExistingRetirementSource
             or source_parent._api is not target_parent._api
@@ -4763,15 +4900,27 @@ class WindowsRootedFileSystem(
             or source_parent._issuer is not self._authority_issuer
             or target_parent._issuer is not self._authority_issuer
             or source._issuer is not self._authority_issuer
+            or source_parent._root_anchor is not source._root_anchor
+            or source_parent._root_anchor is not target_parent._root_anchor
+            or not source._records
+            or not target_parent._records
+            or source._records[0].identity != source_parent._records[0].identity
+            or target_parent._records[0].identity
+            != source_parent._records[0].identity
         ):
             raise _capability_unavailable()
-        source_path = _append_component(
-            source_parent._leaf_path,
-            source_name,
-            maximum_units=source_parent._maximum_component_units,
+        source_token_path = _append_component(
+            source._records[-1].expected_final_path,
+            source._source_name,
+            maximum_units=source._maximum_component_units,
         )
+        if source_token_path != source._entry_path:
+            raise _identity_stale()
+        source_name = source_parent._source_name
+        source_path = source_parent._entry_path
         if (
             source._entry_path != source_path
+            or source._source_name != source_name
             or len(source._records) != len(source_parent._records)
             or any(
                 left.expected_final_path != right.expected_final_path
@@ -4797,9 +4946,9 @@ class WindowsRootedFileSystem(
         try:
             expected_content = source._expected_content
             source_facts = source.reprove()
-            source_parent._reprove()
+            source_parent._reprove_parent()
             target_parent._reprove()
-            named_source = source_parent.inspect_entry(source_name)
+            named_source = source_parent._inspect_source(stale=True)
             named_target = target_parent.inspect_entry(target_name)
             if (
                 named_source is None
@@ -4817,7 +4966,7 @@ class WindowsRootedFileSystem(
                         target_name,
                     )
             _hit_fault(self._fault_injector, "existing_retirement_after_arm")
-            terminal_source = source_parent.inspect_entry(source_name)
+            terminal_source = source_parent._inspect_source(stale=True)
             terminal_target = target_parent.inspect_entry(target_name)
             with source._handle.borrow() as raw_source:
                 moved = _capture_handle_proof(
@@ -4921,6 +5070,11 @@ class WindowsRootedFileSystem(
             or source_parent._api is not target_parent._api
             or source_parent._issuer is not self._authority_issuer
             or target_parent._issuer is not self._authority_issuer
+            or source_parent._root_anchor is not target_parent._root_anchor
+            or not source_parent._records
+            or not target_parent._records
+            or source_parent._records[0].identity
+            != target_parent._records[0].identity
         ):
             raise _capability_unavailable()
         target_path = _append_component(
@@ -5069,6 +5223,7 @@ class WindowsRootedFileSystem(
             return _WindowsBoundDirectory(
                 root._api,
                 root._issuer,
+                root._root_anchor,
                 expanded,
                 root._maximum_component_units,
                 self._fault_injector,
@@ -5856,6 +6011,7 @@ class WindowsPlatformAdapter(
             return _WindowsBoundDirectory(
                 parent._api,
                 parent._issuer,
+                parent._root_anchor,
                 transferred,
                 parent._maximum_component_units,
                 self._fault_injector,
