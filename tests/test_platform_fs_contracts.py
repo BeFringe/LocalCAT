@@ -28,6 +28,8 @@ from platform_fs_contracts import (
     DeviceSecretAuthority,
     EntrySnapshot,
     ExistingFileDurability,
+    ExistingFileRetirement,
+    ExistingRetirementSource,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -277,6 +279,60 @@ class _RetirementService(OwnedNamespaceRetirement):
         result = _RetainedRetirement(identity)
         result._accept_reservation_transfer(reservation)
         return result
+
+
+class _FailingExistingRetirementSource(ExistingRetirementSource):
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(_identity(), CandidateContentFacts(7, _DIGEST))
+        self.error = error
+        self.close_calls = 0
+
+    def _reprove_source(self) -> BoundContentFacts:
+        raise self.error
+
+    def _close_authority(self) -> None:
+        self.close_calls += 1
+
+
+class _ExistingRetirementService(ExistingFileRetirement):
+    def __init__(
+        self,
+        source: ExistingRetirementSource,
+        rebound: RetainedRetirement,
+    ) -> None:
+        self.source = source
+        self.rebound = rebound
+
+    def _open_existing_retirement_source(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        del root, relative, expected_content
+        return self.source
+
+    def _retire_existing_exclusive(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        source: ExistingRetirementSource,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        del source_parent, source_name, source, target_parent, target_name
+        raise AssertionError("not used")
+
+    def _rebind_existing_retirement(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+        expected_content: CandidateContentFacts,
+    ) -> RetainedRetirement:
+        del source_parent, source_name, target_parent, target_name, expected_content
+        return self.rebound
 
 
 class _PrivateEvidence(PrivateAccessEvidence):
@@ -1155,6 +1211,48 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
         self.assertTrue(reservation.closed)
         self.assertEqual(retained.close_calls, 1)
         self.assertEqual(reservation.close_calls, 1)
+
+    def test_existing_retirement_wrappers_close_failed_terminal_authorities_once(self) -> None:
+        source_error = TypeError("source terminal programmer fault")
+        source = _FailingExistingRetirementSource(source_error)
+        rebound = _RetainedRetirement(_identity())
+        rebound.observed = EntrySnapshot(
+            FileObjectIdentity("windows", b"volume", b"x" * 16, "regular", 1),
+            7,
+            b"token",
+            True,
+        )
+        service = _ExistingRetirementService(source, rebound)
+        root = _Directory()
+        target = _RetirementDirectory()
+        expected = CandidateContentFacts(7, _DIGEST)
+        try:
+            with self.assertRaisesRegex(TypeError, "source terminal programmer fault"):
+                service.open_existing_retirement_source(
+                    root,
+                    PurePosixPath("stage.sqlite3"),
+                    expected,
+                )
+            self.assertTrue(source.closed)
+            self.assertEqual(source.close_calls, 1)
+
+            with self.assertRaises(PlatformFileError) as caught:
+                service.rebind_existing_retirement(
+                    root,
+                    "stage.sqlite3",
+                    target,
+                    "stage.sqlite3",
+                    expected,
+                )
+            self.assertEqual(
+                caught.exception.code,
+                PlatformFileErrorCode.IDENTITY_STALE.value,
+            )
+            self.assertTrue(rebound.closed)
+            self.assertEqual(rebound.close_calls, 1)
+        finally:
+            target.close()
+            root.close()
 
     def test_transfer_state_fault_keeps_closed_reservation_owned_until_retained_close(self) -> None:
         identity = _identity()
