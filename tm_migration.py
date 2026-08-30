@@ -1290,6 +1290,7 @@ class TMMigrationService:
             coordinator=coordinator,
             source=source,
             source_before=source_before,
+            reservation=reservation,
         )
         reservation.reprove()
         if recovered_initial is not None:
@@ -1422,7 +1423,18 @@ class TMMigrationService:
                 generation = coordinator.publish_portable_activation(
                     prepared,
                     handle,
-                    **portable_inputs,
+                    platform=cast(
+                        PlatformFileBackend,
+                        portable_inputs["platform"],
+                    ),
+                    persistent_private=cast(
+                        Any,
+                        portable_inputs["persistent_private"],
+                    ),
+                    caller_borrow=cast(
+                        Any,
+                        portable_inputs["caller_borrow"],
+                    ),
                     retire_unpublished_stage=lambda: (
                         _cleanup_initial_unpublished_stage(attempt)
                     ),
@@ -1533,6 +1545,7 @@ class TMMigrationService:
         coordinator: ResourceStoreCoordinator,
         source: Path,
         source_before: str,
+        reservation: _InitialActivationResourceReservation,
     ) -> MigrationOutcome | None:
         """Reconcile durable first-activation facts before any new build.
 
@@ -1543,6 +1556,13 @@ class TMMigrationService:
         failure and never falls through to JSONL activation/query behavior.
         """
 
+        if reservation._backend is not None:
+            return self._recover_existing_portable_initial_activation(
+                coordinator=coordinator,
+                source=source,
+                source_before=source_before,
+                reservation=reservation,
+            )
         try:
             recovery_probe = ResourceStoreCoordinator(
                 canonical_store_id=self._canonical_store_id,
@@ -1673,6 +1693,102 @@ class TMMigrationService:
             recovery_locators=(),
         )
 
+    def _recover_existing_portable_initial_activation(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source: Path,
+        source_before: str,
+        reservation: _InitialActivationResourceReservation,
+    ) -> MigrationOutcome | None:
+        """Recover one Windows portable chain before creating a new stage."""
+
+        try:
+            recovered = coordinator.recover_portable_activation(
+                **reservation.portable_recovery_inputs(),
+            )
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=None,
+                published_generation=None,
+            )
+        if recovered is None:
+            return None
+        try:
+            preflight = _scan_jsonl(source)
+        except Exception as error:
+            if not _is_initial_activation_operational_error(error):
+                raise
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=None,
+                published_generation=(
+                    recovered.generation
+                    if recovered.action == "COMPLETED"
+                    else None
+                ),
+            )
+        if preflight.source_digest != source_before:
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=(
+                    recovered.generation
+                    if recovered.action == "COMPLETED"
+                    else None
+                ),
+            )
+        if recovered.action == "COMPLETED":
+            if recovered.generation != 0:
+                raise MigrationPreflightError("MIGRATION.ALREADY_ACTIVE")
+            try:
+                return self._recovered_initial_success_report(
+                    coordinator=coordinator,
+                    preflight=preflight,
+                    generation=0,
+                    require_legacy_journal_phase=False,
+                )
+            except Exception as error:
+                if not _is_initial_activation_operational_error(error):
+                    raise
+                return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator,
+                    source_before=source_before,
+                    preflight=preflight,
+                    published_generation=0,
+                )
+        if recovered.action != "CANCELLED" or recovered.generation is not None:
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator,
+                source_before=source_before,
+                preflight=preflight,
+                published_generation=None,
+            )
+        return MigrationFailure(
+            stage="RECOVERY",
+            error_code="MIGRATION.INITIAL_RECOVERED_CANCELLED",
+            retryable=True,
+            diagnostics=preflight.diagnostics,
+            active_generation=None,
+            original_source_preservation=_unchanged_preservation(
+                AssetKind.ORIGINAL_SOURCE,
+                source_before,
+            ),
+            active_store_preservation=AssetPreservationEvidence(
+                asset_kind=AssetKind.ACTIVE_STORE,
+                state=AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None,
+                observed_digest=None,
+            ),
+            recovery_locators=(),
+        )
+
     def _recover_published_initial_tail(
         self,
         *,
@@ -1765,6 +1881,7 @@ class TMMigrationService:
         coordinator: ResourceStoreCoordinator,
         preflight: MigrationPreflight,
         generation: int,
+        require_legacy_journal_phase: bool = True,
     ) -> MigrationReport:
         """Project a cold-recovered binding without rebuilding a stage."""
 
@@ -1820,6 +1937,7 @@ class TMMigrationService:
             receipt=receipt,
             expected_binding_digest=_sealed_source_binding_digest(binding),
             generation=generation,
+            require_legacy_journal_phase=require_legacy_journal_phase,
         )
         return MigrationReport(
             resource_id=self._resource_identity.resource_id,
@@ -5557,7 +5675,16 @@ class _InitialActivationResourceReservation:
                 self._backend,
                 self._identity.canonical_sidecar_path.parent,
             )
-            if persistent_private is not self._backend:
+            descendant_inspection = (
+                narrow_windows_locked_descendant_namespace_inspection(
+                    self._backend,
+                    self._identity.canonical_sidecar_path.parent,
+                )
+            )
+            if not (
+                persistent_private is self._backend
+                and descendant_inspection is self._backend
+            ):
                 raise PlatformFileError(
                     PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
                     retryable=False,
@@ -5580,6 +5707,7 @@ class _InitialActivationResourceReservation:
         return {
             "platform": self._backend,
             "persistent_private": persistent_private,
+            "descendant_inspection": descendant_inspection,
             "caller_borrow": borrow,
         }
 
