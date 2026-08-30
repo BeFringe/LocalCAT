@@ -21,6 +21,7 @@ from typing import Callable, Iterator
 from platform_fs_contracts import (
     BoundContentFacts,
     BoundDirectoryAuthority,
+    BoundExistingFileMutationGuard,
     BoundRegularFile,
     BoundSynchronizedRegularFile,
     CandidateFile,
@@ -29,6 +30,7 @@ from platform_fs_contracts import (
     DeviceSecretAuthority,
     EntrySnapshot,
     ExistingFileDurability,
+    ExistingFileMutationGuard,
     ExistingFileRetirement,
     ExistingRetirementSource,
     RetirementSourceDirectoryAuthority,
@@ -3062,6 +3064,88 @@ class _WindowsBoundRegularFile(BoundRegularFile):
             raise _capability_unavailable() from None
 
 
+class _WindowsExistingFileMutationGuard(BoundExistingFileMutationGuard):
+    __slots__ = (
+        "_api",
+        "_records",
+        "_handle",
+        "_entry_path",
+        "_entry_identity",
+    )
+
+    def __init__(
+        self,
+        api: WindowsFileAPI,
+        records: tuple[_WindowsDirectoryRecord, ...],
+        handle: object,
+        entry_path: str,
+        entry_identity: FileObjectIdentity,
+    ) -> None:
+        super().__init__(entry_identity)
+        self._api = api
+        self._records = records
+        self._handle = handle
+        self._entry_path = entry_path
+        self._entry_identity = entry_identity
+        try:
+            self._reprove_guard()
+        except BaseException:
+            try:
+                handle.close()
+            except BaseException:
+                pass
+            _close_handles_reverse(tuple(record.handle for record in records))
+            raise
+
+    def _reprove_guard(self) -> FileObjectIdentity:
+        try:
+            _reprove_directory_chain(self._api, self._records)
+            with self._handle.borrow() as raw:
+                retained = _capture_handle_proof(
+                    self._api,
+                    raw,
+                    expected_final_path=self._entry_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            named = _open_entry_proof(
+                self._api,
+                self._entry_path,
+                self._entry_path,
+                expected_kind="regular",
+                expected_volume_id=self._records[0].identity.volume_id,
+                stale=True,
+            )
+            if named is None or not (
+                _same_object(retained.identity, self._entry_identity)
+                and _same_object(named.identity, self._entry_identity)
+                and retained.identity.link_count == 1
+                and named.identity.link_count == 1
+                and retained.snapshot == named.snapshot
+            ):
+                raise _identity_stale()
+            _reprove_directory_chain(self._api, self._records)
+            return retained.identity
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _identity_stale() from None
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            self._handle.close()
+        except BaseException as error:
+            first_error = error
+        chain_error = _close_handles_reverse(
+            tuple(record.handle for record in self._records)
+        )
+        if first_error is not None or chain_error is not None:
+            raise _capability_unavailable() from None
+
+
 class _WindowsExistingRetirementSource(ExistingRetirementSource):
     __slots__ = (
         "_api",
@@ -3918,6 +4002,7 @@ class WindowsRootedFileSystem(
     MutableFileReservationService,
     OwnedNamespaceRetirement,
     ExistingFileDurability,
+    ExistingFileMutationGuard,
     LockedDescendantNamespaceInspection,
     ExistingFileRetirement,
 ):
@@ -4501,6 +4586,134 @@ class WindowsRootedFileSystem(
                     tuple(record.handle for record in owned_records)
                 )
             raise _durability_unavailable() from None
+        except BaseException:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if owned_records is not None:
+                _close_handles_reverse(
+                    tuple(record.handle for record in owned_records)
+                )
+            raise
+
+    def _guard_existing_for_mutation(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundExistingFileMutationGuard:
+        if not isinstance(root, _WindowsRootedDirectory):
+            raise _capability_unavailable()
+        components = _validated_components(
+            tuple(relative.parts),
+            maximum_units=root._maximum_component_units,
+        )
+        records: tuple[_WindowsDirectoryRecord, ...] = ()
+        owned_records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        handle = None
+        try:
+            root._reprove()
+            records = _duplicate_directory_chain(root._api, root._records)
+            owned_records = records
+            records = _open_directory_components(
+                root._api,
+                records,
+                components[:-1],
+                maximum_component_units=root._maximum_component_units,
+            )
+            owned_records = records
+            entry_path = _append_component(
+                records[-1].expected_final_path,
+                components[-1],
+                maximum_units=root._maximum_component_units,
+            )
+            probed = _open_entry_proof(
+                root._api,
+                entry_path,
+                entry_path,
+                expected_kind="regular",
+                expected_volume_id=records[0].identity.volume_id,
+                stale=False,
+                entry_unavailable=True,
+                reject_wrong_kind=True,
+            )
+            if probed is None:
+                raise _entry_unavailable()
+            if probed.identity.link_count != 1:
+                raise _identity_stale()
+            _hit_fault(
+                self._fault_injector,
+                "windows_mutation_guard_after_entry_probe",
+            )
+            try:
+                handle = root._api.open_handle(
+                    entry_path,
+                    desired_access=FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    share_mode=FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    creation_disposition=OPEN_EXISTING,
+                    flags=FILE_FLAG_OPEN_REPARSE_POINT,
+                )
+            except Win32CallError:
+                raise _identity_stale() from None
+            with handle.borrow() as raw:
+                guarded = _capture_handle_proof(
+                    root._api,
+                    raw,
+                    expected_final_path=entry_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            if (
+                probed.identity != guarded.identity
+                or probed.snapshot != guarded.snapshot
+                or guarded.identity.link_count != 1
+            ):
+                raise _identity_stale()
+            transferred_records = records
+            transferred_handle = handle
+            owned_records = None
+            handle = None
+            return _WindowsExistingFileMutationGuard(
+                root._api,
+                transferred_records,
+                transferred_handle,
+                entry_path,
+                guarded.identity,
+            )
+        except (TypeError, AssertionError, AttributeError):
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if owned_records is not None:
+                _close_handles_reverse(
+                    tuple(record.handle for record in owned_records)
+                )
+            raise
+        except PlatformFileError:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if owned_records is not None:
+                _close_handles_reverse(
+                    tuple(record.handle for record in owned_records)
+                )
+            raise
+        except Exception:
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if owned_records is not None:
+                _close_handles_reverse(
+                    tuple(record.handle for record in owned_records)
+                )
+            raise _identity_stale() from None
         except BaseException:
             if handle is not None:
                 try:

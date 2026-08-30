@@ -220,10 +220,10 @@
   - 完成时，各 journal phase 的不一致注入都恢复一个完整可查询/可保存版本，DB 与 manifest 不会跨代
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.9a 处理 FileId 重用、ACL 漂移与 foreign replacement
+- [x] 5.9a 处理 FileId 重用、ACL 漂移与 foreign replacement
   - same/different bytes replacement、FileId reuse、owner/ACL/reparse/multi-link 变化均须与 digest、handle lineage、journal phase 成套判断；任何单一 metadata 命中不得授权回滚、清理或 generation 发布。
   - _Amendment: WA-06_
-  - _Depends: 1.2a, 5.8a, 5.9_
+  - _Depends: 1.2a, 5.8a, 5.9, windows-platform-enablement 3.7b_
 
 - [x] 5.R1 收束 activation/recovery 模块边界
   - 在 5.9 闭合完整恢复矩阵后，将 journal/terminal codec、durable file protocol 与逐 phase completion/rollback 从 `tm_sqlite_store.py` 提取到设计指定模块；coordinator 只经窄 store-validation port 编排

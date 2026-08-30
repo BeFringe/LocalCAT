@@ -20,12 +20,14 @@ from typing import Any, Callable, Iterator, cast
 from platform_fs_contracts import (
     BoundContentFacts,
     BoundDirectoryAuthority,
+    BoundExistingFileMutationGuard,
     BoundRegularFile,
     BoundSynchronizedRegularFile,
     CandidateFile,
     CandidateContentFacts,
     EntrySnapshot,
     ExistingFileDurability,
+    ExistingFileMutationGuard,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -1839,6 +1841,7 @@ class PosixPlatformAdapter(
     MutableFileReservationService,
     OwnedNamespaceRetirement,
     ExistingFileDurability,
+    ExistingFileMutationGuard,
     ProcessFileLock,
     PrivateStorageProof,
 ):
@@ -1981,6 +1984,17 @@ class PosixPlatformAdapter(
                 fallback=PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
                 retryable=False,
             ) from None
+
+    def _guard_existing_for_mutation(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundExistingFileMutationGuard:
+        del root, relative
+        raise _platform_error(
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            retryable=False,
+        )
 
     def _bind_parent(
         self,

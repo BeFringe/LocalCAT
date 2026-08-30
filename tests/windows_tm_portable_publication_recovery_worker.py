@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import traceback
 from unittest import mock
 
@@ -16,7 +17,14 @@ import tm_activation_journal
 import tm_migration
 import tm_sqlite_store
 import tm_stage_sealer
-from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+import platform_fs_windows
+from platform_fs_contracts import (
+    BoundExistingFileMutationGuard,
+    BoundRegularFile,
+    FileObjectIdentity,
+    PlatformFileError,
+    PlatformFileErrorCode,
+)
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationFailure,
@@ -42,6 +50,55 @@ _PHASES = (
     "MANIFEST_PUBLISHED",
     "GENERATION_PUBLISHED",
 )
+
+
+class _FreshReproveFaultGuard(BoundExistingFileMutationGuard):
+    __slots__ = ("delegate", "primary", "cleanup", "delegate_closed")
+
+    def __init__(
+        self,
+        delegate: BoundExistingFileMutationGuard,
+        primary: BaseException,
+        cleanup: BaseException,
+    ) -> None:
+        identity = delegate.reprove()
+        if type(identity) is not FileObjectIdentity:
+            raise TypeError("delegate guard returned invalid identity")
+        super().__init__(identity)
+        self.delegate = delegate
+        self.primary = primary
+        self.cleanup = cleanup
+        self.delegate_closed = False
+
+    def _reprove_guard(self) -> FileObjectIdentity:
+        raise self.primary
+
+    def _close_authority(self) -> None:
+        try:
+            self.delegate.close()
+        finally:
+            self.delegate_closed = self.delegate.closed
+        raise self.cleanup
+
+
+def _prove_paths_released(paths: tuple[Path, ...]) -> dict[str, bool]:
+    released: dict[str, bool] = {}
+    for target in paths:
+        if not target.is_file():
+            released[target.name] = False
+            continue
+        replacement = target.with_name(target.name + ".release-probe")
+        replacement.write_bytes(target.read_bytes())
+        try:
+            os.replace(replacement, target)
+        except PermissionError:
+            released[target.name] = False
+        else:
+            released[target.name] = True
+        finally:
+            if replacement.exists():
+                replacement.unlink()
+    return released
 
 
 def _identity(root: Path, *, create_source: bool) -> CanonicalResourceIdentity:
@@ -270,6 +327,9 @@ def _disk_facts(identity: CanonicalResourceIdentity) -> dict[str, object]:
         "source": _file_facts(identity.configured_jsonl_path),
         "database": _file_facts(identity.canonical_sidecar_path),
         "manifest": _file_facts(identity.snapshot_manifest_path),
+        "lineage_marker": _file_facts(
+            tm_sqlite_store._activation_lineage_marker_path(identity)
+        ),
         "database_sql": _database_sql_facts(identity.canonical_sidecar_path),
     }
 
@@ -403,6 +463,63 @@ def _mutate(root: Path, mutation: str) -> dict[str, object]:
         if phases != ["DB_REPLACED"]:
             raise AssertionError("wrong manifest requires DB phase")
         identity.snapshot_manifest_path.write_bytes(b"wrong-manifest")
+    elif mutation == "physical-manifest-ahead-sealed":
+        if phases != ["DB_REPLACED"]:
+            raise AssertionError("physical manifest ahead requires DB phase")
+        stage_manifest = root / pending.unsigned.candidate_manifest_temp_name
+        identity.snapshot_manifest_path.write_bytes(stage_manifest.read_bytes())
+    elif mutation in {
+        "same-byte-database",
+        "same-byte-stage-database",
+        "same-byte-source",
+    }:
+        if phases != ["DB_REPLACED"]:
+            raise AssertionError("same-byte replacement requires DB phase")
+        if mutation == "same-byte-database":
+            target = identity.canonical_sidecar_path
+        elif mutation == "same-byte-stage-database":
+            target = root / pending.unsigned.candidate_stage_db_name
+        else:
+            target = identity.configured_jsonl_path
+        replacement = root / (target.name + ".same-byte-replacement")
+        replacement.write_bytes(target.read_bytes())
+        os.replace(replacement, target)
+    elif mutation == "foreign-database-replacement":
+        if phases != ["DB_REPLACED"]:
+            raise AssertionError("foreign database replacement requires DB phase")
+        replacement = root / "foreign-database-replacement"
+        replacement.write_bytes(b"foreign-different-database")
+        os.replace(replacement, identity.canonical_sidecar_path)
+    elif mutation == "foreign-manifest-replacement":
+        if phases != ["DB_REPLACED", "MANIFEST_PUBLISHED"]:
+            raise AssertionError("foreign manifest replacement requires MANIFEST phase")
+        replacement = root / "foreign-manifest-replacement"
+        replacement.write_bytes(b"foreign-different-manifest")
+        os.replace(replacement, identity.snapshot_manifest_path)
+    elif mutation == "stage-database-multilink":
+        if phases != ["DB_REPLACED"]:
+            raise AssertionError("stage hardlink requires DB phase")
+        stage = root / pending.unsigned.candidate_stage_db_name
+        os.link(stage, root / "foreign-stage-hardlink")
+    elif mutation == "stage-database-junction":
+        if phases != ["DB_REPLACED"]:
+            raise AssertionError("stage junction requires DB phase")
+        stage = root / pending.unsigned.candidate_stage_db_name
+        stage.unlink()
+        junction_target = root / "foreign-junction-target"
+        junction_target.mkdir()
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(stage), str(junction_target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr or completed.stdout)
+    elif mutation == "private-journal-foreign-acl":
+        replacement = root / "foreign-private-journal"
+        replacement.write_bytes(pending_path.read_bytes())
+        os.replace(replacement, pending_path)
     elif mutation == "unknown-private":
         (private_root / "foreign.candidate").write_bytes(
             b"foreign-recovery-residue"
@@ -436,6 +553,9 @@ def _creator(root: Path, phase: str) -> dict[str, object]:
         retryable=True,
     )
     boundary_calls = 0
+    expected_primary: BaseException | None = None
+    caught_error: BaseException | None = None
+    cleanup_faults = 0
     with ExitStack() as stack:
         stack.enter_context(
             mock.patch.object(registry, "issue_token", side_effect=issue_token)
@@ -510,14 +630,255 @@ def _creator(root: Path, phase: str) -> dict[str, object]:
                     new=fail_manifest_copy,
                 )
             )
+        elif phase == "MANIFEST_PHYSICAL":
+            real_publish = (
+                tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish
+            )
+
+            def fail_manifest_phase(**kwargs: object) -> object:
+                nonlocal boundary_calls
+                unsigned = kwargs.get("unsigned")
+                if (
+                    isinstance(
+                        unsigned,
+                        tm_activation_journal._PortablePublicationPhaseUnsigned,
+                    )
+                    and unsigned.phase == "MANIFEST_PUBLISHED"
+                ):
+                    boundary_calls += 1
+                    raise injected
+                return real_publish(**kwargs)
+
+            boundary = stack.enter_context(
+                mock.patch.object(
+                    tm_activation_journal._WindowsPortablePublicationPhaseOwner,
+                    "publish",
+                    new=fail_manifest_phase,
+                )
+            )
+        elif phase == "DB_MUTATION_GUARD":
+            real_open_connection = tm_sqlite_store._open_configured_connection
+
+            def attempt_same_byte_swap(path: Path, **kwargs: object) -> object:
+                nonlocal boundary_calls
+                if path == identity.canonical_sidecar_path and path.is_file():
+                    boundary_calls += 1
+                    replacement = path.with_name(path.name + ".live-swap")
+                    replacement.write_bytes(path.read_bytes())
+                    try:
+                        try:
+                            os.replace(replacement, path)
+                        except PermissionError:
+                            pass
+                        else:
+                            raise AssertionError(
+                                "mutation guard allowed a live same-byte swap"
+                            )
+                    finally:
+                        if replacement.exists():
+                            replacement.unlink()
+                return real_open_connection(path, **kwargs)
+
+            boundary = stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store,
+                    "_open_configured_connection",
+                    new=attempt_same_byte_swap,
+                )
+            )
+        elif phase == "ACTIVE_SET_CLOSE":
+            real_close = tm_sqlite_store._PortableActiveSetAuthority._close_authority
+
+            def fail_active_set_close(authority: object) -> None:
+                nonlocal boundary_calls
+                boundary_calls += 1
+                real_close(authority)
+                raise PlatformFileError(
+                    PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                    retryable=False,
+                )
+
+            boundary = stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store._PortableActiveSetAuthority,
+                    "_close_authority",
+                    new=fail_active_set_close,
+                )
+            )
+        elif phase == "APPLY_PROGRAMMER_CLOSE":
+            expected_primary = AssertionError("apply-business-primary")
+            real_open_connection = tm_sqlite_store._open_configured_connection
+            real_guard_init = (
+                platform_fs_windows._WindowsExistingFileMutationGuard.__init__
+            )
+            real_guard_close = (
+                platform_fs_windows._WindowsExistingFileMutationGuard
+                ._close_authority
+            )
+            guard_acquired = False
+
+            def record_guard_acquisition(*args: object, **kwargs: object) -> None:
+                nonlocal guard_acquired
+                real_guard_init(*args, **kwargs)
+                guard_acquired = True
+
+            def fail_apply_business(path: Path, **kwargs: object) -> object:
+                nonlocal boundary_calls
+                if (
+                    guard_acquired
+                    and path == identity.canonical_sidecar_path
+                    and path.is_file()
+                ):
+                    boundary_calls += 1
+                    assert expected_primary is not None
+                    raise expected_primary
+                return real_open_connection(path, **kwargs)
+
+            def fail_guard_cleanup(authority: object) -> None:
+                nonlocal cleanup_faults
+                real_guard_close(authority)
+                cleanup_faults += 1
+                raise AttributeError("apply-guard-cleanup")
+
+            stack.enter_context(
+                mock.patch.object(
+                    platform_fs_windows._WindowsExistingFileMutationGuard,
+                    "__init__",
+                    new=record_guard_acquisition,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store,
+                    "_open_configured_connection",
+                    new=fail_apply_business,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    platform_fs_windows._WindowsExistingFileMutationGuard,
+                    "_close_authority",
+                    new=fail_guard_cleanup,
+                )
+            )
+        elif phase == "SYNCHRONIZED_CLOSE":
+            real_sync_close = (
+                platform_fs_windows._WindowsBoundSynchronizedRegularFile
+                ._close_authority
+            )
+
+            def fail_synchronized_close(authority: object) -> None:
+                nonlocal boundary_calls, cleanup_faults
+                real_sync_close(authority)
+                if Path(getattr(authority, "_entry_path")).name == (
+                    identity.canonical_sidecar_path.name
+                ):
+                    boundary_calls += 1
+                    cleanup_faults += 1
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                        retryable=False,
+                    )
+
+            stack.enter_context(
+                mock.patch.object(
+                    platform_fs_windows._WindowsBoundSynchronizedRegularFile,
+                    "_close_authority",
+                    new=fail_synchronized_close,
+                )
+            )
+        elif phase == "ACTIVE_REPROVE_PROGRAMMER_CLOSE":
+            expected_primary = AssertionError("active-reprove-primary")
+            primary_raised = False
+            real_file_close = (
+                platform_fs_windows._WindowsBoundRegularFile._close_authority
+            )
+            real_guard_close = (
+                platform_fs_windows._WindowsExistingFileMutationGuard
+                ._close_authority
+            )
+
+            def fail_live_construction(*args: object, **kwargs: object) -> None:
+                nonlocal primary_raised, boundary_calls
+                del args, kwargs
+                primary_raised = True
+                boundary_calls += 1
+                assert expected_primary is not None
+                raise expected_primary
+
+            def fail_file_cleanup(authority: object) -> None:
+                nonlocal cleanup_faults
+                real_file_close(authority)
+                if primary_raised:
+                    cleanup_faults += 1
+                    raise AttributeError("active-file-cleanup")
+
+            def fail_active_guard_cleanup(authority: object) -> None:
+                nonlocal cleanup_faults
+                real_guard_close(authority)
+                if primary_raised:
+                    cleanup_faults += 1
+                    raise AttributeError("active-guard-cleanup")
+
+            stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store._PortableActiveSetAuthority,
+                    "__init__",
+                    new=fail_live_construction,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    platform_fs_windows._WindowsBoundRegularFile,
+                    "_close_authority",
+                    new=fail_file_cleanup,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    platform_fs_windows._WindowsExistingFileMutationGuard,
+                    "_close_authority",
+                    new=fail_active_guard_cleanup,
+                )
+            )
         else:
             raise ValueError("unknown durable phase")
-        outcome = service.activate_initial(
-            identity.configured_jsonl_path,
-            identity.resource_id,
-        )
-    if phase != "DB_ACTIVE":
+        try:
+            outcome = service.activate_initial(
+                identity.configured_jsonl_path,
+                identity.resource_id,
+            )
+        except BaseException as error:
+            if expected_primary is None:
+                raise
+            caught_error = error
+            outcome = None
+    if phase not in {
+        "DB_ACTIVE",
+        "MANIFEST_PHYSICAL",
+        "DB_MUTATION_GUARD",
+        "ACTIVE_SET_CLOSE",
+        "APPLY_PROGRAMMER_CLOSE",
+        "SYNCHRONIZED_CLOSE",
+        "ACTIVE_REPROVE_PROGRAMMER_CLOSE",
+    }:
         boundary_calls = boundary.call_count
+
+    released = (
+        _prove_paths_released(
+            (
+                identity.canonical_sidecar_path,
+                identity.snapshot_manifest_path,
+                identity.configured_jsonl_path,
+            )
+        )
+        if phase in {
+            "APPLY_PROGRAMMER_CLOSE",
+            "SYNCHRONIZED_CLOSE",
+            "ACTIVE_REPROVE_PROGRAMMER_CLOSE",
+        }
+        else {}
+    )
 
     return {
         "mode": "create",
@@ -526,16 +887,187 @@ def _creator(root: Path, phase: str) -> dict[str, object]:
         "boundary_calls": boundary_calls,
         "issue_count": issue_count,
         "outcome": _outcome_facts(outcome),
+        "caught_exception_type": (
+            None if caught_error is None else type(caught_error).__name__
+        ),
+        "caught_exception_message": (
+            None if caught_error is None else str(caught_error)
+        ),
+        "caught_is_primary": (
+            caught_error is not None and caught_error is expected_primary
+        ),
+        "cleanup_faults": cleanup_faults,
+        "released": released,
         "runtime": _runtime_facts(identity, coordinator),
         "journal": _journal_facts(root, identity),
     }
 
 
-def _activate(root: Path, *, mode: str, guarded: bool) -> dict[str, object]:
+def _activate(
+    root: Path,
+    *,
+    mode: str,
+    guarded: bool,
+    reject_database_materialization: bool = False,
+    probe_mutation_guard: bool = False,
+    ready_swap: str | None = None,
+    fail_active_set_close: bool = False,
+    fail_fresh_guard_reprove_close: bool = False,
+) -> dict[str, object]:
     identity = _identity(root, create_source=False)
     coordinator, service = _owner(identity)
     registry = coordinator._sealed_registry
+    boundary_calls = 0
+    expected_primary: BaseException | None = None
+    caught_error: BaseException | None = None
+    fault_guard: _FreshReproveFaultGuard | None = None
     with ExitStack() as stack:
+        if reject_database_materialization:
+            private_root = (
+                root
+                / tm_activation_journal._portable_activation_private_directory_name(
+                    identity
+                )
+            )
+            pending = tm_activation_journal._parse_portable_activation_journal_bytes(
+                (private_root / "activation-journal-v3.json").read_bytes()
+            )
+            database_names = {
+                identity.canonical_sidecar_path.name,
+                pending.unsigned.candidate_stage_db_name,
+            }
+            real_read_all = BoundRegularFile.read_all
+
+            def bounded_read_all(authority: BoundRegularFile) -> bytes:
+                entry_path = getattr(authority, "_entry_path", "")
+                if Path(entry_path).name in database_names:
+                    raise AssertionError("fresh recovery materialized a database")
+                return real_read_all(authority)
+
+            stack.enter_context(
+                mock.patch.object(
+                    BoundRegularFile,
+                    "read_all",
+                    new=bounded_read_all,
+                )
+            )
+        if probe_mutation_guard:
+            real_open_connection = tm_sqlite_store._open_configured_connection
+
+            def attempt_same_byte_swap(path: Path, **kwargs: object) -> object:
+                nonlocal boundary_calls
+                if path == identity.canonical_sidecar_path and path.is_file():
+                    boundary_calls += 1
+                    replacement = path.with_name(path.name + ".fresh-live-swap")
+                    replacement.write_bytes(path.read_bytes())
+                    try:
+                        try:
+                            os.replace(replacement, path)
+                        except PermissionError:
+                            pass
+                        else:
+                            raise AssertionError(
+                                "fresh recovery mutation guard allowed replacement"
+                            )
+                    finally:
+                        if replacement.exists():
+                            replacement.unlink()
+                return real_open_connection(path, **kwargs)
+
+            stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store,
+                    "_open_configured_connection",
+                    new=attempt_same_byte_swap,
+                )
+            )
+        if ready_swap is not None:
+            real_marker = coordinator._ensure_portable_activation_lineage_marker
+
+            def attempt_ready_swap(*args: object, **kwargs: object) -> None:
+                nonlocal boundary_calls
+                boundary_calls += 1
+                if ready_swap.startswith("manifest-"):
+                    target = identity.snapshot_manifest_path
+                elif ready_swap.startswith("source-"):
+                    target = identity.configured_jsonl_path
+                else:
+                    raise AssertionError("unknown READY swap target")
+                payload = target.read_bytes()
+                if ready_swap.endswith("different"):
+                    payload += b"foreign-post-business-swap"
+                replacement = target.with_name(target.name + ".ready-swap")
+                replacement.write_bytes(payload)
+                try:
+                    try:
+                        os.replace(replacement, target)
+                    except PermissionError:
+                        pass
+                    else:
+                        raise AssertionError(
+                            "active-set authority allowed a pre-READY swap"
+                        )
+                finally:
+                    if replacement.exists():
+                        replacement.unlink()
+                real_marker(*args, **kwargs)
+
+            stack.enter_context(
+                mock.patch.object(
+                    coordinator,
+                    "_ensure_portable_activation_lineage_marker",
+                    new=attempt_ready_swap,
+                )
+            )
+        if fail_active_set_close:
+            real_close = tm_sqlite_store._PortableActiveSetAuthority._close_authority
+
+            def fail_close(authority: object) -> None:
+                nonlocal boundary_calls
+                boundary_calls += 1
+                real_close(authority)
+                raise PlatformFileError(
+                    PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                    retryable=False,
+                )
+
+            stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store._PortableActiveSetAuthority,
+                    "_close_authority",
+                    new=fail_close,
+                )
+            )
+        if fail_fresh_guard_reprove_close:
+            expected_primary = AssertionError("fresh-guard-reprove-primary")
+            cleanup = AttributeError("fresh-guard-close-cleanup")
+            real_apply = (
+                tm_sqlite_store._CoordinatorStorePort
+                .apply_portable_receipt_activation
+            )
+
+            def return_faulting_guard(
+                port: object,
+                **kwargs: object,
+            ) -> object:
+                nonlocal fault_guard, boundary_calls
+                database, closure, guard = real_apply(port, **kwargs)
+                assert expected_primary is not None
+                fault_guard = _FreshReproveFaultGuard(
+                    guard,
+                    expected_primary,
+                    cleanup,
+                )
+                boundary_calls += 1
+                return database, closure, fault_guard
+
+            stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store._CoordinatorStorePort,
+                    "apply_portable_receipt_activation",
+                    new=return_faulting_guard,
+                )
+            )
         if guarded:
             stack.enter_context(
                 mock.patch.object(
@@ -564,17 +1096,45 @@ def _activate(root: Path, *, mode: str, guarded: bool) -> dict[str, object]:
                     ),
                 )
             )
-        outcome = service.activate_initial(
-            identity.configured_jsonl_path,
-            identity.resource_id,
-        )
+        try:
+            outcome = service.activate_initial(
+                identity.configured_jsonl_path,
+                identity.resource_id,
+            )
+        except BaseException as error:
+            if expected_primary is None:
+                raise
+            caught_error = error
+            outcome = None
+    released = (
+        _prove_paths_released((identity.canonical_sidecar_path,))
+        if fail_fresh_guard_reprove_close
+        else {}
+    )
     return {
         "mode": mode,
         "pid": os.getpid(),
         "guarded": guarded,
+        "boundary_calls": boundary_calls,
         "outcome": _outcome_facts(outcome),
+        "caught_exception_type": (
+            None if caught_error is None else type(caught_error).__name__
+        ),
+        "caught_exception_message": (
+            None if caught_error is None else str(caught_error)
+        ),
+        "caught_is_primary": (
+            caught_error is not None and caught_error is expected_primary
+        ),
+        "fault_guard_closed": (
+            fault_guard is not None
+            and fault_guard.closed
+            and fault_guard.delegate_closed
+        ),
+        "released": released,
         "runtime": _runtime_facts(identity, coordinator),
         "journal": _journal_facts(root, identity),
+        "disk": _disk_facts(identity),
     }
 
 
@@ -582,10 +1142,36 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "mode",
-        choices=("create", "mutate", "recover", "retry", "replay"),
+        choices=(
+            "create",
+            "mutate",
+            "recover",
+            "recover-bounded",
+            "recover-guard",
+            "recover-ready-manifest-same",
+            "recover-ready-manifest-different",
+            "recover-ready-source-different",
+            "recover-close",
+            "recover-guard-reprove-close",
+            "retry",
+            "replay",
+        ),
     )
     parser.add_argument("root", type=Path)
-    parser.add_argument("--phase", choices=("PREPARED", "DB_ACTIVE", *_PHASES))
+    parser.add_argument(
+        "--phase",
+        choices=(
+            "PREPARED",
+            "DB_ACTIVE",
+            "DB_MUTATION_GUARD",
+            "MANIFEST_PHYSICAL",
+            "ACTIVE_SET_CLOSE",
+            "APPLY_PROGRAMMER_CLOSE",
+            "SYNCHRONIZED_CLOSE",
+            "ACTIVE_REPROVE_PROGRAMMER_CLOSE",
+            *_PHASES,
+        ),
+    )
     parser.add_argument(
         "--mutation",
         choices=(
@@ -595,6 +1181,15 @@ def main() -> int:
             "stage-database-changed",
             "source-changed",
             "wrong-manifest",
+            "physical-manifest-ahead-sealed",
+            "same-byte-database",
+            "same-byte-stage-database",
+            "same-byte-source",
+            "foreign-database-replacement",
+            "foreign-manifest-replacement",
+            "stage-database-multilink",
+            "stage-database-junction",
+            "private-journal-foreign-acl",
             "unknown-private",
         ),
     )
@@ -614,7 +1209,23 @@ def main() -> int:
             result = _activate(
                 root,
                 mode=arguments.mode,
-                guarded=arguments.mode in {"recover", "replay"},
+                guarded=(
+                    arguments.mode.startswith("recover")
+                    or arguments.mode == "replay"
+                ),
+                reject_database_materialization=(
+                    arguments.mode == "recover-bounded"
+                ),
+                probe_mutation_guard=arguments.mode == "recover-guard",
+                ready_swap={
+                    "recover-ready-manifest-same": "manifest-same",
+                    "recover-ready-manifest-different": "manifest-different",
+                    "recover-ready-source-different": "source-different",
+                }.get(arguments.mode),
+                fail_active_set_close=arguments.mode == "recover-close",
+                fail_fresh_guard_reprove_close=(
+                    arguments.mode == "recover-guard-reprove-close"
+                ),
             )
     except BaseException as error:
         result = {

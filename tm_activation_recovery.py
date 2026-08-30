@@ -112,6 +112,7 @@ from tm_activation_journal import (
 )
 from platform_fs_contracts import (
     BoundContentFacts,
+    BoundExistingFileMutationGuard,
     BoundRegularFile,
     CandidateContentFacts,
     CandidateFile,
@@ -343,6 +344,12 @@ class _CoordinatorPublishPort(_StoreValidationPort, Protocol):
     ) -> _ActivationJournalHandle: ...
 
 
+class _PortableActiveSetAuthority(Protocol):
+    def reprove(self) -> PortableActiveContentAttestation: ...
+
+    def close(self) -> None: ...
+
+
 class _PortableRecoveryStorePort(Protocol):
     """Store-owned SQLite facts consumed by portable fresh recovery."""
 
@@ -389,7 +396,11 @@ class _PortableRecoveryStorePort(Protocol):
         root: RootedDirectoryAuthority,
         activation_digest: str,
         allow_sealed_transition: bool,
-    ) -> tuple[PortableContentFileProof, str]: ...
+    ) -> tuple[
+        PortableContentFileProof,
+        str,
+        BoundExistingFileMutationGuard,
+    ]: ...
 
     def reprove_portable_sealed_database(
         self,
@@ -408,7 +419,13 @@ class _PortableRecoveryStorePort(Protocol):
         manifest: PortableContentFileProof,
         activation_digest: str,
         expected_logical_closure_digest: str,
-    ) -> tuple[_CanonicalStoreRef, Any, PortableActiveContentAttestation]: ...
+        database_guard: BoundExistingFileMutationGuard,
+    ) -> tuple[
+        _CanonicalStoreRef,
+        Any,
+        PortableActiveContentAttestation,
+        _PortableActiveSetAuthority,
+    ]: ...
 
     def ensure_portable_activation_lineage_marker(
         self,
@@ -661,25 +678,33 @@ def recover_portable_activation(
     manifest_name = identity.snapshot_manifest_path.name
 
     preflight_authorities: list[BoundRegularFile] = []
+    database_guard: BoundExistingFileMutationGuard | None = None
+    active_set_authority: _PortableActiveSetAuthority | None = None
 
     def read_exact(
         name: str,
         expected: PortableContentFileProof,
         *,
         retain: bool = False,
-    ) -> tuple[PortableContentFileProof, bytes]:
+        materialize: bool = False,
+    ) -> tuple[PortableContentFileProof, bytes | None]:
         opened = platform.open_regular(root, PurePath(name))
         try:
             facts = opened.content_facts()
             proof = port.portable_content_proof(facts)
-            payload = opened.read_all()
+            payload = opened.read_all() if materialize else None
             if (
                 facts.snapshot.identity.kind != "regular"
                 or facts.snapshot.identity.link_count != 1
                 or root.inspect_entry(name) != facts.snapshot
                 or proof != expected
-                or len(payload) != expected.size
-                or hashlib.sha256(payload).hexdigest() != expected.sha256
+                or (
+                    payload is not None
+                    and (
+                        len(payload) != expected.size
+                        or hashlib.sha256(payload).hexdigest() != expected.sha256
+                    )
+                )
             ):
                 raise ActivationPreparationError(
                     "ACTIVATION.RECOVERY_REQUIRED",
@@ -692,6 +717,22 @@ def recover_portable_activation(
         finally:
             if opened is not None:
                 opened.close()
+
+    def read_exact_bytes(
+        name: str,
+        expected: PortableContentFileProof,
+        *,
+        retain: bool = False,
+    ) -> tuple[PortableContentFileProof, bytes]:
+        proof, payload = read_exact(
+            name,
+            expected,
+            retain=retain,
+            materialize=True,
+        )
+        if payload is None:
+            raise AssertionError("exact payload was not materialized")
+        return proof, payload
 
     def close_preflight_authorities() -> None:
         active_error = sys.exception()
@@ -768,7 +809,7 @@ def recover_portable_activation(
                 sealed.database,
                 retain=True,
             )
-            _stage_manifest_proof, stage_manifest_bytes = read_exact(
+            _stage_manifest_proof, stage_manifest_bytes = read_exact_bytes(
                 stage_manifest_name,
                 sealed.manifest,
                 retain=True,
@@ -781,7 +822,7 @@ def recover_portable_activation(
 
             canonical_manifest_bytes: bytes | None = None
             if manifest_entry is not None:
-                _canonical_manifest_proof, canonical_manifest_bytes = read_exact(
+                _canonical_manifest_proof, canonical_manifest_bytes = read_exact_bytes(
                     manifest_name,
                     sealed.manifest,
                     retain=True,
@@ -804,17 +845,12 @@ def recover_portable_activation(
                     )
                 allow_sealed_transition = True
             elif len(phase_records) == 1:
-                if manifest_entry is not None:
-                    # DB_REPLACED authorizes either the exact SEALED/issued DB
-                    # or the honest window after the receipt transaction has
-                    # committed ACTIVE/completed but before manifest copy.
-                    # The store port distinguishes and fully reproves those
-                    # states; no other DB state is accepted.
-                    raise ActivationPreparationError(
-                        "ACTIVATION.RECOVERY_REQUIRED",
-                        retryable=True,
-                    )
-                allow_sealed_transition = True
+                # DB_REPLACED authorizes the exact SEALED/issued DB, the honest
+                # ACTIVE/completed window before manifest copy, and the single
+                # physical-effect-ahead window where the exact manifest was
+                # named before its durable phase record.  The store port and
+                # retained handles reprove the complete active set below.
+                allow_sealed_transition = manifest_entry is None
             else:
                 manifest_phase_active = (
                     phase_records[1].unsigned.active_content_attestation
@@ -888,7 +924,7 @@ def recover_portable_activation(
                 "ACTIVATION.RECOVERY_REQUIRED",
                 retryable=True,
             )
-        _manifest_proof, stage_manifest_bytes = read_exact(
+        _manifest_proof, stage_manifest_bytes = read_exact_bytes(
             manifest_name,
             completed_active.manifest,
         )
@@ -907,16 +943,26 @@ def recover_portable_activation(
             stage_manifest_bytes,
         )
         activation_digest = _portable_recovery_activation_digest(prepared)
-        active_database, logical_closure = port.apply_portable_receipt_activation(
-            binding=binding,
-            prepared=prepared,
-            platform=platform,
-            root=root,
-            activation_digest=activation_digest,
-            allow_sealed_transition=allow_sealed_transition,
+        active_database, logical_closure, database_guard = (
+            port.apply_portable_receipt_activation(
+                binding=binding,
+                prepared=prepared,
+                platform=platform,
+                root=root,
+                activation_digest=activation_digest,
+                allow_sealed_transition=allow_sealed_transition,
+            )
         )
+        database_guard.reprove()
     except BaseException:
-        close_preflight_authorities()
+        try:
+            close_preflight_authorities()
+        finally:
+            if database_guard is not None:
+                try:
+                    database_guard.close()
+                except BaseException:
+                    pass
         raise
 
     manifest_pending: PendingPublication | None = None
@@ -941,7 +987,7 @@ def recover_portable_activation(
                 manifest_pending.retained_destination().content_facts()
             )
         else:
-            active_manifest, canonical_manifest_bytes = read_exact(
+            active_manifest, canonical_manifest_bytes = read_exact_bytes(
                 manifest_name,
                 sealed.manifest,
             )
@@ -955,7 +1001,9 @@ def recover_portable_activation(
                 "ACTIVATION.RECOVERY_REQUIRED",
                 retryable=True,
             )
-        active_ref, active_snapshot, active_attestation = (
+        if database_guard is None:
+            raise AssertionError("portable database mutation guard is missing")
+        active_ref, active_snapshot, active_attestation, active_set_authority = (
             port.reprove_portable_active_set(
                 binding=binding,
                 prepared=prepared,
@@ -965,8 +1013,10 @@ def recover_portable_activation(
                 manifest=active_manifest,
                 activation_digest=activation_digest,
                 expected_logical_closure_digest=logical_closure,
+                database_guard=database_guard,
             )
         )
+        database_guard = None
 
         def active_business(record: _PortablePublicationPhaseRecord) -> None:
             if record.unsigned.active_content_attestation != active_attestation:
@@ -974,16 +1024,9 @@ def recover_portable_activation(
                     "ACTIVATION.RECOVERY_REQUIRED",
                     retryable=True,
                 )
-            _ref, _snapshot, observed = port.reprove_portable_active_set(
-                binding=binding,
-                prepared=prepared,
-                platform=platform,
-                root=root,
-                database=active_database,
-                manifest=active_manifest,
-                activation_digest=activation_digest,
-                expected_logical_closure_digest=logical_closure,
-            )
+            if active_set_authority is None:
+                raise AssertionError("portable active-set authority is missing")
+            observed = active_set_authority.reprove()
             if observed != active_attestation:
                 raise ActivationPreparationError(
                     "ACTIVATION.RECOVERY_REQUIRED",
@@ -1090,10 +1133,16 @@ def recover_portable_activation(
             caller_borrow=caller_borrow,
             snapshot=completed,
         )
+        if active_set_authority is None:
+            raise AssertionError("portable active-set authority is missing")
+        active_set_authority.reprove()
         port.ensure_portable_activation_lineage_marker(
             platform=platform,
             root=root,
         )
+        active_set_authority.reprove()
+        active_set_authority.close()
+        active_set_authority = None
         port.view = _SQLiteGenerationView(
             stage=active_ref,
             canonical_store_id=port.canonical_store_id,
@@ -1125,6 +1174,18 @@ def recover_portable_activation(
                 continue
             try:
                 authority.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if database_guard is not None:
+            try:
+                database_guard.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if active_set_authority is not None:
+            try:
+                active_set_authority.close()
             except BaseException as error:
                 if close_error is None:
                     close_error = error
