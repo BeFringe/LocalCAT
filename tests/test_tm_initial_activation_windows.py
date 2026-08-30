@@ -18,6 +18,7 @@ from unittest import mock
 
 import tm_migration
 import tm_activation_journal
+import tm_content_attestation
 import tm_sqlite_store
 import tm_stage_sealer
 import platform_fs_windows
@@ -29,6 +30,7 @@ from platform_fs_contracts import (
     PrivateProofObjectRole,
 )
 from tm_contracts import (
+    ActivationCapabilityState,
     CanonicalResourceIdentity,
     MigrationReport,
     SnapshotReceipt,
@@ -114,7 +116,11 @@ def _release_portable_test_authorities(
 
     try:
         if preparation is not None:
-            coordinator._sealed_registry.cancel(preparation._token)
+            entry = coordinator._sealed_registry._token_entry(
+                preparation._token
+            )
+            if getattr(entry, "live_authority", None) is not None:
+                coordinator._sealed_registry.cancel(preparation._token)
     finally:
         reservation.release()
 
@@ -141,6 +147,65 @@ def _portable_sealed_stage(
             **inputs,
         )
     return reservation, sealed, coordinator._sealed_registry
+
+
+def _portable_publication_active_attestation(
+    prepared: object,
+) -> tm_content_attestation.PortableActiveContentAttestation:
+    record = prepared._record
+    sealed = record.unsigned.sealed_content_attestation
+    return tm_content_attestation._create_portable_active_content_attestation(
+        sealed_attestation_digest=sealed.attestation_digest,
+        journal_id=record.unsigned.journal_id,
+        resource_id=record.unsigned.resource_id,
+        target_identity=record.unsigned.target_identity,
+        canonical_store_id=record.unsigned.canonical_store_id,
+        snapshot_receipt_digest=sealed.snapshot_receipt_digest,
+        generation=0,
+        activation_digest=hashlib.sha256(
+            b"windows-portable-publication-active-v1"
+        ).hexdigest(),
+        database=sealed.database,
+        manifest=sealed.manifest,
+        source=sealed.source,
+        semantic_facts=sealed.semantic_facts,
+    )
+
+
+def _portable_publication_unsigned(
+    prepared: object,
+    identity: CanonicalResourceIdentity,
+    *,
+    phase: str,
+    predecessor_digest: str,
+    active: tm_content_attestation.PortableActiveContentAttestation | None,
+) -> tm_activation_journal._PortablePublicationPhaseUnsigned:
+    pending = prepared._record.unsigned
+    content = pending.sealed_content_attestation if active is None else active
+    return tm_activation_journal._PortablePublicationPhaseUnsigned(
+        publication_version="activation-publication-v1",
+        phase=phase,
+        predecessor_digest=predecessor_digest,
+        journal_id=pending.journal_id,
+        preparation_id=pending.preparation_id,
+        token_id=pending.token_id,
+        token_version=pending.token_version,
+        activation_nonce=pending.activation_nonce,
+        resource_id=pending.resource_id,
+        target_identity=pending.target_identity,
+        canonical_store_id=pending.canonical_store_id,
+        generation=0,
+        canonical_database_name=identity.canonical_sidecar_path.name,
+        canonical_database_size=content.database.size,
+        canonical_database_sha256=content.database.sha256,
+        canonical_manifest_name=identity.snapshot_manifest_path.name,
+        canonical_manifest_size=content.manifest.size,
+        canonical_manifest_sha256=content.manifest.sha256,
+        private_directory_name=pending.private_directory_name,
+        device_key_name=pending.device_key_name,
+        sealed_content_attestation=pending.sealed_content_attestation,
+        active_content_attestation=active,
+    )
 
 
 @unittest.skipUnless(sys.platform == "win32", "requires real Windows")
@@ -343,6 +408,370 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     {},
                 )
                 reservation.reprove()
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_portable_publication_phase_chain_is_write_once_and_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                prepared = coordinator.publish_portable_prepared_activation(
+                    preparation,
+                    **owner_inputs,
+                )
+                private_root = root / prepared.private_directory_name
+                pending_path = private_root / prepared.journal_name
+                pending_bytes = pending_path.read_bytes()
+                active = _portable_publication_active_attestation(prepared)
+                committed: list[str] = []
+                business_reproved: list[str] = []
+
+                def owner_commit(record: object) -> None:
+                    committed.append(record.unsigned.phase)
+
+                def business_reprove(record: object) -> None:
+                    business_reproved.append(record.unsigned.phase)
+
+                predecessor = prepared._record
+                handles: list[object] = []
+                for phase in tm_activation_journal._PORTABLE_PUBLICATION_PHASES:
+                    unsigned = _portable_publication_unsigned(
+                        prepared,
+                        identity,
+                        phase=phase,
+                        predecessor_digest=predecessor.record_digest,
+                        active=None if phase == "DB_REPLACED" else active,
+                    )
+                    handle = (
+                        tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish(
+                            identity=identity,
+                            backend=owner_inputs["platform"],
+                            persistent_private=owner_inputs["persistent_private"],
+                            caller_borrow=owner_inputs["caller_borrow"],
+                            prepared=prepared._record,
+                            predecessor=predecessor,
+                            unsigned=unsigned,
+                            owner_reprove=reservation.reprove,
+                            owner_commit=owner_commit,
+                            business_reprove=business_reprove,
+                        )
+                    )
+                    phase_path = private_root / handle.phase_name
+                    serialized = phase_path.read_bytes()
+                    self.assertEqual(
+                        tm_activation_journal._parse_portable_publication_phase_bytes(
+                            serialized
+                        ),
+                        handle._record,
+                    )
+                    self.assertFalse(
+                        (phase_path.parent / (phase_path.name + ".candidate")).exists()
+                    )
+                    self.assertEqual(handle.predecessor_digest, predecessor.record_digest)
+                    handles.append(handle)
+                    predecessor = handle._record
+
+                self.assertEqual(
+                    [handle.phase for handle in handles],
+                    list(tm_activation_journal._PORTABLE_PUBLICATION_PHASES),
+                )
+                self.assertEqual(committed, list(tm_activation_journal._PORTABLE_PUBLICATION_PHASES))
+                self.assertEqual(business_reproved, committed)
+                self.assertEqual(pending_path.read_bytes(), pending_bytes)
+                self.assertEqual(
+                    tm_activation_journal._parse_portable_activation_journal_bytes(
+                        pending_bytes
+                    ),
+                    prepared._record,
+                )
+                self.assertFalse(identity.canonical_sidecar_path.exists())
+                self.assertFalse(identity.snapshot_manifest_path.exists())
+                self.assertEqual(coordinator.state, "ACTIVATING")
+
+                final_handle = handles[-1]
+                final_unsigned = final_handle._record.unsigned
+                replay = (
+                    tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish(
+                        identity=identity,
+                        backend=owner_inputs["platform"],
+                        persistent_private=owner_inputs["persistent_private"],
+                        caller_borrow=owner_inputs["caller_borrow"],
+                        prepared=prepared._record,
+                        predecessor=handles[-2]._record,
+                        unsigned=final_unsigned,
+                        owner_reprove=reservation.reprove,
+                        owner_commit=owner_commit,
+                        business_reprove=business_reprove,
+                    )
+                )
+                self.assertEqual(replay._record, final_handle._record)
+                self.assertEqual(
+                    committed,
+                    [
+                        "DB_REPLACED",
+                        "MANIFEST_PUBLISHED",
+                        "GENERATION_PUBLISHED",
+                        "GENERATION_PUBLISHED",
+                    ],
+                )
+                self.assertEqual(business_reproved, committed)
+
+                for callback_name in ("owner_commit", "business_reprove"):
+                    def fail_phase(record: object) -> None:
+                        del record
+                        raise ActivationPreparationError(
+                            f"ACTIVATION.TEST_{callback_name.upper()}_FAILED",
+                            retryable=False,
+                        )
+
+                    callbacks = {
+                        "owner_commit": owner_commit,
+                        "business_reprove": business_reprove,
+                    }
+                    callbacks[callback_name] = fail_phase
+                    with self.subTest(callback=callback_name), self.assertRaises(
+                        ActivationPreparationError
+                    ) as callback_failure:
+                        tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish(
+                            identity=identity,
+                            backend=owner_inputs["platform"],
+                            persistent_private=owner_inputs["persistent_private"],
+                            caller_borrow=owner_inputs["caller_borrow"],
+                            prepared=prepared._record,
+                            predecessor=handles[-2]._record,
+                            unsigned=final_unsigned,
+                            owner_reprove=reservation.reprove,
+                            owner_commit=callbacks["owner_commit"],
+                            business_reprove=callbacks["business_reprove"],
+                        )
+                    self.assertEqual(
+                        callback_failure.exception.code,
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                    )
+                    self.assertTrue(callback_failure.exception.retryable)
+
+                final_path = private_root / final_handle.phase_name
+                canonical_final_bytes = final_path.read_bytes()
+                mapping = json.loads(canonical_final_bytes)
+                strict_mutations = (
+                    {**mapping, "unexpected": "field"},
+                    {**mapping, "publication_version": "activation-journal-v3"},
+                    {**mapping, "phase": "PREPARED"},
+                    {**mapping, "record_digest": "0" * 64},
+                )
+                for mutated in strict_mutations:
+                    with self.subTest(mutation=sorted(set(mutated) - set(mapping))):
+                        encoded = (
+                            json.dumps(
+                                mutated,
+                                ensure_ascii=False,
+                                allow_nan=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode("utf-8")
+                            + b"\n"
+                        )
+                        with self.assertRaises(ActivationPreparationError) as caught:
+                            tm_activation_journal._parse_portable_publication_phase_bytes(
+                                encoded
+                            )
+                        self.assertEqual(
+                            caught.exception.code,
+                            "ACTIVATION.PUBLICATION_PARSE_INVALID",
+                        )
+                duplicate = canonical_final_bytes.replace(
+                    b'"phase":"GENERATION_PUBLISHED",',
+                    b'"phase":"GENERATION_PUBLISHED","phase":"GENERATION_PUBLISHED",',
+                    1,
+                )
+                with self.assertRaises(ActivationPreparationError) as duplicate_error:
+                    tm_activation_journal._parse_portable_publication_phase_bytes(
+                        duplicate
+                    )
+                self.assertEqual(
+                    duplicate_error.exception.code,
+                    "ACTIVATION.PUBLICATION_PARSE_INVALID",
+                )
+                with self.assertRaises(ActivationPreparationError):
+                    tm_activation_journal._parse_portable_publication_phase_bytes(
+                        pending_bytes
+                    )
+                with self.assertRaises(ActivationPreparationError):
+                    tm_activation_journal._parse_portable_activation_journal_bytes(
+                        canonical_final_bytes
+                    )
+
+                tampered = canonical_final_bytes.replace(
+                    b'"canonical_store_id":"store.primary"',
+                    b'"canonical_store_id":"store.foreign"',
+                    1,
+                )
+                final_path.write_bytes(tampered)
+                with self.assertRaises(ActivationPreparationError) as mismatch:
+                    tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish(
+                        identity=identity,
+                        backend=owner_inputs["platform"],
+                        persistent_private=owner_inputs["persistent_private"],
+                        caller_borrow=owner_inputs["caller_borrow"],
+                        prepared=prepared._record,
+                        predecessor=handles[-2]._record,
+                        unsigned=final_unsigned,
+                        owner_reprove=reservation.reprove,
+                        owner_commit=owner_commit,
+                        business_reprove=business_reprove,
+                    )
+                self.assertEqual(
+                    mismatch.exception.code,
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                self.assertEqual(final_path.read_bytes(), tampered)
+            finally:
+                _release_portable_test_authorities(
+                    coordinator,
+                    preparation,
+                    reservation,
+                )
+
+    def test_portable_publication_rejects_wrong_order_and_missing_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity = _identity(root)
+            coordinator = ResourceStoreCoordinator(
+                canonical_store_id="store.primary",
+                resource_identity=identity,
+            )
+            service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id="store.primary",
+                coordinator=coordinator,
+            )
+            reservation, sealed, _registry = self._portable_sealed_stage(
+                service,
+                coordinator,
+                identity,
+            )
+            preparation = None
+            try:
+                preparation = coordinator.activate(sealed)
+                owner_inputs = reservation.portable_journal_inputs()
+                prepared = coordinator.publish_portable_prepared_activation(
+                    preparation,
+                    **owner_inputs,
+                )
+                active = _portable_publication_active_attestation(prepared)
+                db_unsigned = _portable_publication_unsigned(
+                    prepared,
+                    identity,
+                    phase="DB_REPLACED",
+                    predecessor_digest=prepared.record_digest,
+                    active=None,
+                )
+                db = tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish(
+                    identity=identity,
+                    backend=owner_inputs["platform"],
+                    persistent_private=owner_inputs["persistent_private"],
+                    caller_borrow=owner_inputs["caller_borrow"],
+                    prepared=prepared._record,
+                    predecessor=prepared._record,
+                    unsigned=db_unsigned,
+                    owner_reprove=reservation.reprove,
+                    owner_commit=lambda record: None,
+                    business_reprove=lambda record: None,
+                )
+                generation_unsigned = _portable_publication_unsigned(
+                    prepared,
+                    identity,
+                    phase="GENERATION_PUBLISHED",
+                    predecessor_digest=db.record_digest,
+                    active=active,
+                )
+                with self.assertRaises(ActivationPreparationError) as wrong_order:
+                    tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish(
+                        identity=identity,
+                        backend=owner_inputs["platform"],
+                        persistent_private=owner_inputs["persistent_private"],
+                        caller_borrow=owner_inputs["caller_borrow"],
+                        prepared=prepared._record,
+                        predecessor=db._record,
+                        unsigned=generation_unsigned,
+                        owner_reprove=reservation.reprove,
+                        owner_commit=lambda record: None,
+                        business_reprove=lambda record: None,
+                    )
+                self.assertEqual(
+                    wrong_order.exception.code,
+                    "ACTIVATION.PUBLICATION_CHAIN_INVALID",
+                )
+                generation_path = (
+                    root
+                    / prepared.private_directory_name
+                    / tm_activation_journal._portable_publication_phase_name(
+                        "GENERATION_PUBLISHED"
+                    )
+                )
+                self.assertFalse(generation_path.exists())
+
+                db_path = (
+                    root
+                    / prepared.private_directory_name
+                    / db.phase_name
+                )
+                db_path.unlink()
+                manifest_unsigned = _portable_publication_unsigned(
+                    prepared,
+                    identity,
+                    phase="MANIFEST_PUBLISHED",
+                    predecessor_digest=db.record_digest,
+                    active=active,
+                )
+                with self.assertRaises(ActivationPreparationError) as missing:
+                    tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish(
+                        identity=identity,
+                        backend=owner_inputs["platform"],
+                        persistent_private=owner_inputs["persistent_private"],
+                        caller_borrow=owner_inputs["caller_borrow"],
+                        prepared=prepared._record,
+                        predecessor=db._record,
+                        unsigned=manifest_unsigned,
+                        owner_reprove=reservation.reprove,
+                        owner_commit=lambda record: None,
+                        business_reprove=lambda record: None,
+                    )
+                self.assertEqual(
+                    missing.exception.code,
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                )
+                manifest_path = (
+                    root
+                    / prepared.private_directory_name
+                    / tm_activation_journal._portable_publication_phase_name(
+                        "MANIFEST_PUBLISHED"
+                    )
+                )
+                self.assertFalse(manifest_path.exists())
+                self.assertFalse(Path(str(manifest_path) + ".candidate").exists())
             finally:
                 _release_portable_test_authorities(
                     coordinator,
@@ -1377,7 +1806,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
             _remove_long_quarantine(root)
 
     def test_real_initial_build_and_seal_retire_exact_pair_before_journal(self) -> None:
-        """The production entry reaches portable seal and B cleanup on denial."""
+        """A pre-journal activation denial retires the exact portable pair."""
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1435,9 +1864,9 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
             self.assertIs(type(outcome), tm_migration.MigrationFailure)
             self.assertEqual(
                 outcome.error_code,
-                "ACTIVATION.ATTESTATION_UNAVAILABLE",
+                "ACTIVATION.GATE_B_DENIED",
             )
-            activate.assert_not_called()
+            activate.assert_called_once()
             publish.assert_not_called()
             verify.assert_not_called()
             self.assertEqual(coordinator._sealed_registry._entries, {})
@@ -1923,10 +2352,17 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                             identity.configured_jsonl_path,
                             identity.resource_id,
                         )
-                    self.assertEqual(
-                        coordinator._sealed_registry._entries,
-                        {},
+                    entries = tuple(
+                        coordinator._sealed_registry._entries.values()
                     )
+                    self.assertEqual(len(entries), 1)
+                    self.assertIs(
+                        entries[0].state,
+                        ActivationCapabilityState.CONSUMED,
+                    )
+                    self.assertIsNone(entries[0].live_authority)
+                    self.assertEqual(coordinator.state, "READY")
+                    self.assertEqual(coordinator.current_generation, 0)
                     self.assertEqual(
                         list(root.glob(".localcat-migration.initial-*")),
                         [],
@@ -1989,7 +2425,9 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     for path in root.glob(".localcat-migration.initial-*"):
                         path.unlink()
 
-    def test_legacy_source_close_failure_is_authority_unavailable(self) -> None:
+    def test_portable_prepared_source_close_failure_is_authority_unavailable(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             identity = _identity(root)
@@ -2027,15 +2465,30 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     identity.resource_id,
                 )
 
-            self.assertEqual(exact_close_calls, 2)
+            self.assertEqual(exact_close_calls, 3)
             self.assertIs(type(outcome), tm_migration.MigrationFailure)
             self.assertEqual(
                 outcome.error_code,
                 "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
             )
             self.assertTrue(outcome.canonical_authority_ambiguous)
-            self.assertEqual(coordinator._sealed_registry._entries, {})
-            self.assertEqual(list(root.glob(".localcat-migration.initial-*")), [])
+            entries = tuple(coordinator._sealed_registry._entries.values())
+            self.assertEqual(len(entries), 1)
+            self.assertIs(
+                entries[0].state,
+                ActivationCapabilityState.TOKEN_ISSUED,
+            )
+            self.assertIsNone(entries[0].live_authority)
+            self.assertEqual(coordinator.state, "ACTIVATING")
+            self.assertIsNone(coordinator.current_generation)
+            self.assertEqual(
+                len(list(root.glob(".localcat-migration.initial-*"))),
+                2,
+            )
+            self.assertEqual(
+                len(list(root.rglob("activation-journal-v3.json"))),
+                1,
+            )
             _remove_long_quarantine(root)
 
     def test_lock_tamper_denies_gate_b_without_grant(self) -> None:

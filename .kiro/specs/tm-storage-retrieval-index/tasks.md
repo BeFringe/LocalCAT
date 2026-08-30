@@ -195,7 +195,7 @@
   - 完成时，并发查询和保存只观察切换前或切换后的完整版本，不出现空白、混合或过渡性版本
   - _Requirements: 2.9, 2.10, 2.11, 2.12, 7.5, 7.14_
 
-- [ ] 5.7a 将 DB/manifest publication 接入 `PendingPublication`
+- [x] 5.7a 将 DB/manifest publication 接入 `PendingPublication`
   - PREPARED与任何publication arm之前，必须按`WindowsDocumentedPublishV1`证明Windows 11 x64、local fixed NTFS及所需API/volume/security事实；缺失时零命名mutation并返回`DURABILITY_UNAVAILABLE`，不读取runtime硬件profile registry。
   - Windows 路径保持 DB→write-through/`FlushFileBuffers`→handle-bound naming→candidate close→retained exact readback→manifest→generation 的既有 phase authority。每个replace执行`begin_publish`后只得到`PendingPublication`与retained destination readback authority；owner在其存活时完成readback、写入并持久化自己的journal phase、复证DB/manifest业务state，再调用`terminal_reproof`并`close`，全过程不得把preliminary facts报告为成功。
   - 任一owner durable phase、business reproof或terminal reproof失败都进入既有recovery-required路径；禁止用删除目标、普通rename、pathname reopen或提前关闭pending authority缩减协议。
