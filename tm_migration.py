@@ -31,6 +31,7 @@ from tm_activation_journal import (
     _lstat_any_entry,
     _require_quarantine_directory,
 )
+from tm_activation_recovery import _PortableReplacementRecoveryRequired
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
     SNAPSHOT_MANIFEST_VERSION,
@@ -286,6 +287,123 @@ class _InitialStageAttempt:
     manifest_retirement: RetainedRetirement | None = None
 
 
+@dataclass(slots=True)
+class _PortableRootedRead:
+    """One caller-held rooted regular-file read for Windows explicit import.
+
+    The authority is opened relative to the same resource root retained by W1.
+    Its frozen ``EntrySnapshot`` remains the expected object for every bounded
+    read, and the basename is re-proved against the retained root before a
+    terminal result is exposed.  No pathname reopen participates in the
+    Windows preflight/build transaction.
+    """
+
+    path: Path
+    root: RootedDirectoryAuthority
+    authority: BoundRegularFile
+    snapshot: EntrySnapshot
+
+    @classmethod
+    def open(
+        cls,
+        reservation: _InitialActivationResourceReservation,
+        path: Path,
+        *,
+        unavailable_code: str,
+    ) -> _PortableRootedRead:
+        if type(reservation) is not _InitialActivationResourceReservation:
+            raise TypeError("reservation must be exact initial reservation")
+        if type(path) is not _NATIVE_PATH_TYPE:
+            raise TypeError("portable rooted read path must be exact Path")
+        backend = reservation._backend
+        root = reservation._root
+        if (
+            backend is None
+            or root is None
+            or path.parent != reservation._identity.canonical_sidecar_path.parent
+            or not path.name
+        ):
+            raise MigrationPreflightError(unavailable_code)
+        authority: BoundRegularFile | None = None
+        try:
+            reservation.reprove()
+            observed = root.inspect_entry(path.name)
+            if observed is None or (
+                observed.identity.kind != "regular"
+                or observed.identity.link_count != 1
+                or not observed.reparse_free
+            ):
+                raise MigrationPreflightError(unavailable_code)
+            authority = backend.open_regular(root, PurePath(path.name))
+            snapshot = authority.snapshot()
+            if snapshot != observed or root.inspect_entry(path.name) != snapshot:
+                raise MigrationPreflightError(unavailable_code)
+            reservation.reprove()
+            result = cls(
+                path=path,
+                root=root,
+                authority=authority,
+                snapshot=snapshot,
+            )
+            authority = None
+            return result
+        except MigrationPreflightError:
+            raise
+        except PlatformFileError as error:
+            raise MigrationPreflightError(unavailable_code) from error
+        finally:
+            if authority is not None:
+                authority.close()
+
+    def iter_lines(self) -> Iterator[bytes]:
+        """Yield exact newline-preserving rows through bounded rooted reads."""
+
+        offset = 0
+        pending = bytearray()
+        while offset < self.snapshot.byte_count:
+            size = min(64 * 1024, self.snapshot.byte_count - offset)
+            chunk = self.authority.read_at(offset, size, self.snapshot)
+            offset += len(chunk)
+            pending.extend(chunk)
+            consumed = 0
+            while True:
+                newline = pending.find(b"\n", consumed)
+                if newline < 0:
+                    break
+                yield bytes(pending[consumed : newline + 1])
+                consumed = newline + 1
+            if consumed:
+                del pending[:consumed]
+        if pending:
+            yield bytes(pending)
+        if (
+            self.authority.read_at(offset, 1, self.snapshot)
+            or self.authority.snapshot() != self.snapshot
+            or self.root.inspect_entry(self.path.name) != self.snapshot
+        ):
+            raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
+
+    def digest(self) -> str:
+        facts = self.authority.content_facts()
+        if (
+            facts.snapshot != self.snapshot
+            or self.root.inspect_entry(self.path.name) != self.snapshot
+        ):
+            raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
+        return facts.content_sha256.hex()
+
+    def reprove_digest(self, expected_digest: str) -> str:
+        if type(expected_digest) is not str or len(expected_digest) != 64:
+            raise TypeError("expected digest must be exact SHA-256")
+        observed = self.digest()
+        if observed != expected_digest:
+            raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
+        return observed
+
+    def close(self) -> None:
+        self.authority.close()
+
+
 class _ExportParentHandle(snapshot_artifacts_module._ExportParentHandle):
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts.
 
@@ -392,6 +510,28 @@ def _is_initial_activation_operational_error(error: Exception) -> bool:
             snapshot_artifacts_module.ExportPreflightError,
             SQLiteStoreSchemaError,
             StageSealError,
+            OSError,
+            sqlite3.Error,
+            UnicodeError,
+        ),
+    )
+
+
+def _is_portable_disambiguation_operational_error(error: Exception) -> bool:
+    """Closed Windows replacement failures eligible for outcome projection."""
+
+    return isinstance(
+        error,
+        (
+            MigrationPreflightError,
+            _InitialActivationReservationError,
+            ActivationPreparationError,
+            RecoveryError,
+            snapshot_artifacts_module.ExportPreflightError,
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            StageSealError,
+            PlatformFileError,
             OSError,
             sqlite3.Error,
             UnicodeError,
@@ -5250,6 +5390,9 @@ class TMMigrationService:
         source: Path,
         resource_id: str,
     ) -> MigrationOutcome:
+        if sys.platform == "win32":
+            return self._portable_explicit_disambiguation(source, resource_id)
+
         coordinator = self._coordinator
         stage_label = "PREFLIGHT"
         preflight: MigrationPreflight | None = None
@@ -5364,6 +5507,485 @@ class TMMigrationService:
                 store_before=store_before,
                 store_path=store_path,
             )
+
+    def _portable_explicit_disambiguation(
+        self,
+        source: Path,
+        resource_id: str,
+    ) -> MigrationOutcome:
+        """Run Windows explicit import/rebuild under one resource owner.
+
+        The same W1 lease and rooted directory authority span source preflight,
+        a CREATE_NEW reserved stage pair, portable sealing, replacement owner
+        publication, and any required cold recovery.  The historical
+        path-bearing replacement journal and POSIX reconciliation machinery are
+        deliberately unreachable from this branch.
+        """
+
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise MigrationPreflightError("IMPORT.COORDINATOR_UNAVAILABLE")
+        if coordinator._resource_identity != self._resource_identity:
+            raise MigrationPreflightError("IMPORT.COORDINATOR_MISMATCH")
+        try:
+            reservation = self._acquire_initial_reservation()
+        except _InitialActivationReservationError as error:
+            raise MigrationPreflightError(
+                "IMPORT.RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+        try:
+            with reservation:
+                return self._portable_explicit_disambiguation_reserved(
+                    source=source,
+                    resource_id=resource_id,
+                    coordinator=coordinator,
+                    reservation=reservation,
+                )
+        except _InitialActivationReservationError as error:
+            raise MigrationPreflightError(
+                "IMPORT.RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+
+    def _portable_explicit_disambiguation_reserved(
+        self,
+        *,
+        source: Path,
+        resource_id: str,
+        coordinator: ResourceStoreCoordinator,
+        reservation: _InitialActivationResourceReservation,
+    ) -> MigrationOutcome:
+        stage_label = "PREFLIGHT"
+        preflight: MigrationPreflight | None = None
+        source_read: _PortableRootedRead | None = None
+        source_before: str | None = None
+        store_before: str | None = None
+        prior_store_id = coordinator.canonical_store_id
+        prior_generation: int | None = coordinator.current_generation
+        new_store_id: str | None = None
+        stage: MutableStageRef | None = None
+        attempt: _InitialStageAttempt | None = None
+        sealed: SealedStage | None = None
+        prepared: object | None = None
+        replacement_stage_retirement_entered = False
+        replacement_stage_retired = False
+        try:
+            reservation.reprove()
+            source_read = reservation.open_portable_rooted_read(
+                self._resource_identity.configured_jsonl_path,
+                unavailable_code="MIGRATION.SOURCE_UNREADABLE",
+            )
+            source_before = source_read.digest()
+            store_before = self._portable_rooted_digest(
+                reservation,
+                self._resource_identity.canonical_sidecar_path,
+                unavailable_code="IMPORT.ACTIVE_STORE_UNREADABLE",
+            )
+            if type(source) is not _NATIVE_PATH_TYPE:
+                raise TypeError("source must be an exact native Path")
+            if source != self._resource_identity.configured_jsonl_path:
+                raise MigrationPreflightError(
+                    "MIGRATION.RESOURCE_IDENTITY_MISMATCH"
+                )
+            if type(resource_id) is not str or not resource_id.strip():
+                raise MigrationPreflightError("IMPORT.RESOURCE_ID_INVALID")
+            if resource_id != self._resource_identity.resource_id:
+                raise MigrationPreflightError(
+                    "MIGRATION.RESOURCE_IDENTITY_MISMATCH"
+                )
+            if coordinator.canonical_store_id != self._canonical_store_id:
+                raise MigrationPreflightError("IMPORT.COORDINATOR_MISMATCH")
+
+            preflight = _scan_portable_jsonl(source_read)
+            if preflight.source_digest != source_before:
+                raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
+            reservation.reprove()
+
+            # A live public gen0/N coordinator already owns a re-proved view;
+            # replacement recovery is intentionally a fresh/fail-stopped seam
+            # and rejects such a live owner.  Only view-less owners recover.
+            if coordinator._view is None:
+                recovered = (
+                    coordinator.recover_portable_replacement_activation(
+                        **reservation.portable_replacement_recovery_inputs()
+                    )
+                )
+                reservation.reprove()
+                if recovered is None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+            if (
+                coordinator.state != "READY"
+                or coordinator.current_generation is None
+                or coordinator.active_store_path
+                != self._resource_identity.canonical_sidecar_path
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+
+            # Recovery may have completed a predecessor replacement.  Store-id
+            # adoption is permitted only after that strict terminal READY.
+            self._canonical_store_id = coordinator.canonical_store_id
+            prior_store_id = coordinator.canonical_store_id
+            prior_generation = coordinator.current_generation
+            store_before = self._portable_rooted_digest(
+                reservation,
+                self._resource_identity.canonical_sidecar_path,
+                unavailable_code="IMPORT.ACTIVE_STORE_UNREADABLE",
+            )
+            source_read.reprove_digest(source_before)
+
+            origin_token = uuid.uuid4().hex
+            new_store_id = f"store.import.{origin_token}"
+            path_salt = f"initial-replacement-{uuid.uuid4().hex}"
+            stage = _deterministic_stage_ref(
+                self._resource_identity,
+                source_digest=preflight.source_digest,
+                stage_prefix="import",
+                path_salt=path_salt,
+            )
+            attempt = _freeze_initial_stage_attempt(
+                stage,
+                path_salt=path_salt,
+                resource_reservation=reservation,
+            )
+            built_stage, _stage_identity, _manifest_identity = self._build_stage(
+                source,
+                preflight=preflight,
+                canonical_store_id=new_store_id,
+                batch_kind="import",
+                batch_prefix="import",
+                snapshot_prefix="snapshot.import",
+                stage_prefix="import",
+                path_salt=path_salt,
+                batch_id=f"import.{origin_token}",
+                initial_attempt=attempt,
+                portable_source=source_read,
+            )
+            if built_stage != stage:
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                )
+            source_read.reprove_digest(source_before)
+            reservation.reprove()
+
+            stage_label = "ACTIVATION"
+            sealed = coordinator._seal_stage(
+                stage,
+                canonical_store_id=new_store_id,
+                expected_prior_generation=prior_generation,
+                **reservation.stage_seal_inputs(attempt),
+            )
+            journal_inputs = reservation.portable_journal_inputs()
+            prepared = coordinator.activate_portable_replacement(
+                sealed,
+                platform=cast(PlatformFileBackend, journal_inputs["platform"]),
+                persistent_private=cast(Any, journal_inputs["persistent_private"]),
+                caller_borrow=cast(Any, journal_inputs["caller_borrow"]),
+            )
+
+            def retire_replacement_stage() -> None:
+                nonlocal replacement_stage_retirement_entered
+                nonlocal replacement_stage_retired
+                replacement_stage_retirement_entered = True
+                _cleanup_initial_unpublished_stage(attempt)
+                replacement_stage_retired = True
+
+            generation = coordinator.publish_portable_replacement_activation(
+                prepared,
+                platform=cast(PlatformFileBackend, journal_inputs["platform"]),
+                persistent_private=cast(Any, journal_inputs["persistent_private"]),
+                caller_borrow=cast(Any, journal_inputs["caller_borrow"]),
+                retire_replacement_stage=retire_replacement_stage,
+            )
+            reservation.reprove()
+            source_read.reprove_digest(source_before)
+            if (
+                coordinator.state != "READY"
+                or coordinator.canonical_store_id != new_store_id
+                or coordinator.current_generation != generation
+                or generation != prior_generation + 1
+                or coordinator.active_store_path
+                != self._resource_identity.canonical_sidecar_path
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            report = self._success_report(
+                preflight=preflight,
+                sealed=sealed,
+                canonical_store_id=new_store_id,
+                generation=generation,
+            )
+            # This is the only new-attempt store-id adoption point.
+            self._canonical_store_id = new_store_id
+            return report
+        except Exception as error:
+            if not _is_portable_disambiguation_operational_error(error):
+                raise
+            if (
+                attempt is not None
+                and prepared is not None
+                and replacement_stage_retirement_entered
+                and not replacement_stage_retired
+            ):
+                try:
+                    _cleanup_initial_unpublished_stage(attempt)
+                except Exception as cleanup_error:
+                    if not _is_portable_disambiguation_operational_error(
+                        cleanup_error
+                    ):
+                        raise
+                    # Durable READY_CLEANUP must remain fail-stopped while its
+                    # exact live stage pair cannot be retired.  This 5.10a
+                    # slice deliberately does not invent a new public envelope
+                    # or consume the owner namespace before cleanup succeeds.
+                    raise cleanup_error
+                replacement_stage_retired = True
+            if attempt is not None and prepared is None:
+                try:
+                    _cleanup_initial_unpublished_stage(attempt)
+                except Exception as cleanup_error:
+                    if not _is_portable_disambiguation_operational_error(
+                        cleanup_error
+                    ):
+                        raise
+                    error = cleanup_error
+
+            if prepared is not None or coordinator.state == "ACTIVATING":
+                try:
+                    recovered = (
+                        coordinator.recover_portable_replacement_activation(
+                            **reservation.portable_replacement_recovery_inputs()
+                        )
+                    )
+                    reservation.reprove()
+                except Exception as recovery_error:
+                    if not _is_portable_disambiguation_operational_error(
+                        recovery_error
+                    ):
+                        raise
+                    if type(recovery_error) is _PortableReplacementRecoveryRequired:
+                        if (
+                            recovery_error.prior_generation != prior_generation
+                            or recovery_error.recovery_locator.expected_digest
+                            != store_before
+                        ):
+                            raise AssertionError(
+                                "portable replacement recovery facts do not "
+                                "match the reserved prior authority"
+                            )
+                        if source_before is None or store_before is None:
+                            raise AssertionError(
+                                "portable replacement recovery lacks prior facts"
+                            )
+                        return self._portable_disambiguation_failure(
+                            recovery_error,
+                            preflight=preflight,
+                            stage_label=stage_label,
+                            coordinator=coordinator,
+                            reservation=reservation,
+                            source_read=source_read,
+                            source_before=source_before,
+                            store_before=store_before,
+                            prior_generation=prior_generation,
+                            recovery_locator=(
+                                recovery_error.recovery_locator
+                            ),
+                        )
+                    # Generic operational recovery failures carry no backup
+                    # authority.  They may still be projected when the rooted
+                    # prior store re-proves unchanged, but never receive a
+                    # fabricated locator.
+                    error = recovery_error
+                    recovered = None
+                if (
+                    recovered is not None
+                    and coordinator.state == "READY"
+                    and new_store_id is not None
+                    and coordinator.canonical_store_id == new_store_id
+                    and coordinator.current_generation is not None
+                    and sealed is not None
+                    and preflight is not None
+                    and source_before is not None
+                ):
+                    source_read.reprove_digest(source_before)
+                    report = self._success_report(
+                        preflight=preflight,
+                        sealed=sealed,
+                        canonical_store_id=new_store_id,
+                        generation=coordinator.current_generation,
+                    )
+                    self._canonical_store_id = new_store_id
+                    return report
+                if coordinator.state == "READY":
+                    self._canonical_store_id = coordinator.canonical_store_id
+                    prior_store_id = coordinator.canonical_store_id
+
+            if (
+                source_before is None
+                or store_before is None
+                or prior_generation is None
+            ):
+                raise
+            if (
+                coordinator.state == "READY"
+                and coordinator.canonical_store_id != prior_store_id
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            return self._portable_disambiguation_failure(
+                error,
+                preflight=preflight,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                reservation=reservation,
+                source_read=source_read,
+                source_before=source_before,
+                store_before=store_before,
+                prior_generation=prior_generation,
+                recovery_locator=None,
+            )
+        finally:
+            active_error = sys.exception()
+            try:
+                if source_read is not None:
+                    source_read.close()
+            except BaseException:
+                if type(active_error) in (TypeError, AssertionError, AttributeError):
+                    pass
+                else:
+                    raise
+            finally:
+                try:
+                    if attempt is not None:
+                        _close_initial_stage_attempt_authorities(attempt)
+                finally:
+                    reservation._initial_attempt = None
+
+    def _portable_rooted_digest(
+        self,
+        reservation: _InitialActivationResourceReservation,
+        path: Path,
+        *,
+        unavailable_code: str,
+    ) -> str:
+        opened = reservation.open_portable_rooted_read(
+            path,
+            unavailable_code=unavailable_code,
+        )
+        try:
+            return opened.digest()
+        finally:
+            opened.close()
+
+    def _portable_disambiguation_failure(
+        self,
+        error: Exception,
+        *,
+        preflight: MigrationPreflight | None,
+        stage_label: str,
+        coordinator: ResourceStoreCoordinator,
+        reservation: _InitialActivationResourceReservation,
+        source_read: _PortableRootedRead | None,
+        source_before: str,
+        store_before: str,
+        prior_generation: int | None,
+        recovery_locator: RecoveryLocator | None,
+    ) -> MigrationFailure:
+        """Project rooted terminal facts without invoking POSIX reconciliation."""
+
+        diagnostics = () if preflight is None else preflight.diagnostics
+        source_observed: str | None = None
+        if source_read is not None:
+            try:
+                source_observed = source_read.reprove_digest(source_before)
+            except Exception as observed_error:
+                if not _is_portable_disambiguation_operational_error(
+                    observed_error
+                ):
+                    raise
+                try:
+                    source_observed = self._portable_rooted_digest(
+                        reservation,
+                        self._resource_identity.configured_jsonl_path,
+                        unavailable_code="MIGRATION.SOURCE_UNREADABLE",
+                    )
+                except Exception as fallback_error:
+                    if not _is_portable_disambiguation_operational_error(
+                        fallback_error
+                    ):
+                        raise
+        try:
+            store_observed = self._portable_rooted_digest(
+                reservation,
+                self._resource_identity.canonical_sidecar_path,
+                unavailable_code="IMPORT.ACTIVE_STORE_UNREADABLE",
+            )
+        except Exception as observed_error:
+            if not _is_portable_disambiguation_operational_error(observed_error):
+                raise
+            store_observed = None
+
+        if source_observed != source_before:
+            # This slice never writes the selected source and therefore owns
+            # no byte-exact source backup.  An operational wrapper failure is
+            # retried through a fresh rooted authority above; actual mutation
+            # or unreadability belongs to the hostile-source recovery scope.
+            # Never let MigrationFailure.__post_init__ discover the missing
+            # locator indirectly as a ValueError.
+            raise AssertionError(
+                "portable source recovery requires exact locator facts"
+            )
+        source_evidence = _unchanged_preservation(
+            AssetKind.ORIGINAL_SOURCE,
+            source_before,
+        )
+        if recovery_locator is not None:
+            if (
+                type(recovery_locator) is not RecoveryLocator
+                or recovery_locator.asset_kind is not AssetKind.ACTIVE_STORE
+                or recovery_locator.expected_digest != store_before
+            ):
+                raise AssertionError(
+                    "portable replacement recovery locator is inconsistent"
+                )
+            store_evidence = _unverified_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            locators = (recovery_locator,)
+            retryable = False
+        elif store_observed == store_before:
+            store_evidence = _unchanged_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            locators = ()
+            retryable = _disambiguation_retryable(error)
+        else:
+            # B owns all private backup authentication.  If the destination
+            # cannot be proved unchanged, its recovery seam must provide the
+            # exact typed locator facts above; C never searches that namespace.
+            raise AssertionError(
+                "portable replacement recovery omitted required locator facts"
+            )
+        return MigrationFailure(
+            stage=stage_label,
+            error_code=_disambiguation_error_code(error),
+            retryable=retryable,
+            diagnostics=diagnostics,
+            active_generation=prior_generation,
+            original_source_preservation=source_evidence,
+            active_store_preservation=store_evidence,
+            recovery_locators=locators,
+        )
 
     def _success_report(
         self,
@@ -6223,6 +6845,7 @@ class TMMigrationService:
         path_salt: str | None = None,
         batch_id: str | None = None,
         initial_attempt: _InitialStageAttempt | None = None,
+        portable_source: _PortableRootedRead | None = None,
     ) -> tuple[
         MutableStageRef,
         _CreatedFileIdentity | None,
@@ -6310,7 +6933,11 @@ class TMMigrationService:
             store.append_streamed_batch(
                 batch_id=batch_id,
                 kind=batch_kind,
-                drafts=_iter_draft_pairs(source, observation),
+                drafts=(
+                    _iter_portable_draft_pairs(portable_source, observation)
+                    if portable_source is not None
+                    else _iter_draft_pairs(source, observation)
+                ),
                 source_digest=preflight.source_digest,
                 source_path=source,
                 invalid_count=preflight.invalid_count,
@@ -6486,6 +7113,25 @@ class TMMigrationService:
 def _scan_jsonl(source: Path) -> MigrationPreflight:
     """One bounded streaming pass producing preflight facts and diagnostics."""
 
+    try:
+        with source.open("rb") as stream:
+            return _scan_jsonl_lines(iter(stream))
+    except OSError as error:
+        raise MigrationPreflightError(
+            "MIGRATION.SOURCE_UNREADABLE"
+        ) from error
+
+
+def _scan_portable_jsonl(source: _PortableRootedRead) -> MigrationPreflight:
+    """Scan one caller-held rooted source without reopening its pathname."""
+
+    try:
+        return _scan_jsonl_lines(source.iter_lines())
+    except PlatformFileError as error:
+        raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED") from error
+
+
+def _scan_jsonl_lines(lines: Iterator[bytes]) -> MigrationPreflight:
     digest = hashlib.sha256()
     valid_count = 0
     invalid_count = 0
@@ -6495,47 +7141,40 @@ def _scan_jsonl(source: Path) -> MigrationPreflight:
     source_counts: dict[str, int] = {}
     diagnostics: list[MigrationDiagnostic] = []
 
-    try:
-        with source.open("rb") as stream:
-            for line_number, raw_line in enumerate(stream, start=1):
-                row_count += 1
-                digest.update(raw_line)
-                rejection_code, payload = _classify_jsonl_line(raw_line)
-                if rejection_code is not None:
-                    invalid_count += 1
-                    diagnostics.append(
-                        _rejected_diagnostic(
-                            line_number,
-                            code=rejection_code,
-                            stage=_REJECTION_DIAGNOSTICS[rejection_code][0],
-                            summary=_REJECTION_DIAGNOSTICS[rejection_code][1],
-                        )
-                    )
-                    continue
-                row = cast(dict[str, object], payload)
-                source_raw = cast(str, row["source"])
-                prior_count = source_counts.get(source_raw, 0)
-                source_counts[source_raw] = prior_count + 1
-                if prior_count == 1:
-                    duplicate_source_count += 1
-                if prior_count >= 1:
-                    variant_count += 1
-                    diagnostics.append(
-                        MigrationDiagnostic(
-                            code="ROW.DUPLICATE_SOURCE",
-                            stage="PREFLIGHT.VALIDATE",
-                            line_number=line_number,
-                            record_id=None,
-                            disposition=DiagnosticDisposition.WARNING,
-                            safe_summary="ROW_PRESERVED_AS_VARIANT",
-                        )
-                    )
-                valid_count += 1
-    except OSError as error:
-        raise MigrationPreflightError(
-            "MIGRATION.SOURCE_UNREADABLE"
-        ) from error
-
+    for line_number, raw_line in enumerate(lines, start=1):
+        row_count += 1
+        digest.update(raw_line)
+        rejection_code, payload = _classify_jsonl_line(raw_line)
+        if rejection_code is not None:
+            invalid_count += 1
+            diagnostics.append(
+                _rejected_diagnostic(
+                    line_number,
+                    code=rejection_code,
+                    stage=_REJECTION_DIAGNOSTICS[rejection_code][0],
+                    summary=_REJECTION_DIAGNOSTICS[rejection_code][1],
+                )
+            )
+            continue
+        row = cast(dict[str, object], payload)
+        source_raw = cast(str, row["source"])
+        prior_count = source_counts.get(source_raw, 0)
+        source_counts[source_raw] = prior_count + 1
+        if prior_count == 1:
+            duplicate_source_count += 1
+        if prior_count >= 1:
+            variant_count += 1
+            diagnostics.append(
+                MigrationDiagnostic(
+                    code="ROW.DUPLICATE_SOURCE",
+                    stage="PREFLIGHT.VALIDATE",
+                    line_number=line_number,
+                    record_id=None,
+                    disposition=DiagnosticDisposition.WARNING,
+                    safe_summary="ROW_PRESERVED_AS_VARIANT",
+                )
+            )
+        valid_count += 1
     if row_count == 0:
         raise MigrationPreflightError("MIGRATION.SOURCE_EMPTY")
     return MigrationPreflight(
@@ -6611,6 +7250,33 @@ def _iter_draft_pairs(
         raise MigrationPreflightError(
             "MIGRATION.SOURCE_UNREADABLE"
         ) from error
+
+
+def _iter_portable_draft_pairs(
+    source: _PortableRootedRead,
+    observation: _StreamingBuildObservation,
+) -> Iterator[tuple[TMRecordDraft, int | None]]:
+    """Re-stream one rooted source into the shared mutable-stage builder."""
+
+    try:
+        for line_number, raw_line in enumerate(source.iter_lines(), start=1):
+            observation.digest.update(raw_line)
+            rejection_code, payload = _classify_jsonl_line(raw_line)
+            if rejection_code is not None:
+                observation.invalid_count += 1
+                continue
+            row = cast(dict[str, object], payload)
+            source_raw = cast(str, row["source"])
+            prior_count = observation.source_counts.get(source_raw, 0)
+            observation.source_counts[source_raw] = prior_count + 1
+            if prior_count == 1:
+                observation.duplicate_source_count += 1
+            if prior_count >= 1:
+                observation.variant_count += 1
+            observation.valid_count += 1
+            yield (_draft_from_jsonl(row), line_number)
+    except PlatformFileError as error:
+        raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED") from error
 
 
 def _observation_matches(
@@ -7182,6 +7848,20 @@ class _InitialActivationResourceReservation:
             "caller_borrow": borrow,
         }
 
+    def open_portable_rooted_read(
+        self,
+        path: Path,
+        *,
+        unavailable_code: str,
+    ) -> _PortableRootedRead:
+        """Open one resource member relative to this reservation's root."""
+
+        return _PortableRootedRead.open(
+            self,
+            path,
+            unavailable_code=unavailable_code,
+        )
+
     def portable_recovery_inputs(self) -> dict[str, object]:
         """Mint one fresh v3 cancellation borrow from the held W1 owner."""
 
@@ -7195,9 +7875,37 @@ class _InitialActivationResourceReservation:
             raise _InitialActivationReservationError(
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
             )
+        result = self._mint_portable_recovery_inputs()
+        self._recovery_borrow_minted = True
+        return result
+
+    def portable_replacement_recovery_inputs(self) -> dict[str, object]:
+        """Mint a fresh single-claim replacement recovery borrow under W1.
+
+        Explicit replacement may need one pre-arm recovery and one post-fault
+        recovery in the same serialized operation.  Each call mints a distinct
+        single-claim borrow, while the retained root and lease remain exactly
+        the same reservation authority.
+        """
+
+        if (
+            self._backend is None
+            or self._root is None
+            or self._lease is None
+            or self._released
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        return self._mint_portable_recovery_inputs()
+
+    def _mint_portable_recovery_inputs(self) -> dict[str, object]:
         self.reprove()
         try:
             probe_root = self._identity.canonical_sidecar_path.parent
+            assert self._backend is not None
+            assert self._root is not None
+            assert self._lease is not None
             persistent_private = narrow_windows_persistent_private_proof(
                 self._backend,
                 probe_root,
@@ -7240,7 +7948,6 @@ class _InitialActivationResourceReservation:
                 "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
                 retryable=False,
             ) from error
-        self._recovery_borrow_minted = True
         return {
             "platform": self._backend,
             "persistent_private": persistent_private,

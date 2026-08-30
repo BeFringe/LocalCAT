@@ -238,6 +238,13 @@
   - 完成时，成功消歧产生新 generation，失败路径不改变三方资产且 last-known-good canonical 继续服务
   - _Requirements: 2.13, 7.5, 7.12, 7.13, 7.14_
 
+- [x] 5.10a 将 Windows 显式 import/rebuild 接入同一 resource activation owner
+  - source rooted preflight取得caller-held resource root与W1 lease，以fresh portable stage、完整索引和sealed candidate进入replacement activation；不得使用pathname重开、operation-local锁或POSIX fallback代替平台authority。
+  - prior `N`到candidate `N+1`复用5.8a冷恢复与5.9a mutation/foreign fail-stop合同；DB/manifest分别经`REPLACE_UNDER_LOCK`与`PendingPublication`闭合，只有terminal `N+1/READY`更新binding、采用新store id并清除divergence。
+  - 任一验证、publication、owner phase或terminal失败只能得到完整prior、完整new或recovery-required；原JSONL与外来对象保持不变，programmer error继续穿透公开seam。本任务限定显式import/rebuild，schema upgrade保持独立后续边界。
+  - _Amendment: WA-06_
+  - _Depends: 5.6a-5.10, windows-platform-enablement 3.7a, 3.7b_
+
 - [x] 5.11 实现 schema upgrade 的复制切换
   - 升级先创建一致快照备份，再在 fresh mutable copy 中迁移 schema、重建完整索引并复用 seal/activate
   - 不原地破坏唯一可用副本，保存升级前后版本、generation 与恢复证据
