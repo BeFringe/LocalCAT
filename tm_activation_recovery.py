@@ -2818,14 +2818,19 @@ def _recover_activation_indexes(
 def _recovery_receipt_row(
     port: _StoreValidationPort,
     connection: sqlite3.Connection,
+    *,
+    expected_snapshot_id: str,
 ) -> tuple[SnapshotReceipt, str]:
-    """Read exactly one receipt ledger row; fail closed otherwise."""
+    """Read the exact activation receipt, never arbitrary export history."""
 
+    if type(expected_snapshot_id) is not str or not expected_snapshot_id:
+        raise TypeError("expected_snapshot_id must be a non-empty string")
     rows = connection.execute(
         "SELECT snapshot_id, resource_id, canonical_store_id, "
         "exported_revision, jsonl_digest, record_count, format_version, "
         "destination_jsonl_path, destination_manifest_path, status "
-        "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+        (expected_snapshot_id,),
     ).fetchall()
     if len(rows) != 1:
         raise port.store_schema_error("STORE.RECEIPT_INVALID")
@@ -3631,8 +3636,10 @@ def _revalidate_discovered_active_set(
                         "STORE.ACTIVE_BINDING_INVALID"
                     )
                 binding = facts.binding
-                receipt_row, receipt_status = _recovery_receipt_row(port,
-                    connection
+                receipt_row, receipt_status = _recovery_receipt_row(
+                    port,
+                    connection,
+                    expected_snapshot_id=binding.receipt.snapshot_id,
                 )
                 if (
                     receipt_status != "completed"
@@ -3751,8 +3758,10 @@ def _complete_recovered_receipt(
                         raise port.store_schema_error(
                             "STORE.ACTIVATION_STATE_INVALID"
                         )
-                    receipt, receipt_status = _recovery_receipt_row(port,
-                        connection
+                    receipt, receipt_status = _recovery_receipt_row(
+                        port,
+                        connection,
+                        expected_snapshot_id=record.new_receipt_id,
                     )
                     if receipt_status != "issued":
                         raise port.store_schema_error("STORE.RECEIPT_INVALID")
@@ -3851,6 +3860,7 @@ def _complete_recovered_receipt(
                     receipt, receipt_status = _recovery_receipt_row(
                         port,
                         connection,
+                        expected_snapshot_id=record.new_receipt_id,
                     )
                     if (
                         port.meta_int(meta, "generation") != next_generation
@@ -3924,7 +3934,11 @@ def _complete_recovered_manifest(
     ) as connection:
         connection.execute("BEGIN")
         try:
-            receipt, receipt_status = _recovery_receipt_row(port, connection)
+            receipt, receipt_status = _recovery_receipt_row(
+                port,
+                connection,
+                expected_snapshot_id=record.new_receipt_id,
+            )
             if receipt_status != "completed":
                 raise port.store_schema_error("STORE.RECEIPT_INVALID")
             if (

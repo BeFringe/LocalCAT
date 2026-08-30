@@ -259,7 +259,7 @@
   - 完成时，export→migrate 的逐字段、变体和 exact winner parity 通过，报告绑定 canonical revision 与 snapshot receipt
   - _Requirements: 2.3, 2.7, 2.8, 2.13, 3.1, 3.2, 3.3, 7.10, 7.11_
 
-- [ ] 5.12a 将 snapshot export family 接入 Windows bound publication
+- [x] 5.12a 将 snapshot export family 接入 Windows bound publication
   - arm前必须按`WindowsDocumentedPublishV1`证明目标位于受支持的local fixed NTFS并具备write-through/flush、handle-bound naming与retained readback能力；缺失时不得进入export业务phase或产生命名mutation。
   - JSONL、adjacent manifest、receipt/ledger 与 temporary family 在同一 destination binding 和 process lock 下发布；每个replace均按`begin_publish → PendingPublication retained readback → owner durable receipt/ledger phase + family business reproof → terminal_reproof → close`闭合，所有family成员终态成立前不得返回成功。
   - 外来目标、锁冲突、readback、owner durable phase、business reproof或terminal reproof失败均保持active binding不变并进入既有recovery分类。

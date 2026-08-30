@@ -111,7 +111,13 @@ from platform_fs import (
     narrow_windows_persistent_private_proof,
 )
 from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    BoundRegularFile,
+    CandidateContentFacts,
+    CandidateFile,
+    EntrySnapshot,
     ExistingFileRetirement,
+    FileObjectIdentity,
     LockLease,
     LockPolicy,
     LockWait,
@@ -119,6 +125,9 @@ from platform_fs_contracts import (
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
+    PendingPublication,
+    PublishFacts,
+    PublishMode,
     LockedDescendantNamespaceInspection,
     RetainedRetirement,
     RetirementDirectoryAuthority,
@@ -129,6 +138,35 @@ from platform_fs_contracts import (
 
 _NATIVE_PATH_TYPE = type(Path())
 MIGRATION_STREAM_CHUNK_SIZE = 20_000
+_BOUND_EXPORT_LOCK_PREFIX = b"localcat.tm.export-family.lock.v1\0"
+_MAX_BOUND_EXPORT_BYTES = (1 << 63) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundExportPrior:
+    snapshot: EntrySnapshot | None
+    digest: str | None
+
+    def __post_init__(self) -> None:
+        if self.snapshot is None:
+            if self.digest is not None:
+                raise ValueError("absent export prior cannot have a digest")
+            return
+        if type(self.snapshot) is not EntrySnapshot:
+            raise TypeError("export prior snapshot must be exact")
+        if type(self.digest) is not str or len(self.digest) != 64:
+            raise TypeError("export prior digest must be exact SHA-256")
+
+
+@dataclass(slots=True)
+class _BoundExportPublication:
+    name: str
+    candidate_name: str
+    content: CandidateContentFacts
+    candidate_identity: FileObjectIdentity
+    candidate: CandidateFile | None = None
+    pending: PendingPublication | None = None
+
 
 
 def _sealed_source_binding_digest(binding: SnapshotBinding) -> str:
@@ -363,6 +401,24 @@ def _is_initial_activation_operational_error(error: Exception) -> bool:
 
 ExportPreflightError = snapshot_artifacts_module.ExportPreflightError
 """ExportPreflightError late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
+
+
+class _BoundCandidateCleanupRequired(ExportPreflightError):
+    """One deterministic candidate remains without proven exact cleanup."""
+
+    __slots__ = ("candidate_identity", "cleanup_stage")
+
+    def __init__(
+        self,
+        *,
+        candidate_identity: FileObjectIdentity | None,
+        cleanup_stage: str,
+    ) -> None:
+        super().__init__("EXPORT.RECOVERY_REQUIRED")
+        self.candidate_identity = candidate_identity
+        self.cleanup_stage = cleanup_stage
+
+
 _ExportArtifactPaths = snapshot_artifacts_module._ExportArtifactPaths
 """_ExportArtifactPaths late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 def _export_artifact_paths(destination: Path) -> _ExportArtifactPaths:
@@ -391,6 +447,720 @@ def _export_path_in_authority_family(
         identity=identity,
         path=path,
     )
+
+
+def _require_bound_export_path(
+    identity: CanonicalResourceIdentity,
+    paths: _ExportArtifactPaths,
+) -> None:
+    """Validate one arbitrary export family before binding its parent."""
+
+    family = (
+        paths.destination,
+        paths.manifest,
+        paths.jsonl_temp,
+        paths.manifest_temp,
+        paths.jsonl_recovery,
+        paths.manifest_recovery,
+    )
+    if any("\x00" in path.name for path in family):
+        raise ExportPreflightError("EXPORT.DESTINATION_UNSAFE")
+    if any(
+        type(path) is not _NATIVE_PATH_TYPE
+        or not path.is_absolute()
+        or path.parent != paths.destination.parent
+        or not path.name
+        or any(part == ".." for part in path.parts)
+        for path in family
+    ):
+        raise ExportPreflightError("EXPORT.PATH_INVALID")
+    if len(set(family)) != len(family):
+        raise ExportPreflightError("EXPORT.PATH_INVALID")
+    authority_paths = _export_authority_paths(identity)
+    if any(
+        path in authority_paths
+        or _export_path_in_authority_family(identity, path)
+        for path in family
+    ):
+        raise ExportPreflightError("EXPORT.PATH_ALIASED")
+
+
+def _bound_export_lock_name(destination_name: str) -> str:
+    del destination_name
+    return ".localcat-tm-export-family.lock"
+
+
+def _bound_export_lock_payload(destination_name: str) -> bytes:
+    del destination_name
+    return _BOUND_EXPORT_LOCK_PREFIX + b"parent-family-v1"
+
+
+def _require_bound_export_snapshot(
+    snapshot: EntrySnapshot | None,
+    unsafe_code: str,
+) -> None:
+    if snapshot is not None and (
+        snapshot.identity.kind != "regular"
+        or snapshot.identity.link_count != 1
+        or not snapshot.reparse_free
+    ):
+        raise ExportPreflightError(unsafe_code)
+
+
+def _capture_bound_export_prior(
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority,
+    parent: BoundDirectoryAuthority,
+    name: str,
+    *,
+    unsafe_code: str,
+) -> _BoundExportPrior:
+    observed = parent.inspect_entry(name)
+    _require_bound_export_snapshot(observed, unsafe_code)
+    if observed is None:
+        return _BoundExportPrior(None, None)
+    opened = backend.open_regular(root, PurePath(name))
+    active_error: BaseException | None = None
+    try:
+        facts = opened.content_facts()
+        if facts.snapshot != observed or parent.inspect_entry(name) != observed:
+            raise ExportPreflightError(unsafe_code)
+        return _BoundExportPrior(observed, facts.content_sha256.hex())
+    except BaseException as error:
+        active_error = error
+        raise
+    finally:
+        close_error = _close_bound_export_authorities(opened)
+        if active_error is None and close_error is not None:
+            raise close_error
+
+
+def _try_bound_export_digest(
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority | None,
+    parent: BoundDirectoryAuthority | None,
+    name: str,
+) -> str | None:
+    if root is None or parent is None or root.closed or parent.closed:
+        return None
+    opened: BoundRegularFile | None = None
+    try:
+        observed = parent.inspect_entry(name)
+        _require_bound_export_snapshot(observed, "EXPORT.DESTINATION_UNSAFE")
+        if observed is None:
+            return None
+        opened = backend.open_regular(root, PurePath(name))
+        facts = opened.content_facts()
+        if facts.snapshot != observed or parent.inspect_entry(name) != observed:
+            return None
+        return facts.content_sha256.hex()
+    except (ExportPreflightError, PlatformFileError):
+        return None
+    finally:
+        if opened is not None:
+            try:
+                opened.close()
+            except PlatformFileError:
+                pass
+
+
+def _bound_export_platform_error(error: PlatformFileError) -> ExportPreflightError:
+    if error.code == PlatformFileErrorCode.LOCK_CONTENDED.value:
+        return ExportPreflightError("EXPORT.LOCK_CONTENDED")
+    if error.code == PlatformFileErrorCode.LOCK_UNAVAILABLE.value:
+        return ExportPreflightError("EXPORT.LOCK_UNAVAILABLE")
+    if error.code == PlatformFileErrorCode.DURABILITY_UNAVAILABLE.value:
+        return ExportPreflightError("EXPORT.DURABILITY_UNAVAILABLE")
+    if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+        return ExportPreflightError("EXPORT.RECOVERY_REQUIRED")
+    if error.code in {
+        PlatformFileErrorCode.IDENTITY_STALE.value,
+        PlatformFileErrorCode.REPARSE_REJECTED.value,
+        PlatformFileErrorCode.OUTSIDE_ROOT.value,
+        PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+    }:
+        return ExportPreflightError("EXPORT.DESTINATION_UNSAFE")
+    return ExportPreflightError("EXPORT.CAPABILITY_UNAVAILABLE")
+
+
+def _close_bound_export_authorities(
+    *authorities: object | None,
+) -> BaseException | None:
+    first_error: BaseException | None = None
+    for authority in authorities:
+        if authority is None or not hasattr(authority, "close"):
+            continue
+        try:
+            authority.close()  # type: ignore[attr-defined]
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    return first_error
+
+
+def _bound_export_chunks(payload: bytes) -> Iterator[bytes]:
+    for offset in range(0, len(payload), 64 * 1024):
+        yield payload[offset : offset + 64 * 1024]
+
+
+def _bound_export_jsonl_chunks(records: tuple[object, ...]) -> Iterator[bytes]:
+    for item in records:
+        payload = (
+            json.dumps(
+                _export_jsonl_row(item),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        yield from _bound_export_chunks(payload)
+
+
+def _cleanup_failed_bound_candidate(
+    parent: BoundDirectoryAuthority,
+    name: str,
+    candidate: CandidateFile | None,
+    identity: FileObjectIdentity | None,
+) -> _BoundCandidateCleanupRequired | None:
+    """Close and unlink one unissued candidate only with exact ownership.
+
+    A close failure does not replace an already-active build failure.  Exact
+    unlink plus absence reproof may still prove cleanup.  Otherwise the
+    deterministic candidate and its captured identity remain structured in a
+    recovery-required failure; no name-only deletion is attempted.
+    """
+
+    close_error = _close_bound_export_authorities(candidate)
+    try:
+        observed = parent.inspect_entry(name)
+        if observed is None:
+            return None
+        if identity is None or observed.identity != identity:
+            return _BoundCandidateCleanupRequired(
+                candidate_identity=identity,
+                cleanup_stage=(
+                    "IDENTITY_UNAVAILABLE"
+                    if identity is None
+                    else "IDENTITY_CHANGED"
+                ),
+            )
+        parent.unlink_owned(name, identity)
+        if parent.inspect_entry(name) is not None:
+            return _BoundCandidateCleanupRequired(
+                candidate_identity=identity,
+                cleanup_stage="ABSENCE_UNPROVEN",
+            )
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            raise
+        return _BoundCandidateCleanupRequired(
+            candidate_identity=identity,
+            cleanup_stage=(
+                "CLOSE_AND_UNLINK_UNPROVEN"
+                if close_error is not None
+                else "UNLINK_UNPROVEN"
+            ),
+        )
+    return None
+
+
+def _bound_candidate_from_chunks(
+    parent: BoundDirectoryAuthority,
+    name: str,
+    chunks: Iterator[bytes],
+    *,
+    maximum_bytes: int,
+) -> tuple[CandidateFile, CandidateContentFacts, FileObjectIdentity]:
+    candidate: CandidateFile | None = None
+    identity: FileObjectIdentity | None = None
+    try:
+        candidate = parent.create_candidate(name, private=False)
+        identity = candidate.identity()
+        facts = candidate.write_chunks(chunks, maximum_bytes=maximum_bytes)
+        candidate.flush_content()
+        return candidate, facts, identity
+    except BaseException as error:
+        cleanup_error = _cleanup_failed_bound_candidate(
+            parent,
+            name,
+            candidate,
+            identity,
+        )
+        if cleanup_error is not None:
+            if not isinstance(error, Exception):
+                raise
+            raise cleanup_error from error
+        raise
+
+
+def _bound_candidate_from_opened(
+    parent: BoundDirectoryAuthority,
+    name: str,
+    source: BoundRegularFile,
+    snapshot: EntrySnapshot,
+) -> tuple[CandidateFile, CandidateContentFacts, FileObjectIdentity]:
+    def chunks() -> Iterator[bytes]:
+        offset = 0
+        while offset < snapshot.byte_count:
+            size = min(64 * 1024, snapshot.byte_count - offset)
+            payload = source.read_at(offset, size, snapshot)
+            offset += len(payload)
+            yield payload
+        if source.snapshot() != snapshot:
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+
+    return _bound_candidate_from_chunks(
+        parent,
+        name,
+        chunks(),
+        maximum_bytes=snapshot.byte_count,
+    )
+
+
+def _bound_publish_mode(prior: _BoundExportPrior) -> PublishMode:
+    return (
+        PublishMode.CREATE_IF_ABSENT
+        if prior.snapshot is None
+        else PublishMode.REPLACE_UNDER_LOCK
+    )
+
+
+def _bound_publish_candidate(
+    parent: BoundDirectoryAuthority,
+    lease: LockLease,
+    publication: _BoundExportPublication,
+    prior: _BoundExportPrior,
+) -> PendingPublication:
+    mode = _bound_publish_mode(prior)
+    candidate = publication.candidate
+    if not isinstance(candidate, CandidateFile):
+        raise TypeError("bound publication candidate is unavailable")
+    try:
+        pending = parent.begin_publish(
+            candidate,
+            publication.name,
+            mode=mode,
+            lease=lease if mode is PublishMode.REPLACE_UNDER_LOCK else None,
+        )
+    finally:
+        publication.candidate = None
+    publication.pending = pending
+    return pending
+
+
+def _copy_bound_export_prior(
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority,
+    parent: BoundDirectoryAuthority,
+    source_name: str,
+    recovery_name: str,
+    prior: _BoundExportPrior,
+) -> tuple[
+    FileObjectIdentity | None,
+    PendingPublication | None,
+    BaseException | None,
+]:
+    if prior.snapshot is None:
+        return None, None, None
+    if parent.inspect_entry(recovery_name) is not None:
+        raise ExportPreflightError("EXPORT.RECOVERY_CONFLICT")
+    source = backend.open_regular(root, PurePath(source_name))
+    pending: PendingPublication | None = None
+    published_identity: FileObjectIdentity | None = None
+    try:
+        facts = source.content_facts()
+        if (
+            facts.snapshot != prior.snapshot
+            or facts.content_sha256.hex() != prior.digest
+            or parent.inspect_entry(source_name) != prior.snapshot
+        ):
+            raise ExportPreflightError("EXPORT.DESTINATION_STALE")
+        candidate, copied, candidate_identity = _bound_candidate_from_opened(
+            parent,
+            recovery_name,
+            source,
+            prior.snapshot,
+        )
+        if (
+            copied.byte_count != prior.snapshot.byte_count
+            or copied.content_sha256 != facts.content_sha256
+        ):
+            mismatch = ExportPreflightError("EXPORT.RECOVERY_COPY_FAILED")
+            cleanup_error = _cleanup_failed_bound_candidate(
+                parent,
+                recovery_name,
+                candidate,
+                candidate_identity,
+            )
+            if cleanup_error is not None:
+                raise cleanup_error from mismatch
+            raise mismatch
+        pending = parent.begin_publish(
+            candidate,
+            recovery_name,
+            mode=PublishMode.CREATE_IF_ABSENT,
+            lease=None,
+        )
+        published = pending.preliminary_facts()
+        retained = pending.retained_destination().content_facts()
+        if (
+            published.content_sha256 != facts.content_sha256
+            or retained.content_sha256 != facts.content_sha256
+            or retained.snapshot.identity != published.destination_identity
+            or parent.inspect_entry(recovery_name) != retained.snapshot
+        ):
+            raise ExportPreflightError("EXPORT.RECOVERY_COPY_FAILED")
+        published_identity = published.destination_identity
+    except BaseException:
+        _close_bound_export_authorities(pending, source)
+        raise
+    close_error = _close_bound_export_authorities(source)
+    return published_identity, pending, close_error
+
+
+def _cleanup_bound_export_artifacts(
+    parent: BoundDirectoryAuthority,
+    artifacts: tuple[tuple[str, FileObjectIdentity | None], ...],
+) -> None:
+    for name, identity in artifacts:
+        if identity is None:
+            continue
+        observed = parent.inspect_entry(name)
+        if observed is None:
+            continue
+        if observed.identity != identity:
+            raise ExportPreflightError("EXPORT.RECOVERY_REQUIRED")
+        parent.unlink_owned(name, identity)
+        if parent.inspect_entry(name) is not None:
+            raise ExportPreflightError("EXPORT.RECOVERY_REQUIRED")
+
+
+def _reprove_bound_export_pending(
+    parent: BoundDirectoryAuthority,
+    pending: PendingPublication,
+    name: str,
+    *,
+    expected_identity: FileObjectIdentity,
+    expected_digest: str,
+    expected_byte_count: int,
+) -> None:
+    facts = pending.preliminary_facts()
+    retained = pending.retained_destination().content_facts()
+    if (
+        facts.destination_identity != expected_identity
+        or facts.content_sha256.hex() != expected_digest
+        or facts.byte_count != expected_byte_count
+        or not facts.reparse_free
+        or retained.snapshot.identity != expected_identity
+        or retained.snapshot.byte_count != expected_byte_count
+        or retained.content_sha256 != facts.content_sha256
+        or parent.inspect_entry(name) != retained.snapshot
+    ):
+        raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
+
+
+def _after_bound_export_rollback_unlink(name: str) -> None:
+    """Test seam after exact final removal and before create-if-absent restore."""
+
+    del name
+
+
+def _restore_bound_export_member(
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority,
+    parent: BoundDirectoryAuthority,
+    publication: _BoundExportPublication,
+    prior: _BoundExportPrior,
+    recovery_name: str,
+) -> PendingPublication | None:
+    current = parent.inspect_entry(publication.name)
+    if current is not None and current.identity == publication.candidate_identity:
+        parent.unlink_owned(publication.name, publication.candidate_identity)
+        if parent.inspect_entry(publication.name) is not None:
+            raise ExportPreflightError("EXPORT.RECOVERY_REQUIRED")
+        _after_bound_export_rollback_unlink(publication.name)
+        if parent.inspect_entry(publication.name) is not None:
+            raise ExportPreflightError("EXPORT.RECOVERY_REQUIRED")
+        if prior.snapshot is None:
+            return None
+
+        def restore_prior() -> PendingPublication:
+            recovery = backend.open_regular(root, PurePath(recovery_name))
+            active_error: BaseException | None = None
+            rollback: PendingPublication | None = None
+            try:
+                recovery_facts = recovery.content_facts()
+                if (
+                    recovery_facts.content_sha256.hex() != prior.digest
+                    or recovery_facts.snapshot.byte_count
+                    != prior.snapshot.byte_count
+                    or parent.inspect_entry(recovery_name)
+                    != recovery_facts.snapshot
+                ):
+                    raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+                candidate, copied, candidate_identity = (
+                    _bound_candidate_from_opened(
+                        parent,
+                        publication.candidate_name,
+                        recovery,
+                        recovery_facts.snapshot,
+                    )
+                )
+                if copied.content_sha256 != recovery_facts.content_sha256:
+                    mismatch = ExportPreflightError("EXPORT.RESTORE_FAILED")
+                    cleanup_error = _cleanup_failed_bound_candidate(
+                        parent,
+                        publication.candidate_name,
+                        candidate,
+                        candidate_identity,
+                    )
+                    if cleanup_error is not None:
+                        raise cleanup_error from mismatch
+                    raise mismatch
+                try:
+                    rollback = parent.begin_publish(
+                        candidate,
+                        publication.name,
+                        mode=PublishMode.CREATE_IF_ABSENT,
+                        lease=None,
+                    )
+                except BaseException as error:
+                    cleanup_error = _cleanup_failed_bound_candidate(
+                        parent,
+                        publication.candidate_name,
+                        None,
+                        candidate_identity,
+                    )
+                    if cleanup_error is not None:
+                        if not isinstance(error, Exception):
+                            raise
+                        raise cleanup_error from error
+                    raise
+                facts = rollback.preliminary_facts()
+                retained = rollback.retained_destination().content_facts()
+                if (
+                    facts.content_sha256 != recovery_facts.content_sha256
+                    or retained.content_sha256
+                    != recovery_facts.content_sha256
+                    or parent.inspect_entry(publication.name)
+                    != retained.snapshot
+                ):
+                    raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+                return rollback
+            except BaseException as error:
+                active_error = error
+                raise
+            finally:
+                close_error = _close_bound_export_authorities(recovery)
+                if active_error is None and close_error is not None:
+                    _close_bound_export_authorities(rollback)
+                    raise close_error
+
+        try:
+            return restore_prior()
+        except (ExportPreflightError, PlatformFileError) as error:
+            if getattr(error, "error_code", None) == "EXPORT.RECOVERY_REQUIRED":
+                raise
+            raise ExportPreflightError("EXPORT.RECOVERY_REQUIRED") from error
+    if current == prior.snapshot:
+        return None
+    raise ExportPreflightError("EXPORT.RECOVERY_REQUIRED")
+
+
+def _restore_bound_export_family(
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority,
+    parent: BoundDirectoryAuthority,
+    lease: LockLease,
+    members: tuple[
+        tuple[_BoundExportPublication | None, _BoundExportPrior, str], ...
+    ],
+    *,
+    recovery_members: tuple[
+        tuple[
+            PendingPublication | None,
+            _BoundExportPrior,
+            str,
+            FileObjectIdentity | None,
+        ],
+        ...,
+    ],
+    cancel: Callable[[], None],
+) -> None:
+    try:
+        _restore_bound_export_family_unchecked(
+            backend,
+            root,
+            parent,
+            lease,
+            members,
+            recovery_members=recovery_members,
+            cancel=cancel,
+        )
+    except (
+        ExportPreflightError,
+        PlatformFileError,
+        SQLiteStoreLifecycleError,
+        SQLiteStoreSchemaError,
+        sqlite3.DatabaseError,
+    ) as error:
+        if (
+            isinstance(error, ExportPreflightError)
+            and error.error_code == "EXPORT.RECOVERY_REQUIRED"
+        ):
+            raise
+        raise ExportPreflightError("EXPORT.RECOVERY_REQUIRED") from error
+
+
+def _restore_bound_export_family_unchecked(
+    backend: PlatformFileBackend,
+    root: RootedDirectoryAuthority,
+    parent: BoundDirectoryAuthority,
+    lease: LockLease,
+    members: tuple[
+        tuple[_BoundExportPublication | None, _BoundExportPrior, str], ...
+    ],
+    *,
+    recovery_members: tuple[
+        tuple[
+            PendingPublication | None,
+            _BoundExportPrior,
+            str,
+            FileObjectIdentity | None,
+        ],
+        ...,
+    ],
+    cancel: Callable[[], None],
+) -> None:
+    lease.reprove()
+    root.reprove()
+    parent.reprove()
+    restored_pendings: list[PendingPublication] = []
+    restored_by_name: dict[str, PendingPublication] = {}
+    published_pendings = [
+        publication.pending
+        for publication, _, _ in members
+        if publication is not None and publication.pending is not None
+    ]
+    recovery_pendings = [
+        pending
+        for pending, _, _, _ in recovery_members
+        if pending is not None
+    ]
+    try:
+        for pending in published_pendings:
+            if pending.terminal_reproof() != pending.preliminary_facts():
+                raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+        published_close_error = _close_bound_export_authorities(
+            *published_pendings
+        )
+        for publication, _, _ in members:
+            if publication is not None:
+                publication.pending = None
+        if published_close_error is not None:
+            raise published_close_error
+        published_pendings.clear()
+        for publication, prior, recovery_name in members:
+            if publication is None:
+                continue
+            pending = _restore_bound_export_member(
+                backend,
+                root,
+                parent,
+                publication,
+                prior,
+                recovery_name,
+            )
+            if pending is not None:
+                restored_pendings.append(pending)
+                restored_by_name[publication.name] = pending
+
+        def reprove_prior_family() -> None:
+            lease.reprove()
+            root.reprove()
+            parent.reprove()
+            for publication, prior, _ in members:
+                if publication is None:
+                    continue
+                observed = parent.inspect_entry(publication.name)
+                if prior.snapshot is None:
+                    if observed is not None:
+                        raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+                    continue
+                restored = restored_by_name.get(publication.name)
+                if restored is not None:
+                    assert prior.digest is not None
+                    _reprove_bound_export_pending(
+                        parent,
+                        restored,
+                        publication.name,
+                        expected_identity=(
+                            restored.preliminary_facts().destination_identity
+                        ),
+                        expected_digest=prior.digest,
+                        expected_byte_count=prior.snapshot.byte_count,
+                    )
+                else:
+                    if observed != prior.snapshot:
+                        raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+                    current = backend.open_regular(
+                        root,
+                        PurePath(publication.name),
+                    )
+                    active_error: BaseException | None = None
+                    try:
+                        facts = current.content_facts()
+                        if (
+                            facts.snapshot != prior.snapshot
+                            or facts.content_sha256.hex() != prior.digest
+                        ):
+                            raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+                    except BaseException as error:
+                        active_error = error
+                        raise
+                    finally:
+                        close_error = _close_bound_export_authorities(current)
+                        if active_error is None and close_error is not None:
+                            raise close_error
+            for pending, prior, name, recovery_identity in recovery_members:
+                if prior.snapshot is None:
+                    if pending is not None or recovery_identity is not None:
+                        raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+                    continue
+                if pending is None or recovery_identity is None:
+                    raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+                assert prior.digest is not None
+                _reprove_bound_export_pending(
+                    parent,
+                    pending,
+                    name,
+                    expected_identity=recovery_identity,
+                    expected_digest=prior.digest,
+                    expected_byte_count=prior.snapshot.byte_count,
+                )
+
+        reprove_prior_family()
+        cancel()
+        reprove_prior_family()
+        terminal_pendings = restored_pendings + recovery_pendings
+        for pending in terminal_pendings:
+            if pending.terminal_reproof() != pending.preliminary_facts():
+                raise ExportPreflightError("EXPORT.RESTORE_FAILED")
+        close_error = _close_bound_export_authorities(*terminal_pendings)
+        restored_pendings.clear()
+        recovery_pendings.clear()
+        if close_error is not None:
+            raise close_error
+    finally:
+        _close_bound_export_authorities(
+            *published_pendings,
+            *restored_pendings,
+            *recovery_pendings,
+        )
 
 def _artifact_parent_identity(destination: Path) -> tuple[int, int]:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
@@ -2510,6 +3280,8 @@ class TMMigrationService:
 
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be exact SQLiteTMStore")
+        if type(destination) is not _NATIVE_PATH_TYPE:
+            raise TypeError("destination must be an exact native Path")
         return self._run_arbitrary_export(store, destination)
 
     def refresh_configured_snapshot(
@@ -2755,11 +3527,663 @@ class TMMigrationService:
                 retryable=_recovery_retryable(error),
             )
 
+    def _run_bound_arbitrary_export(
+        self,
+        store: SQLiteTMStore,
+        destination: Path,
+        backend: PlatformFileBackend,
+    ) -> ExportOutcome:
+        """Run one Windows export family through neutral rooted ports."""
+
+        paths = _export_artifact_paths(destination)
+        root: RootedDirectoryAuthority | None = None
+        parent: BoundDirectoryAuthority | None = None
+        lease: LockLease | None = None
+        destination_prior = _BoundExportPrior(None, None)
+        manifest_prior = _BoundExportPrior(None, None)
+        try:
+            _require_bound_export_path(self._resource_identity, paths)
+            try:
+                root = backend.bind_root(destination.parent)
+                parent = backend.bind_parent(
+                    root,
+                    PurePath(destination.name),
+                )
+            except PlatformFileError as error:
+                raise ExportPreflightError("EXPORT.PARENT_UNSAFE") from error
+            lease = backend.acquire(
+                parent,
+                _bound_export_lock_name(destination.name),
+                _bound_export_lock_payload(destination.name),
+                LockPolicy(LockWait.BLOCK),
+            )
+            lease.reprove()
+            root.reprove()
+            parent.reprove()
+            destination_prior = _capture_bound_export_prior(
+                backend,
+                root,
+                parent,
+                paths.destination.name,
+                unsafe_code="EXPORT.DESTINATION_UNSAFE",
+            )
+            manifest_prior = _capture_bound_export_prior(
+                backend,
+                root,
+                parent,
+                paths.manifest.name,
+                unsafe_code="EXPORT.MANIFEST_UNSAFE",
+            )
+            if destination_prior.snapshot is None and manifest_prior.snapshot is not None:
+                raise ExportPreflightError("EXPORT.PAIR_INCONSISTENT")
+            for artifact, code in (
+                (paths.jsonl_temp, "EXPORT.TEMP_CONFLICT"),
+                (paths.manifest_temp, "EXPORT.TEMP_CONFLICT"),
+                (paths.jsonl_recovery, "EXPORT.RECOVERY_CONFLICT"),
+                (paths.manifest_recovery, "EXPORT.RECOVERY_CONFLICT"),
+            ):
+                if parent.inspect_entry(artifact.name) is not None:
+                    raise ExportPreflightError(code)
+            snapshot = store.capture_export_snapshot()
+            if (
+                snapshot.revision.resource_id
+                != self._resource_identity.resource_id
+                or snapshot.revision.canonical_store_id
+                != self._canonical_store_id
+            ):
+                raise ExportPreflightError("EXPORT.STORE_IDENTITY_MISMATCH")
+            outcome = self._publish_bound_export_snapshot(
+                store,
+                backend=backend,
+                root=root,
+                parent=parent,
+                lease=lease,
+                snapshot=snapshot,
+                paths=paths,
+                destination_prior=destination_prior,
+                manifest_prior=manifest_prior,
+            )
+            close_error = _close_bound_export_authorities(lease, parent, root)
+            lease = None
+            parent = None
+            root = None
+            if close_error is not None and isinstance(outcome, ExportReport):
+                return export_cleanup_pending_failure(
+                    stage="EXPORT.LEDGER",
+                    destination_before=destination_prior.digest,
+                    destination_observed=outcome.destination_digest,
+                    diagnostics=(
+                        _export_diagnostic(
+                            "EXPORT.CLEANUP_PENDING",
+                            "EXPORT_AUTHORITY_CLOSE_FAILED",
+                        ),
+                    ),
+                )
+            return outcome
+        except (
+            ExportPreflightError,
+            PlatformFileError,
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            observed = _try_bound_export_digest(
+                backend,
+                root,
+                parent,
+                destination.name,
+            )
+            normalized = (
+                _bound_export_platform_error(error)
+                if isinstance(error, PlatformFileError)
+                else error
+            )
+            return self._export_failure(
+                normalized,
+                stage_label="EXPORT.PREFLIGHT",
+                destination_before=destination_prior.digest,
+                destination_observed=observed,
+            )
+        finally:
+            _close_bound_export_authorities(lease, parent, root)
+
+    def _publish_bound_export_snapshot(
+        self,
+        store: SQLiteTMStore,
+        *,
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        parent: BoundDirectoryAuthority,
+        lease: LockLease,
+        snapshot: CanonicalExportSnapshot,
+        paths: _ExportArtifactPaths,
+        destination_prior: _BoundExportPrior,
+        manifest_prior: _BoundExportPrior,
+    ) -> ExportOutcome:
+        """Publish one Windows JSONL/manifest family under live authorities."""
+
+        jsonl_publication: _BoundExportPublication | None = None
+        manifest_publication: _BoundExportPublication | None = None
+        jsonl_recovery_identity: FileObjectIdentity | None = None
+        manifest_recovery_identity: FileObjectIdentity | None = None
+        jsonl_recovery_pending: PendingPublication | None = None
+        manifest_recovery_pending: PendingPublication | None = None
+        receipt: SnapshotReceipt | None = None
+        issued = False
+        registration_attempted = False
+        owner_completed = False
+        completion_ambiguous = False
+        record_count = len(snapshot.records)
+
+        def reprove_family(expected_receipt: SnapshotReceipt) -> None:
+            if receipt is None or expected_receipt != receipt:
+                raise ExportPreflightError("EXPORT.RECEIPT_MISMATCH")
+            if (
+                expected_receipt.jsonl_digest
+                != jsonl_publication.content.content_sha256.hex()
+                or expected_receipt.record_count != record_count
+                or expected_receipt.format_version != SNAPSHOT_FORMAT_VERSION
+            ):
+                raise ExportPreflightError("EXPORT.RECEIPT_MISMATCH")
+            lease.reprove()
+            lease.reprove_binding(
+                parent,
+                _bound_export_lock_name(paths.destination.name),
+                _bound_export_lock_payload(paths.destination.name),
+            )
+            root.reprove()
+            parent.reprove()
+            assert jsonl_publication is not None
+            assert manifest_publication is not None
+            for publication in (jsonl_publication, manifest_publication):
+                pending = publication.pending
+                if pending is None:
+                    raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
+                facts = pending.preliminary_facts()
+                retained = pending.retained_destination()
+                content = retained.content_facts()
+                if (
+                    facts.destination_identity != publication.candidate_identity
+                    or facts.content_sha256 != publication.content.content_sha256
+                    or facts.byte_count != publication.content.byte_count
+                    or not facts.reparse_free
+                    or content.snapshot.identity != facts.destination_identity
+                    or content.snapshot.byte_count != facts.byte_count
+                    or content.content_sha256 != facts.content_sha256
+                    or parent.inspect_entry(publication.name) != content.snapshot
+                ):
+                    raise ExportPreflightError("EXPORT.PUBLISH_VERIFY_FAILED")
+            for pending, prior, name, recovery_identity in (
+                (
+                    jsonl_recovery_pending,
+                    destination_prior,
+                    paths.jsonl_recovery.name,
+                    jsonl_recovery_identity,
+                ),
+                (
+                    manifest_recovery_pending,
+                    manifest_prior,
+                    paths.manifest_recovery.name,
+                    manifest_recovery_identity,
+                ),
+            ):
+                if prior.snapshot is None:
+                    if pending is not None or recovery_identity is not None:
+                        raise ExportPreflightError(
+                            "EXPORT.RECOVERY_COPY_FAILED"
+                        )
+                    continue
+                if pending is None or recovery_identity is None:
+                    raise ExportPreflightError("EXPORT.RECOVERY_COPY_FAILED")
+                assert prior.digest is not None
+                _reprove_bound_export_pending(
+                    parent,
+                    pending,
+                    name,
+                    expected_identity=recovery_identity,
+                    expected_digest=prior.digest,
+                    expected_byte_count=prior.snapshot.byte_count,
+                )
+            manifest_bytes = contract_to_json(
+                SnapshotManifest(
+                    manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                    snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                    receipt=expected_receipt,
+                    receipt_digest=snapshot_receipt_digest(expected_receipt),
+                )
+            ).encode("utf-8")
+            if (
+                manifest_publication.content.byte_count != len(manifest_bytes)
+                or manifest_publication.content.content_sha256
+                != hashlib.sha256(manifest_bytes).digest()
+                or manifest_publication.pending.retained_destination().read_all()
+                != manifest_bytes
+            ):
+                raise ExportPreflightError("EXPORT.MANIFEST_VERIFY_FAILED")
+
+        try:
+            jsonl_candidate, jsonl_content, jsonl_identity = (
+                _bound_candidate_from_chunks(
+                    parent,
+                    paths.jsonl_temp.name,
+                    _bound_export_jsonl_chunks(snapshot.records),
+                    maximum_bytes=_MAX_BOUND_EXPORT_BYTES,
+                )
+            )
+            jsonl_publication = _BoundExportPublication(
+                name=paths.destination.name,
+                candidate_name=paths.jsonl_temp.name,
+                content=jsonl_content,
+                candidate_identity=jsonl_identity,
+                candidate=jsonl_candidate,
+            )
+            receipt = SnapshotReceipt(
+                snapshot_id=f"snapshot.export.{uuid.uuid4().hex}",
+                resource_id=snapshot.revision.resource_id,
+                canonical_store_id=snapshot.revision.canonical_store_id,
+                exported_revision=snapshot.revision.head_revision,
+                jsonl_digest=jsonl_content.content_sha256.hex(),
+                record_count=record_count,
+            )
+            manifest_bytes = contract_to_json(
+                SnapshotManifest(
+                    manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                    snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                    receipt=receipt,
+                    receipt_digest=snapshot_receipt_digest(receipt),
+                )
+            ).encode("utf-8")
+            manifest_candidate, manifest_content, manifest_identity = (
+                _bound_candidate_from_chunks(
+                    parent,
+                    paths.manifest_temp.name,
+                    _bound_export_chunks(manifest_bytes),
+                    maximum_bytes=len(manifest_bytes),
+                )
+            )
+            manifest_publication = _BoundExportPublication(
+                name=paths.manifest.name,
+                candidate_name=paths.manifest_temp.name,
+                content=manifest_content,
+                candidate_identity=manifest_identity,
+                candidate=manifest_candidate,
+            )
+            registration_attempted = True
+            store.register_issued_export_receipt(
+                receipt,
+                destination_jsonl_path=paths.destination,
+                destination_manifest_path=paths.manifest,
+                expected_generation=snapshot.revision.generation,
+            )
+            issued = True
+            (
+                jsonl_recovery_identity,
+                jsonl_recovery_pending,
+                recovery_close_error,
+            ) = _copy_bound_export_prior(
+                backend,
+                root,
+                parent,
+                paths.destination.name,
+                paths.jsonl_recovery.name,
+                destination_prior,
+            )
+            if recovery_close_error is not None:
+                raise recovery_close_error
+            (
+                manifest_recovery_identity,
+                manifest_recovery_pending,
+                recovery_close_error,
+            ) = _copy_bound_export_prior(
+                backend,
+                root,
+                parent,
+                paths.manifest.name,
+                paths.manifest_recovery.name,
+                manifest_prior,
+            )
+            if recovery_close_error is not None:
+                raise recovery_close_error
+            _bound_publish_candidate(
+                parent,
+                lease,
+                jsonl_publication,
+                destination_prior,
+            )
+            _bound_publish_candidate(
+                parent,
+                lease,
+                manifest_publication,
+                manifest_prior,
+            )
+            reprove_family(receipt)
+            try:
+                store.complete_bound_issued_export_receipt(
+                    receipt.snapshot_id,
+                    expected_generation=snapshot.revision.generation,
+                    destination_jsonl_path=paths.destination,
+                    destination_manifest_path=paths.manifest,
+                    family_reprove=reprove_family,
+                )
+                owner_completed = True
+            except (
+                ExportPreflightError,
+                PlatformFileError,
+                SQLiteStoreLifecycleError,
+                SQLiteStoreSchemaError,
+                sqlite3.DatabaseError,
+            ):
+                try:
+                    probe = store.probe_issued_receipt_completed(
+                        receipt.snapshot_id,
+                        expected_generation=snapshot.revision.generation,
+                        require_bound=False,
+                    )
+                except (
+                    SQLiteStoreLifecycleError,
+                    SQLiteStoreSchemaError,
+                    sqlite3.DatabaseError,
+                ):
+                    completion_ambiguous = True
+                    raise
+                if probe is ReceiptCompletionProbe.COMMITTED_UNCLEAN:
+                    owner_completed = True
+                    raise
+                if probe is not ReceiptCompletionProbe.COMMITTED:
+                    raise
+                owner_completed = True
+            reprove_family(receipt)
+            terminal_pendings = tuple(
+                pending
+                for pending in (
+                    jsonl_recovery_pending,
+                    manifest_recovery_pending,
+                    jsonl_publication.pending,
+                    manifest_publication.pending,
+                )
+                if pending is not None
+            )
+            for pending in terminal_pendings:
+                if pending.terminal_reproof() != pending.preliminary_facts():
+                    raise ExportPreflightError("EXPORT.TERMINAL_REPROOF_FAILED")
+            close_error = _close_bound_export_authorities(*terminal_pendings)
+            jsonl_recovery_pending = None
+            manifest_recovery_pending = None
+            jsonl_publication.pending = None
+            manifest_publication.pending = None
+            if close_error is not None:
+                raise close_error
+            _cleanup_bound_export_artifacts(
+                parent,
+                (
+                    (paths.jsonl_recovery.name, jsonl_recovery_identity),
+                    (paths.manifest_recovery.name, manifest_recovery_identity),
+                ),
+            )
+            return self._export_report(
+                record_count=record_count,
+                jsonl_digest=receipt.jsonl_digest,
+                snapshot=snapshot,
+                receipt=receipt,
+                diagnostics=(),
+            )
+        except (
+            ExportPreflightError,
+            PlatformFileError,
+            SQLiteStoreLifecycleError,
+            SQLiteStoreSchemaError,
+            sqlite3.DatabaseError,
+        ) as error:
+            observed = _try_bound_export_digest(
+                backend,
+                root,
+                parent,
+                paths.destination.name,
+            )
+            if completion_ambiguous:
+                normalized = (
+                    _bound_export_platform_error(error)
+                    if isinstance(error, PlatformFileError)
+                    else error
+                )
+                return export_ledger_ambiguous_failure(
+                    stage="EXPORT.LEDGER",
+                    error_code=_export_error_code(normalized),
+                    destination_before=destination_prior.digest,
+                    destination_observed=observed,
+                    diagnostics=(
+                        _export_diagnostic(
+                            "EXPORT.LEDGER_AMBIGUOUS",
+                            "EXPORT_LEDGER_AMBIGUOUS",
+                        ),
+                    ),
+                )
+            if owner_completed:
+                return export_cleanup_pending_failure(
+                    stage="EXPORT.LEDGER",
+                    destination_before=destination_prior.digest,
+                    destination_observed=observed,
+                    diagnostics=(
+                        _export_diagnostic(
+                            "EXPORT.CLEANUP_PENDING",
+                            "EXPORT_ARTIFACTS_REMAIN",
+                        ),
+                    ),
+                )
+            candidate_close_unproven = False
+            for publication in (jsonl_publication, manifest_publication):
+                if publication is None or publication.candidate is None:
+                    continue
+                close_error = _close_bound_export_authorities(
+                    publication.candidate
+                )
+                publication.candidate = None
+                if close_error is not None:
+                    candidate_close_unproven = True
+            if registration_attempted and not issued:
+                normalized = (
+                    _bound_export_platform_error(error)
+                    if isinstance(error, PlatformFileError)
+                    else error
+                )
+                return export_ledger_ambiguous_failure(
+                    stage="EXPORT.LEDGER",
+                    error_code=_export_error_code(normalized),
+                    destination_before=destination_prior.digest,
+                    destination_observed=observed,
+                    diagnostics=(
+                        _export_diagnostic(
+                            "EXPORT.LEDGER_AMBIGUOUS",
+                            "EXPORT_LEDGER_AMBIGUOUS",
+                        ),
+                    ),
+                )
+            if not issued:
+                cleanup_unproven = isinstance(
+                    error,
+                    _BoundCandidateCleanupRequired,
+                )
+                for publication in (jsonl_publication, manifest_publication):
+                    if publication is None:
+                        continue
+                    cleanup_error = _cleanup_failed_bound_candidate(
+                        parent,
+                        publication.candidate_name,
+                        publication.candidate,
+                        publication.candidate_identity,
+                    )
+                    publication.candidate = None
+                    if cleanup_error is not None:
+                        cleanup_unproven = True
+                if not cleanup_unproven:
+                    normalized = (
+                        _bound_export_platform_error(error)
+                        if isinstance(error, PlatformFileError)
+                        else error
+                    )
+                    return self._export_failure(
+                        normalized,
+                        stage_label="EXPORT.PUBLISH",
+                        destination_before=destination_prior.digest,
+                        destination_observed=destination_prior.digest,
+                    )
+                return self._export_failure(
+                    ExportPreflightError("EXPORT.RECOVERY_REQUIRED"),
+                    stage_label="EXPORT.RECOVERY",
+                    destination_before=destination_prior.digest,
+                    destination_observed=destination_prior.digest,
+                    diagnostics=(
+                        _export_diagnostic(
+                            "EXPORT.RECOVERY_REQUIRED",
+                            "EXPORT_ARTIFACTS_REMAIN",
+                        ),
+                    ),
+                )
+            restored = False
+            restore_error: BaseException | None = (
+                ExportPreflightError("EXPORT.RECOVERY_REQUIRED")
+                if candidate_close_unproven
+                else None
+            )
+            if (
+                issued
+                and receipt is not None
+                and not candidate_close_unproven
+            ):
+                try:
+                    _restore_bound_export_family(
+                        backend,
+                        root,
+                        parent,
+                        lease,
+                        (
+                            (jsonl_publication, destination_prior, paths.jsonl_recovery.name),
+                            (manifest_publication, manifest_prior, paths.manifest_recovery.name),
+                        ),
+                        recovery_members=(
+                            (
+                                jsonl_recovery_pending,
+                                destination_prior,
+                                paths.jsonl_recovery.name,
+                                jsonl_recovery_identity,
+                            ),
+                            (
+                                manifest_recovery_pending,
+                                manifest_prior,
+                                paths.manifest_recovery.name,
+                                manifest_recovery_identity,
+                            ),
+                        ),
+                        cancel=lambda: store.cancel_issued_export_receipt(
+                            receipt.snapshot_id,
+                            expected_generation=snapshot.revision.generation,
+                        ),
+                    )
+                    jsonl_recovery_pending = None
+                    manifest_recovery_pending = None
+                    restored = True
+                except (
+                    ExportPreflightError,
+                    PlatformFileError,
+                    SQLiteStoreLifecycleError,
+                    SQLiteStoreSchemaError,
+                    sqlite3.DatabaseError,
+                ) as recovery_error:
+                    restore_error = recovery_error
+                    restored = False
+            if restored:
+                try:
+                    _cleanup_bound_export_artifacts(
+                        parent,
+                        (
+                            (
+                                paths.jsonl_temp.name,
+                                None if jsonl_publication is None else jsonl_publication.candidate_identity,
+                            ),
+                            (
+                                paths.manifest_temp.name,
+                                None if manifest_publication is None else manifest_publication.candidate_identity,
+                            ),
+                            (paths.jsonl_recovery.name, jsonl_recovery_identity),
+                            (paths.manifest_recovery.name, manifest_recovery_identity),
+                        ),
+                    )
+                except (
+                    ExportPreflightError,
+                    PlatformFileError,
+                ) as cleanup_error:
+                    if restore_error is None:
+                        restore_error = cleanup_error
+                    restored = False
+            if restored:
+                observed = destination_prior.digest
+                normalized = (
+                    _bound_export_platform_error(error)
+                    if isinstance(error, PlatformFileError)
+                    else error
+                )
+                return self._export_failure(
+                    normalized,
+                    stage_label="EXPORT.PUBLISH",
+                    destination_before=destination_prior.digest,
+                    destination_observed=observed,
+                )
+            selected_error = restore_error if restore_error is not None else error
+            normalized = (
+                _bound_export_platform_error(selected_error)
+                if isinstance(selected_error, PlatformFileError)
+                else selected_error
+            )
+            return export_ledger_ambiguous_failure(
+                stage="EXPORT.RECOVERY",
+                error_code=_export_error_code(normalized),
+                destination_before=destination_prior.digest,
+                destination_observed=observed,
+                diagnostics=(
+                    _export_diagnostic(
+                        "EXPORT.RECOVERY_REQUIRED",
+                        "EXPORT_RECOVERY_REQUIRED",
+                    ),
+                ),
+            )
+        finally:
+            _close_bound_export_authorities(
+                jsonl_recovery_pending,
+                manifest_recovery_pending,
+            )
+            if jsonl_publication is not None:
+                _close_bound_export_authorities(
+                    jsonl_publication.pending,
+                    jsonl_publication.candidate,
+                )
+            if manifest_publication is not None:
+                _close_bound_export_authorities(
+                    manifest_publication.pending,
+                    manifest_publication.candidate,
+                )
+
     def _run_arbitrary_export(
         self,
         store: SQLiteTMStore,
         destination: Path,
     ) -> ExportOutcome:
+        backend = self._platform_backend
+        if sys.platform == "win32":
+            if backend is None:
+                try:
+                    backend = compose_platform_file_backend(destination.parent)
+                except PlatformFileError as error:
+                    return self._export_failure(
+                        _bound_export_platform_error(error),
+                        stage_label="EXPORT.PREFLIGHT",
+                        destination_before=None,
+                        destination_observed=None,
+                    )
+            return self._run_bound_arbitrary_export(
+                store,
+                destination,
+                backend,
+            )
         identity = self._resource_identity
         paths = _export_artifact_paths(destination)
         destination_before: str | None = None

@@ -1901,15 +1901,16 @@ def _rehydrate_completed_portable_authority(
                     connection,
                     staged_view,
                 )
+                binding = facts.binding
+                if binding is None or facts.diagnostic_codes:
+                    raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
                 receipt_row, receipt_status = _recovery_receipt_row(
                     port,
                     connection,
+                    expected_snapshot_id=binding.receipt.snapshot_id,
                 )
-                binding = facts.binding
                 if (
-                    binding is None
-                    or facts.diagnostic_codes
-                    or receipt_status != "completed"
+                    receipt_status != "completed"
                     or receipt_row != binding.receipt
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
@@ -8645,6 +8646,126 @@ class SQLiteTMStore:
             jsonl_identity=jsonl_identity,
             manifest_identity=manifest_identity,
         )
+
+    def complete_bound_issued_export_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        destination_jsonl_path: Path,
+        destination_manifest_path: Path,
+        family_reprove: Callable[[SnapshotReceipt], None],
+    ) -> None:
+        """Complete an export while its rooted publication family is live.
+
+        The platform-neutral caller retains both destination handles and the
+        destination-root lock.  This owner transaction independently closes
+        the receipt/revision ancestry, invokes the live family reproof while
+        the row is still ``issued``, and only then commits ``completed``.
+        It never persists a live platform file identity and never changes the
+        active snapshot binding, generation, or divergence state.
+        """
+
+        if type(snapshot_id) is not str or not snapshot_id.strip():
+            raise ValueError("snapshot id must be a non-empty string")
+        if (
+            type(expected_generation) is not int
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation is invalid")
+        if not callable(family_reprove):
+            raise TypeError("family_reprove must be callable")
+        for path_value, field_name in (
+            (destination_jsonl_path, "destination_jsonl_path"),
+            (destination_manifest_path, "destination_manifest_path"),
+        ):
+            if type(path_value) is not _NATIVE_PATH_TYPE or not path_value.is_absolute():
+                raise TypeError(f"{field_name} must be an absolute exact native Path")
+        if destination_manifest_path != destination_jsonl_path.with_name(
+            f"{destination_jsonl_path.name}.localcat-snapshot.json"
+        ):
+            raise ValueError("bound export manifest path is not deterministic")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version, destination_jsonl_path, "
+                        "destination_manifest_path FROM tm_snapshot_receipt "
+                        "WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise SQLiteStoreSchemaError("STORE.RECEIPT_UNKNOWN")
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    if str(row[2]) != "issued":
+                        raise SQLiteStoreSchemaError("STORE.RECEIPT_STALE")
+                    receipt = SnapshotReceipt(
+                        snapshot_id=snapshot_id,
+                        resource_id=str(row[0]),
+                        canonical_store_id=str(row[1]),
+                        exported_revision=_row_int(row[3]),
+                        jsonl_digest=str(row[4]),
+                        record_count=_row_int(row[5]),
+                        format_version=str(row[6]),
+                    )
+                    if (
+                        str(row[7]) != Path.__str__(destination_jsonl_path)
+                        or str(row[8]) != Path.__str__(destination_manifest_path)
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_DESTINATION_MISMATCH"
+                        )
+                    revision = _canonical_revision_from_transaction(
+                        connection,
+                        lease,
+                    )
+                    counts = _revision_record_counts(
+                        connection,
+                        head_revision=revision.head_revision,
+                        record_count=revision.record_count,
+                    )
+                    if counts.get(receipt.exported_revision) != receipt.record_count:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_ANCESTRY_INVALID"
+                        )
+                    family_reprove(receipt)
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                        "WHERE snapshot_id = ? AND status = 'issued'",
+                        (snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
 
     def _complete_issued_export_receipt_strict(
         self,
