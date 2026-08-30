@@ -279,7 +279,7 @@
   - 完成时，成功刷新产生一致的 JSONL/manifest/ledger completed pair，且不改变 canonical records
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
 
-- [ ] 5.13a 在 Windows 复证配置 pair 与 canonical private root
+- [x] 5.13a 在 Windows 复证配置 pair 与 canonical private root
   - refresh 在锁内同时复验 configured JSONL parent、sidecar/manifest private proof、canonical revision 与 issued receipt，禁止跨 root/ACL 漂移后继续publication；JSONL与manifest各自复用5.12a的`PendingPublication`握手，issued→completed业务phase与terminal reproof未闭合前不得返回成功。
   - _Amendment: WA-06_
   - _Depends: 5.6a, 5.12a, 5.13_
