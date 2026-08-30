@@ -18,6 +18,7 @@ from unittest import mock
 from platform_fs_contracts import (
     BoundContentFacts,
     BoundDirectoryAuthority,
+    BoundExistingFileMutationGuard,
     BoundRegularFile,
     BoundSynchronizedRegularFile,
     CandidateFile,
@@ -28,6 +29,7 @@ from platform_fs_contracts import (
     DeviceSecretAuthority,
     EntrySnapshot,
     ExistingFileDurability,
+    ExistingFileMutationGuard,
     ExistingFileRetirement,
     ExistingRetirementSource,
     RetirementSourceDirectoryAuthority,
@@ -147,6 +149,17 @@ class _SynchronizedRegular(_Regular, BoundSynchronizedRegularFile):
     ) -> BoundContentFacts:
         self.synchronize_calls += 1
         return expected
+
+
+class _MutationGuard(BoundExistingFileMutationGuard):
+    def __init__(self) -> None:
+        super().__init__(_identity())
+
+    def _reprove_guard(self) -> FileObjectIdentity:
+        return _identity()
+
+    def _close_authority(self) -> None:
+        pass
 
 
 class _Candidate(CandidateFile):
@@ -525,6 +538,7 @@ class _FileSystem(
     RootedFileSystem,
     MutableFileReservationService,
     ExistingFileDurability,
+    ExistingFileMutationGuard,
 ):
     def _bind_root(self, root: Path) -> RootedDirectoryAuthority:
         del root
@@ -553,6 +567,14 @@ class _FileSystem(
     ) -> BoundSynchronizedRegularFile:
         del root, relative
         return _SynchronizedRegular()
+
+    def _guard_existing_for_mutation(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundExistingFileMutationGuard:
+        del root, relative
+        return _MutationGuard()
 
     def _reserve_mutable_file(
         self,
@@ -731,6 +753,7 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             BoundDirectoryAuthority,
             BoundRegularFile,
             BoundSynchronizedRegularFile,
+            BoundExistingFileMutationGuard,
             CandidateFile,
             MutableFileReservation,
             RetirementDirectoryAuthority,
@@ -750,6 +773,11 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
             RootedFileSystem.open_regular: ("self", "root", "relative"),
             RootedFileSystem.bind_parent: ("self", "root", "relative"),
             ExistingFileDurability.open_existing_for_synchronization: (
+                "self",
+                "root",
+                "relative",
+            ),
+            ExistingFileMutationGuard.guard_existing_for_mutation: (
                 "self",
                 "root",
                 "relative",
@@ -2412,6 +2440,10 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             root,
             PurePath("nested", "source.json"),
         )
+        mutation_guard = filesystem.guard_existing_for_mutation(
+            root,
+            PurePath("nested", "source.json"),
+        )
         parent = filesystem.bind_parent(root, PurePath("nested", "source.json"))
         reservation = filesystem.reserve_mutable_file(parent, "stage.sqlite3")
         self.assertEqual(regular.read_all(), b"payload")
@@ -2420,6 +2452,8 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             synchronized.synchronize_content(synchronized_facts),
             synchronized_facts,
         )
+        self.assertEqual(mutation_guard.reprove(), _identity())
+        mutation_guard.close()
         parent.reprove()
         self.assertEqual(reservation.identity(), _identity())
         self.assertFalse(reservation.closed)
@@ -2444,10 +2478,17 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
                     filesystem.open_regular(root, relative)
                 with self.assertRaises((TypeError, ValueError)):
                     filesystem.open_existing_for_synchronization(root, relative)
+                with self.assertRaises((TypeError, ValueError)):
+                    filesystem.guard_existing_for_mutation(root, relative)
         with self.assertRaises(TypeError):
             filesystem.open_regular(root, "source.json")  # type: ignore[arg-type]
         with self.assertRaises(TypeError):
             filesystem.open_existing_for_synchronization(
+                root,
+                "source.json",  # type: ignore[arg-type]
+            )
+        with self.assertRaises(TypeError):
+            filesystem.guard_existing_for_mutation(
                 root,
                 "source.json",  # type: ignore[arg-type]
             )
@@ -2458,6 +2499,11 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             filesystem.bind_parent(closed_root, PurePath("source.json"))
         with self.assertRaises(PlatformFileError):
             filesystem.open_existing_for_synchronization(
+                closed_root,
+                PurePath("source.json"),
+            )
+        with self.assertRaises(PlatformFileError):
+            filesystem.guard_existing_for_mutation(
                 closed_root,
                 PurePath("source.json"),
             )

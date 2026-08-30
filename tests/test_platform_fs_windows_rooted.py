@@ -1176,6 +1176,141 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                 synchronized.close()
         os.replace(replacement, self.source)
 
+    def test_existing_file_mutation_guard_allows_sqlite_and_blocks_replacement(
+        self,
+    ) -> None:
+        database = self.nested / "guarded.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE facts(value TEXT NOT NULL)")
+            connection.commit()
+        finally:
+            connection.close()
+        replacement = self.nested / "guarded-replacement.sqlite3"
+        replacement.write_bytes(database.read_bytes())
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            guard = file_system.guard_existing_for_mutation(
+                root,
+                PureWindowsPath("NestedCase", database.name),
+            )
+            try:
+                before = guard.reprove()
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute("INSERT INTO facts(value) VALUES ('kept')")
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.assertEqual(guard.reprove(), before)
+                with self.assertRaises(PermissionError):
+                    os.replace(replacement, database)
+            finally:
+                guard.close()
+        connection = sqlite3.connect(database)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT value FROM facts").fetchall(),
+                [("kept",)],
+            )
+        finally:
+            connection.close()
+        os.replace(replacement, database)
+
+    def test_existing_file_mutation_guard_rejects_multilink(self) -> None:
+        database = self.nested / "guarded-multilink.sqlite3"
+        database.write_bytes(b"guarded")
+        alias = self.nested / "guarded-multilink-alias.sqlite3"
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            guard = file_system.guard_existing_for_mutation(
+                root,
+                PureWindowsPath("NestedCase", database.name),
+            )
+            try:
+                with self.assertRaises(PermissionError):
+                    os.link(database, alias)
+                guard.reprove()
+            finally:
+                guard.close()
+        os.link(database, alias)
+        with file_system.bind_root(self.root_path) as root:
+            with self.assertRaises(PlatformFileError) as caught:
+                file_system.guard_existing_for_mutation(
+                    root,
+                    PureWindowsPath("NestedCase", database.name),
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.IDENTITY_STALE,
+            )
+        alias.unlink()
+
+    def test_mutation_guard_programmer_fault_preserves_primary_and_closes_all(
+        self,
+    ) -> None:
+        for error_type in (TypeError, AssertionError, AttributeError):
+            with self.subTest(error_type=error_type.__name__):
+                api = platform_fs_windows.WindowsFileAPI.load()
+                real_open = api.open_handle
+                real_duplicate = api.duplicate_handle
+                real_close = api.CloseHandle
+                opened = 0
+                closed = 0
+
+                def recording_open(path: str, **kwargs: object) -> object:
+                    nonlocal opened
+                    handle = real_open(path, **kwargs)
+                    opened += 1
+                    return handle
+
+                def recording_duplicate(handle: object) -> object:
+                    nonlocal opened
+                    duplicate = real_duplicate(handle)
+                    opened += 1
+                    return duplicate
+
+                def recording_close(raw: int) -> int:
+                    nonlocal closed
+                    closed += 1
+                    return real_close(raw)
+
+                primary = error_type("mutation-guard-programmer-fault")
+
+                def fault(point: str) -> None:
+                    if point == "windows_mutation_guard_after_entry_probe":
+                        raise primary
+
+                file_system = WindowsRootedFileSystem(
+                    _api=api,
+                    _fault_injector=fault,
+                )
+                with mock.patch.object(
+                    api,
+                    "open_handle",
+                    side_effect=recording_open,
+                ), mock.patch.object(
+                    api,
+                    "duplicate_handle",
+                    side_effect=recording_duplicate,
+                ), mock.patch.object(
+                    api,
+                    "CloseHandle",
+                    side_effect=recording_close,
+                ):
+                    root = file_system.bind_root(self.root_path)
+                    try:
+                        with self.assertRaises(error_type) as caught:
+                            file_system.guard_existing_for_mutation(
+                                root,
+                                PureWindowsPath("NestedCase", "sample.txt"),
+                            )
+                        self.assertIs(caught.exception, primary)
+                    finally:
+                        root.close()
+                self.assertEqual(closed, opened)
+
     def _assert_concurrent_close_is_identity_stale(
         self,
         authority: object,

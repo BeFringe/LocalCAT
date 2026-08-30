@@ -529,7 +529,9 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                         real_publish_generation = (
                             coordinator._publish_portable_generation
                         )
-                        real_reprove = coordinator._reprove_portable_active_set
+                        real_reprove = (
+                            tm_sqlite_store._PortableActiveSetAuthority.reprove
+                        )
                         generation_published = False
 
                         def publish_generation(*args: object, **kwargs: object) -> object:
@@ -539,8 +541,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                             return result
 
                         def fail_final_reproof(
-                            *args: object,
-                            **kwargs: object,
+                            authority: object,
                         ) -> object:
                             nonlocal reached
                             if generation_published:
@@ -549,7 +550,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                                     "ACTIVATION.TEST_TAIL_FAILURE",
                                     retryable=False,
                                 )
-                            return real_reprove(*args, **kwargs)
+                            return real_reprove(authority)
 
                         patchers = [
                             mock.patch.object(
@@ -558,9 +559,9 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                                 side_effect=publish_generation,
                             ),
                             mock.patch.object(
-                                coordinator,
-                                "_reprove_portable_active_set",
-                                side_effect=fail_final_reproof,
+                                tm_sqlite_store._PortableActiveSetAuthority,
+                                "reprove",
+                                new=fail_final_reproof,
                             ),
                         ]
                     elif boundary == "stage_retire":

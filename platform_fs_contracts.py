@@ -959,6 +959,45 @@ class BoundSynchronizedRegularFile(BoundRegularFile, ABC):
     ) -> BoundContentFacts: ...
 
 
+class BoundExistingFileMutationGuard(OpaqueAuthority, ABC):
+    """Live identity guard for one existing file mutated by an external writer.
+
+    The guard does not write, synchronize, publish, or interpret file content.
+    A backend may use its retained handle to prevent delete/rename while a
+    pathname-only writer is active, but every reproof must still bind the same
+    regular single-link object to the same rooted name.
+    """
+
+    __slots__ = ("__identity",)
+
+    def __init__(self, identity: FileObjectIdentity) -> None:
+        super().__init__()
+        if type(identity) is not FileObjectIdentity:
+            raise TypeError("identity must be exact FileObjectIdentity")
+        if identity.kind != "regular" or identity.link_count != 1:
+            raise ValueError("mutation guard requires one regular-file link")
+        self.__identity = identity
+
+    def reprove(self) -> FileObjectIdentity:
+        self._require_open()
+        identity = self._reprove_guard()
+        if type(identity) is not FileObjectIdentity:
+            raise TypeError("backend mutation guard must return exact identity")
+        if (
+            identity != self.__identity
+            or identity.kind != "regular"
+            or identity.link_count != 1
+        ):
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+        return identity
+
+    @abstractmethod
+    def _reprove_guard(self) -> FileObjectIdentity: ...
+
+
 class CandidateFile(OpaqueAuthority, ABC):
     _MAXIMUM_STREAM_CHUNK_BYTES = 64 * 1024
 
@@ -1800,6 +1839,34 @@ class ExistingFileDurability(Protocol):
         root: RootedDirectoryAuthority,
         relative: PurePath,
     ) -> BoundSynchronizedRegularFile: ...
+
+
+@runtime_checkable
+class ExistingFileMutationGuard(Protocol):
+    def guard_existing_for_mutation(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundExistingFileMutationGuard:
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        root._require_open()
+        checked_relative = validate_relative_path(relative)
+        authority = self._guard_existing_for_mutation(root, checked_relative)
+        if not isinstance(authority, BoundExistingFileMutationGuard):
+            raise TypeError(
+                "backend mutation guard must return BoundExistingFileMutationGuard"
+            )
+        authority._require_open()
+        authority.reprove()
+        return authority
+
+    @abstractmethod
+    def _guard_existing_for_mutation(
+        self,
+        root: RootedDirectoryAuthority,
+        relative: PurePath,
+    ) -> BoundExistingFileMutationGuard: ...
 
 
 @runtime_checkable
