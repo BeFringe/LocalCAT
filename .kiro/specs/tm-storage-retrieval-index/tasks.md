@@ -182,11 +182,12 @@
   - 完成时，重放、错配或已消费 token 无法推进 journal，正常路径留下可恢复的逐阶段证据
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5_
 
-- [ ] 5.6a 以 `WindowsPrivateProof` 绑定 activation journal 与恢复资产
+- [x] 5.6a 以 `WindowsPrivateProof` 绑定 activation journal 与恢复资产
   - PREPARED 前以current process primary token复验`WindowsPrivateSecurityV2` owner/DACL/MIC projection、non-reparse root、artifact identity与exclusive process lock；provider origin不参与资格，proof缺失、profile/descriptor漂移或继承状态不闭合时不推进journal。
   - Windows 首次激活使用独立严格 v3 `PREPARED`/`CANCELLED` codec：unsigned owner projection排除nested proof与`record_digest`，private-directory proof绑定其context digest，最外层digest覆盖完整proof；仅持久化portable attestation、owner事实与basename，禁止绝对路径和volume/FileId/device/inode。v2 writer/parser/terminal bytes保持独立不变，mixed-version拒绝；目录proof不得替代journal `private=True` candidate在pending retained destination上的逐对象private/content/identity复证。
+  - fresh recovery须重新取得同一root/W1并重绑private directory、exact 32-byte key与PENDING/terminal，复验W2、portable attestation、owner context、outer digest与真实MAC。CANCELLED terminal durable commit/reproof后，PENDING main、stage DB/manifest及确有的exact terminal candidate逐文件消费3.7a的live retirement或source-absent/target-exact rebind；A observer在B前关闭、B后fresh重绑复证闭集，禁止unlink/overwrite/path adoption。terminal+main仅为中间态，最终只允许private key+terminal及确定性quarantine exact closure；进入retirement/rebind分支后的coexist、both-absent、wrong/foreign/unknown shape均fail closed。
   - _Amendment: WA-06_
-  - _Depends: 1.2a, 5.3a, 5.6, windows-platform-enablement 3.7_
+  - _Depends: 1.2a, 5.3a, 5.6, windows-platform-enablement 3.7a_
 
 - [x] 5.7 实现 DB/manifest 成套替换与 generation 发布
   - 只有 PREPARED 已持久化后才替换 DB、fsync parent、重开并校验 schema/digest/integrity/foreign key/count，再推进 DB_REPLACED
