@@ -24,12 +24,19 @@ import tm_contracts as contract_module
 from tm_content_attestation import (
     ActiveContentAttestation,
     PortableActiveContentAttestation,
+    PortableContentFileProof,
     PortableSealedContentAttestation,
     SealedContentAttestation,
     _active_content_attestation_from_mapping,
     _active_content_attestation_record_from_mapping,
     _active_content_attestation_record_to_mapping,
     _active_content_attestation_to_mapping,
+    _portable_active_content_attestation_from_mapping,
+    _portable_active_content_attestation_to_mapping,
+    _portable_content_file_proof_from_mapping,
+    _portable_content_file_proof_to_mapping,
+    _portable_sealed_content_attestation_from_mapping,
+    _portable_sealed_content_attestation_to_mapping,
     _sealed_content_attestation_from_mapping,
     _sealed_content_attestation_to_mapping,
     _sealed_content_attestation_record_from_mapping,
@@ -5109,6 +5116,760 @@ def _parse_portable_publication_phase_bytes(
             retryable=False,
         )
     return record
+
+
+# Replacement activation is deliberately a new envelope.  The v3 PREPARED
+# record and activation-publication-v1 chain above remain the generation-zero
+# protocol and must never be widened to describe N -> N+1 replacement.
+_PORTABLE_REPLACEMENT_VERSION = "activation-replacement-v1"
+_PORTABLE_REPLACEMENT_OPERATION = "REPLACEMENT"
+_PORTABLE_REPLACEMENT_PHASES = (
+    "PREPARED",
+    "DB_REPLACED",
+    "MANIFEST_PUBLISHED",
+    "GENERATION_PUBLISHED",
+    "READY",
+)
+_PORTABLE_REPLACEMENT_CURRENT_NAME = "activation-replacement-current-v1.json"
+_PORTABLE_REPLACEMENT_PHASE_NAMES = {
+    "PREPARED": "activation-replacement-pending-v1.json",
+    "DB_REPLACED": "activation-replacement-db-replaced-v1.json",
+    "MANIFEST_PUBLISHED": "activation-replacement-manifest-published-v1.json",
+    "GENERATION_PUBLISHED": "activation-replacement-generation-published-v1.json",
+    "READY": _PORTABLE_REPLACEMENT_CURRENT_NAME,
+}
+_PORTABLE_REPLACEMENT_RECORD_NAMES = frozenset(
+    _PORTABLE_REPLACEMENT_PHASE_NAMES.values()
+)
+_PORTABLE_REPLACEMENT_MAX_BYTES = 1024 * 1024
+_PORTABLE_REPLACEMENT_SNAPSHOT_FACTORY_KEY = object()
+
+
+def _portable_replacement_phase_name(phase: str) -> str:
+    try:
+        return _PORTABLE_REPLACEMENT_PHASE_NAMES[phase]
+    except (KeyError, TypeError) as error:
+        raise ValueError("portable replacement phase is invalid") from error
+
+
+def _portable_replacement_backup_name(
+    preparation_id: str,
+    asset_kind: str,
+) -> str:
+    preparation = _require_portable_activation_string(
+        preparation_id,
+        "preparation_id",
+    )
+    if asset_kind not in {"DATABASE", "MANIFEST"}:
+        raise ValueError("portable replacement backup kind is invalid")
+    preparation_digest = hashlib.sha256(preparation.encode("utf-8")).hexdigest()
+    suffix = "database" if asset_kind == "DATABASE" else "manifest"
+    return (
+        f"activation-replacement-prior-{preparation_digest}-{suffix}-v1.backup"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableReplacementBackupProof:
+    """Persisted backup content facts; never a historical live FileId."""
+
+    asset_kind: str
+    backup_name: str
+    content: PortableContentFileProof
+
+    def __post_init__(self) -> None:
+        if self.asset_kind not in {"DATABASE", "MANIFEST"}:
+            raise ValueError("portable replacement backup kind is invalid")
+        _require_portable_activation_basename(self.backup_name, "backup_name")
+        if type(self.content) is not PortableContentFileProof:
+            raise TypeError("portable replacement backup content is invalid")
+
+
+def _portable_replacement_backup_to_mapping(
+    backup: _PortableReplacementBackupProof,
+) -> dict[str, object]:
+    if type(backup) is not _PortableReplacementBackupProof:
+        raise TypeError("portable replacement backup proof is invalid")
+    return {
+        "asset_kind": backup.asset_kind,
+        "backup_name": backup.backup_name,
+        "content": _portable_content_file_proof_to_mapping(backup.content),
+    }
+
+
+def _portable_replacement_backup_from_mapping(
+    mapping: object,
+) -> _PortableReplacementBackupProof:
+    if type(mapping) is not dict or set(mapping) != {
+        "asset_kind",
+        "backup_name",
+        "content",
+    }:
+        raise ValueError("portable replacement backup fields are invalid")
+    return _PortableReplacementBackupProof(
+        asset_kind=mapping["asset_kind"],
+        backup_name=mapping["backup_name"],
+        content=_portable_content_file_proof_from_mapping(mapping["content"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableReplacementUnsigned:
+    """Strict N -> N+1 owner facts before the nested W2 proof is minted."""
+
+    replacement_version: str
+    operation: str
+    phase: str
+    predecessor_digest: str
+    journal_id: str
+    preparation_id: str
+    registry_namespace: str
+    token_id: str
+    token_version: str
+    activation_nonce: str
+    artifact_id: str
+    artifact_seal_digest: str
+    sealed_stage_digest: str
+    resource_id: str
+    target_identity: str
+    prior_authority_digest: str
+    prior_canonical_store_id: str
+    prior_generation: int
+    prior_active_content_attestation: PortableActiveContentAttestation
+    backup_proofs: tuple[
+        _PortableReplacementBackupProof,
+        _PortableReplacementBackupProof,
+    ]
+    candidate_canonical_store_id: str
+    next_generation: int
+    gate_b_grant_digest: str
+    evidence_digest: str
+    source_jsonl_digest: str
+    new_receipt_id: str
+    new_manifest_digest: str
+    candidate_stage_db_name: str
+    candidate_manifest_temp_name: str
+    canonical_database_name: str
+    canonical_manifest_name: str
+    private_directory_name: str
+    device_key_name: str
+    lock_payload_digest: str
+    sealed_content_attestation: PortableSealedContentAttestation
+    active_content_attestation: PortableActiveContentAttestation | None
+
+    def __post_init__(self) -> None:
+        if self.replacement_version != _PORTABLE_REPLACEMENT_VERSION:
+            raise ValueError("portable replacement version is unsupported")
+        if self.operation != _PORTABLE_REPLACEMENT_OPERATION:
+            raise ValueError("portable replacement discriminator is invalid")
+        if self.phase not in _PORTABLE_REPLACEMENT_PHASES:
+            raise ValueError("portable replacement phase is invalid")
+        for field_name in (
+            "journal_id",
+            "preparation_id",
+            "registry_namespace",
+            "token_id",
+            "token_version",
+            "activation_nonce",
+            "artifact_id",
+            "resource_id",
+            "prior_canonical_store_id",
+            "candidate_canonical_store_id",
+            "new_receipt_id",
+        ):
+            _require_portable_activation_string(getattr(self, field_name), field_name)
+        for field_name in (
+            "predecessor_digest",
+            "artifact_seal_digest",
+            "sealed_stage_digest",
+            "target_identity",
+            "prior_authority_digest",
+            "gate_b_grant_digest",
+            "evidence_digest",
+            "source_jsonl_digest",
+            "new_manifest_digest",
+            "lock_payload_digest",
+        ):
+            _require_portable_activation_digest(getattr(self, field_name), field_name)
+        if (
+            self.phase == "PREPARED"
+            and self.predecessor_digest != self.prior_authority_digest
+        ):
+            raise ValueError(
+                "portable replacement PREPARED predecessor is not prior authority"
+            )
+        for field_name in (
+            "candidate_stage_db_name",
+            "candidate_manifest_temp_name",
+            "canonical_database_name",
+            "canonical_manifest_name",
+            "private_directory_name",
+            "device_key_name",
+        ):
+            _require_portable_activation_basename(getattr(self, field_name), field_name)
+        _require_portable_activation_nonnegative_int(
+            self.prior_generation,
+            "prior_generation",
+        )
+        _require_portable_activation_nonnegative_int(
+            self.next_generation,
+            "next_generation",
+        )
+        if self.next_generation != self.prior_generation + 1:
+            raise ValueError("portable replacement generation does not advance once")
+        if self.candidate_canonical_store_id == self.prior_canonical_store_id:
+            raise ValueError("portable replacement candidate store must be fresh")
+        if self.candidate_stage_db_name == self.candidate_manifest_temp_name:
+            raise ValueError("portable replacement candidate names must be distinct")
+        if self.canonical_database_name == self.canonical_manifest_name:
+            raise ValueError("portable replacement canonical names must be distinct")
+
+        prior = self.prior_active_content_attestation
+        if type(prior) is not PortableActiveContentAttestation:
+            raise TypeError("portable replacement prior attestation is invalid")
+        if (
+            prior.resource_id != self.resource_id
+            or prior.target_identity != self.target_identity
+            or prior.canonical_store_id != self.prior_canonical_store_id
+            or prior.generation != self.prior_generation
+        ):
+            raise ValueError("portable replacement prior attestation does not bind")
+        if type(self.backup_proofs) is not tuple or len(self.backup_proofs) != 2:
+            raise TypeError("portable replacement requires two exact backup proofs")
+        database_backup, manifest_backup = self.backup_proofs
+        if (
+            type(database_backup) is not _PortableReplacementBackupProof
+            or type(manifest_backup) is not _PortableReplacementBackupProof
+            or database_backup.asset_kind != "DATABASE"
+            or manifest_backup.asset_kind != "MANIFEST"
+            or database_backup.backup_name
+            != _portable_replacement_backup_name(self.preparation_id, "DATABASE")
+            or manifest_backup.backup_name
+            != _portable_replacement_backup_name(self.preparation_id, "MANIFEST")
+            or database_backup.content != prior.database
+            or manifest_backup.content != prior.manifest
+        ):
+            raise ValueError("portable replacement backup proofs do not bind")
+
+        sealed = self.sealed_content_attestation
+        if type(sealed) is not PortableSealedContentAttestation:
+            raise TypeError("portable replacement sealed attestation is invalid")
+        if (
+            sealed.resource_id != self.resource_id
+            or sealed.target_identity != self.target_identity
+            or sealed.canonical_store_id != self.candidate_canonical_store_id
+            or sealed.expected_prior_generation != self.prior_generation
+            or sealed.evidence_digest != self.evidence_digest
+            or sealed.source.sha256 != self.source_jsonl_digest
+        ):
+            raise ValueError("portable replacement sealed attestation does not bind")
+
+        active = self.active_content_attestation
+        if self.phase in {"PREPARED", "DB_REPLACED"}:
+            if active is not None:
+                raise ValueError(
+                    "portable replacement pre-manifest phase cannot be active"
+                )
+        else:
+            if type(active) is not PortableActiveContentAttestation:
+                raise TypeError(
+                    "portable replacement published phase requires active attestation"
+                )
+            if (
+                active.journal_id != self.journal_id
+                or active.resource_id != self.resource_id
+                or active.target_identity != self.target_identity
+                or active.canonical_store_id != self.candidate_canonical_store_id
+                or active.generation != self.next_generation
+                or active.sealed_attestation_digest != sealed.attestation_digest
+                or active.snapshot_receipt_digest != sealed.snapshot_receipt_digest
+                or active.manifest != sealed.manifest
+                or active.source != sealed.source
+            ):
+                raise ValueError("portable replacement active attestation does not bind")
+
+
+_PORTABLE_REPLACEMENT_UNSIGNED_FIELDS = frozenset(
+    item.name for item in fields(_PortableReplacementUnsigned)
+)
+_PORTABLE_REPLACEMENT_RECORD_FIELDS = (
+    _PORTABLE_REPLACEMENT_UNSIGNED_FIELDS
+    | {"private_directory_proof", "record_digest"}
+)
+
+
+def _portable_replacement_unsigned_to_mapping(
+    unsigned: _PortableReplacementUnsigned,
+) -> dict[str, object]:
+    if type(unsigned) is not _PortableReplacementUnsigned:
+        raise TypeError("portable replacement unsigned facts are invalid")
+    active = unsigned.active_content_attestation
+    return {
+        "activation_nonce": unsigned.activation_nonce,
+        "active_content_attestation": (
+            None
+            if active is None
+            else _portable_active_content_attestation_to_mapping(active)
+        ),
+        "artifact_id": unsigned.artifact_id,
+        "artifact_seal_digest": unsigned.artifact_seal_digest,
+        "backup_proofs": [
+            _portable_replacement_backup_to_mapping(backup)
+            for backup in unsigned.backup_proofs
+        ],
+        "candidate_canonical_store_id": unsigned.candidate_canonical_store_id,
+        "candidate_manifest_temp_name": unsigned.candidate_manifest_temp_name,
+        "candidate_stage_db_name": unsigned.candidate_stage_db_name,
+        "canonical_database_name": unsigned.canonical_database_name,
+        "canonical_manifest_name": unsigned.canonical_manifest_name,
+        "device_key_name": unsigned.device_key_name,
+        "evidence_digest": unsigned.evidence_digest,
+        "gate_b_grant_digest": unsigned.gate_b_grant_digest,
+        "journal_id": unsigned.journal_id,
+        "lock_payload_digest": unsigned.lock_payload_digest,
+        "new_manifest_digest": unsigned.new_manifest_digest,
+        "new_receipt_id": unsigned.new_receipt_id,
+        "next_generation": unsigned.next_generation,
+        "operation": unsigned.operation,
+        "phase": unsigned.phase,
+        "predecessor_digest": unsigned.predecessor_digest,
+        "preparation_id": unsigned.preparation_id,
+        "prior_active_content_attestation": (
+            _portable_active_content_attestation_to_mapping(
+                unsigned.prior_active_content_attestation
+            )
+        ),
+        "prior_authority_digest": unsigned.prior_authority_digest,
+        "prior_canonical_store_id": unsigned.prior_canonical_store_id,
+        "prior_generation": unsigned.prior_generation,
+        "private_directory_name": unsigned.private_directory_name,
+        "registry_namespace": unsigned.registry_namespace,
+        "replacement_version": unsigned.replacement_version,
+        "resource_id": unsigned.resource_id,
+        "sealed_content_attestation": (
+            _portable_sealed_content_attestation_to_mapping(
+                unsigned.sealed_content_attestation
+            )
+        ),
+        "sealed_stage_digest": unsigned.sealed_stage_digest,
+        "source_jsonl_digest": unsigned.source_jsonl_digest,
+        "target_identity": unsigned.target_identity,
+        "token_id": unsigned.token_id,
+        "token_version": unsigned.token_version,
+    }
+
+
+def _portable_replacement_owner_context_sha256(
+    unsigned: _PortableReplacementUnsigned,
+) -> bytes:
+    return hashlib.sha256(
+        _portable_activation_canonical_json(
+            _portable_replacement_unsigned_to_mapping(unsigned)
+        )
+    ).digest()
+
+
+@dataclass(frozen=True, slots=True)
+class _PortableReplacementRecord:
+    unsigned: _PortableReplacementUnsigned
+    private_directory_proof: WindowsPrivateProof
+    record_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.unsigned) is not _PortableReplacementUnsigned:
+            raise TypeError("portable replacement unsigned facts are invalid")
+        if type(self.private_directory_proof) is not WindowsPrivateProof:
+            raise TypeError("portable replacement private proof is invalid")
+        if (
+            self.private_directory_proof.object_role
+            is not PrivateProofObjectRole.PRIVATE_DIRECTORY
+            or self.private_directory_proof.owner_context_sha256
+            != _portable_replacement_owner_context_sha256(self.unsigned)
+        ):
+            raise ValueError("portable replacement private proof does not bind")
+        _require_portable_activation_digest(self.record_digest, "record_digest")
+        if self.record_digest != _portable_replacement_record_digest(
+            self.unsigned,
+            self.private_directory_proof,
+        ):
+            raise ValueError("portable replacement record digest does not close")
+
+
+def _portable_replacement_record_payload(
+    unsigned: _PortableReplacementUnsigned,
+    proof: WindowsPrivateProof,
+) -> dict[str, object]:
+    mapping = _portable_replacement_unsigned_to_mapping(unsigned)
+    mapping["private_directory_proof"] = _portable_activation_proof_to_mapping(proof)
+    return mapping
+
+
+def _portable_replacement_record_digest(
+    unsigned: _PortableReplacementUnsigned,
+    proof: WindowsPrivateProof,
+) -> str:
+    return hashlib.sha256(
+        _portable_activation_canonical_json(
+            _portable_replacement_record_payload(unsigned, proof)
+        )
+    ).hexdigest()
+
+
+def _create_portable_replacement_record(
+    unsigned: _PortableReplacementUnsigned,
+    proof: WindowsPrivateProof,
+) -> _PortableReplacementRecord:
+    return _PortableReplacementRecord(
+        unsigned=unsigned,
+        private_directory_proof=proof,
+        record_digest=_portable_replacement_record_digest(unsigned, proof),
+    )
+
+
+def _serialize_portable_replacement_record(
+    record: _PortableReplacementRecord,
+) -> bytes:
+    if type(record) is not _PortableReplacementRecord:
+        raise TypeError("portable replacement record is invalid")
+    mapping = _portable_replacement_record_payload(
+        record.unsigned,
+        record.private_directory_proof,
+    )
+    mapping["record_digest"] = record.record_digest
+    return _portable_activation_canonical_json(mapping) + b"\n"
+
+
+def _parse_portable_replacement_record_bytes(
+    serialized: bytes,
+) -> _PortableReplacementRecord:
+    if type(serialized) is not bytes:
+        raise TypeError("portable replacement bytes must be exact bytes")
+    if not serialized or len(serialized) > _PORTABLE_REPLACEMENT_MAX_BYTES:
+        raise ActivationPreparationError(
+            "ACTIVATION.REPLACEMENT_PARSE_INVALID",
+            retryable=False,
+        )
+
+    def reject_constant(value: str) -> None:
+        del value
+        raise ValueError("non-finite JSON number is not allowed")
+
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        mapping: dict[str, object] = {}
+        for key, value in pairs:
+            if key in mapping:
+                raise ValueError("duplicate portable replacement key")
+            mapping[key] = value
+        return mapping
+
+    try:
+        mapping = json.loads(
+            serialized.decode("utf-8"),
+            parse_constant=reject_constant,
+            object_pairs_hook=strict_object,
+        )
+        if type(mapping) is not dict or set(mapping) != _PORTABLE_REPLACEMENT_RECORD_FIELDS:
+            raise ValueError("portable replacement fields are invalid")
+        backup_mappings = mapping["backup_proofs"]
+        if type(backup_mappings) is not list or len(backup_mappings) != 2:
+            raise TypeError("portable replacement backup list is invalid")
+        active_mapping = mapping["active_content_attestation"]
+        unsigned = _PortableReplacementUnsigned(
+            replacement_version=mapping["replacement_version"],
+            operation=mapping["operation"],
+            phase=mapping["phase"],
+            predecessor_digest=mapping["predecessor_digest"],
+            journal_id=mapping["journal_id"],
+            preparation_id=mapping["preparation_id"],
+            registry_namespace=mapping["registry_namespace"],
+            token_id=mapping["token_id"],
+            token_version=mapping["token_version"],
+            activation_nonce=mapping["activation_nonce"],
+            artifact_id=mapping["artifact_id"],
+            artifact_seal_digest=mapping["artifact_seal_digest"],
+            sealed_stage_digest=mapping["sealed_stage_digest"],
+            resource_id=mapping["resource_id"],
+            target_identity=mapping["target_identity"],
+            prior_authority_digest=mapping["prior_authority_digest"],
+            prior_canonical_store_id=mapping["prior_canonical_store_id"],
+            prior_generation=mapping["prior_generation"],
+            prior_active_content_attestation=(
+                _portable_active_content_attestation_from_mapping(
+                    mapping["prior_active_content_attestation"]
+                )
+            ),
+            backup_proofs=tuple(
+                _portable_replacement_backup_from_mapping(item)
+                for item in backup_mappings
+            ),
+            candidate_canonical_store_id=mapping["candidate_canonical_store_id"],
+            next_generation=mapping["next_generation"],
+            gate_b_grant_digest=mapping["gate_b_grant_digest"],
+            evidence_digest=mapping["evidence_digest"],
+            source_jsonl_digest=mapping["source_jsonl_digest"],
+            new_receipt_id=mapping["new_receipt_id"],
+            new_manifest_digest=mapping["new_manifest_digest"],
+            candidate_stage_db_name=mapping["candidate_stage_db_name"],
+            candidate_manifest_temp_name=mapping["candidate_manifest_temp_name"],
+            canonical_database_name=mapping["canonical_database_name"],
+            canonical_manifest_name=mapping["canonical_manifest_name"],
+            private_directory_name=mapping["private_directory_name"],
+            device_key_name=mapping["device_key_name"],
+            lock_payload_digest=mapping["lock_payload_digest"],
+            sealed_content_attestation=(
+                _portable_sealed_content_attestation_from_mapping(
+                    mapping["sealed_content_attestation"]
+                )
+            ),
+            active_content_attestation=(
+                None
+                if active_mapping is None
+                else _portable_active_content_attestation_from_mapping(active_mapping)
+            ),
+        )
+        record = _PortableReplacementRecord(
+            unsigned=unsigned,
+            private_directory_proof=_portable_activation_proof_from_mapping(
+                mapping["private_directory_proof"]
+            ),
+            record_digest=mapping["record_digest"],
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.REPLACEMENT_PARSE_INVALID",
+            retryable=False,
+        ) from error
+    if _serialize_portable_replacement_record(record) != serialized:
+        raise ActivationPreparationError(
+            "ACTIVATION.REPLACEMENT_PARSE_INVALID",
+            retryable=False,
+        )
+    return record
+
+
+def _portable_replacement_records_follow(
+    predecessor: _PortableReplacementRecord,
+    successor: _PortableReplacementRecord,
+) -> bool:
+    if (
+        type(predecessor) is not _PortableReplacementRecord
+        or type(successor) is not _PortableReplacementRecord
+    ):
+        return False
+    try:
+        predecessor_index = _PORTABLE_REPLACEMENT_PHASES.index(
+            predecessor.unsigned.phase
+        )
+    except ValueError:
+        return False
+    if predecessor_index + 1 >= len(_PORTABLE_REPLACEMENT_PHASES):
+        return False
+    if successor.unsigned.phase != _PORTABLE_REPLACEMENT_PHASES[
+        predecessor_index + 1
+    ]:
+        return False
+    expected = replace(
+        predecessor.unsigned,
+        phase=successor.unsigned.phase,
+        predecessor_digest=predecessor.record_digest,
+        active_content_attestation=successor.unsigned.active_content_attestation,
+    )
+    return successor.unsigned == expected
+
+
+def _portable_replacement_current_binds_pending(
+    current: _PortableReplacementRecord,
+    prepared: _PortableReplacementRecord,
+) -> bool:
+    if (
+        type(current) is not _PortableReplacementRecord
+        or current.unsigned.phase != "READY"
+        or type(prepared) is not _PortableReplacementRecord
+        or prepared.unsigned.phase != "PREPARED"
+    ):
+        return False
+    current_active = current.unsigned.active_content_attestation
+    prepared_unsigned = prepared.unsigned
+    return (
+        prepared_unsigned.predecessor_digest == current.record_digest
+        and prepared_unsigned.prior_authority_digest == current.record_digest
+        and prepared_unsigned.resource_id == current.unsigned.resource_id
+        and prepared_unsigned.target_identity == current.unsigned.target_identity
+        and prepared_unsigned.prior_canonical_store_id
+        == current.unsigned.candidate_canonical_store_id
+        and prepared_unsigned.prior_generation == current.unsigned.next_generation
+        and prepared_unsigned.prior_active_content_attestation == current_active
+        and prepared_unsigned.private_directory_name
+        == current.unsigned.private_directory_name
+        and prepared_unsigned.device_key_name == current.unsigned.device_key_name
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _PortableReplacementNamespaceSnapshot:
+    """Code-only classification of current READY plus at most one pending chain."""
+
+    state: str
+    highest_pending_phase: str | None
+    current_record: _PortableReplacementRecord | None = field(repr=False)
+    pending_records: tuple[_PortableReplacementRecord, ...] = field(repr=False)
+    backup_proofs: tuple[
+        _PortableReplacementBackupProof,
+        _PortableReplacementBackupProof,
+    ] | tuple[()] = field(repr=False)
+
+    def __init__(
+        self,
+        *,
+        state: str,
+        current_record: _PortableReplacementRecord | None,
+        pending_records: tuple[_PortableReplacementRecord, ...],
+        backup_proofs: tuple[
+            _PortableReplacementBackupProof,
+            _PortableReplacementBackupProof,
+        ] | tuple[()],
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _PORTABLE_REPLACEMENT_SNAPSHOT_FACTORY_KEY:
+            raise TypeError("portable replacement snapshot requires owner factory")
+        if state not in {"EMPTY", "CURRENT", "PENDING", "READY_CLEANUP"}:
+            raise ValueError("portable replacement namespace state is invalid")
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "current_record", current_record)
+        object.__setattr__(self, "pending_records", pending_records)
+        object.__setattr__(self, "backup_proofs", backup_proofs)
+        object.__setattr__(
+            self,
+            "highest_pending_phase",
+            None if not pending_records else pending_records[-1].unsigned.phase,
+        )
+
+    def __reduce__(self) -> object:
+        raise TypeError("portable replacement snapshot is code-only")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("portable replacement snapshot is code-only")
+
+
+def _parse_portable_replacement_namespace(
+    records: dict[str, _PortableReplacementRecord],
+    backups: dict[str, PortableContentFileProof],
+    *,
+    base_authority_digest: str | None,
+) -> _PortableReplacementNamespaceSnapshot:
+    """Classify an already authenticated, bounded replacement subnamespace."""
+
+    if type(records) is not dict or any(
+        type(name) is not str or type(record) is not _PortableReplacementRecord
+        for name, record in records.items()
+    ):
+        raise TypeError("portable replacement records are invalid")
+    if type(backups) is not dict or any(
+        type(name) is not str or type(proof) is not PortableContentFileProof
+        for name, proof in backups.items()
+    ):
+        raise TypeError("portable replacement backups are invalid")
+    if base_authority_digest is not None:
+        _require_portable_activation_digest(
+            base_authority_digest,
+            "base_authority_digest",
+        )
+    if not set(records) <= _PORTABLE_REPLACEMENT_RECORD_NAMES:
+        raise ValueError("portable replacement namespace contains foreign records")
+    for name, record in records.items():
+        if _portable_replacement_phase_name(record.unsigned.phase) != name:
+            raise ValueError("portable replacement record occupies the wrong name")
+
+    current = records.get(_PORTABLE_REPLACEMENT_CURRENT_NAME)
+    pending_names = tuple(
+        _portable_replacement_phase_name(phase)
+        for phase in _PORTABLE_REPLACEMENT_PHASES[:-1]
+    )
+    presence = tuple(name in records for name in pending_names)
+    pending_count = 0
+    while pending_count < len(presence) and presence[pending_count]:
+        pending_count += 1
+    if any(presence[pending_count:]):
+        raise ValueError("portable replacement pending phases contain a gap")
+    pending = tuple(records[name] for name in pending_names[:pending_count])
+    if current is not None and current.unsigned.phase != "READY":
+        raise ValueError("portable replacement current record is not READY")
+    for predecessor, successor in zip(pending, pending[1:]):
+        if not _portable_replacement_records_follow(predecessor, successor):
+            raise ValueError("portable replacement pending chain does not close")
+
+    if not pending:
+        if backups:
+            raise ValueError("portable replacement completed namespace retains backups")
+        state = "EMPTY" if current is None else "CURRENT"
+        return _PortableReplacementNamespaceSnapshot(
+            state=state,
+            current_record=current,
+            pending_records=(),
+            backup_proofs=(),
+            _factory_key=_PORTABLE_REPLACEMENT_SNAPSHOT_FACTORY_KEY,
+        )
+
+    prepared = pending[0]
+    expected_backups = {
+        backup.backup_name: backup.content
+        for backup in prepared.unsigned.backup_proofs
+    }
+    if backups != expected_backups:
+        raise ValueError("portable replacement durable backups do not close")
+
+    same_operation_current = (
+        current is not None
+        and current.unsigned.preparation_id == prepared.unsigned.preparation_id
+    )
+    if same_operation_current:
+        if len(pending) != len(_PORTABLE_REPLACEMENT_PHASES) - 1 or not (
+            _portable_replacement_records_follow(pending[-1], current)
+        ):
+            raise ValueError("portable replacement READY cleanup is incomplete")
+        state = "READY_CLEANUP"
+    else:
+        if current is None:
+            if (
+                base_authority_digest is None
+                or prepared.unsigned.predecessor_digest != base_authority_digest
+                or prepared.unsigned.prior_authority_digest
+                != base_authority_digest
+            ):
+                raise ValueError("portable replacement base authority does not bind")
+        elif not _portable_replacement_current_binds_pending(current, prepared):
+            raise ValueError("portable replacement current authority does not bind")
+        state = "PENDING"
+    return _PortableReplacementNamespaceSnapshot(
+        state=state,
+        current_record=current,
+        pending_records=pending,
+        backup_proofs=prepared.unsigned.backup_proofs,
+        _factory_key=_PORTABLE_REPLACEMENT_SNAPSHOT_FACTORY_KEY,
+    )
+
+
+def _portable_replacement_namespace_limits(
+    backup_proofs: tuple[
+        _PortableReplacementBackupProof,
+        _PortableReplacementBackupProof,
+    ],
+) -> LedgerEnumerationLimits:
+    if type(backup_proofs) is not tuple or len(backup_proofs) != 2 or any(
+        type(proof) is not _PortableReplacementBackupProof
+        for proof in backup_proofs
+    ):
+        raise TypeError("portable replacement backup proofs are invalid")
+    return LedgerEnumerationLimits(
+        maximum_entries=len(_PORTABLE_REPLACEMENT_RECORD_NAMES) + 2,
+        maximum_name_bytes=4096,
+        maximum_total_bytes=(
+            _PORTABLE_REPLACEMENT_MAX_BYTES
+            * len(_PORTABLE_REPLACEMENT_RECORD_NAMES)
+            + sum(proof.content.size for proof in backup_proofs)
+        ),
+    )
 
 
 _PORTABLE_JOURNAL_BORROW_FACTORY_KEY = object()
