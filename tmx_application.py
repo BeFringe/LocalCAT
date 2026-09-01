@@ -243,7 +243,10 @@ class TmxExportApplicationService:
         if resource.kind is not ResourceKind.TRANSLATION_MEMORY:
             raise TmxApplicationError("TMX.SCOPE.KIND_MISMATCH")
         try:
-            store = TMEngine(str(resource.path)).canonical_store
+            store = TMEngine(
+                str(resource.path),
+                expected_resource_id=resource.id,
+            ).canonical_store
         except Exception as error:
             raise TmxApplicationError("TMX.SCOPE.UNAVAILABLE") from error
         if store is None:
