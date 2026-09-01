@@ -2279,7 +2279,10 @@ def _capture_activation_file(
             "ACTIVATION.PRIOR_ASSET_INVALID",
             retryable=False,
         )
-    flags = os.O_RDONLY
+    # Capture the exact bytes sealed by Gate B.  On Windows, ``os.open``
+    # otherwise leaves the CRT descriptor in text mode and ``os.read``
+    # translates CRLF, producing a digest for different bytes.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -2325,7 +2328,9 @@ def _capture_activation_file(
 
 
 def _read_activation_file_bytes(capture: _PriorAssetCapture) -> bytes:
-    flags = os.O_RDONLY
+    # Keep the backup payload byte-exact for the same reason as the capture
+    # above: Windows text-mode reads normalize CRLF.
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
