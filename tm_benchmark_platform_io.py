@@ -18,7 +18,12 @@ from typing import Iterable, Iterator
 
 from platform_fs import compose_platform_file_backend
 from platform_fs_contracts import (
+    BoundDirectoryAuthority,
+    BoundRegularFile,
     CandidateContentFacts,
+    ExactEmptyChildDirectoryRetirement,
+    EntrySnapshot,
+    PlatformFileBackend,
     PublishMode,
     RootedDirectoryAuthority,
     RootedFileSystem,
@@ -481,6 +486,178 @@ def windows_benchmark_artifact_family(
             root_authority.close()
 
 
+def cleanup_windows_benchmark_artifact_family(
+    *,
+    backend: PlatformFileBackend,
+    retirement: ExactEmptyChildDirectoryRetirement,
+    run_root_authority: BoundDirectoryAuthority,
+    run_root: Path,
+    fixture_name: str,
+    sidecar_name: str,
+    manifest_name: str,
+    _fault_injector: object | None = None,
+) -> None:
+    """Remove one already-closed Windows benchmark artifact family.
+
+    The caller retains ``run_root_authority`` from run-root creation.  Every
+    nested directory is rebound through that live authority before any file is
+    removed.  The complete file family is captured once under retained live
+    handles, then each name is unlinked only with that capture's identity;
+    directories are consumed post-order by the exact-empty child capability.
+    This is not a recursive/path deletion primitive.
+    """
+
+    if sys.platform != "win32":
+        raise RuntimeError("Windows artifact cleanup requires win32")
+    if not isinstance(backend, PlatformFileBackend):
+        raise TypeError("backend must be a PlatformFileBackend")
+    if not isinstance(retirement, ExactEmptyChildDirectoryRetirement):
+        raise TypeError("retirement must be an exact-empty child capability")
+    if not isinstance(run_root_authority, BoundDirectoryAuthority):
+        raise TypeError("run_root_authority must be a bound directory authority")
+    if _fault_injector is not None and not callable(_fault_injector):
+        raise TypeError("_fault_injector must be callable or None")
+
+    direct_files = {
+        fixture_name,
+        sidecar_name,
+        manifest_name,
+        f".{sidecar_name}.localcat-activated-lineage.json",
+        f".{sidecar_name}.localcat-initial-activation.lock",
+    }
+    private_prefix = ".localcat-activation-private-v1."
+    quarantine_name = ".localcat-activation-quarantine-v1"
+    expected_private_files = {
+        "activation-journal-v3.json",
+        "activation-publication-db-replaced-v1.json",
+        "activation-publication-generation-published-v1.json",
+        "activation-publication-manifest-published-v1.json",
+        "device.key",
+    }
+    authorities: dict[PurePath, BoundDirectoryAuthority] = {
+        PurePath("."): run_root_authority,
+    }
+    # One-process cleanup receipts: FileObjectIdentity never leaves memory or
+    # enters portable benchmark evidence.
+    regulars: list[tuple[PurePath, BoundRegularFile, EntrySnapshot]] = []
+    fresh_root: RootedDirectoryAuthority | None = None
+    try:
+        run_root_authority.reprove()
+        root_names = {entry.name for entry in run_root.iterdir()}
+        run_root_authority.reprove()
+        if not root_names:
+            return
+        private_names = tuple(
+            sorted(name for name in root_names if name.startswith(private_prefix))
+        )
+        if len(private_names) != 1:
+            raise ValueError("Windows activation private directory is not closed")
+        private_name = private_names[0]
+        if root_names != direct_files | {private_name, quarantine_name}:
+            raise ValueError("Windows activation root family is not closed")
+        private_relative = PurePath(private_name)
+        quarantine_relative = PurePath(quarantine_name)
+        authorities[private_relative] = retirement.bind_existing_child_directory(
+            run_root_authority,
+            private_name,
+        )
+        authorities[quarantine_relative] = retirement.bind_existing_child_directory(
+            run_root_authority,
+            quarantine_name,
+        )
+        private_path = run_root / private_name
+        quarantine_path = run_root / quarantine_name
+        authorities[private_relative].reprove()
+        private_names_observed = {entry.name for entry in private_path.iterdir()}
+        authorities[private_relative].reprove()
+        if private_names_observed != expected_private_files:
+            raise ValueError("Windows private activation family is not closed")
+        authorities[quarantine_relative].reprove()
+        attempt_names = tuple(sorted(entry.name for entry in quarantine_path.iterdir()))
+        authorities[quarantine_relative].reprove()
+        if len(attempt_names) != 1 or not attempt_names[0].startswith("initial-"):
+            raise ValueError("Windows quarantine family is not closed")
+        attempt_relative = PurePath(quarantine_name, attempt_names[0])
+        authorities[attempt_relative] = retirement.bind_existing_child_directory(
+            authorities[quarantine_relative],
+            attempt_names[0],
+        )
+        attempt_path = quarantine_path / attempt_names[0]
+        authorities[attempt_relative].reprove()
+        attempt_names_observed = tuple(
+            sorted(entry.name for entry in attempt_path.iterdir())
+        )
+        authorities[attempt_relative].reprove()
+        suffixes = sorted(
+            ".manifest.tmp" if name.endswith(".manifest.tmp")
+            else ".sqlite3.stage" if name.endswith(".sqlite3.stage")
+            else "foreign"
+            for name in attempt_names_observed
+        )
+        if suffixes != [".manifest.tmp", ".sqlite3.stage"]:
+            raise ValueError("Windows quarantine attempt family is not closed")
+        relatives = tuple(PurePath(name) for name in sorted(direct_files))
+        relatives += tuple(
+            PurePath(private_name, name) for name in sorted(expected_private_files)
+        )
+        relatives += tuple(
+            PurePath(quarantine_name, attempt_names[0], name)
+            for name in attempt_names_observed
+        )
+        relatives = tuple(sorted(relatives, key=lambda value: value.as_posix()))
+        fresh_root = backend.bind_root(run_root)
+        for relative in relatives:
+            parent_authority = authorities[relative.parent]
+            regular = backend.open_regular(fresh_root, relative)
+            content = regular.content_facts()
+            if (
+                content.snapshot.identity.kind != "regular"
+                or content.snapshot.identity.link_count != 1
+                or not content.snapshot.reparse_free
+                or parent_authority.inspect_entry(relative.name) != content.snapshot
+            ):
+                regular.close()
+                raise ValueError("Windows benchmark artifact identity drifted")
+            regulars.append((relative, regular, content.snapshot))
+        for relative, _regular, snapshot in regulars:
+            if authorities[relative.parent].inspect_entry(relative.name) != snapshot:
+                raise ValueError("Windows benchmark artifact family drifted")
+        for authority in authorities.values():
+            authority.reprove()
+
+        for relative, regular, snapshot in regulars:
+            regular.close()
+            if _fault_injector is not None:
+                _fault_injector("after_capture_close", run_root / relative)
+            parent_authority = authorities[relative.parent]
+            parent_authority.unlink_owned(relative.name, snapshot.identity)
+            if parent_authority.inspect_entry(relative.name) is not None:
+                raise ValueError("Windows benchmark artifact unlink is not terminal")
+        fresh_root.close()
+        fresh_root = None
+
+        for relative in (attempt_relative, private_relative, quarantine_relative):
+            child = authorities.pop(relative)
+            retirement.remove_empty_owned_directory(
+                authorities[relative.parent],
+                relative.name,
+                child,
+            )
+        run_root_authority.reprove()
+    finally:
+        for _relative, regular, _snapshot in regulars:
+            if not regular.closed:
+                regular.close()
+        if fresh_root is not None:
+            fresh_root.close()
+        for relative, authority in sorted(
+            tuple(authorities.items()),
+            key=lambda item: -len(item[0].parts),
+        ):
+            if relative != PurePath(".") and not authority.closed:
+                authority.close()
+
+
 class _ProcessMemoryCounters(ctypes.Structure):
     _fields_ = (
         ("cb", ctypes.c_ulong),
@@ -530,6 +707,7 @@ def windows_peak_working_set_bytes() -> int:
 __all__ = [
     "PortableFileFacts",
     "RootedArtifactFileFacts",
+    "cleanup_windows_benchmark_artifact_family",
     "create_new_rooted_file",
     "create_windows_private_work_root",
     "iter_rooted_file_lines",
