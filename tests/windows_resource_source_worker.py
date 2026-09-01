@@ -6,7 +6,13 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from editor_contracts import ResourceKind
+from editor_contracts import (
+    EditorProject,
+    EditorSegment,
+    ImportRequest,
+    ResourceKind,
+)
+from editor_controller import EditorController
 from platform_fs import compose_platform_file_backend
 from platform_fs_contracts import LockPolicy, LockWait
 from resource_artifact_save import (
@@ -24,6 +30,7 @@ from resource_portability import ResourcePortabilityService
 from resource_receipt_ledger import ResourceReceiptLedger
 from resource_repository import ResourceRepository
 from termbase_store import TermbaseStore
+from tm_engine import open_canonical_tm_store
 
 
 _MIXED_TERMS = (
@@ -34,6 +41,22 @@ _PRIOR_TERMS = (
     b"\xef\xbb\xbfprior,translation\n"
     b"localcat-term-v1,id-prior,Prior,Translation,true,false\n"
 )
+_C5_SEED_SOURCE = "C5 seed sentence."
+_C5_SEED_TARGET = "C5 种子译文。"
+_C5_TMX_SOURCE = "C5 imported sentence."
+_C5_TMX_TARGET = "C5 导入译文。"
+_C5_TMX = f'''<?xml version="1.0" encoding="UTF-8"?>
+<tmx version="1.4">
+  <header creationtool="LocalCAT" creationtoolversion="1" segtype="sentence"
+          adminlang="en-US" srclang="en-US" datatype="PlainText"/>
+  <body>
+    <tu tuid="c5-imported">
+      <tuv xml:lang="en-US"><seg>{_C5_TMX_SOURCE}</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>{_C5_TMX_TARGET}</seg></tuv>
+    </tu>
+  </body>
+</tmx>
+'''.encode("utf-8")
 
 
 def _prepare_source(root: Path) -> tuple[ResourceRepository, str]:
@@ -107,6 +130,184 @@ def _reopen(root: Path) -> dict[str, object]:
         "destination_receipts": len(destination_ledger.list_receipts()),
         "destination_pending": len(destination_ledger.list_pending()),
     }
+
+
+def _query_targets(controller: EditorController, source: str) -> tuple[str, ...]:
+    controller.set_project(
+        EditorProject(
+            name="C5 reboot TM query",
+            segments=(EditorSegment(id="query", source=source),),
+        )
+    )
+    return tuple(match.target for match in controller.suggestions().tm_matches)
+
+
+def _receipt_facts(receipt: object) -> dict[str, object]:
+    return {
+        "operation_id": receipt.operation_id,
+        "operation_kind": receipt.operation_kind.value,
+        "resource_kind": receipt.resource_kind.value,
+        "payload_profile": receipt.payload_profile.value,
+        "source_resource_id": receipt.source_resource_id,
+        "destination_resource_id": receipt.destination_resource_id,
+        "package_artifact_digest": receipt.package_artifact_digest,
+        "payload_digest": receipt.payload_digest,
+        "record_count": receipt.record_count,
+        "owner_generation": receipt.owner_generation,
+        "owner_revision": receipt.owner_revision,
+        "durable_state": receipt.durable_state.value,
+    }
+
+
+def _c5_observe(root: Path) -> dict[str, object]:
+    source_repository = ResourceRepository(root / "source-app")
+    destination_repository = ResourceRepository(root / "destination-app")
+    source_resources = source_repository.list_resources()
+    destination_resources = destination_repository.list_resources()
+    if len(source_resources) != 1 or len(destination_resources) != 1:
+        raise AssertionError("C5 TM journey requires one source and destination resource")
+    source_resource = source_resources[0]
+    resource = destination_resources[0]
+    if (
+        source_resource.kind is not ResourceKind.TRANSLATION_MEMORY
+        or resource.kind is not ResourceKind.TRANSLATION_MEMORY
+    ):
+        raise AssertionError("C5 TM journey did not retain translation-memory kinds")
+
+    package_path = root / "tm.localcat-resource"
+    controller = EditorController(destination_repository)
+    package = controller.validate_resource_package(package_path)
+    store = open_canonical_tm_store(
+        resource.path,
+        expected_resource_id=resource.id,
+    )
+    if store is None:
+        raise AssertionError("C5 imported TM did not reopen its canonical owner")
+    revision = store.canonical_revision()
+    seed_targets = _query_targets(controller, _C5_SEED_SOURCE)
+    tmx_targets = _query_targets(controller, _C5_TMX_SOURCE)
+    if _C5_SEED_TARGET not in seed_targets or _C5_TMX_TARGET not in tmx_targets:
+        raise AssertionError("C5 canonical TM business queries did not reopen")
+    if revision.resource_id != resource.id or revision.record_count != 2:
+        raise AssertionError("C5 canonical TM revision changed")
+
+    source_ledger = ResourceReceiptLedger(
+        source_repository.config_dir,
+        source_repository.platform_backend,
+    )
+    destination_ledger = ResourceReceiptLedger(
+        destination_repository.config_dir,
+        destination_repository.platform_backend,
+    )
+    source_receipts = source_ledger.list_receipts()
+    destination_receipts = destination_ledger.list_receipts()
+    if len(source_receipts) != 1 or len(destination_receipts) != 1:
+        raise AssertionError("C5 TM journey requires exact package receipts")
+    if source_ledger.list_pending() or destination_ledger.list_pending():
+        raise AssertionError("C5 TM journey retained a pending resource receipt")
+
+    return {
+        "resource": {
+            "id": resource.id,
+            "kind": resource.kind.value,
+            "lookup": resource.lookup,
+        },
+        "package": {
+            "artifact_digest": package.artifact_digest,
+            "payload_digest": package.payload_digest,
+            "record_count": package.record_count,
+        },
+        "receipts": {
+            "source": _receipt_facts(source_receipts[0]),
+            "destination": _receipt_facts(destination_receipts[0]),
+            "source_pending": 0,
+            "destination_pending": 0,
+        },
+        "canonical": {
+            "generation": revision.generation,
+            "head_revision": revision.head_revision,
+            "record_count": revision.record_count,
+        },
+        "queries": {
+            "seed": seed_targets,
+            "tmx": tmx_targets,
+        },
+    }
+
+
+def _c5_prepare(root: Path) -> dict[str, object]:
+    source_repository = ResourceRepository(root / "source-app")
+    source_controller = EditorController(source_repository)
+    source = source_controller.create_resource(
+        "C5 active TM",
+        ResourceKind.TRANSLATION_MEMORY,
+    )
+    source.path.write_bytes(
+        json.dumps(
+            {"source": _C5_SEED_SOURCE, "target": _C5_SEED_TARGET},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    preflight = source_controller.prepare_tm_activation(source.id)
+    operation = source_controller.activate_tm_resource(preflight)
+    completed = source_controller.wait_tm_activation(
+        operation.operation_id,
+        timeout=120.0,
+    )
+    if not completed.completed or not completed.succeeded:
+        raise AssertionError("C5 source TM activation did not complete")
+    if _C5_SEED_TARGET not in _query_targets(source_controller, _C5_SEED_SOURCE):
+        raise AssertionError("C5 source TM activation is not queryable")
+
+    package_path = root / "tm.localcat-resource"
+    source_controller.export_resource_package(source.id, package_path)
+
+    destination_repository = ResourceRepository(root / "destination-app")
+    destination_controller = EditorController(destination_repository)
+    preview = destination_controller.preview_resource_package_import(
+        package_path,
+        ResourceImportMode.CREATE_NEW,
+        new_resource_name="C5 imported TM",
+    )
+    imported = destination_controller.apply_resource_package_import(preview)
+    resource = destination_repository.get(imported.destination_resource_id)
+    if _C5_SEED_TARGET not in _query_targets(destination_controller, _C5_SEED_SOURCE):
+        raise AssertionError("C5 imported package is not queryable")
+
+    tmx_path = (root / "import.tmx").resolve()
+    tmx_path.write_bytes(_C5_TMX)
+    report = destination_controller.import_resource(
+        ImportRequest(
+            resource_id=resource.id,
+            input_path=tmx_path,
+            source_locale="en-US",
+            target_locale="zh-CN",
+        )
+    )
+    if (
+        report.imported != 1
+        or report.skipped != 0
+        or report.overwritten != 0
+        or report.errors
+    ):
+        raise AssertionError("C5 rooted TMX import did not complete exactly once")
+    if _C5_TMX_TARGET not in _query_targets(destination_controller, _C5_TMX_SOURCE):
+        raise AssertionError("C5 rooted TMX import is not queryable")
+
+    observed = _c5_observe(root)
+    observed["tmx_import"] = {
+        "imported": report.imported,
+        "skipped": report.skipped,
+        "overwritten": report.overwritten,
+        "errors": report.errors,
+    }
+    return observed
+
+
+def _c5_reopen(root: Path) -> dict[str, object]:
+    return _c5_observe(root)
 
 
 def _hold_lock(root: Path, destination_name: str) -> None:
@@ -297,6 +498,10 @@ def main(argv: list[str]) -> int:
         raise AssertionError("ledger crash phase was not reached")
     elif mode == "inspect-crash":
         result = _inspect_crash(root)
+    elif mode == "c5-prepare":
+        result = _c5_prepare(root)
+    elif mode == "c5-reopen":
+        result = _c5_reopen(root)
     else:
         raise SystemExit(f"unknown worker mode: {mode}")
     print(json.dumps(result, sort_keys=True), flush=True)

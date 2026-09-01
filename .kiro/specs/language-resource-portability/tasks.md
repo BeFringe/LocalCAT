@@ -254,7 +254,7 @@ Cluster 0 治理/characterization
   - _Requirements: 9.1–9.7, 10.1–10.6, 12.1–12.7_
   - _Depends: 5.2, 5.3_
 
-- [ ] 5.4a 执行 Windows direct/package hostile 与业务 journey
+- [x] 5.4a 执行 Windows direct/package hostile 与业务 journey
   - 从真实 active TM 和 mixed termbase 完成 direct/package export、validate、create/replace apply、冷重开，并重放 source/destination replacement、锁与 crash matrix。
   - _Amendment: WA-04_
   - _Depends: 2.5a, 4.4a, 5.4, WA-01, WA-06, windows-platform-enablement 3.7_
