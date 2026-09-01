@@ -1106,6 +1106,7 @@ def fault_matrix_source_paths(
         "tm_sqlite_store.py",
         "tests/fault_matrix_registry.py",
         "tests/test_tm_fault_matrix.py",
+        "tools/tm_release_evidence_io.py",
         "tools/validate_tm_fault_matrix.py",
     }
     for row in rows:
