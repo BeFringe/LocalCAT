@@ -4082,21 +4082,337 @@ def _verify_replaced_final(
         raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
 
 
+def _windows_evidence_cleanup_owned(
+    parent: Any,
+    name: str,
+    expected_identity: Any,
+) -> None:
+    """Remove one exact Windows-owned name or expose cleanup uncertainty."""
+
+    try:
+        current = parent.inspect_entry(name)
+        if current is None:
+            return
+        if current.identity != expected_identity:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+        parent.unlink_owned(name, expected_identity)
+        if parent.inspect_entry(name) is not None:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    except BenchmarkGateDError:
+        raise
+    except (PlatformFileError, OSError) as error:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+
+
+def _windows_evidence_close_and_cleanup(
+    authority: Any,
+    parent: Any,
+    name: str,
+    expected_identity: Any,
+) -> None:
+    cleanup_error: BaseException | None = None
+    if authority is not None:
+        try:
+            authority.close()
+        except BaseException as error:
+            cleanup_error = error
+    try:
+        _windows_evidence_cleanup_owned(parent, name, expected_identity)
+    except BaseException as error:
+        if cleanup_error is None:
+            cleanup_error = error
+    if cleanup_error is not None:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from cleanup_error
+
+
+def _windows_evidence_reject_published(
+    error_code: str,
+    *,
+    pending: PendingPublication,
+    parent: Any,
+    destination_name: str,
+    destination_identity: Any,
+    cause: BaseException | None = None,
+) -> None:
+    _windows_evidence_close_and_cleanup(
+        pending,
+        parent,
+        destination_name,
+        destination_identity,
+    )
+    failure = BenchmarkGateDError(error_code)
+    if cause is None:
+        raise failure
+    raise failure from cause
+
+
+def _publish_evidence_bundle_windows(
+    bundle: BenchmarkEvidenceBundle,
+    evidence_path: Path,
+    *,
+    payload: bytes,
+    digest: str,
+    artifact_size: int,
+    artifact_digest: str,
+) -> tuple[str, int, str, BenchmarkEvidenceBundle]:
+    """Publish one Windows bundle through the rooted platform authority."""
+
+    authorities: list[Any] = []
+    candidate: CandidateFile | None = None
+    pending: PendingPublication | None = None
+    parent: Any = None
+    candidate_identity: Any = None
+    candidate_name = (
+        f"{_EVIDENCE_TEMP_PREFIX}{secrets.token_hex(16)}"
+        f"{_EVIDENCE_TEMP_SUFFIX}"
+    )
+    destination_identity: Any = None
+    try:
+        try:
+            backend = compose_platform_file_backend(evidence_path.parent)
+            root = backend.bind_root(evidence_path.parent)
+            authorities.append(root)
+            parent = backend.bind_parent(root, PurePath(evidence_path.name))
+            authorities.append(parent)
+            if parent.inspect_entry(evidence_path.name) is not None:
+                raise BenchmarkGateDError("GATE_D.EVIDENCE_EXISTS")
+            candidate = parent.create_candidate(candidate_name, private=False)
+            candidate_identity = candidate.identity()
+            written = candidate.write_chunks(
+                (
+                    payload[offset : offset + 64 * 1024]
+                    for offset in range(0, len(payload), 64 * 1024)
+                ),
+                maximum_bytes=len(payload),
+            )
+            if (
+                written.byte_count != artifact_size
+                or written.content_sha256.hex() != artifact_digest
+            ):
+                raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED")
+            candidate.flush_content()
+        except BenchmarkGateDError:
+            if candidate is not None and candidate_identity is not None:
+                _windows_evidence_close_and_cleanup(
+                    candidate,
+                    parent,
+                    candidate_name,
+                    candidate_identity,
+                )
+                candidate = None
+                candidate_identity = None
+            raise
+        except PlatformFileError as error:
+            if (
+                candidate is None
+                and error.code == PlatformFileErrorCode.REPARSE_REJECTED.value
+            ):
+                raise BenchmarkGateDError("GATE_D.EVIDENCE_EXISTS") from error
+            if candidate is not None and candidate_identity is not None:
+                _windows_evidence_close_and_cleanup(
+                    candidate,
+                    parent,
+                    candidate_name,
+                    candidate_identity,
+                )
+                candidate = None
+                candidate_identity = None
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+        except OSError as error:
+            if candidate is not None and candidate_identity is not None:
+                _windows_evidence_close_and_cleanup(
+                    candidate,
+                    parent,
+                    candidate_name,
+                    candidate_identity,
+                )
+                candidate = None
+                candidate_identity = None
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+
+        try:
+            pending = parent.begin_publish(
+                candidate,
+                evidence_path.name,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+        except PlatformFileError as error:
+            candidate_authority = candidate
+            candidate = None
+            if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+                try:
+                    current = parent.inspect_entry(evidence_path.name)
+                except PlatformFileError as inspect_error:
+                    if inspect_error.code == (
+                        PlatformFileErrorCode.REPARSE_REJECTED.value
+                    ):
+                        _windows_evidence_close_and_cleanup(
+                            candidate_authority,
+                            parent,
+                            candidate_name,
+                            candidate_identity,
+                        )
+                        candidate_identity = None
+                        raise BenchmarkGateDError(
+                            "GATE_D.EVIDENCE_EXISTS"
+                        ) from error
+                    raise BenchmarkGateDError(
+                        "GATE_D.CLEANUP_PENDING"
+                    ) from inspect_error
+                except OSError as inspect_error:
+                    raise BenchmarkGateDError(
+                        "GATE_D.CLEANUP_PENDING"
+                    ) from inspect_error
+                if (
+                    current is not None
+                    and current.identity != candidate_identity
+                ):
+                    _windows_evidence_close_and_cleanup(
+                        candidate_authority,
+                        parent,
+                        candidate_name,
+                        candidate_identity,
+                    )
+                    candidate_identity = None
+                    raise BenchmarkGateDError("GATE_D.EVIDENCE_EXISTS") from error
+                try:
+                    candidate_authority.close()
+                except BaseException:
+                    pass
+                raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+            _windows_evidence_close_and_cleanup(
+                candidate_authority,
+                parent,
+                candidate_name,
+                candidate_identity,
+            )
+            candidate_identity = None
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+        except OSError as error:
+            candidate_authority = candidate
+            candidate = None
+            _windows_evidence_close_and_cleanup(
+                candidate_authority,
+                parent,
+                candidate_name,
+                candidate_identity,
+            )
+            candidate_identity = None
+            raise BenchmarkGateDError("GATE_D.EVIDENCE_PUBLISH_FAILED") from error
+        candidate = None
+        candidate_identity = None
+
+        try:
+            preliminary = pending.preliminary_facts()
+            destination_identity = preliminary.destination_identity
+            retained = pending.retained_destination()
+            readback_bytes = retained.read_all()
+        except (PlatformFileError, OSError) as error:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+        if (
+            preliminary.mode is not PublishMode.CREATE_IF_ABSENT
+            or preliminary.byte_count != artifact_size
+            or preliminary.content_sha256.hex() != artifact_digest
+            or readback_bytes != payload
+        ):
+            _windows_evidence_reject_published(
+                "GATE_D.EVIDENCE_READBACK_MISMATCH",
+                pending=pending,
+                parent=parent,
+                destination_name=evidence_path.name,
+                destination_identity=destination_identity,
+            )
+        try:
+            readback = benchmark_evidence_bundle_from_json(
+                readback_bytes.decode("utf-8")
+            )
+        except (TypeError, ValueError, UnicodeError) as error:
+            _windows_evidence_reject_published(
+                "GATE_D.EVIDENCE_READBACK_MISMATCH",
+                pending=pending,
+                parent=parent,
+                destination_name=evidence_path.name,
+                destination_identity=destination_identity,
+                cause=error,
+            )
+        if (
+            readback != bundle
+            or benchmark_evidence_bundle_digest(readback) != digest
+        ):
+            _windows_evidence_reject_published(
+                "GATE_D.EVIDENCE_READBACK_MISMATCH",
+                pending=pending,
+                parent=parent,
+                destination_name=evidence_path.name,
+                destination_identity=destination_identity,
+            )
+        try:
+            terminal = pending.terminal_reproof()
+        except (PlatformFileError, OSError) as error:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+        if terminal != preliminary:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+        try:
+            implementation_after_publish = benchmark_implementation_fingerprint()
+        except (TypeError, ValueError) as error:
+            _windows_evidence_reject_published(
+                "GATE_D.IMPLEMENTATION_INVALID",
+                pending=pending,
+                parent=parent,
+                destination_name=evidence_path.name,
+                destination_identity=destination_identity,
+                cause=error,
+            )
+        if implementation_after_publish != bundle.implementation_fingerprint:
+            _windows_evidence_reject_published(
+                "GATE_D.IMPLEMENTATION_CHANGED",
+                pending=pending,
+                parent=parent,
+                destination_name=evidence_path.name,
+                destination_identity=destination_identity,
+            )
+        try:
+            pending.close()
+        except BaseException as error:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
+        pending = None
+        destination_identity = None
+        return digest, artifact_size, artifact_digest, readback
+    finally:
+        active_error = sys.exception()
+        close_error: BaseException | None = None
+        for authority in (pending, candidate):
+            if authority is None:
+                continue
+            try:
+                authority.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        try:
+            _close_gate_d_windows_authorities(authorities)
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        if active_error is None and close_error is not None:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from close_error
+
+
 def _publish_evidence_bundle(
     bundle: BenchmarkEvidenceBundle,
     evidence_path: Path,
 ) -> tuple[str, int, str, BenchmarkEvidenceBundle]:
     """Atomically persist one bundle and return its strict durable readback.
 
-    Writes the canonical JSON to one exclusive same-parent temporary,
-    fsyncs it, revalidates the temp identity/single-link/parent, atomically
-    links it to an absent final only, unlinks the temporary name, fsyncs the
-    parent, then reads the final
-    no-follow and strictly re-decodes it.  The readback bundle is
-    authoritative only when value/digest/bytes all match.  Returns the
-    stable bundle digest, the final artifact's canonical byte size and its
-    SHA-256 digest alongside the readback bundle.  Foreign files are never
-    overwritten or deleted; failures never report success.
+    Writes the canonical JSON through the platform publication authority,
+    proves an absent final before the non-overwriting publish, completes the
+    platform durability boundary, then reopens and strictly decodes the final
+    artifact.  The readback bundle is authoritative only when
+    value/digest/bytes all match.  Returns the stable bundle digest, the final
+    artifact's canonical byte size and its SHA-256 digest alongside the
+    readback bundle.  Foreign files are never overwritten or deleted;
+    failures never report success.
     """
 
     serialized = benchmark_evidence_bundle_to_json(bundle)
@@ -4104,6 +4420,15 @@ def _publish_evidence_bundle(
     payload = serialized.encode("utf-8")
     artifact_size = len(payload)
     artifact_digest = hashlib.sha256(payload).hexdigest()
+    if sys.platform == "win32":
+        return _publish_evidence_bundle_windows(
+            bundle,
+            evidence_path,
+            payload=payload,
+            digest=digest,
+            artifact_size=artifact_size,
+            artifact_digest=artifact_digest,
+        )
     parent = evidence_path.parent
     try:
         parent_st = os.lstat(parent)
