@@ -45,7 +45,7 @@
 - [x] 5.1 接入 Controller typed resource/project/chunk preview/export commands。
 - [x] 5.2 项目菜单增加“导出项目”，资源页增加“导出 TMX”；完成非阻塞 preview/export UI。
 - [x] 5.3 用真实 canonical TM、多文档项目和 active chunk 完成三 scope journey；用 TMX ResourcePackage 完成冷重开事务。
-- [ ] 5.3a 在 Windows 源码运行中重放 TMX import、三 scope export、ResourcePackage 冷重开和 hostile XML/source journey。
+- [x] 5.3a 在 Windows 源码运行中重放 TMX import、三 scope export、ResourcePackage 冷重开和 hostile XML/source journey。
   - _Amendment: WA-05_
   - _Depends: 2.3a, 3.5a, 5.3, WA-03, WA-04, WA-06_
 - [x] 5.4 运行 Parser/TM/ResourcePackage/Project/Chunk/Qt/fault/architecture/full regression，更新 current-source steering/evidence。
