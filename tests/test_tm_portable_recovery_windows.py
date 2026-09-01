@@ -182,6 +182,99 @@ class WindowsPortableFreshProcessRecoveryTests(unittest.TestCase):
             _remove_long_quarantine(root)
             temporary.cleanup()
 
+
+    def test_real_fts5_publish_and_two_cold_queries_close_identically(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name).resolve()
+        try:
+            creator = _run_worker(root, "fts5-activate")
+            first = _run_worker(root, "fts5-cold-query")
+            second = _run_worker(root, "fts5-cold-query")
+
+            for result in (creator, first, second):
+                _assert_no_worker_exception(self, result)
+            self.assertEqual(creator["outcome"]["kind"], "MigrationReport")
+            self.assertEqual(creator["outcome"]["generation"], 0)
+            self.assertEqual(creator["outcome"]["record_count"], 3)
+            self.assertTrue(creator["runtime"]["canonical"]["fts5_runtime"])
+
+            for result in (first, second):
+                capability = result["runtime_capability"]
+                self.assertTrue(capability["fts5_available"])
+                self.assertRegex(capability["sqlite_version"], r"^\d+\.\d+")
+                self.assertRegex(capability["unicode_version"], r"^\d+\.\d+")
+
+                health = result["health"]
+                self.assertTrue(health["healthy"])
+                self.assertTrue(health["leased_equal"])
+                self.assertTrue(health["exact_available"])
+                self.assertEqual(health["generation"], 0)
+                self.assertEqual(health["record_count"], 3)
+                self.assertEqual(health["index_kind"], "FTS5_TRIGRAM")
+                self.assertEqual(health["source_binding_state"], "VERIFIED_CURRENT")
+                self.assertEqual(health["diagnostic_codes"], [])
+                self.assertRegex(health["snapshot_binding_digest"], r"^[0-9a-f]{64}$")
+
+                query = result["query"]
+                self.assertEqual(query["folded_query"], "sam")
+                self.assertEqual(query["candidate_ids"], [1, 2])
+                self.assertEqual(query["record_ids"], [1, 2])
+                self.assertEqual(query["record_sources"], ["same", "same"])
+                self.assertEqual(query["record_targets"], ["first", "winner"])
+                self.assertEqual(query["candidate_pretruncate_ranks"], [1, 2])
+                self.assertEqual(query["index_kind"], "FTS5_TRIGRAM")
+                self.assertTrue(query["fuzzy_available"])
+                self.assertIsNone(query["unavailable_code"])
+                self.assertEqual(query["candidate_stages"][0], "FTS_TRIGRAM")
+                self.assertTrue(
+                    all(
+                        "FTS_TRIGRAM" in stages
+                        for stages in query["candidate_recall_stages"]
+                    )
+                )
+
+                database = result["disk"]["database"]
+                manifest = result["disk"]["manifest"]
+                source = result["disk"]["source"]
+                for authority in (database, manifest, source):
+                    self.assertRegex(authority["sha256"], r"^[0-9a-f]{64}$")
+                sql = result["disk"]["database_sql"]
+                self.assertEqual(sql["integrity_check"], "ok")
+                self.assertEqual(sql["foreign_key_check"], [])
+                self.assertIn("ENABLE_FTS5", sql["compile_options"])
+                self.assertIn("tm_fts", sql["schema_names"])
+                self.assertIn("CREATE VIRTUAL TABLE tm_fts USING fts5", sql["fts_ddl"])
+                self.assertIn("tokenize='trigram case_sensitive 1'", sql["fts_ddl"])
+                self.assertEqual(sql["meta"]["candidate_index_kind"], "FTS5_TRIGRAM")
+                self.assertEqual(sql["meta"]["fts5_available"], "1")
+                self.assertRegex(sql["meta"]["schema_digest"], r"^[0-9a-f]{64}$")
+                self.assertRegex(sql["meta"]["activation_digest"], r"^[0-9a-f]{64}$")
+                attestation = result["journal"]["active_attestation"]
+                self.assertEqual(attestation["generation"], 0)
+                self.assertEqual(attestation["index_kind"], "FTS5_TRIGRAM")
+                self.assertTrue(attestation["fts5_available"])
+                self.assertEqual(
+                    attestation["sqlite_version"],
+                    capability["sqlite_version"],
+                )
+                self.assertEqual(
+                    attestation["unicode_version"],
+                    capability["unicode_version"],
+                )
+                self.assertEqual(attestation["database_sha256"], database["sha256"])
+                self.assertEqual(attestation["manifest_sha256"], manifest["sha256"])
+                self.assertEqual(attestation["source_sha256"], source["sha256"])
+                self.assertRegex(attestation["attestation_digest"], r"^[0-9a-f]{64}$")
+
+            self.assertEqual(first["runtime_capability"], second["runtime_capability"])
+            self.assertEqual(first["health"], second["health"])
+            self.assertEqual(first["query"], second["query"])
+            self.assertEqual(first["journal"], second["journal"])
+            self.assertEqual(first["disk"], second["disk"])
+        finally:
+            _remove_long_quarantine(root)
+            temporary.cleanup()
+
     def test_each_published_prefix_recovers_and_replays_generation_zero(self) -> None:
         for phase in ("DB_REPLACED", "MANIFEST_PUBLISHED", "GENERATION_PUBLISHED"):
             with self.subTest(phase=phase):
