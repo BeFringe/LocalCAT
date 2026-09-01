@@ -31,6 +31,7 @@ from tmx_context_interchange import (
     inspect_tmx_payload,
     prepare_tmx_payload,
 )
+from tmx_resource_package_handler import _write_private_payload
 
 
 class TmxContextInterchangeTests(unittest.TestCase):
@@ -64,6 +65,23 @@ class TmxContextInterchangeTests(unittest.TestCase):
         self.assertEqual(text.count("<tu tuid="), 2)
         self.assertEqual(len(set(part.split('"', 1)[0] for part in text.split('tuid="')[1:])), 2)
         self.assertIn("same &amp; &lt;source&gt;", text)
+
+    def test_private_package_writer_preserves_proved_payload_bytes(self) -> None:
+        payload = prepare_tmx_payload(
+            self.binding(1),
+            TmxEffectiveLocales("en-US", "zh-CN"),
+            (TmxExportUnit("record-1", "Hello", "你好", True),),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary).resolve() / "private-payload.tmx"
+            _write_private_payload(path, payload.data)
+
+            self.assertEqual(path.read_bytes(), payload.data)
+            self.assertEqual(
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                payload.proof.payload_digest,
+            )
+            cold_validate_tmx_file(path, payload.proof)
 
     def test_localcat_registry_then_unknown_props_preserve_order_duplicates_and_scope(self) -> None:
         units = (

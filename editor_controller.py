@@ -4388,7 +4388,10 @@ class EditorController:
                         raise ValueError(
                             "activation completion resource is unavailable"
                         )
-                    target_engine = self._load_tm_engine(target_config.path)
+                    target_engine = self._load_tm_engine(
+                        target_config.path,
+                        target_config.id,
+                    )
                     _validate_activation_compatibility_engine(
                         target_engine,
                         outcome,
@@ -4400,7 +4403,7 @@ class EditorController:
                         config.id: (
                             target_engine
                             if config.id == resource_id
-                            else self._load_tm_engine(config.path)
+                            else self._load_tm_engine(config.path, config.id)
                         )
                         for config in configs
                         if config.active
@@ -5915,6 +5918,7 @@ class EditorController:
                     resource.path,
                     request.source_locale,
                     request.target_locale,
+                    expected_resource_id=resource.id,
                 )
                 if report.imported:
                     try:
@@ -6123,7 +6127,8 @@ class EditorController:
             if resource.kind is ResourceKind.TRANSLATION_MEMORY:
                 if runtime_snapshot is None:
                     tm_engines[resource.id] = self._load_tm_engine(
-                        resource.path
+                        resource.path,
+                        resource.id,
                     )
         return tm_engines, glossary_engines, term_records, term_handoff
 
@@ -6257,7 +6262,7 @@ class EditorController:
                 or resource.id not in legacy_ids | canonical_ids
             ):
                 continue
-            engine = self._load_tm_engine(resource.path)
+            engine = self._load_tm_engine(resource.path, resource.id)
             if resource.id in legacy_ids:
                 if engine.canonical_store is not None:
                     raise ValueError(
@@ -6271,10 +6276,18 @@ class EditorController:
         return tm_engines
 
     @staticmethod
-    def _load_tm_engine(path: Path) -> TMEngine:
+    def _load_tm_engine(path: Path, resource_id: str) -> TMEngine:
+        if type(resource_id) is not str or not resource_id:
+            raise TypeError("translation memory resource id must be a non-empty string")
+        engine = TMEngine(str(path), expected_resource_id=resource_id)
+        if engine.canonical_store is not None:
+            return engine
         if not path.exists() or not path.is_file():
-            raise ValueError(f"translation memory does not exist: {path}")
-        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            raise ValueError("translation memory does not exist")
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
             if not line.strip():
                 continue
             record = json.loads(line)
@@ -6286,7 +6299,7 @@ class EditorController:
                 raise ValueError(f"translation memory line {line_number} has no source")
             if not isinstance(target, str) or not target.strip():
                 raise ValueError(f"translation memory line {line_number} has no target")
-        return TMEngine(str(path))
+        return engine
 
 
 def compose_project_enabled_editor_controller(

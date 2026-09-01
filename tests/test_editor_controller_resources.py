@@ -3,17 +3,24 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 
 from editor_contracts import (
     EditorProject,
     EditorSegment,
+    ImportReport,
     ImportRequest,
     ResourceKind,
 )
-from editor_controller import EditorController, EditorControllerError
+from editor_controller import (
+    EditorController,
+    EditorControllerError,
+    _initial_tm_activation_service,
+)
 from resource_repository import ResourceRepository
+from tm_contracts import CanonicalResourceIdentity, MigrationReport
 
 
 class EditorControllerResourcesTest(unittest.TestCase):
@@ -85,6 +92,137 @@ class EditorControllerResourcesTest(unittest.TestCase):
         self.assertEqual(report.imported, 1)
         self.assertEqual(report.errors, ())
         self.assertEqual(after.tm_matches[0].target, "办公室准备好了。")
+
+    def test_tmx_import_survives_fresh_controller_canonical_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = self._controller(root)
+            resource = controller.create_resource(
+                "Imported canonical TM",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            resource.path.write_text(
+                json.dumps(
+                    {"source": "The office is ready.", "target": "旧译文"},
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            initial = _initial_tm_activation_service(resource).activate_initial(
+                resource.path,
+                resource.id,
+            )
+            self.assertIs(type(initial), MigrationReport)
+            controller.reload_resources()
+
+            source = (root / "fresh-reload.tmx").resolve()
+            self._write_tmx(source)
+            report = controller.import_resource(
+                ImportRequest(
+                    resource_id=resource.id,
+                    input_path=source,
+                    source_locale="en-US",
+                    target_locale="zh-CN",
+                )
+            )
+            self.assertEqual(report.imported, 1)
+            self.assertEqual(report.errors, ())
+            self.assertEqual(
+                controller.suggestions().tm_matches[0].target,
+                "办公室准备好了。",
+            )
+
+            # A completed canonical owner remains authoritative even when the
+            # configured JSONL has diverged or is no longer parseable.
+            resource.path.write_text("{not-json\n", encoding="utf-8")
+            fresh = self._controller(root)
+            self.assertEqual(
+                fresh.suggestions().tm_matches[0].target,
+                "办公室准备好了。",
+            )
+
+    def test_wrong_resource_identity_does_not_mutate_canonical_tm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = self._controller(root)
+            resource = controller.create_resource(
+                "Identity guarded TM",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            resource.path.write_text(
+                json.dumps(
+                    {"source": "The office is ready.", "target": "稳定译文"},
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            initial = _initial_tm_activation_service(resource).activate_initial(
+                resource.path,
+                resource.id,
+            )
+            self.assertIs(type(initial), MigrationReport)
+            identity = CanonicalResourceIdentity.from_configured_jsonl(
+                resource.id,
+                resource.path,
+            )
+            source_before = resource.path.read_bytes()
+            canonical_before = identity.canonical_sidecar_path.read_bytes()
+            source = (root / "identity-failure.tmx").resolve()
+            self._write_tmx(source)
+
+            with self.assertRaises(EditorControllerError):
+                controller.import_resource(
+                    ImportRequest(
+                        resource_id="wrong-resource-id",
+                        input_path=source,
+                        source_locale="en-US",
+                        target_locale="zh-CN",
+                    )
+                )
+            with self.assertRaises(ValueError):
+                EditorController._load_tm_engine(resource.path, "wrong-resource-id")
+
+            self.assertEqual(resource.path.read_bytes(), source_before)
+            self.assertEqual(
+                identity.canonical_sidecar_path.read_bytes(),
+                canonical_before,
+            )
+
+    def test_tmx_import_passes_managed_resource_identity_to_canonical_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            controller = self._controller(root)
+            resource = controller.create_resource(
+                "Managed identity",
+                ResourceKind.TRANSLATION_MEMORY,
+            )
+            source = (root / "identity.tmx").resolve()
+            self._write_tmx(source)
+            blocked = ImportReport(errors=("test stop",))
+
+            with mock.patch(
+                "editor_controller.import_tmx",
+                return_value=blocked,
+            ) as importer:
+                report = controller.import_resource(
+                    ImportRequest(
+                        resource_id=resource.id,
+                        input_path=source,
+                        source_locale="en-US",
+                        target_locale="zh-CN",
+                    )
+                )
+
+        self.assertIs(report, blocked)
+        importer.assert_called_once_with(
+            source,
+            resource.path,
+            "en-US",
+            "zh-CN",
+            expected_resource_id=resource.id,
+        )
 
     def test_speaker_wrapped_renpy_tm_is_a_safe_exact_compatibility_match(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

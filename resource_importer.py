@@ -410,6 +410,8 @@ def import_tmx(
     target_path: Path,
     source_locale: str,
     target_locale: str,
+    *,
+    expected_resource_id: str | None = None,
 ) -> ImportReport:
     """Merge one safe TMX Level 1 file into a translation memory.
 
@@ -448,7 +450,10 @@ def import_tmx(
             }
         skipped = len(staged.warnings)
         warnings = tuple(_format_parser_issue(issue) for issue in staged.warnings)
-        canonical = open_canonical_tm_store(target)
+        canonical = open_canonical_tm_store(
+            target,
+            expected_resource_id=expected_resource_id,
+        )
         if canonical is not None:
             drafts = tuple(
                 _tmx_import_draft(record, receipt_source.name)

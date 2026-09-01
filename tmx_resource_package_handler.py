@@ -143,7 +143,10 @@ def _canonical_owner(resource: ResourceConfig):
     if resource.kind is not ResourceKind.TRANSLATION_MEMORY:
         raise ResourcePortabilityError("RESOURCE.PORTABILITY.KIND_MISMATCH")
     try:
-        store = TMEngine(str(resource.path)).canonical_store
+        store = TMEngine(
+            str(resource.path),
+            expected_resource_id=resource.id,
+        ).canonical_store
     except Exception as error:
         raise ResourcePortabilityError("RESOURCE.EXPORT.SNAPSHOT_UNAVAILABLE") from error
     if store is None or store.coordinator.resource_id != resource.id:
@@ -154,7 +157,16 @@ def _canonical_owner(resource: ResourceConfig):
 def _write_private_payload(destination: Path, data: bytes) -> None:
     if not isinstance(destination, Path) or not destination.is_absolute():
         raise TypeError("TMX package payload destination must be absolute")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    # TMX payload bytes are already sealed and hashed by the proof.  Open the
+    # destination in binary mode so Windows CRT newline translation cannot
+    # change those bytes before the cold validation below.
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(destination, flags, 0o600)
