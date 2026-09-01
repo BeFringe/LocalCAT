@@ -33,6 +33,7 @@ from tm_contracts import (
     ActivationCapabilityState,
     CanonicalResourceIdentity,
     MigrationReport,
+    MigrationFailure,
     SnapshotReceipt,
     SourceBindingState,
 )
@@ -40,7 +41,11 @@ from tm_engine import SourceUnit, TMEngine
 from tm_migration import TMMigrationService
 from tm_gate_b import GateBEvaluator
 from tm_snapshot_recovery import RefreshRecoveryOutcome, RefreshRecoveryState
-from tm_sqlite_store import ActivationPreparationError, ResourceStoreCoordinator
+from tm_sqlite_store import (
+    ActivationPreparationError,
+    ResourceStoreCoordinator,
+    SQLiteStoreSchemaError,
+)
 
 
 SOURCE_BYTES = (
@@ -236,6 +241,43 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
         identity: CanonicalResourceIdentity,
     ) -> tuple[object, object, object]:
         return _portable_sealed_stage(service, coordinator, identity)
+
+    def test_fts5_write_unavailable_is_stable_nonretryable_and_unpublished(
+        self,
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name).resolve()
+        try:
+            identity = _identity(root)
+            service = _service(identity)
+            coordinator = service._coordinator
+            before = identity.configured_jsonl_path.read_bytes()
+            with mock.patch.object(
+                service,
+                "_build_stage",
+                side_effect=SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE"),
+            ):
+                outcome = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+
+            self.assertIs(type(outcome), MigrationFailure)
+            assert isinstance(outcome, MigrationFailure)
+            self.assertEqual(outcome.stage, "BUILD")
+            self.assertEqual(outcome.error_code, "STORE.FTS5_UNAVAILABLE")
+            self.assertFalse(outcome.retryable)
+            self.assertFalse(outcome.canonical_authority_published)
+            self.assertFalse(outcome.canonical_authority_ambiguous)
+            self.assertIsNone(outcome.active_generation)
+            self.assertIsNone(coordinator.current_generation)
+            self.assertEqual(identity.configured_jsonl_path.read_bytes(), before)
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(identity.snapshot_manifest_path.exists())
+            self.assertEqual(list(root.glob(".localcat-migration.initial-*")), [])
+        finally:
+            _remove_long_quarantine(root)
+            temporary.cleanup()
 
     def test_completed_portable_cold_open_classifies_changed_jsonl(self) -> None:
         temporary = tempfile.TemporaryDirectory()

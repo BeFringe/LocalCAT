@@ -11230,6 +11230,11 @@ def _require_proven_initial_posix_attempt_state(
 
 
 def _initial_activation_error_code(error: Exception) -> str:
+    if (
+        isinstance(error, SQLiteStoreSchemaError)
+        and str(error) == "STORE.FTS5_UNAVAILABLE"
+    ):
+        return "STORE.FTS5_UNAVAILABLE"
     error_code = getattr(error, "error_code", None)
     if type(error_code) is str and error_code:
         return error_code
@@ -11242,6 +11247,11 @@ def _initial_activation_error_code(error: Exception) -> str:
 
 
 def _initial_activation_retryable(error: Exception) -> bool:
+    if (
+        isinstance(error, SQLiteStoreSchemaError)
+        and str(error) == "STORE.FTS5_UNAVAILABLE"
+    ):
+        return False
     retryable = getattr(error, "retryable", None)
     if type(retryable) is bool:
         return retryable

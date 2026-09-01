@@ -451,7 +451,7 @@
   - _Boundary: Migration Content Attestation_
   - _Depends: 8.6, 5.R1_
 
-- [ ] 8.8a 在 Windows 冷重开中重验 SQLite/FTS5 与 attestation
+- [x] 8.8a 在 Windows 冷重开中重验 SQLite/FTS5 与 attestation
   - 使用 CPython 3.14 x64 的真实 SQLite 检查 FTS5、schema/index/integrity、sealed/active attestation、generation lease 与 canonical query；不得以 gram fallback 掩盖 FTS5 缺失。
   - _Amendment: WA-06_
   - _Depends: 5.8a, 5.9a, 8.8_
