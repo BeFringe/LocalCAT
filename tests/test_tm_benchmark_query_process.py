@@ -83,6 +83,22 @@ def _digest(prefix: str) -> str:
     return prefix * 64
 
 
+def _activation_journal_path(root: Path) -> Path:
+    if sys.platform == "win32":
+        candidates = tuple(
+            root.glob(
+                ".localcat-activation-private-v1.*/activation-journal-v3.json"
+            )
+        )
+    else:
+        candidates = tuple(
+            path for path in root.iterdir() if "activation-journal" in path.name
+        )
+    if len(candidates) != 1:
+        raise AssertionError("expected exactly one activation journal")
+    return candidates[0]
+
+
 def _latency_environment(fts5_enabled: str) -> tuple[tuple[str, str], ...]:
     facts = {
         "cpu": "test-cpu",
@@ -556,7 +572,16 @@ class ArtifactVerificationTests(unittest.TestCase):
                 snapshot.manifest_digest,
                 hashlib.sha256(manifest.read_bytes()).hexdigest(),
             )
-            self.assertGreater(snapshot.sidecar_identity.inode, 0)
+            if sys.platform == "win32":
+                self.assertEqual(snapshot.sidecar_identity.device, 0)
+                self.assertEqual(snapshot.sidecar_identity.inode, 0)
+                self.assertEqual(snapshot.sidecar_identity.mtime_ns, 0)
+                self.assertEqual(
+                    snapshot.sidecar_identity.size,
+                    sidecar.stat().st_size,
+                )
+            else:
+                self.assertGreater(snapshot.sidecar_identity.inode, 0)
 
     def test_rejects_missing_sidecar_and_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -589,13 +614,34 @@ class ArtifactVerificationTests(unittest.TestCase):
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
-            target = root / "planted.db"
-            target.write_bytes(b"foreign")
             sidecar.unlink()
-            sidecar.symlink_to(target)
+            if sys.platform == "win32":
+                target = root / "planted-directory"
+                target.mkdir()
+                marker = target / "marker.txt"
+                marker.write_bytes(b"foreign")
+                created = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(sidecar),
+                        str(target),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+            else:
+                target = root / "planted.db"
+                target.write_bytes(b"foreign")
+                sidecar.symlink_to(target)
             with self.assertRaisesRegex(
                 ValueError,
-                "escape the run root|single-link|foreign",
+                "escape the run root|single-link|foreign|cannot be inspected",
             ):
                 verify_canonical_artifact(
                     run_root=root,
@@ -603,6 +649,8 @@ class ArtifactVerificationTests(unittest.TestCase):
                     resource_id=evidence.resource_id,
                     expected_fixture_digest=evidence.fixture_digest,
                 )
+            if sys.platform == "win32":
+                self.assertEqual(marker.read_bytes(), b"foreign")
 
     def test_rejects_multilink_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -960,11 +1008,7 @@ class ProbeIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
-            journal = next(
-                path
-                for path in root.iterdir()
-                if "activation-journal" in path.name
-            )
+            journal = _activation_journal_path(root)
             journal.write_bytes(journal.read_bytes() + b"tampered")
             with self.assertRaises(QueryProcessError) as raised:
                 run_query_process_probe(evidence, timeout_seconds=120.0)
@@ -1002,13 +1046,36 @@ class ProbeIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
-            target = root / "planted.db"
-            target.write_bytes(b"foreign")
             sidecar.unlink()
-            sidecar.symlink_to(target)
+            if sys.platform == "win32":
+                target = root / "planted-directory"
+                target.mkdir()
+                marker = target / "marker.txt"
+                marker.write_bytes(b"foreign")
+                created = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(sidecar),
+                        str(target),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+            else:
+                target = root / "planted.db"
+                target.write_bytes(b"foreign")
+                sidecar.symlink_to(target)
             with self.assertRaises(QueryProcessError) as raised:
                 run_query_process_probe(evidence, timeout_seconds=120.0)
             self.assertEqual(raised.exception.error_code, "QUERY.ARTIFACT_INVALID")
+            if sys.platform == "win32":
+                self.assertEqual(marker.read_bytes(), b"foreign")
 
 
 class ParentRunnerFailureTests(unittest.TestCase):
@@ -1347,11 +1414,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
-            journal = next(
-                path
-                for path in root.iterdir()
-                if "activation-journal" in path.name
-            )
+            journal = _activation_journal_path(root)
 
             def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
                 journal.write_bytes(journal.read_bytes() + b"tampered")
@@ -1488,12 +1551,21 @@ class ProcessOwnerCodecRegressionTests(unittest.TestCase):
             )
 
     def test_rss_peak_bytes_facts_normalize_to_bytes(self) -> None:
-        import resource as resource_module
+        if sys.platform == "win32":
+            from tm_benchmark_platform_io import windows_peak_working_set_bytes
 
-        usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
+            usage: object = windows_peak_working_set_bytes()
+        else:
+            import resource as resource_module
+
+            usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
         platform_name, raw_unit, peak_bytes = rss_peak_bytes_facts(usage)
         self.assertIn(raw_unit, ("kib", "bytes"))
-        if raw_unit == "kib":
+        if sys.platform == "win32":
+            self.assertEqual(platform_name, "windows")
+            self.assertEqual(raw_unit, "bytes")
+            self.assertEqual(peak_bytes, usage)
+        elif raw_unit == "kib":
             self.assertEqual(peak_bytes, usage.ru_maxrss * 1024)
         else:
             self.assertEqual(peak_bytes, usage.ru_maxrss)

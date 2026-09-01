@@ -25,8 +25,8 @@ Invariant capsule
 - Artifact authority: before spawn (parent), before reopen (child), and after
   all queries (child) the canonical artifact is re-verified against the
   dedicated run-root namespace, the deterministic sidecar/manifest locators,
-  no-follow regular single-link identity, stable dev/inode/size/mtime facts,
-  a full SHA-256/identity digest over every retained family entry, and the
+  no-follow regular single-link identity, fresh live platform handles, and a
+  full SHA-256/portable-size digest over every retained family entry, and the
   process contract/corpus/fixture/resource/
   store/generation/path/count bindings.  Symlink, multi-link, foreign entry,
   path escape, substitution, drift, and unknown/missing facts fail closed.
@@ -68,6 +68,7 @@ import time
 from typing import Any
 from unittest.mock import patch
 
+from platform_fs_contracts import PlatformFileError
 from tm_benchmark import (
     benchmark_digest,
     benchmark_implementation_fingerprint,
@@ -82,6 +83,12 @@ from tm_benchmark_latency import (
     latency_evidence_from_payload,
     latency_evidence_to_payload,
     measure_path_latency,
+)
+from tm_benchmark_platform_io import (
+    rooted_first_nonempty_line,
+    rooted_file_facts,
+    windows_benchmark_artifact_family,
+    windows_peak_working_set_bytes,
 )
 from tm_benchmark_process import (
     ArtifactSnapshot as ProcessArtifactSnapshot,
@@ -109,6 +116,7 @@ from tm_contracts import (
     benchmark_environment_digest,
 )
 from tm_retrieval import prove_and_score_fuzzy_candidates
+from tm_migration import TMMigrationService
 from tm_sqlite_store import ResourceStoreCoordinator, SQLiteTMStore
 
 QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION = "tm-benchmark-query-process-evidence-v2"
@@ -164,6 +172,8 @@ def _resolved_absolute_path_string(value: object, field_name: str) -> str:
     """Canonicalize an already-absolute benchmark path before binding it."""
 
     text = _require_absolute_path_string(value, field_name)
+    if sys.platform == "win32":
+        return text
     try:
         return str(Path(text).resolve())
     except OSError as error:
@@ -476,10 +486,14 @@ def verify_canonical_artifact(
         raise TypeError("fixture path must be a Path")
     _require_identity(resource_id, "resource id")
     _require_digest(expected_fixture_digest, "expected fixture digest")
-    run_root = run_root.resolve()
-    if not run_root.is_absolute() or not run_root.is_dir():
-        raise ValueError("run root must be an existing absolute directory")
-    fixture_path = fixture_path.resolve()
+    if sys.platform == "win32":
+        if not run_root.is_absolute() or not fixture_path.is_absolute():
+            raise ValueError("run root and fixture must be absolute")
+    else:
+        run_root = run_root.resolve()
+        if not run_root.is_absolute() or not run_root.is_dir():
+            raise ValueError("run root must be an existing absolute directory")
+        fixture_path = fixture_path.resolve()
     if fixture_path.parent != run_root:
         raise ValueError("fixture path must live directly in the run root")
     fixture, sidecar_path, manifest_path = process_canonical_artifact_paths(
@@ -495,29 +509,39 @@ def verify_canonical_artifact(
     ):
         if path.parent != run_root:
             raise ValueError(f"{label} must live directly in the run root")
-        if path.resolve() != path:
+        if sys.platform != "win32" and path.resolve() != path:
             raise ValueError(f"{label} must not escape the run root")
 
     try:
-        entries = sorted(run_root.iterdir())
-    except OSError as error:
+        if sys.platform == "win32":
+            rooted_artifacts = windows_benchmark_artifact_family(
+                run_root=run_root,
+                fixture_name=fixture_path.name,
+                sidecar_name=sidecar_path.name,
+                manifest_name=manifest_path.name,
+            )
+            entries = [artifact.path for artifact in rooted_artifacts]
+        else:
+            entries = sorted(run_root.iterdir())
+            expected_names = _expected_run_root_entry_names(
+                fixture_path=fixture_path,
+                sidecar_path=sidecar_path,
+                manifest_path=manifest_path,
+            )
+            entry_names = [path.name for path in entries]
+            unknown = sorted(set(entry_names) - set(expected_names))
+            if unknown:
+                raise ValueError(
+                    "run root contains foreign entries "
+                    f"{unknown!r}"
+                )
+            for required in (fixture_path.name, sidecar_path.name, manifest_path.name):
+                if required not in entry_names:
+                    raise ValueError(
+                        f"run root is missing required artifact {required!r}"
+                    )
+    except (OSError, PlatformFileError) as error:
         raise ValueError("run root cannot be inspected") from error
-    expected_names = _expected_run_root_entry_names(
-        fixture_path=fixture_path,
-        sidecar_path=sidecar_path,
-        manifest_path=manifest_path,
-    )
-    entry_names = [path.name for path in entries]
-    unknown = sorted(set(entry_names) - set(expected_names))
-    if unknown:
-        raise ValueError(
-            "run root contains foreign entries "
-            f"{unknown!r}"
-        )
-    missing = sorted(expected_names - set(entry_names))
-    for required in (fixture_path.name, sidecar_path.name, manifest_path.name):
-        if required not in entry_names:
-            raise ValueError(f"run root is missing required artifact {required!r}")
     sqlite_entries = [
         path for path in entries if path.name.endswith(".sqlite3")
     ]
@@ -525,28 +549,44 @@ def verify_canonical_artifact(
         raise ValueError("canonical sidecar must be the only sqlite entry")
 
     family_payload: list[dict[str, object]] = []
-    family_proofs: dict[str, tuple[str, os.stat_result]] = {}
-    for entry in entries:
-        digest, stat_result = _stable_file_proof(entry, "run-root entry")
-        family_proofs[entry.name] = (digest, stat_result)
+    family_proofs: dict[str, tuple[str, ArtifactFileIdentity]] = {}
+    artifact_rows = (
+        (
+            artifact.path,
+            artifact.facts.sha256,
+            ArtifactFileIdentity(
+                device=0,
+                inode=0,
+                size=artifact.facts.byte_count,
+                mtime_ns=0,
+            ),
+        )
+        for artifact in rooted_artifacts
+    ) if sys.platform == "win32" else (
+        (entry, *_stable_file_proof(entry, "run-root entry"))
+        for entry in entries
+    )
+    for entry, digest, identity in artifact_rows:
+        relative_name = entry.relative_to(run_root).as_posix()
+        family_proofs[relative_name] = (digest, identity)
         family_payload.append(
             {
                 "digest": digest,
                 "identity": {
-                    "device": stat_result.st_dev,
-                    "inode": stat_result.st_ino,
-                    "mtime_ns": stat_result.st_mtime_ns,
-                    "size": stat_result.st_size,
+                    "device": identity.device,
+                    "inode": identity.inode,
+                    "mtime_ns": identity.mtime_ns,
+                    "size": identity.size,
                 },
-                "name": entry.name,
+                "name": relative_name,
             }
         )
 
     fixture_digest, _fixture_stat = family_proofs[fixture_path.name]
     if fixture_digest != expected_fixture_digest:
         raise ValueError("fixture digest does not match the run request")
-    sidecar_digest, sidecar_stat = family_proofs[sidecar_path.name]
-    manifest_digest, manifest_stat = family_proofs[manifest_path.name]
+    sidecar_digest, sidecar_identity = family_proofs[sidecar_path.name]
+    manifest_digest, manifest_identity = family_proofs[manifest_path.name]
     return ArtifactSnapshot(
         sidecar_digest=sidecar_digest,
         manifest_digest=manifest_digest,
@@ -555,18 +595,8 @@ def verify_canonical_artifact(
             "process-artifact-family",
             family_payload,
         ),
-        sidecar_identity=ArtifactFileIdentity(
-            device=sidecar_stat.st_dev,
-            inode=sidecar_stat.st_ino,
-            size=sidecar_stat.st_size,
-            mtime_ns=sidecar_stat.st_mtime_ns,
-        ),
-        manifest_identity=ArtifactFileIdentity(
-            device=manifest_stat.st_dev,
-            inode=manifest_stat.st_ino,
-            size=manifest_stat.st_size,
-            mtime_ns=manifest_stat.st_mtime_ns,
-        ),
+        sidecar_identity=sidecar_identity,
+        manifest_identity=manifest_identity,
     )
 
 
@@ -590,8 +620,16 @@ def _require_single_link_regular_file(
 def _stable_file_proof(
     path: Path,
     field_name: str,
-) -> tuple[str, os.stat_result]:
+) -> tuple[str, ArtifactFileIdentity]:
     """Read one no-follow file while proving its path identity stayed fixed."""
+    if sys.platform == "win32":
+        facts = rooted_file_facts(path)
+        return facts.sha256, ArtifactFileIdentity(
+            device=0,
+            inode=0,
+            size=facts.byte_count,
+            mtime_ns=0,
+        )
     before = _require_single_link_regular_file(path, field_name)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -632,7 +670,12 @@ def _stable_file_proof(
     after = _require_single_link_regular_file(path, field_name)
     if identity(after) != identity(terminal):
         raise ValueError(f"{field_name} path changed after read")
-    return digest.hexdigest(), after
+    return digest.hexdigest(), ArtifactFileIdentity(
+        device=after.st_dev,
+        inode=after.st_ino,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+    )
 
 
 def _artifact_snapshots_equal(
@@ -1098,6 +1141,16 @@ def _fts5_available() -> bool:
 
 
 def _first_fixture_source(fixture_path: Path) -> str:
+    if sys.platform == "win32":
+        try:
+            raw_line = rooted_first_nonempty_line(fixture_path)
+            payload = _parse_strict_json(raw_line.decode("utf-8"))
+            source_raw = payload.get("source")
+            if type(source_raw) is not str or not source_raw:
+                raise ValueError("fixture first row source is invalid")
+            return source_raw
+        except OSError as error:
+            raise ValueError("cannot read fixture file") from error
     try:
         with fixture_path.open("rb") as stream:
             for raw_line in stream:
@@ -2277,6 +2330,8 @@ def _collect_query_environment(
         rss_platform, rss_raw_unit = "linux", "kib"
     elif sys.platform == "darwin":
         rss_platform, rss_raw_unit = "darwin", "bytes"
+    elif sys.platform == "win32":
+        rss_platform, rss_raw_unit = "windows", "bytes"
     else:
         raise _WorkerError("QUERY.RSS_UNSUPPORTED_PLATFORM")
     return collect_process_environment(
@@ -2342,7 +2397,7 @@ def _reopen_store(request: _WorkerRequest) -> tuple[
     fixture_path = Path(request.fixture_path)
     identity = CanonicalResourceIdentity.from_configured_jsonl(
         request.resource_id,
-        fixture_path.resolve(),
+        fixture_path if sys.platform == "win32" else fixture_path.resolve(),
     )
     coordinator = ResourceStoreCoordinator(
         canonical_store_id=request.canonical_store_id,
@@ -2363,7 +2418,15 @@ def _reopen_store(request: _WorkerRequest) -> tuple[
                 patch("tm_sqlite_store._probe_fts5", return_value=False)
             )
         try:
-            report = coordinator.rehydrate_runtime_authority()
+            if sys.platform == "win32":
+                service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id=request.canonical_store_id,
+                    coordinator=coordinator,
+                )
+                report = service.rehydrate_completed_portable_activation()
+            else:
+                report = coordinator.rehydrate_runtime_authority()
         except Exception as error:
             raise _WorkerError("QUERY.REOPEN_FAILED") from error
         if report is None:
@@ -2544,8 +2607,11 @@ def _rss_start_bytes(start_usage: object) -> int:
 def _terminal_rss_facts(
     start_usage: object,
 ) -> tuple[int, str]:
-    resource_module = _query_resource_module()
-    terminal_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
+    if sys.platform == "win32":
+        terminal_usage: object = windows_peak_working_set_bytes()
+    else:
+        resource_module = _query_resource_module()
+        terminal_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
     _platform, raw_unit, terminal_bytes = rss_peak_bytes_facts(terminal_usage)
     return terminal_bytes, raw_unit
 
@@ -2699,8 +2765,11 @@ def _worker_main(argv: list[str]) -> int:
         )
         return 2
     try:
-        resource_module = _query_resource_module()
-        start_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
+        if sys.platform == "win32":
+            start_usage: object = windows_peak_working_set_bytes()
+        else:
+            resource_module = _query_resource_module()
+            start_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
         raw_request = sys.stdin.buffer.read()
         payload = _read_worker_request(raw_request)
         request = _validate_worker_request(payload)
@@ -2846,10 +2915,16 @@ def _run_query_child(
         timeout_seconds
     ) or timeout_seconds <= 0:
         raise ValueError("timeout seconds must be a positive finite float")
-    run_root = Path(process_evidence.run_root).resolve()
-    fixture_path = Path(process_evidence.fixture_path).resolve()
-    if not run_root.is_dir():
-        raise QueryProcessError("QUERY.RUN_ROOT_INVALID")
+    if sys.platform == "win32":
+        run_root = Path(process_evidence.run_root)
+        fixture_path = Path(process_evidence.fixture_path)
+        if not run_root.is_absolute() or not fixture_path.is_absolute():
+            raise QueryProcessError("QUERY.RUN_ROOT_INVALID")
+    else:
+        run_root = Path(process_evidence.run_root).resolve()
+        fixture_path = Path(process_evidence.fixture_path).resolve()
+        if not run_root.is_dir():
+            raise QueryProcessError("QUERY.RUN_ROOT_INVALID")
     if fixture_path.parent != run_root:
         raise QueryProcessError("QUERY.FIXTURE_PATH_INVALID")
     try:

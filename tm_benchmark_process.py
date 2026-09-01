@@ -37,9 +37,10 @@ Process/RSS invariant capsule
   ``GRAM_FALLBACK`` from the real schema/index health and query report.
 - Migration elapsed uses ``perf_counter_ns`` from before parse/open through
   reopen + health + query proof and reports raw ``elapsed_ns``.  Peak RSS
-  covers the whole child lifetime; on Linux ``ru_maxrss`` KiB is normalized
-  to bytes with the platform/unit recorded.  Start and terminal samples plus
-  the maximum are captured; baseline RSS is never subtracted.
+  covers the whole child lifetime; POSIX ``ru_maxrss`` and Windows
+  ``GetProcessMemoryInfo.PeakWorkingSetSize`` are normalized to bytes with the
+  platform/unit recorded.  Start and terminal samples plus the maximum are
+  captured; baseline RSS is never subtracted.
 - Evidence is frozen and self-validating: it carries a private complete
   ``BenchmarkContract`` snapshot, contract/corpus/path/fixture/environment/
   worker-protocol digests, the path, actual index kind, record counts,
@@ -89,6 +90,7 @@ import unicodedata
 from typing import Any
 from unittest.mock import patch
 
+from platform_fs_contracts import PlatformFileError
 from tm_benchmark import (
     BenchmarkRecord,
     _record_payload,
@@ -99,6 +101,15 @@ from tm_benchmark import (
     recompute_benchmark_inputs,
 )
 from tm_benchmark_latency import validate_environment_for_path
+from tm_benchmark_platform_io import (
+    RootedArtifactFileFacts,
+    create_new_rooted_file,
+    iter_rooted_file_lines,
+    rooted_file_facts,
+    windows_benchmark_artifact_family,
+    windows_peak_working_set_bytes,
+    windows_rooted_directory_names,
+)
 from tm_candidate_index import CandidateRetriever
 from tm_contracts import (
     BENCHMARK_RSS_SCOPE,
@@ -107,6 +118,7 @@ from tm_contracts import (
     BenchmarkExecutionPath,
     CandidateProofMetadata,
     CanonicalResourceIdentity,
+    MigrationReport,
     TMQuery,
     benchmark_contract_digest,
     benchmark_environment_digest,
@@ -294,11 +306,24 @@ def _generate_fixture(
     """Write one immutable JSONL fixture and return (sha256, record count)."""
     hasher = hashlib.sha256()
     count = 0
-    with fixture_path.open("xb") as stream:
+    def measured_lines() -> Iterator[bytes]:
+        nonlocal count
         for line in _iter_fixture_lines(records):
-            stream.write(line)
             hasher.update(line)
             count += 1
+            yield line
+
+    if sys.platform == "win32":
+        published = create_new_rooted_file(fixture_path, measured_lines())
+        if (
+            published.byte_count < 1
+            or published.content_sha256.hex() != hasher.hexdigest()
+        ):
+            raise ValueError("fixture publication facts drifted")
+    else:
+        with fixture_path.open("xb") as stream:
+            for line in measured_lines():
+                stream.write(line)
     if count < 1:
         raise ValueError("fixture generation produced no records")
     return hasher.hexdigest(), count
@@ -337,6 +362,31 @@ def _read_fixture_facts(
     expected_count: int,
 ) -> tuple[str, int, str]:
     """Hash and count the immutable fixture; return digest, count, source."""
+    if sys.platform == "win32":
+        hasher = hashlib.sha256()
+        count = 0
+        first_source: str | None = None
+        for raw_line in iter_rooted_file_lines(fixture_path):
+            hasher.update(raw_line)
+            line = raw_line.strip()
+            if not line:
+                continue
+            count += 1
+            if first_source is None:
+                payload = _parse_strict_json(line.decode("utf-8"))
+                source_raw = payload.get("source")
+                if type(source_raw) is not str or not source_raw:
+                    raise ValueError("fixture first row source is invalid")
+                first_source = source_raw
+        digest = hasher.hexdigest()
+        if digest != expected_digest:
+            raise ValueError("fixture digest does not match the run request")
+        if count != expected_count:
+            raise ValueError("fixture record count does not match the run request")
+        if first_source is None:
+            raise ValueError("fixture is empty")
+        return digest, count, first_source
+
     before = _require_single_link_regular_file(fixture_path, "fixture")
     hasher = hashlib.sha256()
     count = 0
@@ -885,7 +935,7 @@ def process_canonical_artifact_paths(
     fixture = Path(fixture_path)
     identity = CanonicalResourceIdentity.from_configured_jsonl(
         resource_id,
-        fixture.resolve(),
+        fixture if sys.platform == "win32" else fixture.resolve(),
     )
     return (
         fixture,
@@ -1030,8 +1080,16 @@ def artifact_snapshot_digest(snapshot: ArtifactSnapshot) -> str:
 def _stable_file_proof(
     path: Path,
     label: str,
-) -> tuple[str, os.stat_result]:
+) -> tuple[str, ArtifactFileIdentity]:
     """Read one no-follow file while proving its path identity stayed fixed."""
+    if sys.platform == "win32":
+        facts = rooted_file_facts(path)
+        return facts.sha256, ArtifactFileIdentity(
+            device=0,
+            inode=0,
+            size=facts.byte_count,
+            mtime_ns=0,
+        )
     before = _require_single_link_regular_file(path, label)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -1072,7 +1130,12 @@ def _stable_file_proof(
     after = _require_single_link_regular_file(path, label)
     if identity(after) != identity(terminal):
         raise ValueError(f"{label} path identity changed after read")
-    return digest.hexdigest(), after
+    return digest.hexdigest(), ArtifactFileIdentity(
+        device=after.st_dev,
+        inode=after.st_ino,
+        size=after.st_size,
+        mtime_ns=after.st_mtime_ns,
+    )
 
 
 def _file_sha256(path: Path, label: str) -> str:
@@ -1102,26 +1165,68 @@ def _expected_artifact_family_names(
 def _artifact_family_proof(
     *,
     entries: tuple[Path, ...],
-) -> tuple[str, dict[str, tuple[str, os.stat_result]]]:
+    run_root: Path,
+) -> tuple[str, dict[str, tuple[str, ArtifactFileIdentity]]]:
     """Digest every retained entry and return its no-follow stable proof."""
     payload: list[dict[str, object]] = []
-    proofs: dict[str, tuple[str, os.stat_result]] = {}
+    proofs: dict[str, tuple[str, ArtifactFileIdentity]] = {}
     for entry in entries:
-        digest, stat_result = _stable_file_proof(
+        relative_name = entry.relative_to(run_root).as_posix()
+        digest, identity = _stable_file_proof(
             entry,
-            f"artifact family entry {entry.name!r}",
+            f"artifact family entry {relative_name!r}",
         )
-        proofs[entry.name] = (digest, stat_result)
+        proofs[relative_name] = (digest, identity)
         payload.append(
             {
                 "digest": digest,
                 "identity": {
-                    "device": stat_result.st_dev,
-                    "inode": stat_result.st_ino,
-                    "mtime_ns": stat_result.st_mtime_ns,
-                    "size": stat_result.st_size,
+                    "device": identity.device,
+                    "inode": identity.inode,
+                    "mtime_ns": identity.mtime_ns,
+                    "size": identity.size,
                 },
-                "name": entry.name,
+                "name": relative_name,
+            }
+        )
+    return (
+        benchmark_digest(
+            PROCESS_ARTIFACT_SNAPSHOT_DIGEST_VERSION,
+            "process-artifact-family",
+            payload,
+        ),
+        proofs,
+    )
+
+
+def _rooted_artifact_family_proof(
+    *,
+    artifacts: tuple[RootedArtifactFileFacts, ...],
+    run_root: Path,
+) -> tuple[str, dict[str, tuple[str, ArtifactFileIdentity]]]:
+    """Project one retained Windows rooted capture into portable evidence."""
+
+    payload: list[dict[str, object]] = []
+    proofs: dict[str, tuple[str, ArtifactFileIdentity]] = {}
+    for artifact in artifacts:
+        relative_name = artifact.path.relative_to(run_root).as_posix()
+        identity = ArtifactFileIdentity(
+            device=0,
+            inode=0,
+            size=artifact.facts.byte_count,
+            mtime_ns=0,
+        )
+        proofs[relative_name] = (artifact.facts.sha256, identity)
+        payload.append(
+            {
+                "digest": artifact.facts.sha256,
+                "identity": {
+                    "device": identity.device,
+                    "inode": identity.inode,
+                    "mtime_ns": identity.mtime_ns,
+                    "size": identity.size,
+                },
+                "name": relative_name,
             }
         )
     return (
@@ -1159,10 +1264,14 @@ def _capture_artifact_snapshot(
         raise TypeError("fixture path must be a Path")
     _require_identity(resource_id, "resource id")
     _require_digest(fixture_digest, "fixture digest")
-    run_root = run_root.resolve()
-    fixture_path = fixture_path.resolve()
-    if not run_root.is_absolute() or not run_root.is_dir():
-        raise ValueError("run root must be an existing absolute directory")
+    if sys.platform == "win32":
+        if not run_root.is_absolute() or not fixture_path.is_absolute():
+            raise ValueError("run root and fixture must be absolute")
+    else:
+        run_root = run_root.resolve()
+        fixture_path = fixture_path.resolve()
+        if not run_root.is_absolute() or not run_root.is_dir():
+            raise ValueError("run root must be an existing absolute directory")
     if fixture_path.parent != run_root:
         raise ValueError("fixture path must live directly in the run root")
     fixture, sidecar_path, manifest_path = process_canonical_artifact_paths(
@@ -1172,71 +1281,83 @@ def _capture_artifact_snapshot(
     if fixture != fixture_path:
         raise ValueError("fixture path is not deterministic for the resource")
     try:
-        entries = tuple(sorted(run_root.iterdir(), key=lambda path: path.name))
-    except OSError as error:
-        raise ValueError("run root cannot be inspected") from error
-    expected_names = _expected_artifact_family_names(
-        fixture_path=fixture_path,
-        sidecar_path=sidecar_path,
-        manifest_path=manifest_path,
-    )
-    entry_names = {entry.name for entry in entries}
-    foreign_names = sorted(entry_names - expected_names)
-    if foreign_names:
-        raise ValueError(
-            f"run root contains foreign entries {foreign_names!r}"
-        )
-    for required_name in (
-        fixture_path.name,
-        sidecar_path.name,
-        manifest_path.name,
-    ):
-        if required_name not in entry_names:
-            raise ValueError(
-                f"run root is missing required artifact {required_name!r}"
+        if sys.platform == "win32":
+            rooted_artifacts = windows_benchmark_artifact_family(
+                run_root=run_root,
+                fixture_name=fixture_path.name,
+                sidecar_name=sidecar_path.name,
+                manifest_name=manifest_path.name,
             )
+            entries = tuple(artifact.path for artifact in rooted_artifacts)
+        else:
+            entries = tuple(sorted(run_root.iterdir(), key=lambda path: path.name))
+            expected_names = _expected_artifact_family_names(
+                fixture_path=fixture_path,
+                sidecar_path=sidecar_path,
+                manifest_path=manifest_path,
+            )
+            entry_names = {entry.name for entry in entries}
+            foreign_names = sorted(entry_names - expected_names)
+            if foreign_names:
+                raise ValueError(
+                    f"run root contains foreign entries {foreign_names!r}"
+                )
+            for required_name in (
+                fixture_path.name,
+                sidecar_path.name,
+                manifest_path.name,
+            ):
+                if required_name not in entry_names:
+                    raise ValueError(
+                        f"run root is missing required artifact {required_name!r}"
+                    )
+    except (OSError, PlatformFileError) as error:
+        raise ValueError("run root cannot be inspected") from error
     for path, label in (
         (sidecar_path, "canonical sidecar"),
         (manifest_path, "snapshot manifest"),
     ):
         if path.parent != run_root:
             raise ValueError(f"{label} must live directly in the run root")
-        if path.resolve() != path:
-            raise ValueError(f"{label} must not escape the run root")
-        _require_single_link_regular_file(path, label)
-    family_digest, family_proofs = _artifact_family_proof(entries=entries)
+        if sys.platform != "win32":
+            if path.resolve() != path:
+                raise ValueError(f"{label} must not escape the run root")
+            _require_single_link_regular_file(path, label)
+    if sys.platform == "win32":
+        family_digest, family_proofs = _rooted_artifact_family_proof(
+            artifacts=rooted_artifacts,
+            run_root=run_root,
+        )
+    else:
+        family_digest, family_proofs = _artifact_family_proof(
+            entries=entries,
+            run_root=run_root,
+        )
     captured_fixture_digest, _fixture_stat = family_proofs[fixture_path.name]
     if captured_fixture_digest != fixture_digest:
         raise ValueError("fixture digest does not match the run request")
-    sidecar_digest, sidecar_stat = family_proofs[sidecar_path.name]
-    manifest_digest, manifest_stat = family_proofs[manifest_path.name]
+    sidecar_digest, sidecar_identity = family_proofs[sidecar_path.name]
+    manifest_digest, manifest_identity = family_proofs[manifest_path.name]
     return ArtifactSnapshot(
         sidecar_digest=sidecar_digest,
         manifest_digest=manifest_digest,
         family_digest=family_digest,
-        sidecar_identity=ArtifactFileIdentity(
-            device=sidecar_stat.st_dev,
-            inode=sidecar_stat.st_ino,
-            size=sidecar_stat.st_size,
-            mtime_ns=sidecar_stat.st_mtime_ns,
-        ),
-        manifest_identity=ArtifactFileIdentity(
-            device=manifest_stat.st_dev,
-            inode=manifest_stat.st_ino,
-            size=manifest_stat.st_size,
-            mtime_ns=manifest_stat.st_mtime_ns,
-        ),
+        sidecar_identity=sidecar_identity,
+        manifest_identity=manifest_identity,
     )
 
 
 def rss_peak_bytes_facts(usage: object) -> tuple[str, str, int]:
-    """Normalize one child rusage high-water sample to bytes.
+    """Normalize one child high-water sample to bytes.
 
-    Returns ``(rss_platform, rss_raw_unit, peak_rss_bytes)`` with the same
-    Linux/macOS unit rules the Task 8.3 child uses: Linux ``ru_maxrss`` is
-    KiB and is multiplied by 1024; macOS reports bytes directly.  The
-    sample is the raw high-water mark with no baseline subtraction.
+    Windows supplies an exact positive ``PeakWorkingSetSize`` integer. POSIX
+    retains the existing ``rusage`` unit rules. The sample is the raw
+    high-water mark with no baseline subtraction.
     """
+    if sys.platform == "win32":
+        if type(usage) is not int or usage < 1:
+            raise TypeError("Windows usage must be a positive exact int")
+        return "windows", "bytes", usage
     resource_module = _resource_module()
     if type(usage) is not resource_module.struct_rusage:
         raise TypeError("usage must be resource.struct_rusage")
@@ -1564,6 +1685,8 @@ def _rss_platform_facts() -> tuple[str, str]:
         return "linux", "kib"
     if sys.platform == "darwin":
         return "darwin", "bytes"
+    if sys.platform == "win32":
+        return "windows", "bytes"
     raise _WorkerError("PROCESS.RSS_UNSUPPORTED_PLATFORM")
 
 
@@ -1577,6 +1700,10 @@ def _resource_module() -> Any:
 
 
 def _rss_bytes(usage: object, raw_unit: str) -> int:
+    if sys.platform == "win32":
+        if raw_unit != "bytes" or type(usage) is not int or usage < 1:
+            raise _WorkerError("PROCESS.RSS_INVALID")
+        return usage
     resource_module = _resource_module()
     if type(usage) is not resource_module.struct_rusage:
         raise TypeError("usage must be resource.struct_rusage")
@@ -1747,18 +1874,30 @@ def _validate_worker_request(
     )
     if caller_protocol_digest != expected_protocol_digest:
         raise _WorkerError("PROCESS.PROTOCOL_DIGEST_MISMATCH")
-    try:
-        entries = tuple(
-            os.path.join(run_root, name) for name in os.listdir(run_root)
-        )
-    except OSError as error:
-        raise _WorkerError("PROCESS.RUN_ROOT_INVALID") from error
-    if entries != (fixture_path,):
-        raise _WorkerError("PROCESS.RUN_ROOT_NOT_CLOSED")
-    try:
-        _require_single_link_regular_file(Path(fixture_path), "fixture")
-    except (TypeError, ValueError) as error:
-        raise _WorkerError("PROCESS.FIXTURE_INVALID") from error
+    if sys.platform == "win32":
+        try:
+            entry_names = windows_rooted_directory_names(Path(run_root))
+        except (OSError, PlatformFileError, ValueError) as error:
+            raise _WorkerError("PROCESS.RUN_ROOT_INVALID") from error
+        if entry_names != (Path(fixture_path).name,):
+            raise _WorkerError("PROCESS.RUN_ROOT_NOT_CLOSED")
+        try:
+            rooted_file_facts(Path(fixture_path))
+        except (OSError, PlatformFileError, ValueError) as error:
+            raise _WorkerError("PROCESS.FIXTURE_INVALID") from error
+    else:
+        try:
+            entries = tuple(
+                os.path.join(run_root, name) for name in os.listdir(run_root)
+            )
+        except OSError as error:
+            raise _WorkerError("PROCESS.RUN_ROOT_INVALID") from error
+        if entries != (fixture_path,):
+            raise _WorkerError("PROCESS.RUN_ROOT_NOT_CLOSED")
+        try:
+            _require_single_link_regular_file(Path(fixture_path), "fixture")
+        except (TypeError, ValueError) as error:
+            raise _WorkerError("PROCESS.FIXTURE_INVALID") from error
     return _WorkerRequest(
         contract=contract,
         contract_digest=contract_digest,
@@ -1895,7 +2034,7 @@ def _run_measured_lifecycle(
             expected_digest=request.fixture_digest,
             expected_count=request.fixture_record_count,
         )
-    except (OSError, ValueError) as error:
+    except (OSError, PlatformFileError, ValueError) as error:
         raise _WorkerError("PROCESS.FIXTURE_INVALID") from error
     expected_index_kind = (
         "FTS5_TRIGRAM"
@@ -1910,7 +2049,7 @@ def _run_measured_lifecycle(
 
     identity = CanonicalResourceIdentity.from_configured_jsonl(
         resource_id,
-        fixture_path.resolve(),
+        fixture_path if sys.platform == "win32" else fixture_path.resolve(),
     )
     coordinator = ResourceStoreCoordinator(
         canonical_store_id=canonical_store_id,
@@ -1919,6 +2058,7 @@ def _run_measured_lifecycle(
     service = TMMigrationService(
         resource_identity=identity,
         canonical_store_id=canonical_store_id,
+        coordinator=coordinator,
     )
     force_fallback = (
         execution_path is BenchmarkExecutionPath.GRAM_FALLBACK
@@ -1928,37 +2068,25 @@ def _run_measured_lifecycle(
             stack.enter_context(
                 patch("tm_sqlite_store._probe_fts5", return_value=False)
             )
-        build = service.build_mutable_stage(fixture_path)
-        stage = build.mutable_stage
-        if stage is None:
-            raise _WorkerError("PROCESS.STAGE_UNREUSED")
-        if build.reused_completed_revision is not None:
-            raise _WorkerError("PROCESS.STAGE_REUSED")
-        if build.preflight.valid_count != fixture_count:
-            raise _WorkerError("PROCESS.COUNT_MISMATCH")
-        if build.preflight.invalid_count != 0:
-            raise _WorkerError("PROCESS.FIXTURE_INVALID")
-        sealed = coordinator._seal_stage(
-            stage,
-            canonical_store_id=canonical_store_id,
-            expected_prior_generation=None,
-        )
-        seal_evidence = sealed.evidence
-        if not seal_evidence.integrity_ok:
-            raise _WorkerError("PROCESS.GATE_B_FAILED")
-        if seal_evidence.record_count != fixture_count:
-            raise _WorkerError("PROCESS.COUNT_MISMATCH")
-        prepared = coordinator.activate(sealed)
-        journal = coordinator.publish_prepared_activation(prepared)
-        coordinator.publish_activation(prepared, journal)
-        generation = coordinator.current_generation
-        if generation is None:
+        outcome = service.activate_initial(fixture_path, resource_id)
+        if type(outcome) is not MigrationReport:
             raise _WorkerError("PROCESS.ACTIVATION_FAILED")
+        if outcome.migrated_count != fixture_count:
+            raise _WorkerError("PROCESS.COUNT_MISMATCH")
+        generation = outcome.activated_generation
         fresh = ResourceStoreCoordinator(
             canonical_store_id=canonical_store_id,
             resource_identity=identity,
         )
-        report = fresh.rehydrate_runtime_authority()
+        if sys.platform == "win32":
+            fresh_service = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id=canonical_store_id,
+                coordinator=fresh,
+            )
+            report = fresh_service.rehydrate_completed_portable_activation()
+        else:
+            report = fresh.rehydrate_runtime_authority()
         if report is None:
             raise _WorkerError("PROCESS.REOPEN_FAILED")
         if (
@@ -2034,8 +2162,11 @@ def _run_measured_lifecycle(
         raise _WorkerError("PROCESS.ARTIFACT_INVALID") from error
 
     terminal_ns = time.perf_counter_ns()
-    resource_module = _resource_module()
-    terminal_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
+    terminal_usage = (
+        windows_peak_working_set_bytes()
+        if sys.platform == "win32"
+        else _resource_module().getrusage(_resource_module().RUSAGE_SELF)
+    )
     elapsed_ns = terminal_ns - started_ns
     if elapsed_ns < 0:
         raise _WorkerError("PROCESS.ELAPSED_INVALID")
@@ -2186,8 +2317,11 @@ def _worker_main(argv: list[str]) -> int:
         started_ns = time.perf_counter_ns()
         rss_platform, _rss_unit = _rss_platform_facts()
         del rss_platform, _rss_unit
-        resource_module = _resource_module()
-        start_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
+        start_usage = (
+            windows_peak_working_set_bytes()
+            if sys.platform == "win32"
+            else _resource_module().getrusage(_resource_module().RUSAGE_SELF)
+        )
         raw_request = sys.stdin.buffer.read()
         payload = _read_worker_request(raw_request)
         request = _validate_worker_request(payload)
@@ -2254,9 +2388,15 @@ def run_process_migration_evidence(
         raise TypeError("execution path must be BenchmarkExecutionPath")
     if type(run_root) is not _NATIVE_PATH_TYPE:
         raise TypeError("run root must be a Path")
-    run_root = run_root.resolve()
-    if not run_root.is_dir():
-        raise ValueError("run root must be an existing directory")
+    if sys.platform == "win32":
+        if not run_root.is_absolute():
+            raise ValueError("run root must be an existing absolute directory")
+        initial_entry_names = windows_rooted_directory_names(run_root)
+    else:
+        run_root = run_root.resolve()
+        if not run_root.is_dir():
+            raise ValueError("run root must be an existing directory")
+        initial_entries = tuple(run_root.iterdir())
     if fixture_path is not None and type(fixture_path) is not _NATIVE_PATH_TYPE:
         raise TypeError("fixture path must be a Path or None")
     _require_identity(resource_id, "resource id")
@@ -2308,26 +2448,40 @@ def run_process_migration_evidence(
             record_count=contract.corpus_record_count,
         )
 
-    initial_entries = tuple(run_root.iterdir())
     if fixture_path is None:
-        if initial_entries:
+        if (
+            initial_entry_names
+            if sys.platform == "win32"
+            else initial_entries
+        ):
             raise ValueError("run root must be empty before fixture generation")
         fixture_path = run_root / "fixture.jsonl"
-        if fixture_path.exists():
+        if sys.platform != "win32" and fixture_path.exists():
             raise ValueError("fixture path must not pre-exist for generation")
         fixture_digest, fixture_record_count = _generate_fixture(
             fixture_path,
             records,
         )
     else:
-        fixture_path = fixture_path.resolve()
+        if sys.platform == "win32":
+            if not fixture_path.is_absolute():
+                raise ValueError("fixture path must be absolute")
+        else:
+            fixture_path = fixture_path.resolve()
         if fixture_path.parent != run_root:
             raise ValueError("fixture path must live directly in the run root")
-        if initial_entries != (fixture_path,):
+        if (
+            initial_entry_names != (fixture_path.name,)
+            if sys.platform == "win32"
+            else initial_entries != (fixture_path,)
+        ):
             raise ValueError("provided fixture must be the sole run-root entry")
-        _require_single_link_regular_file(fixture_path, "fixture")
         fixture_digest, fixture_record_count = _expected_fixture_facts(records)
-        observed_digest = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+        observed_digest = (
+            rooted_file_facts(fixture_path).sha256
+            if sys.platform == "win32"
+            else hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+        )
         if observed_digest != fixture_digest:
             raise ValueError(
                 "provided fixture does not match the requested corpus"
