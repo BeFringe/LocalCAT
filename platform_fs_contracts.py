@@ -1654,6 +1654,65 @@ class LockedDescendantNamespaceInspection(Protocol):
 
 
 @runtime_checkable
+class ExactEmptyChildDirectoryRetirement(Protocol):
+    """Bind and remove one exact empty direct child directory.
+
+    This narrow capability is intentionally not part of ``PlatformFileBackend``.
+    The retained child is live, process-local authority; removal consumes it and
+    never authorizes recursive deletion or a path-only operation.
+    """
+
+    def bind_existing_child_directory(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> BoundDirectoryAuthority:
+        if not isinstance(parent, BoundDirectoryAuthority):
+            raise TypeError("parent must be a bound directory authority")
+        parent._require_open()
+        checked_name = validate_relative_name(name)
+        authority = self._bind_existing_child_directory(parent, checked_name)
+        if not isinstance(authority, BoundDirectoryAuthority):
+            raise TypeError("backend child bind must return BoundDirectoryAuthority")
+        authority._require_open()
+        return authority
+
+    @abstractmethod
+    def _bind_existing_child_directory(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> BoundDirectoryAuthority: ...
+
+    def remove_empty_owned_directory(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        child: BoundDirectoryAuthority,
+    ) -> None:
+        if not isinstance(parent, BoundDirectoryAuthority):
+            raise TypeError("parent must be a bound directory authority")
+        if not isinstance(child, BoundDirectoryAuthority):
+            raise TypeError("child must be a bound directory authority")
+        parent._require_open()
+        child._require_open()
+        checked_name = validate_relative_name(name)
+        result = self._remove_empty_owned_directory(parent, checked_name, child)
+        if result is not None:
+            raise TypeError("backend empty-directory removal must return None")
+        if not child.closed:
+            raise TypeError("backend empty-directory removal must consume child")
+
+    @abstractmethod
+    def _remove_empty_owned_directory(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        child: BoundDirectoryAuthority,
+    ) -> None: ...
+
+
+@runtime_checkable
 class ExistingFileRetirement(Protocol):
     """Retire or freshly rebind one exact existing file without creator state."""
 

@@ -145,7 +145,9 @@ from tm_benchmark_latency import (
     latency_evidence_to_payload,
 )
 from tm_benchmark_oracle import (
+    ORACLE_DEFAULT_RESOURCE_ID,
     ORACLE_EVIDENCE_SCHEMA_VERSION,
+    ORACLE_FIXTURE_NAME,
     OracleRecallEvidence,
     evidence_from_json as oracle_evidence_from_json,
     evidence_to_json as oracle_evidence_to_json,
@@ -154,6 +156,7 @@ from tm_benchmark_oracle import (
 from tm_benchmark_process import (
     PROCESS_EVIDENCE_SCHEMA_VERSION,
     TMBenchmarkProcessEvidence,
+    process_canonical_artifact_paths,
     run_process_migration_evidence,
 )
 from tm_benchmark_query_process import (
@@ -191,23 +194,29 @@ from tm_retrieval_capability import (
 )
 from platform_fs import (
     compose_platform_file_backend,
+    narrow_windows_exact_empty_child_directory_retirement,
     narrow_windows_persistent_private_proof,
 )
 from platform_fs_contracts import (
+    BoundDirectoryAuthority,
     DEVICE_SECRET_SIZE_BYTES,
     CandidateFile,
+    ExactEmptyChildDirectoryRetirement,
     LockPolicy,
     LockWait,
     PendingPublication,
     PlatformFileError,
     PlatformFileErrorCode,
+    PlatformFileBackend,
     PrivateProofContext,
     PrivateProofObjectRole,
     PublishMode,
+    RootedDirectoryAuthority,
     WindowsPrivateProof,
     decode_windows_private_proof,
     encode_windows_private_proof,
 )
+from tm_benchmark_platform_io import cleanup_windows_benchmark_artifact_family
 
 BENCHMARK_BUNDLE_SCHEMA_VERSION = "tm-benchmark-bundle-v2"
 BENCHMARK_BUNDLE_DIGEST_VERSION = "tm-benchmark-bundle-digest-v2"
@@ -3852,6 +3861,252 @@ def _create_dedicated_roots(
         raise
 
 
+@dataclass(slots=True)
+class _WindowsGateDRunTree:
+    backend: PlatformFileBackend
+    retirement: ExactEmptyChildDirectoryRetirement
+    work_root: RootedDirectoryAuthority
+    work_parent: BoundDirectoryAuthority
+    private: BoundDirectoryAuthority
+    private_path: Path
+    children: dict[str, tuple[Path, BoundDirectoryAuthority]]
+
+
+def _create_windows_gate_d_run_tree(work_root: Path) -> _WindowsGateDRunTree:
+    """Create and retain the exact Windows Gate D directory authority chain."""
+
+    backend = compose_platform_file_backend(work_root)
+    retirement = narrow_windows_exact_empty_child_directory_retirement(
+        backend,
+        work_root,
+    )
+    root = parent = private = None
+    children: dict[str, tuple[Path, BoundDirectoryAuthority]] = {}
+    private_name = f"{_PRIVATE_RUN_DIR_PREFIX}{secrets.token_hex(16)}"
+    try:
+        root = backend.bind_root(work_root)
+        parent = backend.bind_parent(root, PurePath(private_name))
+        if parent.inspect_entry(private_name) is not None:
+            raise BenchmarkGateDError("GATE_D.RUN_ROOT_CREATION_FAILED")
+        private = backend.create_private_directory(parent, private_name)
+        private_path = work_root / private_name
+        for role, prefix in (
+            ("process_fts5", "process-fts5-"),
+            ("process_fallback", "process-fallback-"),
+            ("oracle_fts5", "oracle-fts5-"),
+            ("oracle_fallback", "oracle-fallback-"),
+        ):
+            name = f"{prefix}{secrets.token_hex(16)}"
+            if private.inspect_entry(name) is not None:
+                raise BenchmarkGateDError("GATE_D.RUN_ROOT_CREATION_FAILED")
+            child = backend.create_private_directory(private, name)
+            children[role] = (private_path / name, child)
+        return _WindowsGateDRunTree(
+            backend=backend,
+            retirement=retirement,
+            work_root=root,
+            work_parent=parent,
+            private=private,
+            private_path=private_path,
+            children=children,
+        )
+    except BaseException as error:
+        cleanup_error: BaseException | None = None
+        if (
+            private is None
+            and isinstance(error, PlatformFileError)
+            and error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value
+        ):
+            # The private directory may have been created before its authority
+            # could be returned.  It is intentionally left untouched because
+            # this scope has no live identity with which to claim it.
+            cleanup_error = error
+        if private is not None:
+            try:
+                private.reprove()
+                observed = tuple(sorted(entry.name for entry in (work_root / private_name).iterdir()))
+                private.reprove()
+                expected = tuple(sorted(path.name for path, _authority in children.values()))
+                if observed != expected:
+                    raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+                for path, generic_child in reversed(tuple(children.values())):
+                    retained = retirement.bind_existing_child_directory(private, path.name)
+                    try:
+                        generic_child.close()
+                        retirement.remove_empty_owned_directory(private, path.name, retained)
+                    finally:
+                        if not retained.closed:
+                            retained.close()
+                assert parent is not None
+                retained_private = retirement.bind_existing_child_directory(parent, private_name)
+                try:
+                    private.close()
+                    retirement.remove_empty_owned_directory(
+                        parent,
+                        private_name,
+                        retained_private,
+                    )
+                finally:
+                    if not retained_private.closed:
+                        retained_private.close()
+            except BaseException as failure:
+                cleanup_error = failure
+        for _path, authority in reversed(tuple(children.values())):
+            if not authority.closed:
+                try:
+                    authority.close()
+                except BaseException as failure:
+                    if cleanup_error is None:
+                        cleanup_error = failure
+        for authority in (private, parent, root):
+            if authority is not None and not authority.closed:
+                try:
+                    authority.close()
+                except BaseException as failure:
+                    if cleanup_error is None:
+                        cleanup_error = failure
+        if cleanup_error is not None:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from cleanup_error
+        if isinstance(error, BenchmarkGateDError):
+            raise
+        raise BenchmarkGateDError("GATE_D.RUN_ROOT_CREATION_FAILED") from error
+
+
+def _windows_artifact_locators(
+    run_root: Path,
+    *,
+    fixture_name: str,
+    resource_id: str,
+) -> tuple[str, str, str]:
+    fixture, sidecar, manifest = process_canonical_artifact_paths(
+        resource_id=resource_id,
+        fixture_path=str(run_root / fixture_name),
+    )
+    if fixture != run_root / fixture_name:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+    return fixture.name, sidecar.name, manifest.name
+
+
+def _cleanup_windows_gate_d_run_tree(
+    tree: _WindowsGateDRunTree,
+    *,
+    process_fts5: TMBenchmarkProcessEvidence | None,
+    process_fallback: TMBenchmarkProcessEvidence | None,
+    oracle_fts5: OracleRecallEvidence | None,
+    oracle_fallback: OracleRecallEvidence | None,
+) -> None:
+    """Clean only the closed family below the retained Windows run tree."""
+
+    first_error: BaseException | None = None
+    try:
+        tree.private.reprove()
+        names = tuple(sorted(entry.name for entry in tree.private_path.iterdir()))
+        tree.private.reprove()
+        expected_names = tuple(
+            sorted(path.name for path, _authority in tree.children.values())
+        )
+        if names != expected_names:
+            raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
+
+        descriptors: dict[str, tuple[str, str]] = {
+            "process_fts5": (
+                Path(process_fts5.fixture_path).name
+                if process_fts5 is not None
+                else "fixture.jsonl",
+                process_fts5.resource_id if process_fts5 is not None else "tm.benchmark",
+            ),
+            "process_fallback": (
+                Path(process_fallback.fixture_path).name
+                if process_fallback is not None
+                else "fixture.jsonl",
+                process_fallback.resource_id
+                if process_fallback is not None
+                else "tm.benchmark",
+            ),
+            "oracle_fts5": (
+                ORACLE_FIXTURE_NAME,
+                oracle_fts5.resource_id
+                if oracle_fts5 is not None
+                else f"{ORACLE_DEFAULT_RESOURCE_ID}.fts5",
+            ),
+            "oracle_fallback": (
+                ORACLE_FIXTURE_NAME,
+                oracle_fallback.resource_id
+                if oracle_fallback is not None
+                else f"{ORACLE_DEFAULT_RESOURCE_ID}.fallback",
+            ),
+        }
+        for role in (
+            "process_fts5",
+            "process_fallback",
+            "oracle_fts5",
+            "oracle_fallback",
+        ):
+            path, generic_child = tree.children[role]
+            fixture_name, resource_id = descriptors[role]
+            fixture_name, sidecar_name, manifest_name = _windows_artifact_locators(
+                path,
+                fixture_name=fixture_name,
+                resource_id=resource_id,
+            )
+            cleanup_windows_benchmark_artifact_family(
+                backend=tree.backend,
+                retirement=tree.retirement,
+                run_root_authority=generic_child,
+                run_root=path,
+                fixture_name=fixture_name,
+                sidecar_name=sidecar_name,
+                manifest_name=manifest_name,
+            )
+            retained = tree.retirement.bind_existing_child_directory(
+                tree.private,
+                path.name,
+            )
+            try:
+                generic_child.close()
+                tree.retirement.remove_empty_owned_directory(
+                    tree.private,
+                    path.name,
+                    retained,
+                )
+            finally:
+                if not retained.closed:
+                    retained.close()
+        private_retained = tree.retirement.bind_existing_child_directory(
+            tree.work_parent,
+            tree.private_path.name,
+        )
+        try:
+            tree.private.close()
+            tree.retirement.remove_empty_owned_directory(
+                tree.work_parent,
+                tree.private_path.name,
+                private_retained,
+            )
+        finally:
+            if not private_retained.closed:
+                private_retained.close()
+    except BaseException as error:
+        first_error = error
+    finally:
+        for _path, authority in reversed(tuple(tree.children.values())):
+            if not authority.closed:
+                try:
+                    authority.close()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+        for authority in (tree.private, tree.work_parent, tree.work_root):
+            if not authority.closed:
+                try:
+                    authority.close()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+    if first_error is not None:
+        raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from first_error
+
+
 def _require_test_count(value: object) -> int:
     if (
         type(value) is not int
@@ -4699,31 +4954,46 @@ def _run_benchmark_gate_d_core(
         implementation_before = benchmark_implementation_fingerprint()
     except (TypeError, ValueError) as error:
         raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_INVALID") from error
-    private_dir, work_identity, private_identity = _create_private_run_dir(
-        work_root
-    )
+    windows_tree: _WindowsGateDRunTree | None = None
+    if sys.platform == "win32":
+        windows_tree = _create_windows_gate_d_run_tree(work_root)
+        private_dir = windows_tree.private_path
+        process_fts5_root = windows_tree.children["process_fts5"][0]
+        process_fallback_root = windows_tree.children["process_fallback"][0]
+        oracle_fts5_root = windows_tree.children["oracle_fts5"][0]
+        oracle_fallback_root = windows_tree.children["oracle_fallback"][0]
+        work_identity = private_identity = (0, 0)
+    else:
+        private_dir, work_identity, private_identity = _create_private_run_dir(
+            work_root
+        )
     root_identities: dict[str, tuple[int, int]] = {}
+    fts5_oracle: OracleRecallEvidence | None = None
+    fallback_oracle: OracleRecallEvidence | None = None
+    fts5_process: TMBenchmarkProcessEvidence | None = None
+    fallback_process: TMBenchmarkProcessEvidence | None = None
     try:
         _require_outside_run_subtree(private_dir, evidence_path)
         contract = _load_contract(contract_path)
-        (
-            process_fts5_root,
-            process_fallback_root,
-            oracle_fts5_root,
-            oracle_fallback_root,
-        ) = _create_dedicated_roots(private_dir)
-        root_identities = {
-            root.name: _directory_identity(
-                root,
-                "GATE_D.RUN_ROOT_CREATION_FAILED",
-            )
-            for root in (
+        if windows_tree is None:
+            (
                 process_fts5_root,
                 process_fallback_root,
                 oracle_fts5_root,
                 oracle_fallback_root,
-            )
-        }
+            ) = _create_dedicated_roots(private_dir)
+            root_identities = {
+                root.name: _directory_identity(
+                    root,
+                    "GATE_D.RUN_ROOT_CREATION_FAILED",
+                )
+                for root in (
+                    process_fts5_root,
+                    process_fallback_root,
+                    oracle_fts5_root,
+                    oracle_fallback_root,
+                )
+            }
         fts5_oracle, fallback_oracle = ports.run_oracle_recall_suite(
             contract=contract,
             fts5_run_root=oracle_fts5_root,
@@ -4774,21 +5044,39 @@ def _run_benchmark_gate_d_core(
         )
     except BaseException:
         try:
-            _cleanup_private_run_dir(
-                private_dir,
-                private_identity,
-                work_identity,
-                expected_children=root_identities,
-            )
+            if windows_tree is not None:
+                _cleanup_windows_gate_d_run_tree(
+                    windows_tree,
+                    process_fts5=fts5_process,
+                    process_fallback=fallback_process,
+                    oracle_fts5=fts5_oracle,
+                    oracle_fallback=fallback_oracle,
+                )
+            else:
+                _cleanup_private_run_dir(
+                    private_dir,
+                    private_identity,
+                    work_identity,
+                    expected_children=root_identities,
+                )
         except BenchmarkGateDError as error:
             raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING") from error
         raise
-    _cleanup_private_run_dir(
-        private_dir,
-        private_identity,
-        work_identity,
-        expected_children=root_identities,
-    )
+    if windows_tree is not None:
+        _cleanup_windows_gate_d_run_tree(
+            windows_tree,
+            process_fts5=fts5_process,
+            process_fallback=fallback_process,
+            oracle_fts5=fts5_oracle,
+            oracle_fallback=fallback_oracle,
+        )
+    else:
+        _cleanup_private_run_dir(
+            private_dir,
+            private_identity,
+            work_identity,
+            expected_children=root_identities,
+        )
     return _issue_benchmark_gate_d_run_result(
         bundle=readback,
         bundle_digest=bundle_digest,
