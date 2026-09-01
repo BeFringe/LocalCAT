@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path, PureWindowsPath
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,12 +13,14 @@ from unittest import mock
 
 import platform_fs_windows
 from platform_fs import (
+    narrow_windows_exact_empty_child_directory_retirement,
     narrow_windows_existing_file_retirement,
     narrow_windows_locked_descendant_namespace_inspection,
 )
 from platform_fs_contracts import (
     CandidateContentFacts,
     DEVICE_SECRET_SIZE_BYTES,
+    ExactEmptyChildDirectoryRetirement,
     ExistingCandidateRecovery,
     ExistingFileRetirement,
     LedgerEnumerationLimits,
@@ -46,6 +49,159 @@ def _assert_platform_error(
     case.assertEqual(caught.exception.code, code.value)
     case.assertEqual(caught.exception.args, (code.value,))
     case.assertIsNone(caught.exception.__cause__)
+
+
+@unittest.skipUnless(sys.platform == "win32", "real capability tests require Windows")
+class WindowsExactEmptyChildDirectoryRetirementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(
+            prefix="localcat-empty-child-",
+        )
+        self.root_path = Path(self._temporary.name)
+        self.adapter = WindowsPlatformAdapter()
+        self.root = self.adapter.bind_root(self.root_path)
+        self.parent = self.adapter.bind_parent(
+            self.root,
+            PureWindowsPath("owner-child"),
+        )
+
+    def tearDown(self) -> None:
+        for authority in (self.parent, self.root):
+            if not authority.closed:
+                authority.close()
+        self._temporary.cleanup()
+
+    def _bind(self, name: str = "owner-child") -> object:
+        return self.adapter.bind_existing_child_directory(self.parent, name)
+
+    def test_narrow_removes_only_the_exact_empty_child_and_consumes_it(self) -> None:
+        child_path = self.root_path / "owner-child"
+        child_path.mkdir()
+        narrowed = narrow_windows_exact_empty_child_directory_retirement(
+            self.adapter,
+            self.root_path,
+        )
+        self.assertIs(narrowed, self.adapter)
+        self.assertIsInstance(narrowed, ExactEmptyChildDirectoryRetirement)
+        child = self._bind()
+        narrowed.remove_empty_owned_directory(self.parent, "owner-child", child)
+        self.assertTrue(child.closed)
+        self.assertFalse(child_path.exists())
+        self.parent.reprove()
+
+    def test_nonempty_child_is_preserved_and_authority_is_not_consumed(self) -> None:
+        child_path = self.root_path / "owner-child"
+        child_path.mkdir()
+        marker = child_path / "foreign.txt"
+        marker.write_text("foreign", encoding="utf-8")
+        child = self._bind()
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                self.adapter.remove_empty_owned_directory(
+                    self.parent,
+                    "owner-child",
+                    child,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+            )
+            self.assertFalse(child.closed)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "foreign")
+        finally:
+            child.close()
+
+    def test_reparse_child_is_rejected_without_touching_target(self) -> None:
+        target = self.root_path / "target"
+        target.mkdir()
+        marker = target / "marker.txt"
+        marker.write_text("foreign", encoding="utf-8")
+        junction = self.root_path / "owner-child"
+        created = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction),
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                self._bind()
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.REPARSE_REJECTED,
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "foreign")
+        finally:
+            os.rmdir(junction)
+
+    def test_named_identity_drift_is_rejected_without_deleting_replacement(self) -> None:
+        child_path = self.root_path / "owner-child"
+        child_path.mkdir()
+        child = self._bind()
+        os.rmdir(child_path)
+        child_path.mkdir()
+        marker = child_path / "replacement.txt"
+        marker.write_text("foreign", encoding="utf-8")
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                self.adapter.remove_empty_owned_directory(
+                    self.parent,
+                    "owner-child",
+                    child,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "foreign")
+        finally:
+            child.close()
+
+    def test_child_created_after_empty_check_is_preserved(self) -> None:
+        child_path = self.root_path / "owner-child"
+        child_path.mkdir()
+        child = self._bind()
+        marker = child_path / "late-foreign.txt"
+        real_empty = platform_fs_windows._directory_handle_is_empty
+
+        def create_after_empty(api: object, raw: int) -> bool:
+            result = real_empty(api, raw)
+            self.assertTrue(result)
+            marker.write_text("foreign", encoding="utf-8")
+            return result
+
+        try:
+            with mock.patch.object(
+                platform_fs_windows,
+                "_directory_handle_is_empty",
+                side_effect=create_after_empty,
+            ), self.assertRaises(PlatformFileError) as caught:
+                self.adapter.remove_empty_owned_directory(
+                    self.parent,
+                    "owner-child",
+                    child,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+            )
+            self.assertFalse(child.closed)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "foreign")
+        finally:
+            child.close()
 
 
 @unittest.skipUnless(sys.platform == "win32", "real capability tests require Windows")
