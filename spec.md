@@ -42,7 +42,7 @@
 **职责**: 用户交互与数据展示
 
 **实现方案**:
-- **Excel Adapter**: 
+- **Excel Adapter**:
   - `excel_adapter.py` - xlwings 交互式适配器（手动触发）
   - `excel_adapter_openpyxl.py` - openpyxl 文件模式（批处理）
   - 侧重于利用 Excel 的网格编辑能力
@@ -118,7 +118,7 @@ from abc import ABC, abstractmethod
 from typing import List
 
 class IEngine(ABC):
-    
+
     @abstractmethod
     def load_project_context(self, config_path: str) -> bool:
         """加载项目配置，初始化术语表和 TM 引擎"""
@@ -146,7 +146,7 @@ Logic UI 暴露给 Frontend (Excel/QT) 的调用入口。
 
 ```python
 class ILogicController(ABC):
-    
+
     @abstractmethod
     def on_selection_change(self, text: str, row_index: int, sheet_name: str):
         """
@@ -154,7 +154,7 @@ class ILogicController(ABC):
         逻辑：封装 SourceUnit -> 调用 Engine.get_suggestions -> 通知前端渲染
         """
         pass
-        
+
     @abstractmethod
     def commit_translation(self, text: str, translation: str):
         """前端触发：用户确认翻译"""
@@ -169,11 +169,11 @@ class ILogicController(ABC):
 
 ### 4.1 核心实现逻辑
 1.  **Storage**: 编写 `GlossaryLoader`，读取 CSV/XLSX 文件，清洗数据。
-2.  **Engine**: 
+2.  **Engine**:
     - 采用 **Aho-Corasick 算法** (使用 `pyahocorasick` 库或纯 Python 实现的 Trie 树) 构建内存索引。
     - 实现 `TermExtractor` 类，输入 `text`，输出 `List[TermHit]`。
     - 确保算法复杂度为 O(n + m + z) (n=文本长度, m=模式总长, z=匹配数量)，而非简单的循环 replace，以应对长句和海量术语。
-3.  **Logic UI**: 
+3.  **Logic UI**:
     - 接收 Excel 当前选中单元格的文本。
     - 调用 Engine 获取 `TermHit`。
     - 格式化输出：生成一个简单的 HTML 字符串或纯文本列表 (如 `[Term] Source -> Target`)。
