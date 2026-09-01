@@ -74,9 +74,10 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 import stat
+import sys
 
 from tm_contracts import (
     BENCHMARK_CONTRACT_VERSION,
@@ -689,6 +690,31 @@ def _canonical_json(value: Mapping[str, object]) -> str:
 
 def _stable_benchmark_source_digest(path: Path) -> str:
     """Hash one direct regular implementation member without aliases."""
+
+    if sys.platform == "win32":
+        from platform_fs import compose_platform_file_backend
+
+        backend = compose_platform_file_backend(path.parent)
+        root = None
+        source = None
+        try:
+            root = backend.bind_root(path.parent)
+            source = backend.open_regular(root, PurePath(path.name))
+            facts = source.content_facts()
+            if (
+                facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or not facts.snapshot.reparse_free
+            ):
+                raise ValueError(
+                    "benchmark implementation source is not regular"
+                )
+            return facts.content_sha256.hex()
+        finally:
+            if source is not None:
+                source.close()
+            if root is not None:
+                root.close()
 
     try:
         before = os.lstat(path)

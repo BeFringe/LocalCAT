@@ -73,19 +73,20 @@ from collections.abc import Iterable, Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 import hashlib
+import importlib
 import json
 import math
 import os
 from pathlib import Path
 import platform
 import re
-import resource
 import stat
 import sqlite3
 import subprocess
 import sys
 import time
 import unicodedata
+from typing import Any
 from unittest.mock import patch
 
 from tm_benchmark import (
@@ -1236,7 +1237,8 @@ def rss_peak_bytes_facts(usage: object) -> tuple[str, str, int]:
     KiB and is multiplied by 1024; macOS reports bytes directly.  The
     sample is the raw high-water mark with no baseline subtraction.
     """
-    if type(usage) is not resource.struct_rusage:
+    resource_module = _resource_module()
+    if type(usage) is not resource_module.struct_rusage:
         raise TypeError("usage must be resource.struct_rusage")
     if sys.platform.startswith("linux"):
         platform_name, raw_unit = "linux", "kib"
@@ -1565,7 +1567,19 @@ def _rss_platform_facts() -> tuple[str, str]:
     raise _WorkerError("PROCESS.RSS_UNSUPPORTED_PLATFORM")
 
 
-def _rss_bytes(usage: resource.struct_rusage, raw_unit: str) -> int:
+def _resource_module() -> Any:
+    """Load the POSIX RSS owner only when a supported worker actually runs."""
+
+    try:
+        return importlib.import_module("resource")
+    except ModuleNotFoundError as error:
+        raise _WorkerError("PROCESS.RSS_UNSUPPORTED_PLATFORM") from error
+
+
+def _rss_bytes(usage: object, raw_unit: str) -> int:
+    resource_module = _resource_module()
+    if type(usage) is not resource_module.struct_rusage:
+        raise TypeError("usage must be resource.struct_rusage")
     value = usage.ru_maxrss
     if type(value) is not int or isinstance(value, bool):
         raise _WorkerError("PROCESS.RSS_INVALID")
@@ -1866,7 +1880,7 @@ def _run_measured_lifecycle(
     request: _WorkerRequest,
     *,
     started_ns: int,
-    start_usage: resource.struct_rusage,
+    start_usage: object,
 ) -> _MeasuredFacts:
     contract = request.contract
     execution_path = request.execution_path
@@ -2020,7 +2034,8 @@ def _run_measured_lifecycle(
         raise _WorkerError("PROCESS.ARTIFACT_INVALID") from error
 
     terminal_ns = time.perf_counter_ns()
-    terminal_usage = resource.getrusage(resource.RUSAGE_SELF)
+    resource_module = _resource_module()
+    terminal_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
     elapsed_ns = terminal_ns - started_ns
     if elapsed_ns < 0:
         raise _WorkerError("PROCESS.ELAPSED_INVALID")
@@ -2167,9 +2182,12 @@ def _worker_main(argv: list[str]) -> int:
             "usage: python -m tm_benchmark_process --worker\n"
         )
         return 2
-    started_ns = time.perf_counter_ns()
-    start_usage = resource.getrusage(resource.RUSAGE_SELF)
     try:
+        started_ns = time.perf_counter_ns()
+        rss_platform, _rss_unit = _rss_platform_facts()
+        del rss_platform, _rss_unit
+        resource_module = _resource_module()
+        start_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
         raw_request = sys.stdin.buffer.read()
         payload = _read_worker_request(raw_request)
         request = _validate_worker_request(payload)

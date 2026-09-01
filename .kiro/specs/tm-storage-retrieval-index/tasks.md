@@ -16,7 +16,7 @@
   - 完成时，只有身份、digest、ancestry、expected generation 和 artifact registry 全部闭合的不可变对象能构造激活请求
   - _Requirements: 1.9, 2.9, 2.10, 2.11, 2.12, 2.13, 7.5, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14_
 
-- [ ] 1.2a 冻结 Windows 平台 identity 与 private-storage proof 合同
+- [x] 1.2a 冻结 Windows 平台 identity 与 private-storage proof 合同
   - 合同消费 ADR-020 opaque file/root/lock facts 与 ADR-021经ADR-023/024接管后的`WindowsPrivateProof`；`security_profile_id`与descriptor digest绑定`WindowsPrivateSecurityV2` exact owner+DACL+MIC projection，资格来自实际current process primary token，provider origin不持久化，V1/unknown profile拒绝。FileId只作本次proof的一项事实，不成为跨重启永久身份或单独授权。
   - activation、snapshot、schema和export publication只消费ADR-025的正常platform publish/`PendingPublication`；pre-arm API/volume/security不足时零命名mutation并报告`DURABILITY_UNAVAILABLE`，post-arm结果不确定时进入既有recovery-required。source/frozen不加载硬件durability registry，frozen仍由W3 manifest约束其余source closure。
   - _Amendment: WA-06_
@@ -484,7 +484,7 @@
   - 完成时，只有验证并激活成功的显式消歧会清除 divergence，其他路径均保持三方资产、durable replay 证据与 canonical authority，外来 inode 不被删除或覆盖
   - _Requirements: 2.4, 2.8, 2.13, 7.5, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13, 7.14_
 
-- [ ] 9.2a 执行 Windows snapshot/private-proof 负空间矩阵
+- [x] 9.2a 执行 Windows snapshot/private-proof 负空间矩阵
   - 覆盖 reparse/hardlink/multi-link、ancestor/parent rename/ABA、same-byte replacement、FileId复用、durable handoff缺失/损坏及每个publish/cleanup kill点。
   - private-proof闭集必须覆盖V1/unknown `security_profile_id`、descriptor digest mismatch、owner/DACL漂移、MIC缺失/额外/unknown/drift、`LABEL_SECURITY_INFORMATION`读取失败；全部在业务phase前fail closed且不改变canonical/receipt/generation。
   - 以真实current process primary standard/medium与elevated/high token分别验证正向创建/重开，以same TokenUser的low-integrity与restricted token子进程验证owner-facing fail-closed；核对TokenPrimary、canonical TokenUser SID、integrity、non-AppContainer与exact AccessCheck，DACL-only `AccessCheck`成功不得代替MIC通过。local/domain/Entra等provider来源不作为mandatory profile。

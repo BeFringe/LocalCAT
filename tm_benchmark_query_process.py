@@ -54,17 +54,18 @@ from collections.abc import Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 import hashlib
+import importlib
 import json
 import math
 import os
 from pathlib import Path
 import re
-import resource
 import sqlite3
 import stat
 import subprocess
 import sys
 import time
+from typing import Any
 from unittest.mock import patch
 
 from tm_benchmark import (
@@ -2286,6 +2287,15 @@ def _collect_query_environment(
     )
 
 
+def _query_resource_module() -> Any:
+    """Load the POSIX RSS module only inside a supported query worker."""
+
+    try:
+        return importlib.import_module("resource")
+    except ModuleNotFoundError as error:
+        raise _WorkerError("QUERY.RSS_UNSUPPORTED_PLATFORM") from error
+
+
 def _latency_environment(
     *,
     fts5_enabled: bool,
@@ -2383,7 +2393,7 @@ def _reopen_store(request: _WorkerRequest) -> tuple[
 def _run_probe(
     request: _WorkerRequest,
     *,
-    start_usage: resource.struct_rusage,
+    start_usage: object,
 ) -> dict[str, object]:
     fixture_path = Path(request.fixture_path)
     run_root = Path(request.run_root)
@@ -2526,15 +2536,16 @@ def _run_probe(
     return query_probe_to_payload(report)
 
 
-def _rss_start_bytes(start_usage: resource.struct_rusage) -> int:
+def _rss_start_bytes(start_usage: object) -> int:
     _platform, _raw_unit, start_bytes = rss_peak_bytes_facts(start_usage)
     return start_bytes
 
 
 def _terminal_rss_facts(
-    start_usage: resource.struct_rusage,
+    start_usage: object,
 ) -> tuple[int, str]:
-    terminal_usage = resource.getrusage(resource.RUSAGE_SELF)
+    resource_module = _query_resource_module()
+    terminal_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
     _platform, raw_unit, terminal_bytes = rss_peak_bytes_facts(terminal_usage)
     return terminal_bytes, raw_unit
 
@@ -2542,7 +2553,7 @@ def _terminal_rss_facts(
 def _run_evidence(
     request: _WorkerRequest,
     *,
-    start_usage: resource.struct_rusage,
+    start_usage: object,
 ) -> dict[str, object]:
     fixture_path = Path(request.fixture_path)
     run_root = Path(request.run_root)
@@ -2687,8 +2698,9 @@ def _worker_main(argv: list[str]) -> int:
             "usage: python -m tm_benchmark_query_process --worker\n"
         )
         return 2
-    start_usage = resource.getrusage(resource.RUSAGE_SELF)
     try:
+        resource_module = _query_resource_module()
+        start_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
         raw_request = sys.stdin.buffer.read()
         payload = _read_worker_request(raw_request)
         request = _validate_worker_request(payload)
