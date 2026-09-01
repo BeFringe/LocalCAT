@@ -1,6 +1,6 @@
 # 实施计划
 
-> **APPROVED FOR STAGED IMPLEMENTATION**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。ADR-020～026、`windows-platform-enablement` owning scope、WA-01～08 current R/D/T request、ledger与独立Design review均已闭合；ADR-024/025的活动合同同步由Task 0.6记录，ADR-026的Parser收窄由Task 0.7记录。从Task 1起仍必须逐项满足task/merge/evidence依赖，任何早期局部通过都不构成Windows Feature GO。owner 指 Spec/合同 authority；branch 只记录提交血缘，worktree/Agent/thread 都不是 owner。单个执行者或独立 reviewer 可以覆盖多个 Spec，但不能借此跨越各 Spec 审批门。实施/累计复审节奏见 `review-clustering.md`。
+> **APPROVED FOR STAGED IMPLEMENTATION**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。ADR-020～026、`windows-platform-enablement` owning scope、WA-01～08 current R/D/T request、ledger与独立Design review均已闭合；ADR-024/025的活动合同同步由Task 0.6记录，ADR-026的Parser收窄由Task 0.7记录。从Task 1起仍必须逐项满足task/integration/evidence依赖，任何早期局部通过都不构成Windows Feature GO。owner 指 Spec/合同 authority；branch 只记录提交血缘，worktree/Agent/thread 都不是 owner。单个执行者或独立 reviewer 可以覆盖多个 Spec，但不能借此跨越各 Spec 审批门。实施/累计复审节奏见 `review-clustering.md`。
 
 - [x] 0. 闭合 ADR、所有权、跨 Spec amendment 与设计授权
 
@@ -14,8 +14,8 @@
 
 - [x] 0.2 由 Governance owner批准 Windows owning scope 与 Steering 同步
   - 在治理分支把 `windows-platform-enablement` 记录到 `spec-ownership.md`/`roadmap.md`，固定本 Spec 只拥有共享合同/backends/bootstrap/build/release ledger，相邻 Spec 拥有 consumer business invariants
-  - 确定 `tmx-context-interchange` 是唯一 owning Spec、`ui-mvp` 是其 amendment 提交血缘，并确认 Qt avatar 只作为 Windows 功能回归，不改变现有资源或打包边界
-  - 完成时，scope lineage、Steering、Design 与 amendment ledger 无冲突，功能分支不产生重复 Steering 提交
+  - 确定 `tmx-context-interchange` 是唯一 owning Spec，并确认 Qt avatar 只作为 Windows 功能回归，不改变现有资源或打包边界
+  - 完成时，scope ownership、Steering、Design 与 amendment ledger 无冲突，不产生重复 Steering 提交
   - _Requirements: 5.1, 10.5, 11.2, 11.4, 12.5_
   - _Boundary: Steering and Spec Ownership_
   - _Depends: 0.1_
@@ -23,15 +23,15 @@
 - [x] 0.3a 派发 startup/source amendments
   - 按 `cross-spec-amendments.md` 向 WA-01 Parser、WA-02 Chunk、WA-07 CapabilityHost owners 派发精确 R/D/T delta；追加既有 task 的 `a` 后缀，不重排原任务。WA-07在本组只提前冻结接口，并与0.3c复用同一request revision、acknowledgement和ledger row，不制造第二次派发
   - 每个 owner 记录 approval/commit，覆盖 rooted source/writer、无顶层 `fcntl`、bootstrap-before-import、stable body-safe errors
-  - 完成时，三项 dispatch 均有 owning Spec acknowledgement；lineage branch只记录后续提交/merge血缘，缺一项不得进入任务 4
+  - 完成时，三项 dispatch 均有 owning Spec acknowledgement与可追踪commit；缺一项不得进入任务 4
   - _Requirements: 1.1, 1.2, 2.1, 2.6, 5.1, 5.2, 10.6_
   - _Boundary: Cross-Spec Dispatch Group A_
   - _Depends: 0.1, 0.2_
 
 - [x] 0.3b 派发 persistence/recovery amendments
   - WA-03 Project、WA-04 Resource、WA-05 TMX 的原dispatch已获acknowledgement；WA-06当时因ADR-023把private profile从V1接管为V2，以`R2` superseding request重新派发并获acknowledgement，后由Task 0.6的`R3`完整取代；不得静默改写已批准历史
-  - 当前活动交付按Task 0.6采用publish mode、owner lease、`WindowsDocumentedPublishV1`、owner-specific receipt + nested W2 proof和FileId reuse反例，并明确每项 R/D/T suffix、merge dependency、zero-mutation/recovery evidence；已被ADR-025取代的registry/硬断电条款不得驱动实现，WA-05保持任务0.2批准的唯一owner
-  - 完成时，WA-03/04/05与当时WA-06 revision均有owning Spec acknowledgement；后续superseding request由Task 0.6和ledger记录，lineage branch只记录后续提交/merge血缘，缺一项不得进入任务5/6
+  - 当前活动交付按Task 0.6采用publish mode、owner lease、`WindowsDocumentedPublishV1`、owner-specific receipt + nested W2 proof和FileId reuse反例，并明确每项 R/D/T suffix、integration dependency、zero-mutation/recovery evidence；已被ADR-025取代的registry/硬断电条款不得驱动实现，WA-05保持任务0.2批准的唯一owner
+  - 完成时，WA-03/04/05与当时WA-06 revision均有owning Spec acknowledgement；后续superseding request由Task 0.6和ledger记录，缺一项不得进入任务5/6
   - _Requirements: 3.1, 4.1, 4.3, 5.1, 7.1, 8.1, 8.4, 9.1_
   - _Boundary: Cross-Spec Dispatch Group B_
   - _Depends: 0.1, 0.2, 0.4a_
@@ -39,17 +39,17 @@
 - [x] 0.3c 派发 UI/frozen journey amendments与 revalidation-only manifest
   - 完成0.3a同一WA-07 Feature5/UI request并派发 WA-08 Qt increment；将 WR-01 TM store、WR-02 termbase、WR-03 old Qt 标为 revalidation-only/no-amendment，不制造重复dispatch或空洞任务
   - 固定 qwindows/visible window、avatar catalog解码与无匹配头像fallback、clean-user/non-repository CWD 与 source-proof failure diagnostics
-  - 完成时，UI/frozen dispatch 与 revalidation理由均获 owner确认；缺少 WA-07/08 merge 不得进入最终 EXE gate
+  - 完成时，UI/frozen dispatch 与 revalidation理由均获 owning Spec确认；缺少 WA-07/08 批准实现与证据不得进入最终 EXE gate
   - _Requirements: 6.2, 6.4, 6.5, 10.1, 10.5, 11.2, 11.3, 12.1_
   - _Boundary: Cross-Spec Dispatch Group C_
   - _Depends: 0.1, 0.2_
 
-- [x] 0.4 冻结 amendment merge ledger 与实现依赖图
-  - ledger schema、WA-01～08唯一current dispatch request revisions、owning Spec acknowledgement与lineage branch已批准；Task 0.6后WA-03 `R2`与WA-06 `R3`是各自唯一current request，WA-03 `R1`及WA-06 `R1`/`R2`只作`SUPERSEDED`历史且不得驱动实现/merge/evidence。本任务不预填尚未发生的 amendment/merge commit、artifact 或终态 disposition
-  - 验证合并顺序为 platform → Parser/Chunk → Project/Resource/TMX → TM Core → Feature5/UI → Qt journey；平行线不得复制 patch-equivalent commit
-  - 完成时，ledger schema/dispatch identity获批且每个实现 cluster都有fail-closed dependency gate；实际 commit/merge/evidence/disposition由任务4.1/5.1/6.1/6.5/7.5逐行追加，禁止用`SKIPPED`放行required row
+- [x] 0.4 冻结 amendment integration ledger 与实现依赖图
+  - ledger schema、WA-01～08唯一current dispatch request revisions与owning Spec acknowledgement已批准；Task 0.6后WA-03 `R2`与WA-06 `R3`是各自唯一current request，WA-03 `R1`及WA-06 `R1`/`R2`只作`SUPERSEDED`历史且不得驱动实现或evidence。本任务不预填尚未发生的 amendment commit、artifact 或终态 disposition
+  - 验证集成顺序为 platform → Parser/Chunk → Project/Resource/TMX → TM Core → Feature5/UI → Qt journey；commit可直接位于Windows线或从其他工作树形成，拓扑不构成authority
+  - 完成时，ledger schema/dispatch identity获批且每个实现 cluster都有fail-closed dependency gate；实际 commit/evidence/disposition由任务4.1/5.1/6.1/6.5/7.5逐行追加，禁止用`SKIPPED`放行required row
   - _Requirements: 5.1, 5.3, 12.3, 12.4, 12.5_
-  - _Boundary: Amendment Merge Authority Ledger_
+  - _Boundary: Amendment Integration Ledger_
   - _Depends: 0.3a, 0.3b, 0.3c_
 
 - [x] 0.4a 由Governance owner审阅并采纳ADR-023 pre-authority proof-order补充决策
@@ -288,14 +288,14 @@
   - _Boundary: Windows Source Qt Startup_
   - _Depends: 4.2, 4.3_
 
-- [ ] 5. 合并 Project/Resource/TMX amendments并完成持久化 vertical slices
+- [x] 5. 集成 Project/Resource/TMX amendments并完成持久化 vertical slices
 
-- [x] 5.1 验证并合并 WA-03 Project、WA-04 Resource、WA-05 TMX commits
-  - 核对owner/approvals/task suffix/commit/merge/evidence；WA-05 owner必须与任务0.2一致
-  - 合并后重跑共享rooted/publish contract和各owner业务baseline，ledger仅在fresh pass后标`SOURCE_MERGED_PASS`；frozen阶段未闭合前不得写入terminal `MERGED_PASS`
+- [x] 5.1 验证并集成 WA-03 Project、WA-04 Resource、WA-05 TMX commits
+  - 核对owning Spec/approvals/task suffix/commit可达性/evidence；WA-05 owner必须与任务0.2一致
+  - 集成后重跑共享rooted/publish contract和各owner业务baseline，ledger仅在fresh pass后标`SOURCE_MERGED_PASS`；frozen阶段未闭合前不得写入terminal `MERGED_PASS`
   - 完成时，三个consumer都通过platform port且无重复Windows filesystem实现
   - _Requirements: 5.1, 5.2, 5.3, 7.1, 9.1, 12.5_
-  - _Boundary: Persistence Amendment Merge_
+  - _Boundary: Persistence Amendment Integration_
   - _Depends: 0.3b, 4.4_
 
 - [x] 5.2 完成Project保存、退出、重开与deterministic carrier验证
@@ -306,7 +306,7 @@
   - _Boundary: Windows Project Save and Reopen_
   - _Depends: 5.1_
 
-- [ ] 5.3 (P) 完成Resource/Termbase portability与receipt验证
+- [x] 5.3 (P) 完成Resource/Termbase portability与receipt验证
   - 验证resource artifact/package/importer/repository/ledger/workspace state与termbase consumer通过shared ports保存/重开
   - hostile source、target-open、receipt tamper和resource-local failure不影响其他authority；WR-02 column-selection regression保持业务语义
   - 完成时，resource/termbase结果、bytes与portable receipts可重启复核
@@ -314,7 +314,7 @@
   - _Boundary: Windows Resource Portability_
   - _Depends: 5.1, 6.2_
 
-- [ ] 5.4 (P) 完成TMX获授权导入、canonical保存与重启验证
+- [x] 5.4 (P) 完成TMX获授权导入、canonical保存与重启验证
   - 从真实rooted source导入有效TMX，保持locale normalization/conflict rules/准确count并保存canonical target
   - escaped/reparse/swap/invalid source在发布前fail closed且目标byte hash不变；进程重启后结果仍可查询
   - 完成时，source TMX journey全绿并交付frozen阶段可复用的owner port，无import count伪成功；packaged复验由WA-05 5.4a与Task 7负责
@@ -322,22 +322,22 @@
   - _Boundary: Windows TMX Import and Persistence_
   - _Depends: 5.1, 6.2_
 
-- [ ] 5.5 运行Project/Resource/TMX组合并发、崩溃与documented publish恢复矩阵
+- [x] 5.5 运行Project/Resource/TMX组合并发、崩溃与documented publish恢复矩阵
   - 在owner resource lease下重放save/import/export instruction faults、process termination、uncooperative target swap、opened-target rejection、应用重启和正常OS reboot recovery
-  - 验证每个business owner只消费platform facts并决定journal/LKG，不将pre-snapshot当CAS或擅自清理ambiguous residue
-  - 完成时，三个vertical slices只产生完整old/new或recovery-only且日志可审计
+  - 核对并集成WA-02 package-completion commit；验证每个business owner只消费platform facts并决定journal/LKG，不将pre-snapshot当CAS或擅自清理ambiguous residue；以WA-03真实Windows ProjectPackage重放WA-02 `4.4a/4.5a`，不得用mock、私有ZIP builder或skip代答
+  - 完成时，三个persistence vertical slices及WA-02 package-coupled chunk acceptance只产生完整old/new或recovery-only且日志可审计；WA-02 ledger由`SOURCE_COMMITTED`推进为`SOURCE_MERGED_PASS`
   - _Requirements: 3.4, 4.2, 4.3, 4.5, 7.3, 7.4, 9.2, 12.2, 12.7_
   - _Boundary: Persistence Recovery Matrix_
   - _Depends: 5.2, 5.3, 5.4_
 
-- [ ] 6. 合并TM Core/Feature5 UI amendments并完成activation/FTS5恢复
+- [ ] 6. 集成TM Core/Feature5 UI amendments并完成activation/FTS5恢复
 
-- [ ] 6.1 验证并合并 WA-06 TM Core amendment
-  - 核对W1/W2及ADR-023/024/025 superseding映射、当前approved R/D/T request revision与task suffix、feature5 commit/merge identity和activation/attestation/recovery evidence；任何非current revision或V1 private profile实现不得进入merge
+- [ ] 6.1 验证并集成 WA-06 TM Core amendment
+  - 核对W1/W2及ADR-023/024/025 superseding映射、当前approved R/D/T request revision与task suffix、feature5 commit可达性和activation/attestation/recovery evidence；任何非current revision或V1 private profile实现不得进入集成
   - 重跑Core frozen contracts、canonical migration/retrieval、FileId reuse、ACL token、two-process/instruction-fault/process-termination/正常OS reboot和WR-01 module-extraction regression
-  - 完成时，Core business authority仍归`tm-storage-retrieval-index`，Windows分支只提供platform能力和source merge evidence；ledger记录`SOURCE_MERGED_PASS`，frozen复验后才可进入terminal状态
+  - 完成时，Core business authority仍归`tm-storage-retrieval-index`，Windows分支只提供platform能力和source integration evidence；ledger记录`SOURCE_MERGED_PASS`，frozen复验后才可进入terminal状态
   - _Requirements: 5.1, 8.1, 8.3, 8.4, 8.5, 8.6, 12.5_
-  - _Boundary: TM Core Amendment Merge_
+  - _Boundary: TM Core Amendment Integration_
   - _Depends: 0.3b, 3.7, 5.2_
 
 - [x] 6.2 完成TM首次激活、双进程唯一authority与restart recovery
@@ -368,12 +368,12 @@
   - _Boundary: Windows SQLite FTS5 Runtime_
   - _Depends: 6.2_
 
-- [ ] 6.5 验证并合并 WA-07 Feature5/UI source阶段
-  - 核对Feature5/UI owner route tasks、commit/merge identity；source composition先由Windows platform factory建立rooted source、lock与private-proof ports，再进入CapabilityHost/Controller，不消费ADR-022 `TrustedSourceAuthority`
+- [ ] 6.5 验证并集成 WA-07 Feature5/UI source阶段
+  - 核对Feature5/UI owning Spec route tasks、commit可达性与evidence；source composition先由Windows platform factory建立rooted source、lock与private-proof ports，再进入CapabilityHost/Controller，不消费ADR-022 `TrustedSourceAuthority`
   - 运行activation/restart projections、resource-local safe state、source bootstrap-before-business-import、no raw proof/path UI和existing Gate A/C/D contract regression
   - 完成时，source UI可激活TM、重启恢复并查询FTS5；ledger只记录`SOURCE_MERGED_PASS`，不得提前记录terminal `MERGED_PASS`
   - _Requirements: 5.1, 6.3, 8.1, 8.2, 9.4_
-  - _Boundary: Feature5 UI Windows Source Integration Merge_
+  - _Boundary: Feature5 UI Windows Source Integration_
   - _Depends: 0.3a, 0.3c, 6.3, 6.4_
 
 - [ ] 6.6a 实现并验证user-managed Windows轻量GUI入口
@@ -393,12 +393,12 @@
 
 - [ ] 7. 构建完整 frozen-source closure 与 Windows onedir/windowed发行物
 
-- [ ] 7.0 合并frozen pre-build消费合同与WA-07 trusted bootstrap实现
-  - 在1.6全PASS后，只合并生成manifest/build前必须存在的owner roots/hooks与WA-07 3.6a `TrustedSourceAuthority`消费实现；WA-01/02/04/05/06及WA-07其余packaged revalidation不得在发行候选生成前标为完成
+- [ ] 7.0 集成frozen pre-build消费合同与WA-07 trusted bootstrap实现
+  - 在1.6全PASS后，只集成生成manifest/build前必须存在的owner roots/hooks与WA-07 3.6a `TrustedSourceAuthority`消费实现；WA-01/02/04/05/06及WA-07其余packaged revalidation不得在发行候选生成前标为完成
   - CapabilityHost只消费native entry移交的`TrustedSourceAuthority`，完整Boot TCB先于platform factory与业务import；source阶段结果与最小spike都不得代答full candidate runtime
   - 完成时ledger只追加`FROZEN_PREBUILD_COMMITTED`事实，所有owner row仍等待7.4a post-build revalidation，terminal `MERGED_PASS`继续禁止
   - _Requirements: 5.1, 10.1, 10.2, 10.3, 10.5, 10.6, 12.5_
-  - _Boundary: Frozen Consumer Amendment Merge_
+  - _Boundary: Frozen Consumer Amendment Integration_
   - _Depends: 1.6, 6.6b, feature5-ui-integration 3.6a_
 
 - [ ] 7.1 生成deterministic frozen source/fixture/data manifest
@@ -433,20 +433,20 @@
   - _Boundary: Frozen Distribution Visibility_
   - _Depends: 7.3_
 
-- [ ] 7.4a 在同一发行候选完成并合并owner frozen revalidation
+- [ ] 7.4a 在同一发行候选完成并集成owner frozen revalidation
   - 以7.4已验证的同一dist依次闭合WA-01 `5.12b`、WA-02 `1.4b/4.5b`、WA-04 `5.5a`、WA-05 `5.4a`、WA-06 `9.6b`及WA-07 `6.6b/7.4b/7.6b/9.2a`；每项都必须运行真实packaged consumer/API，不得由1.6最小spike、source证据或mock代答
-  - 核对每个owning Spec的route approval、amendment commit、merge identity、同一bundle manifest/evidence SHA与失败安全语义；任一失败保持该row和下游WA-08 frozen journey为BLOCKED
+  - 核对每个owning Spec的route approval、amendment commit可达性、同一bundle manifest/evidence SHA与失败安全语义；任一失败保持该row和下游WA-08 frozen journey为BLOCKED
   - 完成时各owner row推进为`FROZEN_REVALIDATED_PASS`，但只有WA-08 packaged journey闭合后才可进入terminal `MERGED_PASS`
   - _Requirements: 5.1, 5.3, 10.3, 10.5, 11.2, 12.3, 12.5_
-  - _Boundary: Post-build Frozen Owner Revalidation Merge_
+  - _Boundary: Post-build Frozen Owner Revalidation Integration_
   - _Depends: 7.4, WA-01 5.12b, WA-02 1.4b, WA-02 4.5b, WA-04 5.5a, WA-05 5.4a, WA-06 9.6b, WA-07 6.6b, WA-07 7.4b, WA-07 7.6b, WA-07 9.2a_
 
-- [ ] 7.5 验证并合并 WA-08 Qt increment amendment
-  - 核对Qt owner approvals/task suffix/commit/merge evidence，运行单JSON editor、bundle resources、qwindows/visible window、avatar功能回归和clean-user journeys
+- [ ] 7.5 验证并集成 WA-08 Qt increment amendment
+  - 核对Qt owning Spec approvals/task suffix/commit可达性/evidence，运行单JSON editor、bundle resources、qwindows/visible window、avatar功能回归和clean-user journeys
   - 保持Layer 4/Controller boundary、keyboard/accessibility与旧Qt baseline；不得把Windows平台逻辑散落进widgets
   - 完成时，WA-08与WR-03 evidence闭合，所有required amendment rows均`MERGED_PASS`
   - _Requirements: 5.1, 6.2, 6.4, 6.5, 7.1, 11.2, 11.3, 12.5_
-  - _Boundary: Qt Windows Journey Amendment Merge_
+  - _Boundary: Qt Windows Journey Amendment Integration_
   - _Depends: 0.3c, 7.4a, qt-editor-json-mvp-increment 5.2b, qt-editor-json-mvp-increment 5.3b, qt-editor-json-mvp-increment 5.4b_
 
 - [ ] 8. 在clean Windows发行环境运行分能力packaged E2E
@@ -519,7 +519,7 @@
 
 - [ ] 9.4 完成累计对抗性实现评审与最终治理差异核对
   - Cumulative reviewer从Requirements/Design/ADRs/ledger反向检查实际tree/runtime，重放Boot TCB/executed-byte binding、share/CAS、ACL/FileId、`WindowsDocumentedPublishV1`、Windows source/EXE与Mac/Linux红线
-  - 检查所有WA merge identity、WR evidence、Steering sync与实际delta；实施期新增跨门槛事实必须回到ADR/Spec审批，不能用Implementation Notes补授权
+  - 检查所有WA owning Spec批准、commit可达性、WR evidence、Steering sync与实际delta；实施期新增跨门槛事实必须回到ADR/Spec审批，不能用Implementation Notes补授权
   - 完成时，无unresolved blocker/major、无未批准delta、diff/checksum/branch tree一致；否则保持NO-GO
   - _Requirements: 1.2, 5.1, 10.3, 12.2, 12.3, 12.5_
   - _Boundary: Independent Implementation and Governance Review_
