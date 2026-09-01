@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ from tm_contracts import (
     contract_from_json,
     contract_to_json,
 )
+from tm_engine import TMEngine
 from tm_sqlite_store import (
     ActivationPreparationError,
     ResourceStoreCoordinator,
@@ -520,6 +522,50 @@ def _mutate(root: Path, mutation: str) -> dict[str, object]:
         replacement = root / "foreign-private-journal"
         replacement.write_bytes(pending_path.read_bytes())
         os.replace(replacement, pending_path)
+    elif mutation == "private-generation-owner-envelope":
+        if phases != [
+            "DB_REPLACED",
+            "MANIFEST_PUBLISHED",
+            "GENERATION_PUBLISHED",
+        ]:
+            raise AssertionError(
+                "private proof mutation requires completed generation"
+            )
+        generation_path = (
+            private_root
+            / tm_activation_journal._portable_publication_phase_name(
+                "GENERATION_PUBLISHED"
+            )
+        )
+        generation = (
+            tm_activation_journal._parse_portable_publication_phase_bytes(
+                generation_path.read_bytes()
+            )
+        )
+        tampered_unsigned = replace(
+            generation.unsigned,
+            token_id="token.tampered-owner-envelope",
+        )
+        tampered_proof = replace(
+            generation.private_directory_proof,
+            owner_context_sha256=(
+                tm_activation_journal._portable_publication_owner_context_sha256(
+                    tampered_unsigned
+                )
+            ),
+            device_secret_mac=b"x" * 32,
+        )
+        tampered = (
+            tm_activation_journal._create_portable_publication_phase_record(
+                tampered_unsigned,
+                tampered_proof,
+            )
+        )
+        generation_path.write_bytes(
+            tm_activation_journal._serialize_portable_publication_phase_record(
+                tampered
+            )
+        )
     elif mutation == "unknown-private":
         (private_root / "foreign.candidate").write_bytes(
             b"foreign-recovery-residue"
@@ -533,6 +579,70 @@ def _mutate(root: Path, mutation: str) -> dict[str, object]:
         "before": before,
         "journal": _journal_facts(root, identity),
         "disk": _disk_facts(identity),
+    }
+
+
+def _cold_open_private_failure(
+    root: Path,
+    *,
+    fail_narrowing: bool,
+) -> dict[str, object]:
+    identity = _identity(root, create_source=False)
+    before_disk = _disk_facts(identity)
+    before_journal = _journal_facts(root, identity)
+    generic_fallback_calls = 0
+
+    def reject_generic_fallback(
+        coordinator: ResourceStoreCoordinator,
+    ) -> object:
+        nonlocal generic_fallback_calls
+        del coordinator
+        generic_fallback_calls += 1
+        raise AssertionError("generic legacy/v2 fallback used")
+
+    error: ValueError | None = None
+    with ExitStack() as stack:
+        stack.enter_context(
+            mock.patch.object(
+                ResourceStoreCoordinator,
+                "rehydrate_runtime_authority",
+                new=reject_generic_fallback,
+            )
+        )
+        if fail_narrowing:
+            stack.enter_context(
+                mock.patch(
+                    "tm_migration.narrow_windows_persistent_private_proof",
+                    side_effect=PlatformFileError(
+                        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                        retryable=False,
+                    ),
+                )
+            )
+        try:
+            TMEngine(
+                str(identity.configured_jsonl_path),
+                update=False,
+                expected_resource_id=identity.resource_id,
+            )
+        except ValueError as caught:
+            error = caught
+    if error is None:
+        raise AssertionError("private cold open unexpectedly succeeded")
+    return {
+        "mode": (
+            "cold-open-narrow-failure"
+            if fail_narrowing
+            else "cold-open-private-tamper"
+        ),
+        "pid": os.getpid(),
+        "failure_type": type(error).__name__,
+        "failure_message": str(error),
+        "generic_fallback_calls": generic_fallback_calls,
+        "before_disk": before_disk,
+        "after_disk": _disk_facts(identity),
+        "before_journal": before_journal,
+        "after_journal": _journal_facts(root, identity),
     }
 
 
@@ -1153,6 +1263,8 @@ def main() -> int:
             "recover-ready-source-different",
             "recover-close",
             "recover-guard-reprove-close",
+            "cold-open-private-tamper",
+            "cold-open-narrow-failure",
             "retry",
             "replay",
         ),
@@ -1190,6 +1302,7 @@ def main() -> int:
             "stage-database-multilink",
             "stage-database-junction",
             "private-journal-foreign-acl",
+            "private-generation-owner-envelope",
             "unknown-private",
         ),
     )
@@ -1205,6 +1318,16 @@ def main() -> int:
             if arguments.mutation is None:
                 parser.error("mutate requires --mutation")
             result = _mutate(root, arguments.mutation)
+        elif arguments.mode in {
+            "cold-open-private-tamper",
+            "cold-open-narrow-failure",
+        }:
+            result = _cold_open_private_failure(
+                root,
+                fail_narrowing=(
+                    arguments.mode == "cold-open-narrow-failure"
+                ),
+            )
         else:
             result = _activate(
                 root,
