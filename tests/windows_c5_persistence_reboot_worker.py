@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -23,39 +21,52 @@ from project_workspace_intake import (
     SelectedProjectDocumentsRequest,
     stage_selected_project_documents,
 )
-from tmx_context_contracts import (
-    TmxEffectiveLocales,
-    TmxExportUnit,
-    TmxScopeBinding,
-    TmxScopeKind,
-)
-from tmx_context_interchange import (
-    ParserTmxColdValidator,
-    inspect_tmx_payload,
-    prepare_tmx_payload,
-)
-from tmx_artifact_save import TmxDirectArtifactSaver
-
-
-SCHEMA = "localcat.windows-c5-persistence-reboot-ticket.v1"
+SCHEMA = "localcat.windows-c5-persistence-reboot-ticket.v2"
 _PROJECT_WORKER = WORKSPACE_ROOT / "tests" / "windows_project_package_worker.py"
 _RESOURCE_WORKER = WORKSPACE_ROOT / "tests" / "windows_resource_source_worker.py"
 _SOURCE_FILES = (
     "platform_fs.py",
     "platform_fs_contracts.py",
     "platform_fs_windows.py",
+    "windows_file_api.py",
     "project_package.py",
     "project_save.py",
     "project_workspace.py",
     "project_workspace_intake.py",
     "resource_artifact_save.py",
+    "resource_importer.py",
+    "resource_package.py",
+    "resource_package_contracts.py",
+    "resource_payload_port.py",
+    "resource_platform_io.py",
     "resource_portability.py",
     "resource_receipt_ledger.py",
     "resource_repository.py",
     "termbase_store.py",
-    "tmx_artifact_save.py",
-    "tmx_bound_artifact_save.py",
+    "tm_activation_journal.py",
+    "tm_activation_recovery.py",
+    "tm_content_attestation.py",
+    "tm_contracts.py",
+    "tm_engine.py",
+    "tm_migration.py",
+    "tm_resource_port.py",
+    "tm_snapshot_artifacts.py",
+    "tm_snapshot_recovery.py",
+    "tm_sqlite_store.py",
+    "tm_stage_sealer.py",
+    "parser_composition.py",
+    "parser_contracts.py",
+    "parser_registry.py",
+    "parser_source.py",
+    "parser_tmx_codec.py",
+    "tm_application_composition.py",
+    "tmx_application.py",
+    "tmx_context_contracts.py",
     "tmx_context_interchange.py",
+    "tmx_platform_io.py",
+    "tmx_resource_package_handler.py",
+    "editor_contracts.py",
+    "editor_controller.py",
     "tests/windows_c5_persistence_reboot_worker.py",
     "tests/windows_project_package_worker.py",
     "tests/windows_resource_source_worker.py",
@@ -197,57 +208,6 @@ def _run_resource(root: Path, mode: str, *arguments: object, expected: int = 0) 
     return json.loads(completed.stdout)
 
 
-def _tmx_binding_and_payload():
-    binding = TmxScopeBinding(
-        TmxScopeKind.MANAGED_RESOURCE,
-        "c5-reboot-resource",
-        hashlib.sha256(b"c5-reboot-generation").hexdigest(),
-        1,
-        attached_count=1,
-    )
-    payload = prepare_tmx_payload(
-        binding,
-        TmxEffectiveLocales("en-US", "zh-CN"),
-        (TmxExportUnit("record-1", "source", "译文", True),),
-    )
-    return binding, payload
-
-
-def _crash_tmx(destination: Path) -> None:
-    binding, payload = _tmx_binding_and_payload()
-
-    def terminate(phase: str) -> None:
-        if phase == "owner_commit":
-            os._exit(91)
-
-    saver = TmxDirectArtifactSaver(
-        ParserTmxColdValidator(),
-        lambda current: current == binding,
-        fault_hook=terminate,
-    )
-    _preview, plan = saver.preview(binding, payload, destination)
-    saver.apply(plan)
-    raise AssertionError("TMX owner_commit crash phase was not reached")
-
-
-def _prepare_tmx(root: Path) -> dict[str, object]:
-    root.mkdir()
-    destination = root / "recovery.tmx"
-    destination.write_bytes(b"prior exact bytes")
-    completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "tmx-crash", str(destination)],
-        check=False,
-        cwd=root,
-    )
-    if completed.returncode != 91:
-        raise AssertionError(f"TMX recovery worker exited {completed.returncode}")
-    _binding, payload = _tmx_binding_and_payload()
-    return {
-        "destination": destination.name,
-        "payload_digest": payload.proof.payload_digest,
-    }
-
-
 def _ticket_path(root: Path) -> Path:
     return root / "reboot-ticket.json"
 
@@ -283,16 +243,14 @@ def prepare(root: Path) -> dict[str, object]:
     project_root = root / "project"
     resource_root = root / "resource"
     resource_recovery_root = root / "resource-recovery"
-    tmx_root = root / "tmx"
     project = _prepare_project(project_root)
-    resource = _run_resource(resource_root, "produce")
+    resource = _run_resource(resource_root, "c5-prepare")
     _run_resource(
         resource_recovery_root,
         "crash-direct-ledger",
         3,
         expected=91,
     )
-    tmx = _prepare_tmx(tmx_root)
     unsigned = {
         "schema": SCHEMA,
         "boot_session": boot_session,
@@ -300,13 +258,11 @@ def prepare(root: Path) -> dict[str, object]:
         "expected": {
             "project": project,
             "resource": resource,
-            "tmx": tmx,
         },
         "inventories": {
             "project": _inventory(project_root),
             "resource": _inventory(resource_root),
             "resource_recovery": _inventory(resource_recovery_root),
-            "tmx": _inventory(tmx_root),
         },
     }
     ticket = {**unsigned, "ticket_sha256": _sha256(_canonical(unsigned))}
@@ -359,7 +315,6 @@ def resume(root: Path) -> dict[str, object]:
         "project": root / "project",
         "resource": root / "resource",
         "resource_recovery": root / "resource-recovery",
-        "tmx": root / "tmx",
     }
     for role, role_root in roots.items():
         if inventories.get(role) != _inventory(role_root):
@@ -392,16 +347,18 @@ def resume(root: Path) -> dict[str, object]:
         raise RuntimeError("C5 reboot project recovery did not close")
 
     resource_expected = expected["resource"]
-    reopened_resource = _run_resource(roots["resource"], "reopen")
-    if type(resource_expected) is not dict or any(
-        reopened_resource[key] != resource_expected[key]
-        for key in (
-            "direct_digest",
-            "package_digest",
-            "payload_digest",
-            "imported_resource_id",
-        )
-    ):
+    reopened_resource = _run_resource(roots["resource"], "c5-reopen")
+    if type(resource_expected) is not dict:
+        raise RuntimeError("C5 reboot resource expectation is invalid")
+    expected_tmx_import = resource_expected.get("tmx_import")
+    expected_resource_reopen = dict(resource_expected)
+    expected_resource_reopen.pop("tmx_import", None)
+    if expected_tmx_import != {
+        "imported": 1,
+        "skipped": 0,
+        "overwritten": 0,
+        "errors": [],
+    } or reopened_resource != expected_resource_reopen:
         raise RuntimeError("C5 reboot resource cold reopen changed")
     recovered_resource = _run_resource(
         roots["resource_recovery"],
@@ -415,22 +372,6 @@ def resume(root: Path) -> dict[str, object]:
     ):
         raise RuntimeError("C5 reboot resource recovery did not close")
 
-    tmx_expected = expected["tmx"]
-    if type(tmx_expected) is not dict:
-        raise RuntimeError("C5 reboot TMX expectation is invalid")
-    binding, _payload = _tmx_binding_and_payload()
-    tmx_target = roots["tmx"] / str(tmx_expected["destination"])
-    receipt = TmxDirectArtifactSaver(
-        ParserTmxColdValidator(),
-        lambda current: current == binding,
-    ).recover(tmx_target)
-    reopened_tmx = inspect_tmx_payload(tmx_target)
-    if (
-        receipt is None
-        or receipt.after_digest != tmx_expected["payload_digest"]
-        or reopened_tmx.payload_digest != tmx_expected["payload_digest"]
-    ):
-        raise RuntimeError("C5 reboot TMX recovery did not close")
     return {
         "project": "PASS",
         "reboot": "PASS",
@@ -442,9 +383,6 @@ def resume(root: Path) -> dict[str, object]:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) == 2 and arguments[0] == "tmx-crash":
-        _crash_tmx(Path(arguments[1]))
-        return 2
     if len(arguments) != 2 or arguments[0] not in {"prepare", "resume"}:
         raise SystemExit("usage: worker prepare|resume ROOT")
     action, root_text = arguments
