@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import unittest
 from unittest.mock import patch
 
+from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
 from tm_benchmark import (
     benchmark_implementation_fingerprint,
     iter_corpus_records,
@@ -27,6 +28,7 @@ from tm_benchmark_process import (
     PROCESS_WORKER_PROTOCOL_VERSION,
     ProcessEvidenceError,
     TMBenchmarkProcessEvidence,
+    _WorkerError,
     _canonical_json,
     _evidence_from_stdout,
     _evidence_payload,
@@ -35,6 +37,8 @@ from tm_benchmark_process import (
     collect_process_environment,
     evidence_from_payload,
     process_evidence_digest,
+    _run_measured_lifecycle,
+    _validate_worker_request,
     run_process_migration_evidence,
     worker_protocol_digest,
 )
@@ -53,8 +57,8 @@ _CONTRACT = load_benchmark_contract(_ROOT / "benchmark_tm_contract.json")
 _FTS5 = BenchmarkExecutionPath.FTS5_TRIGRAM
 _FALLBACK = BenchmarkExecutionPath.GRAM_FALLBACK
 
-_RUN_ROOT = "/tmp/benchmark-run-test"
-_FIXTURE_PATH = f"{_RUN_ROOT}/fixture.jsonl"
+_RUN_ROOT = str(Path(tempfile.gettempdir()).resolve() / "benchmark-run-test")
+_FIXTURE_PATH = str(Path(_RUN_ROOT) / "fixture.jsonl")
 _RESOURCE_ID = "tm.benchmark"
 _STORE_ID = "store.benchmark"
 _IMPLEMENTATION_FINGERPRINT = benchmark_implementation_fingerprint(_ROOT)
@@ -286,7 +290,13 @@ class ProcessEvidenceConstructorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _small_evidence(record_count=41)
         with self.assertRaises(ValueError):
-            _small_evidence(fixture_path="/tmp/other/fixture.jsonl")
+            _small_evidence(
+                fixture_path=str(
+                    Path(tempfile.gettempdir()).resolve()
+                    / "other"
+                    / "fixture.jsonl"
+                )
+            )
 
     def test_rejects_bool_as_int_and_negative_or_nonfinite_scalars(self) -> None:
         for field_name in (
@@ -551,7 +561,11 @@ class ProcessRunnerTests(unittest.TestCase):
                 evidence.fixture_digest,
                 hashlib.sha256(fixture.read_bytes()).hexdigest(),
             )
-            names = sorted(path.name for path in root.iterdir())
+            names = sorted(
+                path.relative_to(root).as_posix()
+                for path in root.rglob("*")
+                if path.is_file()
+            )
             self.assertIn("fixture.jsonl", names)
             self.assertIn("fixture.jsonl.sqlite3", names)
             self.assertIn("fixture.jsonl.localcat-snapshot.json", names)
@@ -571,14 +585,31 @@ class ProcessRunnerTests(unittest.TestCase):
             )
             self.assertRegex(snapshot.family_digest, r"[0-9a-f]{64}\Z")
             sidecar_stat = sidecar.lstat()
-            self.assertEqual(snapshot.sidecar_identity.device, sidecar_stat.st_dev)
-            self.assertEqual(snapshot.sidecar_identity.inode, sidecar_stat.st_ino)
             self.assertEqual(snapshot.sidecar_identity.size, sidecar_stat.st_size)
-            self.assertEqual(
-                snapshot.sidecar_identity.mtime_ns,
-                sidecar_stat.st_mtime_ns,
-            )
-            self.assertEqual(snapshot.manifest_identity.inode, manifest.lstat().st_ino)
+            if sys.platform == "win32":
+                self.assertEqual(snapshot.sidecar_identity.device, 0)
+                self.assertEqual(snapshot.sidecar_identity.inode, 0)
+                self.assertEqual(snapshot.sidecar_identity.mtime_ns, 0)
+                self.assertEqual(snapshot.manifest_identity.device, 0)
+                self.assertEqual(snapshot.manifest_identity.inode, 0)
+                self.assertEqual(snapshot.manifest_identity.mtime_ns, 0)
+            else:
+                self.assertEqual(
+                    snapshot.sidecar_identity.device,
+                    sidecar_stat.st_dev,
+                )
+                self.assertEqual(
+                    snapshot.sidecar_identity.inode,
+                    sidecar_stat.st_ino,
+                )
+                self.assertEqual(
+                    snapshot.sidecar_identity.mtime_ns,
+                    sidecar_stat.st_mtime_ns,
+                )
+                self.assertEqual(
+                    snapshot.manifest_identity.inode,
+                    manifest.lstat().st_ino,
+                )
 
     def test_run_root_must_be_closed_before_spawn(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -856,6 +887,36 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             self.assertEqual(completed.stdout, "")
 
+    def test_worker_maps_rooted_fixture_read_failure_to_stable_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture = root / "fixture.jsonl"
+            fixture.write_bytes(b"fixture")
+            request = _validate_worker_request(
+                json.loads(
+                    self._request_json(
+                        fixture_path=fixture,
+                        run_root=root,
+                        execution_path=_FTS5,
+                    )
+                )
+            )
+            failure = PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+            with patch(
+                "tm_benchmark_process._read_fixture_facts",
+                side_effect=failure,
+            ):
+                with self.assertRaises(_WorkerError) as caught:
+                    _run_measured_lifecycle(
+                        request,
+                        started_ns=0,
+                        start_usage=1,
+                    )
+            self.assertEqual(caught.exception.error_code, "PROCESS.FIXTURE_INVALID")
+
     def test_worker_rejects_run_root_that_is_not_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -922,8 +983,10 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertTrue(imported)
         stdlib = set(sys.stdlib_module_names)
         allowed = {
+            "platform_fs_contracts",
             "tm_benchmark",
             "tm_benchmark_latency",
+            "tm_benchmark_platform_io",
             "tm_candidate_index",
             "tm_contracts",
             "tm_migration",

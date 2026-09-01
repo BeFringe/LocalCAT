@@ -110,6 +110,7 @@ BENCHMARK_IMPLEMENTATION_SOURCE_PATHS = (
     "tm_benchmark_gate.py",
     "tm_benchmark_latency.py",
     "tm_benchmark_oracle.py",
+    "tm_benchmark_platform_io.py",
     "tm_benchmark_process.py",
     "tm_benchmark_query_process.py",
     "tm_candidate_index.py",
