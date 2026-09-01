@@ -35,6 +35,7 @@ from tm_contracts import (
     contract_to_json,
 )
 from tm_engine import TMEngine
+from tm_candidate_index import CandidateRetriever
 from tm_sqlite_store import (
     ActivationPreparationError,
     ResourceStoreCoordinator,
@@ -219,6 +220,23 @@ def _journal_facts(
             and record.unsigned.predecessor_digest == predecessor
         )
         predecessor = record.record_digest
+    active_attestation = None
+    if records:
+        active = records[-1].unsigned.active_content_attestation
+        if active is not None:
+            active_attestation = {
+                "generation": active.generation,
+                "activation_digest": active.activation_digest,
+                "attestation_digest": active.attestation_digest,
+                "snapshot_receipt_digest": active.snapshot_receipt_digest,
+                "database_sha256": active.database.sha256,
+                "manifest_sha256": active.manifest.sha256,
+                "source_sha256": active.source.sha256,
+                "index_kind": active.semantic_facts.candidate_index_kind,
+                "sqlite_version": active.semantic_facts.sqlite_runtime_version,
+                "unicode_version": active.semantic_facts.unicode_runtime_version,
+                "fts5_available": active.semantic_facts.fts5_available,
+            }
 
     retirement: dict[str, object] | None = None
     if prepared is not None:
@@ -262,6 +280,7 @@ def _journal_facts(
         "phases": chain,
         "phase_files": phase_files,
         "predecessor_closed": predecessor_closed,
+        "active_attestation": active_attestation,
         "prepared": _file_facts(main),
         "terminal": _file_facts(terminal),
         "retirement": retirement,
@@ -306,8 +325,29 @@ def _database_sql_facts(path: Path) -> dict[str, object] | None:
             uri=True,
         )
         try:
+            fts_ddl_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'tm_fts'"
+            ).fetchone()
             return {
                 "meta": dict(connection.execute("SELECT key, value FROM tm_meta")),
+                "fts_ddl": None if fts_ddl_row is None else fts_ddl_row[0],
+                "compile_options": sorted(
+                    row[0] for row in connection.execute("PRAGMA compile_options")
+                ),
+                "schema_names": [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+                    )
+                ],
+                "integrity_check": connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()[0],
+                "foreign_key_check": connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall(),
                 "receipt_statuses": [
                     row[0]
                     for row in connection.execute(
@@ -410,6 +450,101 @@ def _runtime_facts(
         ],
     }
     return facts
+
+
+def _fts5_activate(root: Path) -> dict[str, object]:
+    """Publish one real FTS5 canonical generation before process exit."""
+
+    identity = _identity(root, create_source=True)
+    coordinator, service = _owner(identity)
+    outcome = service.activate_initial(
+        identity.configured_jsonl_path,
+        identity.resource_id,
+    )
+    return {
+        "mode": "fts5-activate",
+        "pid": os.getpid(),
+        "outcome": _outcome_facts(outcome),
+        "runtime": _runtime_facts(identity, coordinator),
+        "journal": _journal_facts(root, identity),
+        "disk": _disk_facts(identity),
+    }
+
+
+def _fts5_cold_query(root: Path) -> dict[str, object]:
+    """Cold-open the published authority and query through production ports."""
+
+    identity = _identity(root, create_source=False)
+    engine = TMEngine(
+        str(identity.configured_jsonl_path),
+        update=False,
+        expected_resource_id=identity.resource_id,
+    )
+    store = engine.canonical_store
+    if not engine.canonical_active or store is None:
+        raise AssertionError("cold open did not bind the canonical store")
+
+    runtime = tm_sqlite_store.detect_sqlite_runtime()
+    health = store.health()
+    with store.query_lease() as view:
+        leased_health = view.health()
+        report = CandidateRetriever().candidates_from_view(
+            identity.resource_id,
+            view,
+            "sam",
+            result_limit=10,
+        )
+        record_ids = tuple(candidate.record_id for candidate in report.candidates)
+        records = view.records_by_id(record_ids)
+
+    return {
+        "mode": "fts5-cold-query",
+        "pid": os.getpid(),
+        "runtime_capability": {
+            "sqlite_version": runtime.sqlite_version,
+            "unicode_version": runtime.unicode_version,
+            "fts5_available": runtime.fts5_available,
+        },
+        "health": {
+            "healthy": health.healthy,
+            "schema_version": health.schema_version,
+            "generation": health.generation,
+            "record_count": health.record_count,
+            "index_kind": health.index_kind,
+            "snapshot_binding_digest": health.snapshot_binding_digest,
+            "source_binding_state": (
+                None
+                if health.source_binding_state is None
+                else health.source_binding_state.value
+            ),
+            "exact_available": health.exact_available,
+            "diagnostic_codes": health.diagnostic_codes,
+            "leased_equal": leased_health == health,
+        },
+        "query": {
+            "folded_query": "sam",
+            "candidate_ids": record_ids,
+            "candidate_stages": [
+                candidate_stage.stage.value
+                for candidate_stage in report.metadata.stages
+            ],
+            "candidate_pretruncate_ranks": [
+                candidate.pretruncate_rank for candidate in report.candidates
+            ],
+            "candidate_recall_stages": [
+                [stage.value for stage in candidate.recall_stages]
+                for candidate in report.candidates
+            ],
+            "record_ids": [record.record_id for record in records],
+            "record_sources": [record.source_raw for record in records],
+            "record_targets": [record.target_raw for record in records],
+            "index_kind": report.metadata.index_kind,
+            "fuzzy_available": report.metadata.fuzzy_available,
+            "unavailable_code": report.metadata.fuzzy_unavailable_code,
+        },
+        "journal": _journal_facts(root, identity),
+        "disk": _disk_facts(identity),
+    }
 
 
 def _mutate(root: Path, mutation: str) -> dict[str, object]:
@@ -1254,6 +1389,8 @@ def main() -> int:
         "mode",
         choices=(
             "create",
+            "fts5-activate",
+            "fts5-cold-query",
             "mutate",
             "recover",
             "recover-bounded",
@@ -1314,6 +1451,10 @@ def main() -> int:
             if arguments.phase is None:
                 parser.error("create requires --phase")
             result = _creator(root, arguments.phase)
+        elif arguments.mode == "fts5-activate":
+            result = _fts5_activate(root)
+        elif arguments.mode == "fts5-cold-query":
+            result = _fts5_cold_query(root)
         elif arguments.mode == "mutate":
             if arguments.mutation is None:
                 parser.error("mutate requires --mutation")

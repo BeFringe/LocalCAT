@@ -360,7 +360,7 @@
   - _Boundary: Windows TM Attestation Re-proof_
   - _Depends: 6.2, 5.5_
 
-- [ ] 6.4 完成SQLite FTS5/trigram真实创建、查询、关闭与重开
+- [x] 6.4 完成SQLite FTS5/trigram真实创建、查询、关闭与重开
   - 在Windows source runtime对canonical store创建实际FTS5/trigram schema，写入数据、执行MATCH/排序，关闭进程后重开同一published authority查询
   - 不只检查compile options；运行时缺能力返回稳定unavailable并阻止依赖发布/激活，不切换未批准算法
   - 完成时，结果与Core排序合同一致并包含exact version/options/schema/query evidence
