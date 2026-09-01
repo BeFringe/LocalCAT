@@ -155,7 +155,7 @@
   - 完成时，未闭合索引的工作副本无法 seal，已 seal artifact 无法继续写入或以裸路径激活
   - _Requirements: 2.3, 2.4, 2.9, 7.5, 7.14_
 
-- [ ] 5.3a 将 stage registry reservation 接入 Windows 平台 root/lock
+- [x] 5.3a 将 stage registry reservation 接入 Windows 平台 root/lock
   - 初始激活的调用方 reservation 是 platform backend、sidecar-parent root 与 `LockLease` 的唯一 owner；StageSealer 不得自取锁，只消费绑定同一 resource/backend 的 non-closing borrow。DB/manifest 必须复用 borrow root，source 使用独立 rooted handle；borrow 随 registry live authority 贯穿 seal、两次 Gate B 与 token terminal，terminal 只撤销 borrow而不关闭 base root/lease。
   - 缺少或错配 borrow、lock/root 漂移、跨进程 replay 或 foreign handle 必须在 portable registry/`SEALED` mutation 前拒绝；首轮 Gate B 或 token 发行前失败须退休未发行 portable entry。尚无 caller-held reservation 的 Windows import/rebuild/schema upgrade 继续 fail closed，不得由 StageSealer 临时补锁。
   - 未发布stage的DB/manifest通过`ExistingFileDurability`持有专用同步authority：Windows在同一handle上执行`FlushFileBuffers`并复证exact content/live identity与parent/root，parent reproof不宣称directory fsync；同步或复证缺失/漂移时不得登记sealed registry，冷重开只允许重建或保持unavailable。canonical publication仍归5.7a。
@@ -471,7 +471,7 @@
   - 完成时，每个故障都有稳定证据，原 JSONL、last-known-good canonical 和 matching manifest/binding 按规则保持或成套恢复
   - _Requirements: 2.4, 2.5, 2.9, 2.10, 2.11, 2.12, 7.4, 7.5, 7.6, 7.14_
 
-- [ ] 9.1a 执行 Windows 激活、双进程锁与 owner-kill 矩阵
+- [x] 9.1a 执行 Windows 激活、双进程锁与 owner-kill 矩阵
   - 以真实业务 API 覆盖首次激活、并发激活/查询、busy/timeout、持锁进程退出、四 journal phase kill/restart、app restart与正常OS reboot；不确定时platform返回`RECOVERY_REQUIRED`，原 JSONL 与 LKG canonical 按既有规则成套保全，owner-visible结果只接受完整old、完整new或recovery-only。
   - 逐个覆盖DB与manifest的`PendingPublication` owner durable phase/business reproof/terminal reproof边界，证明preliminary facts不产生generation或公开成功。
   - _Amendment: WA-06_
