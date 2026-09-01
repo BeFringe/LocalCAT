@@ -110,7 +110,7 @@ class ResourcePortabilityService:
             raise TypeError("resource portability repository must be exact")
         self.repository = repository
         self._termbase = termbase_store or TermbaseStore(repository.platform_backend)
-        self._tm = tm_port or TMResourceSnapshotPort()
+        self._tm = tm_port or TMResourceSnapshotPort(repository.platform_backend)
         self._ledger = ledger or ResourceReceiptLedger(
             repository.config_dir,
             repository.platform_backend,
@@ -684,7 +684,7 @@ class ResourcePortabilityService:
                         payload,
                         owner,
                         create=True,
-                        create_owner_commit=commit_created_resource,
+                        owner_commit=commit_created_resource,
                     )
                     if receipt is None:
                         raise AssertionError(
@@ -693,22 +693,47 @@ class ResourcePortabilityService:
                     self._commit_ready_receipt(receipt)
                     pending_started = False
                 else:
+                    def commit_replaced_resource(
+                        applied_snapshot: PortableResourceSnapshot,
+                    ) -> None:
+                        nonlocal owner_published, receipt
+                        receipt = _import_receipt(
+                            operation_id=preview.operation_id,
+                            report=report,
+                            destination=destination,
+                            before_digest=before_digest,
+                            snapshot=applied_snapshot,
+                            durable_state=ResourceDurableState.COMMITTED,
+                        )
+                        self._mark_pending_receipt_ready(receipt)
+                        owner_published = True
+
                     applied = self._apply_owner_snapshot(
                         destination,
                         payload,
                         owner,
                         create=False,
+                        owner_commit=(
+                            commit_replaced_resource
+                            if destination.kind is ResourceKind.TRANSLATION_MEMORY
+                            else None
+                        ),
                     )
-                    owner_published = True
-                    receipt = _import_receipt(
-                        operation_id=preview.operation_id,
-                        report=report,
-                        destination=destination,
-                        before_digest=before_digest,
-                        snapshot=applied,
-                        durable_state=ResourceDurableState.COMMITTED,
-                    )
-                    self._mark_pending_receipt_ready(receipt)
+                    if receipt is None and destination.kind is ResourceKind.TRANSLATION_MEMORY:
+                        raise AssertionError(
+                            "replaced resource owner commit did not issue receipt"
+                        )
+                    if destination.kind is not ResourceKind.TRANSLATION_MEMORY:
+                        owner_published = True
+                        receipt = _import_receipt(
+                            operation_id=preview.operation_id,
+                            report=report,
+                            destination=destination,
+                            before_digest=before_digest,
+                            snapshot=applied,
+                            durable_state=ResourceDurableState.COMMITTED,
+                        )
+                        self._mark_pending_receipt_ready(receipt)
                     self._commit_ready_receipt(receipt)
                     pending_started = False
             return ResourcePackageImportResult(
@@ -856,7 +881,24 @@ class ResourcePortabilityService:
                     configured.path,
                 )
             except ResourceError:
+                configured = None
                 digest = None
+            if (
+                configured is not None
+                and configured.kind is ResourceKind.TRANSLATION_MEMORY
+                and digest == receipt.destination_after_digest
+            ):
+                try:
+                    self._tm.reopen_snapshot(configured, receipt)
+                except (ResourcePortabilityError, OSError, ValueError):
+                    return (
+                        ResourceRecoveryDisposition.MANUAL_REQUIRED,
+                        ("RESOURCE.RECOVERY.OWNER_PENDING",),
+                    )
+                return (
+                    ResourceRecoveryDisposition.COMPLETE_AVAILABLE,
+                    ("RESOURCE.RECOVERY.OWNER_PUBLISHED",),
+                )
             if digest == receipt.destination_after_digest:
                 return (
                     ResourceRecoveryDisposition.COMPLETE_AVAILABLE,
@@ -982,22 +1024,26 @@ class ResourcePortabilityService:
         owner: PortableResourceSnapshot,
         *,
         create: bool,
-        create_owner_commit: Callable[[PortableResourceSnapshot], None] | None = None,
+        owner_commit: Callable[[PortableResourceSnapshot], None] | None = None,
     ) -> PortableResourceSnapshot:
         if owner.profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
             raise ResourcePortabilityError("RESOURCE.IMPORT.PROFILE_UNSUPPORTED")
         if destination.kind is ResourceKind.TRANSLATION_MEMORY:
             applied = (
-                self._tm.create_snapshot(destination, payload, owner)
+                self._tm.create_snapshot(
+                    destination,
+                    payload,
+                    owner,
+                    owner_commit=owner_commit,
+                )
                 if create
-                else self._tm.replace_snapshot(destination, payload, owner)
+                else self._tm.replace_snapshot(
+                    destination,
+                    payload,
+                    owner,
+                    owner_commit=owner_commit,
+                )
             )
-            if create:
-                if create_owner_commit is None:
-                    raise TypeError("create owner commit callback is required")
-                create_owner_commit(applied)
-            elif create_owner_commit is not None:
-                raise ValueError("replace owner cannot receive create commit callback")
             return applied
         if create:
             applied_snapshot: PortableResourceSnapshot | None = None
@@ -1016,9 +1062,9 @@ class ResourcePortabilityService:
                     raise ResourcePortabilityError(
                         "RESOURCE.IMPORT.COLD_REOPEN_FAILED"
                     )
-                if create_owner_commit is None:
+                if owner_commit is None:
                     raise TypeError("create owner commit callback is required")
-                create_owner_commit(applied_snapshot)
+                owner_commit(applied_snapshot)
 
             _copy_new_bound(
                 self.repository.platform_backend,
@@ -1030,8 +1076,8 @@ class ResourcePortabilityService:
                 raise AssertionError("created owner snapshot was not committed")
             applied = applied_snapshot
         else:
-            if create_owner_commit is not None:
-                raise ValueError("replace owner cannot receive create commit callback")
+            if owner_commit is not None:
+                raise ValueError("replace owner callback is unsupported")
             prepared = self._termbase.prepare_snapshot_replace(
                 destination.path,
                 payload,
