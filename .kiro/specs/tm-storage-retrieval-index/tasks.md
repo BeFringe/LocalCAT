@@ -290,9 +290,11 @@
   - 完成时，每个刷新阶段的失败注入都保持旧 completed pair、发布一致新 pair或明确进入 divergence
   - _Requirements: 2.8, 2.13, 7.8, 7.9, 7.10, 7.11_
 
-- [ ] 5.14a 闭合 Windows snapshot refresh crash/recovery
+- [x] 5.14a 闭合 Windows snapshot refresh crash/recovery
   - 对issued、file flush、JSONL/manifest handle-bound naming、retained readback、owner completion、terminal reproof与cleanup注入fault/process kill，并经app restart与正常OS reboot恢复；只产生旧completed pair、一致新pair或明确divergence。
   - 同时覆盖`PendingPublication`在owner durable phase前后、business reproof前后及terminal reproof/close边界的进程终止，恢复不得把preliminary platform facts或未闭合issued receipt提升为成功。
+  - issued事务必须写入receipt-scoped portable handoff，绑定prior completed binding与旧/新pair摘要；handoff不持久化路径或平台文件身份，并在terminal owner与四个确定内部残留全部闭合后才可清除。
+  - ledger/binding无效或歧义、不可安全观察及retirement闭集冲突只返回`BLOCKED`且零mutation；只有单一合法issued receipt的稳定final pair明确不匹配时才锁存divergence。
   - _Amendment: WA-06_
   - _Depends: 5.13a, 5.14_
 

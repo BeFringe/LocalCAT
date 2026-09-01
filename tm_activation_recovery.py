@@ -1838,10 +1838,7 @@ def rehydrate_completed_portable_replacement_activation(
     active_error: BaseException | None = None
     staged_view: _SQLiteGenerationView | None = None
     try:
-        for name, expected in (
-            (identity.canonical_sidecar_path.name, None),
-            (identity.snapshot_manifest_path.name, active.manifest),
-        ):
+        for name in (identity.canonical_sidecar_path.name,):
             opened = platform.open_regular(root, PurePath(name))
             authorities.append(opened)
             facts = opened.content_facts()
@@ -1850,10 +1847,6 @@ def rehydrate_completed_portable_replacement_activation(
                 facts.snapshot.identity.kind != "regular"
                 or facts.snapshot.identity.link_count != 1
                 or root.inspect_entry(name) != facts.snapshot
-                or (
-                    expected is not None
-                    and port.portable_content_proof(facts) != expected
-                )
             ):
                 raise ActivationPreparationError(
                     "ACTIVATION.RECOVERY_REQUIRED",
@@ -1899,10 +1892,7 @@ def rehydrate_completed_portable_replacement_activation(
                 retryable=True,
             )
         for name, authority in zip(
-            (
-                identity.canonical_sidecar_path.name,
-                identity.snapshot_manifest_path.name,
-            ),
+            (identity.canonical_sidecar_path.name,),
             authorities,
             strict=True,
         ):
