@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
-import os
 from pathlib import Path
-import shutil
-from uuid import uuid4
+from pathlib import PurePath
 
 from editor_contracts import ResourceConfig, ResourceKind
+from platform_fs_contracts import PlatformFileBackend, PlatformFileError
 from resource_package_contracts import (
     PortableResourceKind,
     PortableResourceSnapshot,
@@ -25,7 +25,11 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_engine import TMEngine
-from tm_migration import MigrationPreflightError, TMMigrationService
+from tm_migration import (
+    ActivationPreparationError,
+    MigrationPreflightError,
+    TMMigrationService,
+)
 from tm_sqlite_store import ResourceStoreCoordinator
 
 
@@ -34,6 +38,11 @@ _EXPORT_MANIFEST_SUFFIX = ".localcat-snapshot.json"
 
 class TMResourceSnapshotPort:
     """Call the existing Core export transaction without re-encoding JSONL."""
+
+    def __init__(self, platform_backend: PlatformFileBackend) -> None:
+        if not isinstance(platform_backend, PlatformFileBackend):
+            raise TypeError("TM resource backend must satisfy PlatformFileBackend")
+        self._backend = platform_backend
 
     def export_snapshot(
         self,
@@ -45,7 +54,7 @@ class TMResourceSnapshotPort:
         resource.__post_init__()
         if resource.kind is not ResourceKind.TRANSLATION_MEMORY:
             raise ResourcePortabilityError("RESOURCE.PORTABILITY.KIND_MISMATCH")
-        engine = TMEngine(str(resource.path))
+        engine = TMEngine(str(resource.path), expected_resource_id=resource.id)
         store = engine.canonical_store
         if store is None:
             raise ResourcePortabilityError("RESOURCE.EXPORT.SNAPSHOT_UNAVAILABLE")
@@ -60,6 +69,7 @@ class TMResourceSnapshotPort:
             resource_identity=identity,
             canonical_store_id=coordinator.canonical_store_id,
             coordinator=coordinator,
+            platform_backend=self._backend,
         )
         outcome = service.export_jsonl(store, destination)
         if type(outcome) is ExportFailure:
@@ -113,6 +123,7 @@ class TMResourceSnapshotPort:
         service = TMMigrationService(
             resource_identity=identity,
             canonical_store_id="store.portable-validation",
+            platform_backend=self._backend,
         )
         try:
             preflight = service.preflight(source)
@@ -152,7 +163,10 @@ class TMResourceSnapshotPort:
         ):
             raise ResourcePortabilityError("RESOURCE.PORTABILITY.KIND_MISMATCH")
         try:
-            store = TMEngine(str(resource.path)).canonical_store
+            store = TMEngine(
+                str(resource.path),
+                expected_resource_id=resource.id,
+            ).canonical_store
             if store is None or store.coordinator.resource_id != resource.id:
                 raise ResourcePortabilityError("RESOURCE.EXPORT.SOURCE_STALE")
             revision = store.canonical_revision()
@@ -178,7 +192,10 @@ class TMResourceSnapshotPort:
         if resource.kind is not ResourceKind.TRANSLATION_MEMORY:
             raise ResourcePortabilityError("RESOURCE.PORTABILITY.KIND_MISMATCH")
         try:
-            store = TMEngine(str(resource.path)).canonical_store
+            store = TMEngine(
+                str(resource.path),
+                expected_resource_id=resource.id,
+            ).canonical_store
             if store is None or store.coordinator.resource_id != resource.id:
                 raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE")
             revision = store.canonical_revision()
@@ -226,19 +243,43 @@ class TMResourceSnapshotPort:
             or receipt.payload_profile is not ResourcePayloadProfile.TM_JSONL_V1
         ):
             raise ResourcePortabilityError("RESOURCE.PORTABILITY.KIND_MISMATCH")
-        validated = self.validate_snapshot(resource.path)
+        payload_root = None
+        payload_authority = None
         try:
-            store = TMEngine(str(resource.path)).canonical_store
+            payload_root = self._backend.bind_root(resource.path.parent)
+            payload_authority = self._backend.open_regular(
+                payload_root,
+                PurePath(resource.path.name),
+            )
+            payload_facts = payload_authority.content_facts()
+            store = TMEngine(
+                str(resource.path),
+                expected_resource_id=resource.id,
+            ).canonical_store
             if store is None or store.coordinator.resource_id != resource.id:
                 raise ResourcePortabilityError("RESOURCE.IMPORT.COLD_REOPEN_FAILED")
             revision = store.canonical_revision()
         except ResourcePortabilityError:
             raise
-        except (OSError, ValueError) as error:
+        except (PlatformFileError, OSError, ValueError) as error:
             raise ResourcePortabilityError("RESOURCE.IMPORT.COLD_REOPEN_FAILED") from error
+        finally:
+            close_error: PlatformFileError | OSError | None = None
+            for authority in (payload_authority, payload_root):
+                if authority is None:
+                    continue
+                try:
+                    authority.close()
+                except (PlatformFileError, OSError) as error:
+                    if close_error is None:
+                        close_error = error
+            if close_error is not None:
+                raise ResourcePortabilityError(
+                    "RESOURCE.IMPORT.COLD_REOPEN_FAILED"
+                ) from close_error
         if (
-            validated.payload_digest != receipt.payload_digest
-            or validated.record_count != receipt.record_count
+            payload_facts.content_sha256.hex() != receipt.payload_digest
+            or revision.record_count != receipt.record_count
             or (
                 receipt.owner_generation is not None
                 and revision.generation != receipt.owner_generation
@@ -247,18 +288,17 @@ class TMResourceSnapshotPort:
                 receipt.owner_revision is not None
                 and revision.head_revision != receipt.owner_revision
             )
-            or revision.record_count != receipt.record_count
         ):
             raise ResourcePortabilityError("RESOURCE.IMPORT.COLD_REOPEN_FAILED")
         return PortableResourceSnapshot(
-            kind=validated.kind,
-            profile=validated.profile,
-            payload_digest=validated.payload_digest,
-            payload_byte_count=validated.payload_byte_count,
-            record_count=validated.record_count,
+            kind=PortableResourceKind.TRANSLATION_MEMORY,
+            profile=ResourcePayloadProfile.TM_JSONL_V1,
+            payload_digest=receipt.payload_digest,
+            payload_byte_count=payload_facts.snapshot.byte_count,
+            record_count=receipt.record_count,
             legacy_record_count=0,
             v1_record_count=0,
-            source_baseline_digest=validated.source_baseline_digest,
+            source_baseline_digest=receipt.source_baseline_digest,
             owner_receipt_digest=receipt.owner_receipt_digest,
             owner_generation=revision.generation,
             owner_revision=revision.head_revision,
@@ -269,11 +309,13 @@ class TMResourceSnapshotPort:
         resource: ResourceConfig,
         payload: Path,
         validated: PortableResourceSnapshot,
+        *,
+        owner_commit: Callable[[PortableResourceSnapshot], None] | None = None,
     ) -> PortableResourceSnapshot:
         """Replace one configured JSONL then drive Core's full generation swap."""
 
         _validate_apply_inputs(resource, payload, validated)
-        engine = TMEngine(str(resource.path))
+        engine = TMEngine(str(resource.path), expected_resource_id=resource.id)
         store = engine.canonical_store
         if store is None:
             raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE")
@@ -286,20 +328,64 @@ class TMResourceSnapshotPort:
             resource_identity=identity,
             canonical_store_id=coordinator.canonical_store_id,
             coordinator=coordinator,
+            platform_backend=self._backend,
         )
-        return self._publish_and_activate(
-            resource=resource,
-            payload=payload,
-            validated=validated,
-            service=service,
-            initial=False,
-        )
+        committed: PortableResourceSnapshot | None = None
+
+        def commit_before_terminal(report: MigrationReport) -> None:
+            nonlocal committed
+            try:
+                owner_facts = service.project_applied_owner(
+                    report,
+                    expected_digest=validated.payload_digest,
+                    expected_record_count=validated.record_count,
+                )
+            except ActivationPreparationError as error:
+                raise ResourcePortabilityError(
+                    "RESOURCE.IMPORT.RECOVERY_REQUIRED"
+                ) from error
+            committed = _project_apply_outcome(
+                resource,
+                validated,
+                report,
+                owner_facts=owner_facts,
+            )
+            if owner_commit is not None:
+                owner_commit(committed)
+
+        try:
+            outcome = service.apply_snapshot_payload(
+                payload,
+                resource.id,
+                expected_digest=validated.payload_digest,
+                expected_record_count=validated.record_count,
+                initial=False,
+                owner_commit=commit_before_terminal,
+            )
+        except ResourcePortabilityError:
+            raise
+        except (
+            MigrationPreflightError,
+            PlatformFileError,
+            OSError,
+        ) as error:
+            raise ResourcePortabilityError(
+                "RESOURCE.IMPORT.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
+        if type(outcome) is MigrationReport:
+            if committed is None:
+                raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+            return committed
+        return _project_apply_outcome(resource, validated, outcome)
 
     def create_snapshot(
         self,
         resource: ResourceConfig,
         payload: Path,
         validated: PortableResourceSnapshot,
+        *,
+        owner_commit: Callable[[PortableResourceSnapshot], None] | None = None,
     ) -> PortableResourceSnapshot:
         """Publish one new configured JSONL and its first canonical generation."""
 
@@ -319,95 +405,56 @@ class TMResourceSnapshotPort:
             resource_identity=identity,
             canonical_store_id=canonical_store_id,
             coordinator=coordinator,
+            platform_backend=self._backend,
         )
-        return self._publish_and_activate(
-            resource=resource,
-            payload=payload,
-            validated=validated,
-            service=service,
-            initial=True,
-        )
+        committed: PortableResourceSnapshot | None = None
 
-    def _publish_and_activate(
-        self,
-        *,
-        resource: ResourceConfig,
-        payload: Path,
-        validated: PortableResourceSnapshot,
-        service: TMMigrationService,
-        initial: bool,
-    ) -> PortableResourceSnapshot:
-        original = None if initial else _backup_file(resource.path)
-        manifest = resource.path.with_name(
-            f"{resource.path.name}.localcat-snapshot.json"
-        )
-        original_manifest = _backup_file(manifest) if manifest.exists() else None
-        candidate = resource.path.with_name(
-            f".{resource.path.name}.{uuid4().hex}.portable.tmp"
-        )
-        retain_recovery = False
-        try:
-            _copy_new_file(payload, candidate)
-            if hashlib.sha256(candidate.read_bytes()).hexdigest() != validated.payload_digest:
-                raise ResourcePortabilityError("RESOURCE.IMPORT.SOURCE_STALE")
-            os.replace(candidate, resource.path)
-            _fsync_directory(resource.path.parent)
-            outcome = (
-                service.activate_initial(resource.path, resource.id)
-                if initial
-                else service.import_snapshot(resource.path, resource.id)
-            )
-            if type(outcome) is MigrationFailure:
-                if outcome.canonical_authority_published or outcome.canonical_authority_ambiguous:
-                    retain_recovery = True
-                    raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
-                _restore_file(original, resource.path)
-                _restore_file(original_manifest, manifest)
-                raise ResourcePortabilityError(
-                    "RESOURCE.IMPORT.APPLY_FAILED",
-                    retryable=outcome.retryable,
+        def commit_before_terminal(report: MigrationReport) -> None:
+            nonlocal committed
+            try:
+                owner_facts = service.project_applied_owner(
+                    report,
+                    expected_digest=validated.payload_digest,
+                    expected_record_count=validated.record_count,
                 )
-            if type(outcome) is not MigrationReport:
-                raise TypeError("TM import returned an unknown outcome")
-            if (
-                outcome.source_digest != validated.payload_digest
-                or outcome.migrated_count != validated.record_count
-                or outcome.skipped_count
-            ):
-                retain_recovery = True
-                raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
-            reopened = TMEngine(str(resource.path)).canonical_store
-            if (
-                reopened is None
-                or reopened.coordinator.resource_id != resource.id
-                or reopened.coordinator.current_generation != outcome.activated_generation
-            ):
-                retain_recovery = True
-                raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
-            return PortableResourceSnapshot(
-                kind=PortableResourceKind.TRANSLATION_MEMORY,
-                profile=ResourcePayloadProfile.TM_JSONL_V1,
-                payload_digest=outcome.source_digest,
-                payload_byte_count=resource.path.stat().st_size,
-                record_count=outcome.migrated_count,
-                legacy_record_count=0,
-                v1_record_count=0,
-                source_baseline_digest=outcome.source_digest,
-                owner_receipt_digest=snapshot_receipt_digest(outcome.snapshot_receipt),
-                owner_generation=outcome.activated_generation,
-                owner_revision=outcome.snapshot_receipt.exported_revision,
+            except ActivationPreparationError as error:
+                raise ResourcePortabilityError(
+                    "RESOURCE.IMPORT.RECOVERY_REQUIRED"
+                ) from error
+            committed = _project_apply_outcome(
+                resource,
+                validated,
+                report,
+                owner_facts=owner_facts,
+            )
+            if owner_commit is not None:
+                owner_commit(committed)
+
+        try:
+            outcome = service.apply_snapshot_payload(
+                payload,
+                resource.id,
+                expected_digest=validated.payload_digest,
+                expected_record_count=validated.record_count,
+                initial=True,
+                owner_commit=commit_before_terminal,
             )
         except ResourcePortabilityError:
             raise
-        except BaseException:
-            retain_recovery = True
-            raise
-        finally:
-            candidate.unlink(missing_ok=True)
-            if original is not None and not retain_recovery:
-                original.unlink(missing_ok=True)
-            if original_manifest is not None and not retain_recovery:
-                original_manifest.unlink(missing_ok=True)
+        except (
+            MigrationPreflightError,
+            PlatformFileError,
+            OSError,
+        ) as error:
+            raise ResourcePortabilityError(
+                "RESOURCE.IMPORT.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
+        if type(outcome) is MigrationReport:
+            if committed is None:
+                raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+            return committed
+        return _project_apply_outcome(resource, validated, outcome)
 
 
 __all__ = ["TMResourceSnapshotPort"]
@@ -433,31 +480,77 @@ def _validate_apply_inputs(
         raise ResourcePortabilityError("RESOURCE.PORTABILITY.KIND_MISMATCH")
 
 
-def _copy_new_file(source: Path, destination: Path) -> None:
-    with source.open("rb") as input_handle, destination.open("xb") as output_handle:
-        shutil.copyfileobj(input_handle, output_handle, 1024 * 1024)
-        output_handle.flush()
-        os.fsync(output_handle.fileno())
-    _fsync_directory(destination.parent)
-
-
-def _backup_file(source: Path) -> Path:
-    destination = source.with_name(f".{source.name}.{uuid4().hex}.portable.lkg")
-    _copy_new_file(source, destination)
-    return destination
-
-
-def _restore_file(backup: Path | None, destination: Path) -> None:
-    if backup is None:
-        destination.unlink(missing_ok=True)
+def _project_apply_outcome(
+    resource: ResourceConfig,
+    validated: PortableResourceSnapshot,
+    outcome: object,
+    *,
+    owner_facts: tuple[int, int, int, int] | None = None,
+) -> PortableResourceSnapshot:
+    if type(outcome) is MigrationFailure:
+        if (
+            outcome.canonical_authority_published
+            or outcome.canonical_authority_ambiguous
+        ):
+            raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+        raise ResourcePortabilityError(
+            "RESOURCE.IMPORT.APPLY_FAILED",
+            retryable=outcome.retryable,
+        )
+    if type(outcome) is not MigrationReport:
+        raise TypeError("TM import returned an unknown outcome")
+    if (
+        outcome.source_digest != validated.payload_digest
+        or outcome.migrated_count != validated.record_count
+        or outcome.skipped_count
+    ):
+        raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+    if owner_facts is not None:
+        if (
+            type(owner_facts) is not tuple
+            or len(owner_facts) != 4
+            or any(type(value) is not int for value in owner_facts)
+        ):
+            raise TypeError("owner projection facts are invalid")
+        generation, head_revision, record_count, payload_byte_count = owner_facts
     else:
-        os.replace(backup, destination)
-    _fsync_directory(destination.parent)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        try:
+            reopened = TMEngine(
+                str(resource.path),
+                expected_resource_id=resource.id,
+            ).canonical_store
+            if (
+                reopened is None
+                or reopened.coordinator.resource_id != resource.id
+            ):
+                raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+            revision = reopened.canonical_revision()
+            generation = revision.generation
+            head_revision = revision.head_revision
+            record_count = revision.record_count
+            payload_byte_count = resource.path.stat().st_size
+        except ResourcePortabilityError:
+            raise
+        except (OSError, ValueError) as error:
+            raise ResourcePortabilityError(
+                "RESOURCE.IMPORT.RECOVERY_REQUIRED"
+            ) from error
+    if (
+        generation != outcome.activated_generation
+        or head_revision != outcome.snapshot_receipt.exported_revision
+        or record_count != outcome.migrated_count
+    ):
+        raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+    return PortableResourceSnapshot(
+        kind=PortableResourceKind.TRANSLATION_MEMORY,
+        profile=ResourcePayloadProfile.TM_JSONL_V1,
+        payload_digest=outcome.source_digest,
+        payload_byte_count=payload_byte_count,
+        record_count=outcome.migrated_count,
+        legacy_record_count=0,
+        v1_record_count=0,
+        source_baseline_digest=outcome.source_digest,
+        owner_receipt_digest=snapshot_receipt_digest(outcome.snapshot_receipt),
+        owner_generation=outcome.activated_generation,
+        owner_revision=outcome.snapshot_receipt.exported_revision,
+    )

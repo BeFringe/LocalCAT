@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+from contextlib import ExitStack
 from pathlib import Path
 import tempfile
 import unittest
@@ -30,6 +31,19 @@ _MIXED_TERMS = (
     b"\xef\xbb\xbfsource,target\n"
     b"localcat-term-v1,id-1,Case,Target,true,false\n"
 )
+
+
+def _remove_long_quarantine(root: Path) -> None:
+    """Remove authenticated Core quarantine residue through Win32 long paths."""
+
+    quarantine_root = root / ".localcat-activation-quarantine-v1"
+    if not quarantine_root.exists():
+        return
+    for attempt_directory in quarantine_root.iterdir():
+        for path in attempt_directory.iterdir():
+            os.unlink("\\\\?\\" + str(path))
+        os.rmdir("\\\\?\\" + str(attempt_directory))
+    os.rmdir("\\\\?\\" + str(quarantine_root))
 
 
 class ResourcePortabilityExportTests(unittest.TestCase):
@@ -227,8 +241,36 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             self.assertEqual(old.path.read_bytes(), _MIXED_TERMS)
 
     def test_tm_package_create_and_replace_use_core_generation_transactions(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        callback_observations: list[str] = []
+
+        def assert_pending_path_locked(path: Path) -> None:
+            """The Core pending publication must retain exclusive handles."""
+
+            self.assertTrue(path.exists())
+            with self.assertRaises(PermissionError):
+                path.write_bytes(path.read_bytes())
+            with self.assertRaises(PermissionError):
+                path.unlink()
+            replacement = path.with_name(f"{path.name}.callback-replacement")
+            replacement.write_bytes(path.read_bytes())
+            try:
+                with self.assertRaises(PermissionError):
+                    replacement.replace(path)
+            finally:
+                if replacement.exists():
+                    replacement.unlink()
+
+        with ExitStack() as stack:
+            raw = stack.enter_context(tempfile.TemporaryDirectory())
             root = Path(raw).resolve()
+            stack.callback(
+                _remove_long_quarantine,
+                root / "source-app" / "resources",
+            )
+            stack.callback(
+                _remove_long_quarantine,
+                root / "destination-app" / "resources",
+            )
             source_repo = ResourceRepository(root / "source-app")
             source = source_repo.create_resource("Source TM", ResourceKind.TRANSLATION_MEMORY)
             source.path.write_text(
@@ -253,12 +295,28 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                 MigrationReport,
             )
             service = ResourcePortabilityService(destination_repo)
+            real_mark_ready = service._mark_pending_receipt_ready
+
+            def observe_replace_ready(receipt: object) -> None:
+                real_mark_ready(receipt)
+                pending = service._ledger.list_pending()
+                self.assertEqual(len(pending), 1)
+                self.assertIs(pending[0].phase, ResourcePendingPhase.RECEIPT_READY)
+                self.assertEqual(service._ledger.list_receipts(), ())
+                assert_pending_path_locked(existing.path)
+                callback_observations.append("replace")
+
             replace_preview = service.preview_resource_package_import(
                 package,
                 ResourceImportMode.REPLACE_SELECTED,
                 destination_resource_id=existing.id,
             )
-            replaced = service.apply_resource_package_import(replace_preview)
+            with patch.object(
+                service,
+                "_mark_pending_receipt_ready",
+                side_effect=observe_replace_ready,
+            ):
+                replaced = service.apply_resource_package_import(replace_preview)
             self.assertEqual(
                 replaced.receipt.payload_digest,
                 source_package.receipt.payload_digest,
@@ -270,7 +328,29 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                 ResourceImportMode.CREATE_NEW,
                 new_resource_name="Imported TM",
             )
-            created = service.apply_resource_package_import(create_preview)
+            receipts_before_create = service._ledger.list_receipts()
+            real_publish = destination_repo.publish_prepared_create
+
+            def observe_create_publish(prepared: object) -> object:
+                pending = service._ledger.list_pending()
+                self.assertEqual(len(pending), 1)
+                self.assertIs(pending[0].phase, ResourcePendingPhase.RECEIPT_READY)
+                self.assertEqual(service._ledger.list_receipts(), receipts_before_create)
+                assert_pending_path_locked(prepared.resource.path)  # type: ignore[attr-defined]
+                result = real_publish(prepared)
+                self.assertIsNotNone(
+                    destination_repo.get(prepared.resource.id)  # type: ignore[attr-defined]
+                )
+                self.assertEqual(service._ledger.list_receipts(), receipts_before_create)
+                callback_observations.append("create")
+                return result
+
+            with patch.object(
+                destination_repo,
+                "publish_prepared_create",
+                side_effect=observe_create_publish,
+            ):
+                created = service.apply_resource_package_import(create_preview)
             created_resource = destination_repo.get(created.destination_resource_id)
             self.assertEqual(
                 created.receipt.payload_digest,
@@ -283,6 +363,93 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             exported = root / "created-export.jsonl"
             post = service.export_direct(created_resource.id, exported)
             self.assertEqual(post.receipt.record_count, created.receipt.record_count)
+
+            # Programming errors from the owner callback must remain visible
+            # to the caller, while Core still closes its configured-source
+            # publication and removes the private replace recovery copy.
+            receipts_before_faults = service._ledger.list_receipts()
+            real_replace_snapshot = service._tm.replace_snapshot
+
+            def raise_type_error(
+                resource: object,
+                payload: Path,
+                validated: object,
+                *,
+                owner_commit: object = None,
+            ) -> object:
+                del owner_commit
+
+                def callback(_snapshot: object) -> None:
+                    raise TypeError("owner callback programming error")
+
+                return real_replace_snapshot(
+                    resource,  # type: ignore[arg-type]
+                    payload,
+                    validated,  # type: ignore[arg-type]
+                    owner_commit=callback,
+                )
+
+            fault_replace_preview = service.preview_resource_package_import(
+                package,
+                ResourceImportMode.REPLACE_SELECTED,
+                destination_resource_id=created_resource.id,
+            )
+            with patch.object(
+                service._tm,
+                "replace_snapshot",
+                side_effect=raise_type_error,
+            ):
+                with self.assertRaises(TypeError):
+                    service.apply_resource_package_import(fault_replace_preview)
+            self.assertEqual(service._ledger.list_receipts(), receipts_before_faults)
+            self.assertEqual(service._ledger.list_pending(), ())
+            self.assertEqual(
+                list(
+                    created_resource.path.parent.glob(
+                        f".{created_resource.path.name}.localcat-import-recovery-*.jsonl"
+                    )
+                ),
+                [],
+            )
+            created_resource.path.write_bytes(created_resource.path.read_bytes())
+
+            real_create_snapshot = service._tm.create_snapshot
+
+            def raise_assertion_error(
+                resource: object,
+                payload: Path,
+                validated: object,
+                *,
+                owner_commit: object = None,
+            ) -> object:
+                del owner_commit
+
+                def callback(_snapshot: object) -> None:
+                    raise AssertionError("owner callback assertion")
+
+                return real_create_snapshot(
+                    resource,  # type: ignore[arg-type]
+                    payload,
+                    validated,  # type: ignore[arg-type]
+                    owner_commit=callback,
+                )
+
+            fault_create_preview = service.preview_resource_package_import(
+                package,
+                ResourceImportMode.CREATE_NEW,
+                new_resource_name="Faulted TM",
+            )
+            with patch.object(
+                service._tm,
+                "create_snapshot",
+                side_effect=raise_assertion_error,
+            ):
+                with self.assertRaises(AssertionError):
+                    service.apply_resource_package_import(fault_create_preview)
+            self.assertEqual(service._ledger.list_receipts(), receipts_before_faults)
+            self.assertEqual(service._ledger.list_pending(), ())
+            self.assertEqual(callback_observations, ["replace", "create"])
+            self.assertEqual(len(service._ledger.list_receipts()), 3)
 
     @unittest.skipUnless(os.name == "nt", "Windows retained-handle behavior")
     def test_create_registry_commit_precedes_destination_terminal_close(self) -> None:
@@ -460,8 +627,17 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             self.assertEqual(destination_repo.list_resources(), ())
 
     def test_tm_replace_preview_rejects_canonical_revision_advance(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with ExitStack() as stack:
+            raw = stack.enter_context(tempfile.TemporaryDirectory())
             root = Path(raw).resolve()
+            stack.callback(
+                _remove_long_quarantine,
+                root / "source-app" / "resources",
+            )
+            stack.callback(
+                _remove_long_quarantine,
+                root / "destination-app" / "resources",
+            )
             source_repo = ResourceRepository(root / "source-app")
             source = source_repo.create_resource("Source TM", ResourceKind.TRANSLATION_MEMORY)
             source.path.write_text(
@@ -499,7 +675,10 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                 ResourceImportMode.REPLACE_SELECTED,
                 destination_resource_id=destination.id,
             )
-            store = TMEngine(str(destination.path)).canonical_store
+            store = TMEngine(
+                str(destination.path),
+                expected_resource_id=destination.id,
+            ).canonical_store
             self.assertIsNotNone(store)
             store.append(
                 TMRecordDraft(
