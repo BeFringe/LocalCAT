@@ -352,7 +352,7 @@
   - _Boundary: Windows TM Activation and Recovery_
   - _Depends: 3.7a, 3.7b, 6.1_
 
-- [ ] 6.3 验证W2 attestation、FileId reuse与device-local恢复
+- [x] 6.3 验证W2 attestation、FileId reuse与device-local恢复
   - restart时由Gate D/canonical owner分别重验自身compatibility或generation/phase envelope、exact bytes/digest及nested `WindowsPrivateProof`/device-secret MAC；历史Volume/FileId只作反例/diagnostic
   - 覆盖delete/recreate复用、owner/ACE/inheritance/link/reparse/volume/tamper、standard/elevated、同SID low-integrity/restricted与service/AppContainer/impersonation边界；不可证明的mandatory token shape fail closed且不回落legacy
   - 完成时，合法authority恢复，任何弱路径/token/identity替代均被拒绝
