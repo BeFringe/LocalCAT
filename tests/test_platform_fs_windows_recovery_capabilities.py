@@ -18,6 +18,7 @@ from platform_fs import (
 from platform_fs_contracts import (
     CandidateContentFacts,
     DEVICE_SECRET_SIZE_BYTES,
+    ExistingCandidateRecovery,
     ExistingFileRetirement,
     LedgerEnumerationLimits,
     LockPolicy,
@@ -1230,6 +1231,677 @@ class WindowsExistingFileRetirementTests(unittest.TestCase):
             fresh_target.close()
             fresh_parent.close()
             fresh_root.close()
+
+
+@unittest.skipUnless(sys.platform == "win32", "real capability tests require Windows")
+class WindowsExistingCandidateRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(
+            prefix="localcat-existing-candidate-",
+        )
+        self.container = Path(self._temporary.name)
+        self.root_path = self.container / "RootCase"
+        self.parent_path = self.root_path / "CandidateCase"
+        self.target_path = self.parent_path / "quarantine"
+        self.target_path.mkdir(parents=True)
+        self._owner_serial = 0
+
+    def tearDown(self) -> None:
+        self._temporary.cleanup()
+
+    @staticmethod
+    def _facts(payload: bytes) -> CandidateContentFacts:
+        return CandidateContentFacts(len(payload), hashlib.sha256(payload).digest())
+
+    def _authorities(
+        self,
+        adapter: WindowsPlatformAdapter,
+        source_name: str,
+    ) -> tuple[object, object, object]:
+        root = adapter.bind_root(self.root_path)
+        parent = adapter.bind_parent(
+            root,
+            PureWindowsPath("CandidateCase", source_name),
+        )
+        target = adapter.bind_or_create_child_directory(parent, "quarantine")
+        return root, parent, target
+
+    def _owner_authorities(
+        self,
+        adapter: WindowsPlatformAdapter,
+        root: object,
+        source_parent: object,
+    ) -> tuple[object, object]:
+        self._owner_serial += 1
+        token = f"{self._owner_serial:04d}"
+        sidecar_name = f".candidate-owner-{token}.sqlite3"
+        if source_parent is root:
+            sidecar_path = self.root_path / sidecar_name
+            sidecar_relative = PureWindowsPath(sidecar_name)
+        else:
+            sidecar_path = self.parent_path / sidecar_name
+            sidecar_relative = PureWindowsPath("CandidateCase", sidecar_name)
+        sidecar_path.write_bytes(b"canonical-sidecar")
+        lease = adapter.acquire(
+            source_parent,
+            f".candidate-owner-{token}.lock",
+            b"candidate-owner-v1",
+            LockPolicy(LockWait.FAIL_FAST),
+        )
+        try:
+            guard = adapter.guard_existing_for_mutation(
+                root, sidecar_relative
+            )
+        except BaseException:
+            lease.close()
+            raise
+        return lease, guard
+
+    def _recover_and_publish(
+        self,
+        *,
+        source_only: bool,
+    ) -> None:
+        payload = b'exact internal candidate\n{"schema":1}\n'
+        source_name = "manifest.candidate"
+        target_name = "manifest.retired"
+        source_path = self.parent_path / source_name
+        retired_path = self.target_path / target_name
+        (source_path if source_only else retired_path).write_bytes(payload)
+        adapter = WindowsPlatformAdapter()
+        self.assertIsInstance(adapter, ExistingCandidateRecovery)
+        root, parent, target = self._authorities(adapter, source_name)
+        lease, guard = self._owner_authorities(adapter, root, parent)
+        candidate = pending = None
+        try:
+            candidate = adapter.recover_existing_candidate(
+                parent,
+                source_name,
+                target,
+                target_name,
+                self._facts(payload),
+                owner_lease=lease,
+                mutation_guard=guard,
+            )
+            self.assertFalse(retired_path.exists())
+            pending = parent.begin_publish(
+                candidate,
+                "manifest.json",
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            candidate = None
+            facts = pending.terminal_reproof()
+            self.assertEqual(facts.byte_count, len(payload))
+            self.assertEqual(facts.content_sha256, hashlib.sha256(payload).digest())
+        finally:
+            if pending is not None:
+                pending.close()
+            if candidate is not None:
+                candidate.close()
+            guard.close()
+            lease.close()
+            target.close()
+            parent.close()
+            root.close()
+        self.assertFalse(source_path.exists())
+        self.assertFalse(retired_path.exists())
+        self.assertEqual((self.parent_path / "manifest.json").read_bytes(), payload)
+
+    def test_source_only_exact_candidate_is_flushed_and_publishable(self) -> None:
+        self._recover_and_publish(source_only=True)
+
+    def test_target_only_exact_candidate_is_restored_without_overwrite(self) -> None:
+        self._recover_and_publish(source_only=False)
+
+    def test_rooted_source_parent_is_recovered_by_the_same_contract(self) -> None:
+        payload = b"rooted internal candidate"
+        source_name = "root-manifest.candidate"
+        target_name = "root-manifest.retired"
+        final_name = "root-manifest.json"
+        source_path = self.root_path / source_name
+        source_path.write_bytes(payload)
+        adapter = WindowsPlatformAdapter()
+        root = adapter.bind_root(self.root_path)
+        target = adapter.bind_or_create_child_directory(root, "root-quarantine")
+        lease, guard = self._owner_authorities(adapter, root, root)
+        candidate = pending = None
+        try:
+            candidate = adapter.recover_existing_candidate(
+                root,
+                source_name,
+                target,
+                target_name,
+                self._facts(payload),
+                owner_lease=lease,
+                mutation_guard=guard,
+            )
+            pending = root.begin_publish(
+                candidate,
+                final_name,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            candidate = None
+            facts = pending.terminal_reproof()
+            self.assertEqual(facts.byte_count, len(payload))
+            self.assertEqual(facts.content_sha256, hashlib.sha256(payload).digest())
+        finally:
+            if pending is not None:
+                pending.close()
+            if candidate is not None:
+                candidate.close()
+            guard.close()
+            lease.close()
+            target.close()
+            root.close()
+        self.assertFalse(source_path.exists())
+        self.assertEqual((self.root_path / final_name).read_bytes(), payload)
+
+    def test_rooted_target_only_candidate_is_restored_without_overwrite(self) -> None:
+        payload = b"rooted retired internal candidate"
+        source_name = "root-target-manifest.candidate"
+        target_name = source_name
+        source_path = self.root_path / source_name
+        retired_path = (
+            self.root_path / "root-quarantine" / "receipt" / target_name
+        )
+        retired_path.parent.mkdir(parents=True)
+        retired_path.write_bytes(payload)
+        adapter = WindowsPlatformAdapter()
+        root = adapter.bind_root(self.root_path)
+        retirement_root = adapter.bind_or_create_child_directory(
+            root, "root-quarantine"
+        )
+        target = adapter.bind_or_create_child_directory(
+            retirement_root, "receipt"
+        )
+        lease, guard = self._owner_authorities(adapter, root, root)
+        candidate = None
+        try:
+            candidate = adapter.recover_existing_candidate(
+                root,
+                source_name,
+                target,
+                target_name,
+                self._facts(payload),
+                owner_lease=lease,
+                mutation_guard=guard,
+            )
+            self.assertTrue(source_path.is_file())
+            self.assertFalse(retired_path.exists())
+        finally:
+            if candidate is not None:
+                candidate.close()
+            guard.close()
+            lease.close()
+            target.close()
+            retirement_root.close()
+            root.close()
+
+    def test_rooted_target_restore_keeps_w1_and_sidecar_guard_live(self) -> None:
+        payload = b"rooted candidate with live owner authorities"
+        source_name = "root-live-owner.candidate"
+        sidecar_name = "canonical.sqlite3"
+        source_path = self.root_path / source_name
+        sidecar_path = self.root_path / sidecar_name
+        retired_path = (
+            self.root_path / "root-quarantine" / "receipt" / source_name
+        )
+        sidecar_path.write_bytes(b"sqlite-sidecar")
+        retired_path.parent.mkdir(parents=True)
+        retired_path.write_bytes(payload)
+        rename_window_handles: dict[str, object] = {}
+
+        def observe_window(point: str) -> None:
+            if point == "existing_candidate_recovery_after_restore":
+                rename_window_handles["source"] = root._records[-1].handle
+                rename_window_handles["lease"] = lease._records[-1].handle
+                rename_window_handles["guard"] = guard._records[-1].handle
+
+        adapter = WindowsPlatformAdapter(_fault_injector=observe_window)
+        root = adapter.bind_root(self.root_path)
+        lease = adapter.acquire(
+            root,
+            ".resource.lock",
+            b"resource-lock-v1",
+            LockPolicy(LockWait.FAIL_FAST),
+        )
+        guard = adapter.guard_existing_for_mutation(
+            root, PureWindowsPath(sidecar_name)
+        )
+        retirement_root = adapter.bind_or_create_child_directory(
+            root, "root-quarantine"
+        )
+        target = adapter.bind_or_create_child_directory(
+            retirement_root, "receipt"
+        )
+        candidate = None
+        try:
+            candidate = adapter.recover_existing_candidate(
+                root,
+                source_name,
+                target,
+                source_name,
+                self._facts(payload),
+                owner_lease=lease,
+                mutation_guard=guard,
+            )
+            lease.reprove()
+            guard.reprove()
+            self.assertEqual(
+                set(rename_window_handles), {"source", "lease", "guard"}
+            )
+            self.assertIsNot(
+                root._records[-1].handle,
+                rename_window_handles["source"],
+            )
+            self.assertIsNot(
+                lease._records[-1].handle,
+                rename_window_handles["lease"],
+            )
+            self.assertIsNot(
+                guard._records[-1].handle,
+                rename_window_handles["guard"],
+            )
+            self.assertTrue(source_path.is_file())
+            self.assertFalse(retired_path.exists())
+        finally:
+            if candidate is not None:
+                candidate.close()
+            target.close()
+            retirement_root.close()
+            if guard is not None:
+                guard.close()
+            lease.close()
+            root.close()
+
+    def test_each_owner_window_restores_strict_records_and_rejects_root_drift(self) -> None:
+        source_name = "owner-window.candidate"
+        adapter = WindowsPlatformAdapter()
+        root = adapter.bind_root(self.root_path)
+        lease, guard = self._owner_authorities(adapter, root, root)
+        foreign_path = self.container / "ForeignRoot"
+        foreign_path.mkdir()
+        original_open = platform_fs_windows._open_directory_record
+
+        def open_foreign_record(
+            api: object,
+            _path: str,
+            _expected_final_path: str,
+            **kwargs: object,
+        ) -> object:
+            return original_open(
+                api,
+                str(foreign_path),
+                str(foreign_path),
+                **kwargs,
+            )
+
+        try:
+            for label, authority in (("lease", lease), ("guard", guard)):
+                with self.subTest(authority=label):
+                    strict_handle = authority._records[-1].handle
+                    window = authority._begin_directory_rename_window(root)
+                    compatible_handle = authority._records[-1].handle
+                    self.assertIsNot(compatible_handle, strict_handle)
+                    with (
+                        mock.patch.object(
+                            platform_fs_windows,
+                            "_open_directory_record",
+                            side_effect=open_foreign_record,
+                        ),
+                        self.assertRaises(PlatformFileError) as caught,
+                    ):
+                        window.restore()
+                    _assert_platform_error(
+                        self,
+                        caught,
+                        PlatformFileErrorCode.IDENTITY_STALE,
+                    )
+                    self.assertIs(
+                        authority._records[-1].handle,
+                        compatible_handle,
+                    )
+                    window.restore()
+                    self.assertIsNot(
+                        authority._records[-1].handle,
+                        compatible_handle,
+                    )
+                    authority.reprove()
+        finally:
+            guard.close()
+            lease.close()
+            root.close()
+
+    def test_owner_authorities_from_a_different_parent_are_rejected(self) -> None:
+        payload = b"wrong-owner-parent"
+        source_name = "wrong-owner.candidate"
+        source_path = self.parent_path / source_name
+        source_path.write_bytes(payload)
+        adapter = WindowsPlatformAdapter()
+        root, parent, target = self._authorities(adapter, source_name)
+        lease, guard = self._owner_authorities(adapter, root, root)
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                adapter.recover_existing_candidate(
+                    parent,
+                    source_name,
+                    target,
+                    "wrong-owner.retired",
+                    self._facts(payload),
+                    owner_lease=lease,
+                    mutation_guard=guard,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+            )
+            self.assertEqual(source_path.read_bytes(), payload)
+        finally:
+            guard.close()
+            lease.close()
+            target.close()
+            parent.close()
+            root.close()
+
+    def test_restore_fault_boundaries_replay_exact_target_or_source(self) -> None:
+        payload = b"recoverable-retired-candidate"
+        facts = self._facts(payload)
+        cases = (
+            ("existing_candidate_recovery_before_restore", False),
+            ("existing_candidate_recovery_after_restore", True),
+            ("existing_candidate_recovery_before_terminal", True),
+        )
+        for index, (fault_point, expect_source) in enumerate(cases):
+            with self.subTest(fault_point=fault_point):
+                source_name = f"fault-{index}.candidate"
+                target_name = f"fault-{index}.retired"
+                final_name = f"fault-{index}.json"
+                source_path = self.parent_path / source_name
+                retired_path = self.target_path / target_name
+                retired_path.write_bytes(payload)
+
+                def fault(point: str) -> None:
+                    if point == fault_point:
+                        raise OSError("simulated process boundary")
+
+                adapter = WindowsPlatformAdapter(_fault_injector=fault)
+                root, parent, target = self._authorities(adapter, source_name)
+                lease, guard = self._owner_authorities(adapter, root, parent)
+                try:
+                    with self.assertRaises(PlatformFileError) as caught:
+                        adapter.recover_existing_candidate(
+                            parent,
+                            source_name,
+                            target,
+                            target_name,
+                            facts,
+                            owner_lease=lease,
+                            mutation_guard=guard,
+                        )
+                    _assert_platform_error(
+                        self,
+                        caught,
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    )
+                finally:
+                    guard.close()
+                    lease.close()
+                    target.close()
+                    parent.close()
+                    root.close()
+                self.assertEqual(source_path.exists(), expect_source)
+                self.assertEqual(retired_path.exists(), not expect_source)
+                self.assertEqual(
+                    (source_path if expect_source else retired_path).read_bytes(),
+                    payload,
+                )
+
+                fresh = WindowsPlatformAdapter()
+                fresh_root, fresh_parent, fresh_target = self._authorities(
+                    fresh,
+                    source_name,
+                )
+                fresh_lease, fresh_guard = self._owner_authorities(
+                    fresh, fresh_root, fresh_parent
+                )
+                candidate = pending = None
+                try:
+                    candidate = fresh.recover_existing_candidate(
+                        fresh_parent,
+                        source_name,
+                        fresh_target,
+                        target_name,
+                        facts,
+                        owner_lease=fresh_lease,
+                        mutation_guard=fresh_guard,
+                    )
+                    pending = fresh_parent.begin_publish(
+                        candidate,
+                        final_name,
+                        mode=PublishMode.CREATE_IF_ABSENT,
+                        lease=None,
+                    )
+                    candidate = None
+                    self.assertEqual(
+                        pending.terminal_reproof().content_sha256,
+                        facts.content_sha256,
+                    )
+                finally:
+                    if pending is not None:
+                        pending.close()
+                    if candidate is not None:
+                        candidate.close()
+                    fresh_guard.close()
+                    fresh_lease.close()
+                    fresh_target.close()
+                    fresh_parent.close()
+                    fresh_root.close()
+                self.assertEqual((self.parent_path / final_name).read_bytes(), payload)
+
+    def test_owner_reproof_failure_closes_recovered_handles_for_fresh_retry(self) -> None:
+        payload = b"owner-reproof-failure-candidate"
+        source_name = "owner-reproof.candidate"
+        target_name = "owner-reproof.retired"
+        source_path = self.parent_path / source_name
+        retired_path = self.target_path / target_name
+        retired_path.write_bytes(payload)
+        facts = self._facts(payload)
+
+        adapter = WindowsPlatformAdapter()
+        root, parent, target = self._authorities(adapter, source_name)
+        lease, guard = self._owner_authorities(adapter, root, parent)
+        original_reprove = type(guard)._reprove_guard
+        guard_reproofs = 0
+
+        def fail_final_guard_reproof(authority: object) -> object:
+            nonlocal guard_reproofs
+            if authority is guard:
+                guard_reproofs += 1
+                if guard_reproofs == 3:
+                    raise OSError("simulated post-window owner reproof failure")
+            return original_reprove(authority)
+
+        try:
+            with (
+                mock.patch.object(
+                    type(guard),
+                    "_reprove_guard",
+                    fail_final_guard_reproof,
+                ),
+                self.assertRaises(PlatformFileError) as caught,
+            ):
+                adapter.recover_existing_candidate(
+                    parent,
+                    source_name,
+                    target,
+                    target_name,
+                    facts,
+                    owner_lease=lease,
+                    mutation_guard=guard,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+            )
+            self.assertEqual(guard_reproofs, 3)
+            lease.reprove()
+            guard.reprove()
+        finally:
+            guard.close()
+            lease.close()
+            target.close()
+            parent.close()
+            root.close()
+
+        self.assertEqual(source_path.read_bytes(), payload)
+        self.assertFalse(retired_path.exists())
+        fresh = WindowsPlatformAdapter()
+        fresh_root, fresh_parent, fresh_target = self._authorities(
+            fresh, source_name
+        )
+        fresh_lease, fresh_guard = self._owner_authorities(
+            fresh, fresh_root, fresh_parent
+        )
+        candidate = None
+        try:
+            candidate = fresh.recover_existing_candidate(
+                fresh_parent,
+                source_name,
+                fresh_target,
+                target_name,
+                facts,
+                owner_lease=fresh_lease,
+                mutation_guard=fresh_guard,
+            )
+            fresh_lease.reprove()
+            fresh_guard.reprove()
+        finally:
+            if candidate is not None:
+                candidate.close()
+            fresh_guard.close()
+            fresh_lease.close()
+            fresh_target.close()
+            fresh_parent.close()
+            fresh_root.close()
+
+    def test_source_only_flush_failure_is_durability_unavailable_and_non_mutating(self) -> None:
+        payload = b"flush-before-adopt"
+        source_name = "flush.candidate"
+        target_name = "flush.retired"
+        source_path = self.parent_path / source_name
+        retired_path = self.target_path / target_name
+        source_path.write_bytes(payload)
+        adapter = WindowsPlatformAdapter()
+        root, parent, target = self._authorities(adapter, source_name)
+        lease, guard = self._owner_authorities(adapter, root, parent)
+        original_checked_bool = parent._api.checked_bool
+
+        def checked_bool(operation: str, function: object, *args: object) -> None:
+            if operation == "FlushFileBuffers":
+                raise Win32CallError(operation, 5)
+            original_checked_bool(operation, function, *args)
+
+        try:
+            with (
+                mock.patch.object(parent._api, "checked_bool", side_effect=checked_bool),
+                self.assertRaises(PlatformFileError) as caught,
+            ):
+                adapter.recover_existing_candidate(
+                    parent,
+                    source_name,
+                    target,
+                    target_name,
+                    self._facts(payload),
+                    owner_lease=lease,
+                    mutation_guard=guard,
+                )
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.DURABILITY_UNAVAILABLE,
+            )
+        finally:
+            guard.close()
+            lease.close()
+            target.close()
+            parent.close()
+            root.close()
+        self.assertEqual(source_path.read_bytes(), payload)
+        self.assertFalse(retired_path.exists())
+
+    def test_coexist_mismatch_unknown_and_unsafe_states_are_non_mutating(self) -> None:
+        payload = b"expected-candidate"
+        facts = self._facts(payload)
+        cases = (
+            "coexist",
+            "source-mismatch",
+            "target-mismatch",
+            "unknown",
+            "unsafe",
+            "hardlink",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                source_name = f"{case}.candidate"
+                target_name = f"{case}.retired"
+                source_path = self.parent_path / source_name
+                retired_path = self.target_path / target_name
+                unknown_path = self.target_path / f"{case}.unknown"
+                alias_path = self.parent_path / f"{case}.alias"
+                if case == "coexist":
+                    source_path.write_bytes(payload)
+                    retired_path.write_bytes(payload)
+                elif case == "source-mismatch":
+                    source_path.write_bytes(b"wrong-source")
+                elif case == "target-mismatch":
+                    retired_path.write_bytes(b"wrong-target")
+                elif case == "unknown":
+                    unknown_path.write_bytes(b"foreign")
+                elif case == "unsafe":
+                    retired_path.mkdir()
+                else:
+                    source_path.write_bytes(payload)
+                    os.link(source_path, alias_path)
+                before = {
+                    path.name: ("directory" if path.is_dir() else path.read_bytes())
+                    for path in (source_path, retired_path, unknown_path, alias_path)
+                    if path.exists()
+                }
+                adapter = WindowsPlatformAdapter()
+                root, parent, target = self._authorities(adapter, source_name)
+                lease, guard = self._owner_authorities(adapter, root, parent)
+                try:
+                    with self.assertRaises(PlatformFileError) as caught:
+                        adapter.recover_existing_candidate(
+                            parent,
+                            source_name,
+                            target,
+                            target_name,
+                            facts,
+                            owner_lease=lease,
+                            mutation_guard=guard,
+                        )
+                    _assert_platform_error(
+                        self,
+                        caught,
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    )
+                finally:
+                    guard.close()
+                    lease.close()
+                    target.close()
+                    parent.close()
+                    root.close()
+                after = {
+                    path.name: ("directory" if path.is_dir() else path.read_bytes())
+                    for path in (source_path, retired_path, unknown_path, alias_path)
+                    if path.exists()
+                }
+                self.assertEqual(after, before)
 
 
 class WindowsRecoveryCapabilityStaticTests(unittest.TestCase):
