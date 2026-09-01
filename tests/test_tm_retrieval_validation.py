@@ -228,7 +228,7 @@ def _store_entry() -> dict[str, Any]:
 def _service_digests() -> tuple[str, str, str]:
     fixture_digest = aggregate_paths_digest(
         _REPOSITORY_ROOT,
-        (str(_VECTORS_FIXTURE.relative_to(_REPOSITORY_ROOT)),),
+        (_VECTORS_FIXTURE.relative_to(_REPOSITORY_ROOT).as_posix(),),
     )
     context_transcript = _observe_context_transcript(_VECTORS_FIXTURE)
     context_digest = canonical_digest(
@@ -974,11 +974,9 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
         fixture_digest = aggregate_paths_digest(
             _REPOSITORY_ROOT,
             (
-                str(
-                    _VECTORS_FIXTURE.relative_to(
-                        _REPOSITORY_ROOT
-                    )
-                ),
+                _VECTORS_FIXTURE.relative_to(
+                    _REPOSITORY_ROOT
+                ).as_posix(),
             ),
         )
         context_transcript = _observe_context_transcript(
@@ -2204,9 +2202,7 @@ class RetrievalValidationReleaseTests(unittest.TestCase):
                         ),
                         encoding="utf-8",
                     )
-                    fixture_relative = str(
-                        fixture.relative_to(root)
-                    )
+                    fixture_relative = fixture.relative_to(root).as_posix()
                     fixture_digest = aggregate_paths_digest(
                         root,
                         (fixture_relative,),
