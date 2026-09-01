@@ -1,9 +1,10 @@
-"""Independent-process worker for Windows portable activation recovery."""
+"""Independent-process worker for Windows portable activation/recovery."""
 
 from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+import ctypes
 from dataclasses import replace
 import hashlib
 import json
@@ -11,6 +12,8 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
+import time
 import traceback
 from unittest import mock
 
@@ -23,6 +26,7 @@ from platform_fs_contracts import (
     BoundExistingFileMutationGuard,
     BoundRegularFile,
     FileObjectIdentity,
+    PendingPublication,
     PlatformFileError,
     PlatformFileErrorCode,
 )
@@ -41,6 +45,7 @@ from tm_sqlite_store import (
     ResourceStoreCoordinator,
     SQLiteTMStore,
 )
+from tools.windows_c3b_source_snapshot import source_snapshot_sha256
 
 
 _SOURCE_BYTES = (
@@ -53,6 +58,140 @@ _PHASES = (
     "MANIFEST_PUBLISHED",
     "GENERATION_PUBLISHED",
 )
+_PROCESS_SCHEMA = "localcat.windows-tm-activation-process-recovery.v1"
+_REBOOT_TICKET_SCHEMA = "localcat.windows-tm-activation-reboot-ticket.v1"
+_WORKER_MODULE = "tests.windows_tm_portable_publication_recovery_worker"
+_REBOOT_SOURCE_KEYS = (
+    "platform_fs.py",
+    "platform_fs_contracts.py",
+    "platform_fs_windows.py",
+    "tm_activation_journal.py",
+    "tm_activation_recovery.py",
+    "tm_candidate_index.py",
+    "tm_candidate_store_contracts.py",
+    "tm_content_attestation.py",
+    "tm_contracts.py",
+    "tm_engine.py",
+    "tm_migration.py",
+    "tm_schema_upgrade.py",
+    "tm_similarity.py",
+    "tm_snapshot_artifacts.py",
+    "tm_snapshot_recovery.py",
+    "tm_sqlite_candidate_projection.py",
+    "tm_sqlite_store.py",
+    "tm_stage_sealer.py",
+    "tests/windows_tm_portable_publication_recovery_worker.py",
+    "windows_file_api.py",
+)
+_PROCESS_TERMINATION_PHASES = (
+    "LOCK_HELD",
+    "PREPARED",
+    "DB_REPLACED",
+    "MANIFEST_PUBLISHED",
+    "GENERATION_PUBLISHED",
+    *(
+        f"{asset}.{boundary}"
+        for asset in ("DB", "MANIFEST")
+        for boundary in (
+            "post_begin",
+            "owner_durable",
+            "business_reproof",
+            "terminal_reproof",
+        )
+    ),
+)
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _write_marker(marker: Path, phase: str, details: object = None) -> None:
+    payload = {
+        "details": details,
+        "phase": phase,
+        "pid": os.getpid(),
+        "schema": _PROCESS_SCHEMA,
+    }
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with marker.open("x", encoding="utf-8", newline="\n") as stream:
+        json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _park_at_marker(marker: Path, phase: str, details: object = None) -> None:
+    _write_marker(marker, phase, details)
+    while True:
+        time.sleep(30.0)
+
+
+def _wait_for_path(path: Path, *, timeout: float = 180.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for {path.name}")
+        time.sleep(0.02)
+
+
+def _terminate_process(process: subprocess.Popen[bytes], exit_code: int = 93) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    terminate = kernel32.TerminateProcess
+    terminate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    terminate.restype = ctypes.c_int32
+    if not terminate(int(process._handle), exit_code):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _current_boot_session() -> str:
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToFileTimeUtc()",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+    )
+    boot_session = completed.stdout.strip()
+    if (
+        completed.returncode != 0
+        or not boot_session.isascii()
+        or not boot_session.isdigit()
+    ):
+        raise RuntimeError("Windows boot session is unavailable")
+    return boot_session
+
+
+def _source_snapshot() -> str:
+    return source_snapshot_sha256(
+        Path(__file__).resolve().parents[1],
+        keys=_REBOOT_SOURCE_KEYS,
+    )
+
+
+def _coordinator_projection(
+    coordinator: ResourceStoreCoordinator,
+) -> dict[str, object]:
+    return {
+        "generation": coordinator.current_generation,
+        "state": coordinator.state,
+        "view_visible": coordinator._view is not None,
+    }
 
 
 class _FreshReproveFaultGuard(BoundExistingFileMutationGuard):
@@ -1383,14 +1522,444 @@ def _activate(
     }
 
 
+def _asset_inventory(identity: CanonicalResourceIdentity) -> dict[str, object]:
+    return {
+        "database": _file_facts(identity.canonical_sidecar_path),
+        "lineage_marker": _file_facts(
+            tm_sqlite_store._activation_lineage_marker_path(identity)
+        ),
+        "manifest": _file_facts(identity.snapshot_manifest_path),
+        "source": _file_facts(identity.configured_jsonl_path),
+    }
+
+
+def _pending_destination_name(pending: PendingPublication) -> str | None:
+    retained = pending.retained_destination()
+    entry_path = getattr(retained, "_entry_path", None)
+    if type(entry_path) is not str:
+        return None
+    return Path(entry_path).name
+
+
+def _install_activation_process_fault(
+    stack: ExitStack,
+    *,
+    phase: str,
+    marker: Path,
+    identity: CanonicalResourceIdentity,
+    coordinator: ResourceStoreCoordinator,
+    service: tm_migration.TMMigrationService,
+) -> None:
+    if phase not in _PROCESS_TERMINATION_PHASES:
+        raise ValueError("unknown process-termination phase")
+
+    if phase == "LOCK_HELD":
+        def hold_resource_owner(**kwargs: object) -> object:
+            del kwargs
+            _park_at_marker(
+                marker,
+                phase,
+                {
+                    "coordinator": _coordinator_projection(coordinator),
+                    "owner": "activate_initial",
+                },
+            )
+
+        stack.enter_context(
+            mock.patch.object(
+                service,
+                "_activate_initial_with_resource_reservation",
+                new=hold_resource_owner,
+            )
+        )
+        return
+
+    if phase in {"PREPARED", *_PHASES}:
+        registry = coordinator._sealed_registry
+
+        def hold(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            _park_at_marker(
+                marker,
+                phase,
+                {
+                    "coordinator": _coordinator_projection(coordinator),
+                    "owner": "activation_journal",
+                },
+            )
+
+        if phase == "PREPARED":
+            target = coordinator
+            member = "publish_portable_activation"
+        elif phase == "DB_REPLACED":
+            target = coordinator
+            member = "_apply_portable_receipt_activation"
+        elif phase == "MANIFEST_PUBLISHED":
+            target = coordinator
+            member = "_publish_portable_generation"
+        else:
+            target = registry
+            member = "consume"
+        stack.enter_context(mock.patch.object(target, member, new=hold))
+        return
+
+    asset, boundary = phase.split(".", 1)
+    journal_phase = {
+        "DB": "DB_REPLACED",
+        "MANIFEST": "MANIFEST_PUBLISHED",
+    }[asset]
+    destination_name = {
+        "DB": identity.canonical_sidecar_path.name,
+        "MANIFEST": identity.snapshot_manifest_path.name,
+    }[asset]
+
+    if boundary == "terminal_reproof":
+        real_terminal = PendingPublication.terminal_reproof
+
+        def terminal(pending: PendingPublication) -> object:
+            if _pending_destination_name(pending) == destination_name:
+                _park_at_marker(
+                    marker,
+                    phase,
+                    {
+                        "asset": asset,
+                        "boundary": boundary,
+                        "coordinator": _coordinator_projection(coordinator),
+                        "preliminary": True,
+                    },
+                )
+            return real_terminal(pending)
+
+        stack.enter_context(
+            mock.patch.object(PendingPublication, "terminal_reproof", new=terminal)
+        )
+        return
+
+    real_publish = tm_activation_journal._WindowsPortablePublicationPhaseOwner.publish
+
+    def publish(**kwargs: object) -> object:
+        unsigned = kwargs.get("unsigned")
+        if getattr(unsigned, "phase", None) != journal_phase:
+            return real_publish(**kwargs)
+        if boundary == "post_begin":
+            _park_at_marker(
+                marker,
+                phase,
+                {
+                    "asset": asset,
+                    "boundary": boundary,
+                    "coordinator": _coordinator_projection(coordinator),
+                },
+            )
+        if boundary == "owner_durable":
+            real_owner_commit = kwargs["owner_commit"]
+
+            def owner_commit(record: object) -> None:
+                result = real_owner_commit(record)
+                if result is not None:
+                    raise TypeError("owner commit must return None")
+                _park_at_marker(
+                    marker,
+                    phase,
+                    {
+                        "asset": asset,
+                        "boundary": boundary,
+                        "coordinator": _coordinator_projection(coordinator),
+                    },
+                )
+
+            kwargs["owner_commit"] = owner_commit
+        elif boundary == "business_reproof":
+            real_business_reprove = kwargs["business_reprove"]
+
+            def business_reprove(record: object) -> None:
+                result = real_business_reprove(record)
+                if result is not None:
+                    raise TypeError("business reproof must return None")
+                _park_at_marker(
+                    marker,
+                    phase,
+                    {
+                        "asset": asset,
+                        "boundary": boundary,
+                        "coordinator": _coordinator_projection(coordinator),
+                    },
+                )
+
+            kwargs["business_reprove"] = business_reprove
+        return real_publish(**kwargs)
+
+    stack.enter_context(
+        mock.patch.object(
+            tm_activation_journal._WindowsPortablePublicationPhaseOwner,
+            "publish",
+            new=publish,
+        )
+    )
+
+
+def _activation_process_fault(
+    root: Path,
+    phase: str,
+    marker: Path,
+) -> dict[str, object]:
+    identity = _identity(root, create_source=not _identity_source_exists(root))
+    coordinator, service = _owner(identity)
+    with ExitStack() as stack:
+        _install_activation_process_fault(
+            stack,
+            phase=phase,
+            marker=marker,
+            identity=identity,
+            coordinator=coordinator,
+            service=service,
+        )
+        outcome = service.activate_initial(
+            identity.configured_jsonl_path,
+            identity.resource_id,
+        )
+    return {
+        "mode": "activation-fault",
+        "phase": phase,
+        "outcome": _outcome_facts(outcome),
+    }
+
+
+def _identity_source_exists(root: Path) -> bool:
+    return (root / "tm.primary.jsonl").is_file()
+
+
+def _cold_open_probe(root: Path) -> dict[str, object]:
+    identity = _identity(root, create_source=False)
+    engine: TMEngine | None = None
+    exact: object | None = None
+    error: BaseException | None = None
+    try:
+        engine = TMEngine(
+            str(identity.configured_jsonl_path),
+            update=False,
+        )
+        exact = engine.query_exact("same")
+    except (ValueError, OSError) as caught:
+        error = caught
+    canonical_active = engine is not None and engine.canonical_active
+    canonical_store_visible = engine is not None and engine.canonical_store is not None
+    exact_result = (
+        None
+        if exact is None
+        else {
+            "source": getattr(exact, "source"),
+            "target": getattr(exact, "target"),
+        }
+    )
+    return {
+        "mode": "cold-open-probe",
+        "pid": os.getpid(),
+        "canonical_active": canonical_active,
+        "runtime_profile": (
+            "CANONICAL"
+            if canonical_active and canonical_store_visible
+            else "LEGACY"
+            if engine is not None and exact_result is not None
+            else "UNAVAILABLE"
+        ),
+        "canonical_store_visible": canonical_store_visible,
+        "exact_result": exact_result,
+        "failure_type": None if error is None else type(error).__name__,
+        "failure_message": None if error is None else str(error),
+    }
+
+
+def _inspect_process_state(root: Path) -> dict[str, object]:
+    identity = _identity(root, create_source=False)
+    return {
+        "mode": "inspect",
+        "pid": os.getpid(),
+        "inventory": _asset_inventory(identity),
+        "journal": _journal_facts(root, identity),
+    }
+
+
+def _reboot_inventory(root: Path) -> dict[str, object]:
+    identity = _identity(root, create_source=False)
+    journal = _journal_facts(root, identity)
+    return {
+        "assets": _asset_inventory(identity),
+        "journal": {
+            "phase_files": journal["phase_files"],
+            "phases": journal["phases"],
+            "predecessor_closed": journal["predecessor_closed"],
+            "prepared": journal["prepared"],
+            "terminal": journal["terminal"],
+        },
+    }
+
+
+def _load_reboot_ticket(root: Path, ticket_path: Path) -> dict[str, object]:
+    raw = ticket_path.read_bytes()
+    ticket = json.loads(raw.decode("utf-8"))
+    if type(ticket) is not dict or _canonical_json_bytes(ticket) != raw:
+        raise RuntimeError("activation reboot ticket is not canonical")
+    expected_keys = {
+        "boot_session",
+        "expected",
+        "inventory",
+        "root",
+        "schema",
+        "source_snapshot_sha256",
+        "ticket_sha256",
+        "worker_sha256",
+    }
+    if set(ticket) != expected_keys or ticket["schema"] != _REBOOT_TICKET_SCHEMA:
+        raise RuntimeError("activation reboot ticket shape mismatch")
+    unsigned = dict(ticket)
+    digest = unsigned.pop("ticket_sha256")
+    if (
+        ticket["root"] != str(root)
+        or ticket["worker_sha256"]
+        != hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        or ticket["source_snapshot_sha256"] != _source_snapshot()
+        or digest != hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest()
+    ):
+        raise RuntimeError("activation reboot ticket authority mismatch")
+    return ticket
+
+
+def _reboot_prepare(root: Path, ticket_path: Path) -> dict[str, object]:
+    if ticket_path.parent != root.parent:
+        raise ValueError("activation reboot root and ticket must share one directory")
+    if root.exists() or ticket_path.exists():
+        raise ValueError("activation reboot prepare requires a new root and ticket")
+    marker = ticket_path.with_suffix(ticket_path.suffix + ".phase.json")
+    if marker.exists():
+        raise ValueError("activation reboot marker already exists")
+    command = [
+        sys.executable,
+        "-B",
+        "-m",
+        _WORKER_MODULE,
+        "activation-fault",
+        str(root),
+        "--phase",
+        "GENERATION_PUBLISHED",
+        "--marker",
+        str(marker),
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    terminated = False
+    try:
+        _wait_for_path(marker)
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                "activation reboot creator exited before termination: "
+                f"{process.returncode}; stdout={stdout!r}; stderr={stderr!r}"
+            )
+        _terminate_process(process)
+        terminated = True
+        stdout, stderr = process.communicate(timeout=30.0)
+        if process.returncode != 93:
+            raise AssertionError(
+                "activation reboot creator exit mismatch: "
+                f"{process.returncode}; stdout={stdout!r}; stderr={stderr!r}"
+            )
+    finally:
+        if process.poll() is None:
+            _terminate_process(process)
+            process.communicate(timeout=30.0)
+        if not terminated and marker.exists():
+            marker.unlink()
+
+    inventory = _reboot_inventory(root)
+    if inventory["journal"]["phases"] != list(_PHASES):
+        raise AssertionError("reboot preparation did not reach generation phase")
+    unsigned = {
+        "boot_session": _current_boot_session(),
+        "expected": {
+            "generation": 0,
+            "query": {"source": "same", "targets": ["winner", "first"]},
+            "record_count": 3,
+        },
+        "inventory": inventory,
+        "root": str(root),
+        "schema": _REBOOT_TICKET_SCHEMA,
+        "source_snapshot_sha256": _source_snapshot(),
+        "worker_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    }
+    ticket = {
+        **unsigned,
+        "ticket_sha256": hashlib.sha256(_canonical_json_bytes(unsigned)).hexdigest(),
+    }
+    ticket_bytes = _canonical_json_bytes(ticket)
+    with ticket_path.open("xb") as stream:
+        stream.write(ticket_bytes)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if ticket_path.read_bytes() != ticket_bytes:
+        raise RuntimeError("activation reboot ticket readback mismatch")
+    return {
+        "mode": "activation-reboot-prepare",
+        "reboot": "PREPARED",
+        "schema": _REBOOT_TICKET_SCHEMA,
+        "ticket": str(ticket_path),
+        "ticket_sha256": ticket["ticket_sha256"],
+    }
+
+
+def _reboot_resume(root: Path, ticket_path: Path) -> dict[str, object]:
+    ticket = _load_reboot_ticket(root, ticket_path)
+    if _current_boot_session() == ticket["boot_session"]:
+        return {
+            "mode": "activation-reboot-resume",
+            "reboot": "NOT_RUN",
+            "schema": _REBOOT_TICKET_SCHEMA,
+            "ticket_sha256": ticket["ticket_sha256"],
+        }
+    if _reboot_inventory(root) != ticket["inventory"]:
+        raise RuntimeError("activation reboot inventory changed before resume")
+    recovered = _activate(root, mode="reboot-recover", guarded=True)
+    query = _fts5_cold_query(root)
+    expected = ticket["expected"]
+    if (
+        recovered["outcome"].get("kind") != "MigrationReport"
+        or recovered["outcome"].get("generation") != expected["generation"]
+        or recovered["outcome"].get("record_count") != expected["record_count"]
+        or recovered["runtime"]["canonical"]["same_targets"]
+        != expected["query"]["targets"]
+        or query["health"]["generation"] != expected["generation"]
+        or query["query"]["record_targets"] != ["first", "winner"]
+    ):
+        raise AssertionError("activation reboot recovery result mismatch")
+    return {
+        "mode": "activation-reboot-resume",
+        "reboot": "PASS",
+        "recovery": recovered,
+        "query": query,
+        "schema": _REBOOT_TICKET_SCHEMA,
+        "ticket_sha256": ticket["ticket_sha256"],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "mode",
         choices=(
+            "activate",
+            "activation-fault",
+            "activation-reboot-prepare",
+            "activation-reboot-resume",
+            "cold-open-probe",
             "create",
             "fts5-activate",
             "fts5-cold-query",
+            "inspect",
             "mutate",
             "recover",
             "recover-bounded",
@@ -1410,7 +1979,7 @@ def main() -> int:
     parser.add_argument(
         "--phase",
         choices=(
-            "PREPARED",
+            *_PROCESS_TERMINATION_PHASES,
             "DB_ACTIVE",
             "DB_MUTATION_GUARD",
             "MANIFEST_PHYSICAL",
@@ -1418,9 +1987,10 @@ def main() -> int:
             "APPLY_PROGRAMMER_CLOSE",
             "SYNCHRONIZED_CLOSE",
             "ACTIVE_REPROVE_PROGRAMMER_CLOSE",
-            *_PHASES,
         ),
     )
+    parser.add_argument("--marker", type=Path)
+    parser.add_argument("--ticket", type=Path)
     parser.add_argument(
         "--mutation",
         choices=(
@@ -1445,9 +2015,33 @@ def main() -> int:
     )
     arguments = parser.parse_args()
     root = arguments.root.resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    if arguments.mode not in {
+        "activation-reboot-prepare",
+        "activation-reboot-resume",
+    }:
+        root.mkdir(parents=True, exist_ok=True)
     try:
-        if arguments.mode == "create":
+        if arguments.mode == "activation-fault":
+            if arguments.phase is None or arguments.marker is None:
+                parser.error("activation-fault requires --phase and --marker")
+            result = _activation_process_fault(
+                root,
+                arguments.phase,
+                arguments.marker.resolve(),
+            )
+        elif arguments.mode == "activation-reboot-prepare":
+            if arguments.ticket is None:
+                parser.error("activation-reboot-prepare requires --ticket")
+            result = _reboot_prepare(root, arguments.ticket.resolve())
+        elif arguments.mode == "activation-reboot-resume":
+            if arguments.ticket is None:
+                parser.error("activation-reboot-resume requires --ticket")
+            result = _reboot_resume(root, arguments.ticket.resolve())
+        elif arguments.mode == "cold-open-probe":
+            result = _cold_open_probe(root)
+        elif arguments.mode == "inspect":
+            result = _inspect_process_state(root)
+        elif arguments.mode == "create":
             if arguments.phase is None:
                 parser.error("create requires --phase")
             result = _creator(root, arguments.phase)
