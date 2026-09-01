@@ -6,13 +6,9 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from datetime import datetime, timezone
-import hashlib
 import io
 import json
-import os
 from pathlib import Path
-import stat
-import tempfile
 import sys
 import unittest
 
@@ -27,6 +23,11 @@ from tests.fault_matrix_registry import (  # noqa: E402
     fault_matrix_registry_digest,
     fault_matrix_source_fingerprint,
     fault_matrix_source_paths,
+)
+from tools.tm_release_evidence_io import (  # noqa: E402
+    atomic_write as _platform_atomic_write,
+    strict_read_regular as _platform_strict_read_regular,
+    validate_evidence_target as _platform_validate_evidence_target,
 )
 
 
@@ -69,65 +70,15 @@ def _canonical_source_relative(relative: str) -> Path:
 
 
 def _strict_source_digest(root: Path, relative: str) -> str:
-    """Hash one source through a root-to-file no-follow descriptor walk."""
-
     relative_path = _canonical_source_relative(relative)
-    directory_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        directory_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        directory_flags |= os.O_NOFOLLOW
-    file_flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        file_flags |= os.O_NOFOLLOW
-    directory_descriptor = os.open(root, directory_flags)
-    file_descriptor = -1
-    try:
-        for component in relative_path.parts[:-1]:
-            next_descriptor = os.open(
-                component,
-                directory_flags,
-                dir_fd=directory_descriptor,
-            )
-            observed = os.fstat(next_descriptor)
-            if not stat.S_ISDIR(observed.st_mode):
-                os.close(next_descriptor)
-                raise ValueError(
-                    "fault-matrix source parent is not a real directory"
-                )
-            os.close(directory_descriptor)
-            directory_descriptor = next_descriptor
-        filename = relative_path.parts[-1]
-        file_descriptor = os.open(
-            filename,
-            file_flags,
-            dir_fd=directory_descriptor,
-        )
-        opened = os.fstat(file_descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
-            raise ValueError("fault-matrix source is not a regular file")
-        digest = hashlib.sha256()
-        while chunk := os.read(file_descriptor, 1024 * 1024):
-            digest.update(chunk)
-        terminal = os.stat(
-            filename,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(terminal.st_mode)
-            or terminal.st_nlink != 1
-            or (terminal.st_dev, terminal.st_ino)
-            != (opened.st_dev, opened.st_ino)
-        ):
-            raise ValueError("fault-matrix source identity changed")
-        return digest.hexdigest()
-    except OSError as error:
-        raise ValueError("fault-matrix source is not no-follow regular") from error
-    finally:
-        if file_descriptor >= 0:
-            os.close(file_descriptor)
-        os.close(directory_descriptor)
+    return _platform_strict_read_regular(
+        root,
+        relative_path,
+        parent_error="fault-matrix source parent is not a real directory",
+        nonregular_error="fault-matrix source is not a regular file",
+        source_error="fault-matrix source is not no-follow regular",
+        identity_error="fault-matrix source identity changed",
+    )[1]
 
 
 def _strict_source_file(root: Path, relative: str) -> Path:
@@ -148,12 +99,10 @@ def _source_file_digests(root: Path) -> tuple[tuple[str, str], ...]:
 def _validate_evidence_target(path: Path) -> None:
     """Reject aliases and non-regular existing canonical evidence targets."""
 
-    try:
-        observed = os.lstat(path)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-        raise ValueError("fault matrix evidence target is not a regular file")
+    _platform_validate_evidence_target(
+        path,
+        target_error="fault matrix evidence target is not a regular file",
+    )
 
 
 def _run_row(row_id: str, test_ids: tuple[str, ...]) -> bool:
@@ -178,62 +127,15 @@ def _atomic_write(
     payload: bytes,
     validate_snapshot: Callable[[], None],
 ) -> None:
-    parent = path.parent.resolve(strict=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=".tm-fault-matrix-",
-        suffix=".tmp",
-        dir=str(parent),
+    _platform_atomic_write(
+        path,
+        payload,
+        validate_snapshot,
+        candidate_prefix=".tm-fault-matrix-",
+        identity_error="fault matrix evidence identity changed",
+        readback_error="fault matrix evidence readback changed",
+        platform_error="fault matrix evidence platform I/O failed",
     )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb", closefd=True) as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-            published_identity = os.fstat(stream.fileno())
-        validate_snapshot()
-        os.replace(temporary, path)
-        flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            flags |= os.O_DIRECTORY
-        parent_descriptor = os.open(parent, flags)
-        try:
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(parent_descriptor)
-        observed = os.lstat(path)
-        if (
-            not stat.S_ISREG(observed.st_mode)
-            or observed.st_nlink != 1
-            or (observed.st_dev, observed.st_ino)
-            != (published_identity.st_dev, published_identity.st_ino)
-        ):
-            raise ValueError("fault matrix evidence identity changed")
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        read_descriptor = os.open(path, flags)
-        try:
-            readback = bytearray()
-            while chunk := os.read(read_descriptor, 1024 * 1024):
-                readback.extend(chunk)
-            terminal = os.fstat(read_descriptor)
-        finally:
-            os.close(read_descriptor)
-        if (
-            bytes(readback) != payload
-            or terminal.st_nlink != 1
-            or (terminal.st_dev, terminal.st_ino)
-            != (published_identity.st_dev, published_identity.st_ino)
-        ):
-            raise ValueError("fault matrix evidence readback changed")
-        validate_snapshot()
-    except BaseException:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-        raise
 
 
 def main(argv: list[str] | None = None) -> int:
