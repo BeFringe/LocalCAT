@@ -663,6 +663,7 @@ def acceptance_matrix_source_paths(
     paths = {
         "tests/acceptance_matrix_registry.py",
         "tests/test_tm_acceptance_matrix.py",
+        "tools/tm_release_evidence_io.py",
         "tools/validate_tm_acceptance_matrix.py",
     }
     if any(row.task == "9.4" for row in rows):
