@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 from datetime import datetime, timezone
 import tempfile
 from typing import Any, cast
@@ -1666,6 +1667,7 @@ class GateDRunnerTests(unittest.TestCase):
         )
         self._assert_clean_work_root(work_root)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX evidence publisher fault seam")
     def test_runner_write_failure_fails_closed(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         with mock.patch("os.write", side_effect=OSError("write failed")):
@@ -1678,6 +1680,7 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertFalse(evidence_path.exists())
         self._assert_clean_work_root(work_root)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX evidence publisher fault seam")
     def test_runner_link_publication_failure_fails_closed(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         with mock.patch("os.link", side_effect=OSError("link failed")):
@@ -1690,6 +1693,7 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertFalse(evidence_path.exists())
         self._assert_clean_work_root(work_root)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX evidence publisher fault seam")
     def test_runner_link_race_never_overwrites_foreign_final(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         real_link = os.link
@@ -1717,6 +1721,7 @@ class GateDRunnerTests(unittest.TestCase):
         )
         self._assert_clean_work_root(work_root)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX evidence publisher fault seam")
     def test_runner_fsync_failure_fails_closed(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         with mock.patch("os.fsync", side_effect=OSError("fsync failed")):
@@ -1729,6 +1734,7 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertFalse(evidence_path.exists())
         self._assert_clean_work_root(work_root)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX evidence publisher fault seam")
     def test_runner_readback_mismatch_fails_closed(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         with mock.patch.object(
@@ -1745,6 +1751,7 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertFalse(evidence_path.exists())
         self._assert_clean_work_root(work_root)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX evidence publisher fault seam")
     def test_published_final_cleanup_failure_is_explicit(self) -> None:
         bundle = _combined_bundle()
         with tempfile.TemporaryDirectory() as temporary:
@@ -1903,6 +1910,163 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertEqual(ctx.exception.error_code, "GATE_D.WORK_ROOT_INVALID")
         self.assertEqual(os.listdir(work_root), ["existing.txt"])
         self.assertFalse(evidence_path.exists())
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows evidence publisher only")
+class GateDWindowsEvidencePublisherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name)
+        self.evidence_path = self.parent / "bundle.json"
+        self.bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+        self.payload = benchmark_evidence_bundle_to_json(self.bundle).encode("utf-8")
+
+    def _publish(self, *, backend: object | None = None) -> tuple[object, ...]:
+        if backend is None:
+            return tm_benchmark_gate._publish_evidence_bundle(
+                self.bundle,
+                self.evidence_path,
+            )
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "compose_platform_file_backend",
+            return_value=backend,
+        ):
+            return tm_benchmark_gate._publish_evidence_bundle(
+                self.bundle,
+                self.evidence_path,
+            )
+
+    def _assert_code(self, expected: str, *, backend: object | None = None) -> None:
+        with self.assertRaises(BenchmarkGateDError) as caught:
+            self._publish(backend=backend)
+        self.assertEqual(caught.exception.error_code, expected)
+
+    def test_windows_success_uses_retained_exact_readback_and_terminal_reproof(
+        self,
+    ) -> None:
+        digest, size, artifact_digest, readback = self._publish()
+        self.assertEqual(digest, self.bundle.bundle_digest)
+        self.assertEqual(size, len(self.payload))
+        self.assertEqual(artifact_digest, hashlib.sha256(self.payload).hexdigest())
+        self.assertEqual(readback, self.bundle)
+        self.assertEqual(self.evidence_path.read_bytes(), self.payload)
+        self.assertEqual(tuple(self.parent.iterdir()), (self.evidence_path,))
+
+    def test_windows_existing_final_is_preserved(self) -> None:
+        self.evidence_path.write_bytes(b"foreign")
+        self._assert_code("GATE_D.EVIDENCE_EXISTS")
+        self.assertEqual(self.evidence_path.read_bytes(), b"foreign")
+        self.assertEqual(tuple(self.parent.iterdir()), (self.evidence_path,))
+
+    def test_windows_create_if_absent_race_is_evidence_exists(self) -> None:
+        from platform_fs_windows import WindowsPlatformAdapter
+
+        def race(phase: str) -> None:
+            if phase == "publish_before_rename":
+                self.evidence_path.write_bytes(b"foreign-race")
+
+        self._assert_code(
+            "GATE_D.EVIDENCE_EXISTS",
+            backend=WindowsPlatformAdapter(_fault_injector=race),
+        )
+        self.assertEqual(self.evidence_path.read_bytes(), b"foreign-race")
+        self.assertEqual(tuple(self.parent.iterdir()), (self.evidence_path,))
+
+    def test_windows_pre_arm_failure_cleans_candidate_and_final_is_absent(
+        self,
+    ) -> None:
+        from windows_file_api import WindowsFileAPI
+
+        with mock.patch.object(
+            WindowsFileAPI,
+            "self_probe_nt_set_information_file",
+            side_effect=OSError("pre-arm fault"),
+        ):
+            self._assert_code("GATE_D.EVIDENCE_PUBLISH_FAILED")
+        self.assertFalse(self.evidence_path.exists())
+        self.assertEqual(tuple(self.parent.iterdir()), ())
+
+    def test_windows_post_arm_fault_is_cleanup_pending(self) -> None:
+        from platform_fs_windows import WindowsPlatformAdapter
+
+        def fail_after_rename(phase: str) -> None:
+            if phase == "publish_after_rename":
+                raise OSError("post-arm fault")
+
+        self._assert_code(
+            "GATE_D.CLEANUP_PENDING",
+            backend=WindowsPlatformAdapter(_fault_injector=fail_after_rename),
+        )
+        self.assertEqual(self.evidence_path.read_bytes(), self.payload)
+
+    def test_windows_retained_byte_mismatch_is_removed(self) -> None:
+        from platform_fs_windows import _WindowsBoundRegularFile
+
+        with mock.patch.object(
+            _WindowsBoundRegularFile,
+            "read_all",
+            return_value=b"corrupted-readback",
+        ):
+            self._assert_code("GATE_D.EVIDENCE_READBACK_MISMATCH")
+        self.assertFalse(self.evidence_path.exists())
+        self.assertEqual(tuple(self.parent.iterdir()), ())
+
+    def test_windows_codec_mismatch_is_removed(self) -> None:
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "benchmark_evidence_bundle_from_json",
+            side_effect=ValueError("codec mismatch"),
+        ):
+            self._assert_code("GATE_D.EVIDENCE_READBACK_MISMATCH")
+        self.assertFalse(self.evidence_path.exists())
+        self.assertEqual(tuple(self.parent.iterdir()), ())
+
+    def test_windows_digest_mismatch_is_removed(self) -> None:
+        original = tm_benchmark_gate.benchmark_evidence_bundle_digest
+        calls = 0
+
+        def changed_digest(value: BenchmarkEvidenceBundle) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return original(value)
+            return "0" * 64
+
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "benchmark_evidence_bundle_digest",
+            side_effect=changed_digest,
+        ):
+            self._assert_code("GATE_D.EVIDENCE_READBACK_MISMATCH")
+        self.assertFalse(self.evidence_path.exists())
+        self.assertEqual(tuple(self.parent.iterdir()), ())
+
+    def test_windows_terminal_fault_is_cleanup_pending(self) -> None:
+        failure = tm_benchmark_gate.PlatformFileError(
+            tm_benchmark_gate.PlatformFileErrorCode.RECOVERY_REQUIRED,
+            retryable=True,
+        )
+        with mock.patch.object(
+            tm_benchmark_gate.PendingPublication,
+            "terminal_reproof",
+            side_effect=failure,
+        ):
+            self._assert_code("GATE_D.CLEANUP_PENDING")
+        self.assertEqual(self.evidence_path.read_bytes(), self.payload)
+
+    def test_windows_implementation_drift_keeps_existing_error_and_removes_final(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            tm_benchmark_gate,
+            "benchmark_implementation_fingerprint",
+            return_value="0" * 64,
+        ):
+            self._assert_code("GATE_D.IMPLEMENTATION_CHANGED")
+        self.assertFalse(self.evidence_path.exists())
+        self.assertEqual(tuple(self.parent.iterdir()), ())
 
 
 class GateDPublicationTests(unittest.TestCase):
