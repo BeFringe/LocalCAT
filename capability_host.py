@@ -79,6 +79,7 @@ _GATE_D_MODULE_NAMES = (
     "tm_benchmark",
     "tm_benchmark_latency",
     "tm_benchmark_oracle",
+    "tm_benchmark_platform_io",
     "tm_benchmark_process",
     "tm_benchmark_query_process",
     "tm_retrieval_capability",
@@ -4111,20 +4112,62 @@ class _RetrievalGateDOwner:
         evaluated_at_utc: datetime,
     ) -> None:
         try:
-            raw_root = tempfile.mkdtemp(
-                prefix="localcat-gate-d-",
-            )
-            work_root = Path(raw_root).resolve(strict=True)
-            os.chmod(work_root, 0o700)
-            mode = work_root.lstat().st_mode
-            if (
-                work_root.resolve(strict=True) != work_root
-                or not stat.S_ISDIR(mode)
-                or stat.S_IMODE(mode) != 0o700
-            ):
-                raise _GateDOperationalError(
-                    "GATE_D.WORK_ROOT_INVALID"
+            if sys.platform == "win32":
+                from platform_fs_contracts import PlatformFileError
+                from tm_benchmark_platform_io import (
+                    create_windows_private_work_root,
                 )
+
+                try:
+                    work_root = create_windows_private_work_root(
+                        "localcat-gate-d-",
+                    )
+                except PlatformFileError as error:
+                    raise _GateDOperationalError(
+                        "GATE_D.WORK_ROOT_UNAVAILABLE"
+                    ) from error
+                except ValueError as error:
+                    raise _GateDOperationalError(
+                        "GATE_D.WORK_ROOT_INVALID"
+                    ) from error
+                from platform_fs import compose_platform_file_backend
+
+                backend = compose_platform_file_backend(work_root)
+                authority = private_evidence = None
+                try:
+                    authority = backend.bind_root(work_root)
+                    private_evidence = backend.prove_private(authority)
+                    authority.reprove()
+                    entries = tuple(work_root.iterdir())
+                    authority.reprove()
+                except (PlatformFileError, OSError) as error:
+                    raise _GateDOperationalError(
+                        "GATE_D.WORK_ROOT_INVALID"
+                    ) from error
+                finally:
+                    if private_evidence is not None:
+                        private_evidence.close()
+                    if authority is not None:
+                        authority.close()
+                if entries:
+                    raise _GateDOperationalError(
+                        "GATE_D.WORK_ROOT_INVALID"
+                    )
+            else:
+                raw_root = tempfile.mkdtemp(
+                    prefix="localcat-gate-d-",
+                )
+                work_root = Path(raw_root).resolve(strict=True)
+                os.chmod(work_root, 0o700)
+                mode = work_root.lstat().st_mode
+                if (
+                    work_root.resolve(strict=True) != work_root
+                    or not stat.S_ISDIR(mode)
+                    or stat.S_IMODE(mode) != 0o700
+                ):
+                    raise _GateDOperationalError(
+                        "GATE_D.WORK_ROOT_INVALID"
+                    )
             evidence_path = work_root / "benchmark_tm_evidence.json"
             if evidence_path.exists():
                 raise _GateDOperationalError(

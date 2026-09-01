@@ -83,6 +83,7 @@ from pathlib import Path
 import platform
 import re
 import sqlite3
+import sys
 import unicodedata
 from typing import Protocol
 from unittest.mock import patch
@@ -101,11 +102,13 @@ from tm_benchmark import (
     recompute_benchmark_inputs,
 )
 from tm_candidate_index import CandidateRetriever
+from tm_benchmark_platform_io import create_new_rooted_file
 from tm_contracts import (
     CANDIDATE_BUDGET_VERSION,
     CANDIDATE_PROOF_QUERY_VERSION,
     CandidateProofMetadata,
     CanonicalResourceIdentity,
+    MigrationReport,
     SCORER_VERSION_V1,
     BenchmarkContract,
     BenchmarkExecutionPath,
@@ -451,15 +454,25 @@ def _generate_fixture(
         raise TypeError("fixture path must be a native pathlib.Path")
     hasher = hashlib.sha256()
     count = 0
+    def lines() -> Iterable[bytes]:
+        nonlocal count
+        for record in records:
+            line = (_canonical_json(_fixture_row(record)) + "\n").encode(
+                "utf-8"
+            )
+            hasher.update(line)
+            count += 1
+            yield line
+
     try:
-        with fixture_path.open("xb") as stream:
-            for record in records:
-                line = (_canonical_json(_fixture_row(record)) + "\n").encode(
-                    "utf-8"
-                )
-                stream.write(line)
-                hasher.update(line)
-                count += 1
+        if sys.platform == "win32":
+            published = create_new_rooted_file(fixture_path, lines())
+            if published.content_sha256.hex() != hasher.hexdigest():
+                raise ValueError("fixture publication facts drifted")
+        else:
+            with fixture_path.open("xb") as stream:
+                for line in lines():
+                    stream.write(line)
     except FileExistsError as error:
         raise ValueError(
             "run root is not closed: fixture already exists"
@@ -763,7 +776,7 @@ def _build_oracle_store(
 
     identity = CanonicalResourceIdentity.from_configured_jsonl(
         resource_id,
-        fixture_path.resolve(),
+        fixture_path if sys.platform == "win32" else fixture_path.resolve(),
     )
     coordinator = ResourceStoreCoordinator(
         canonical_store_id=canonical_store_id,
@@ -772,32 +785,26 @@ def _build_oracle_store(
     service = TMMigrationService(
         resource_identity=identity,
         canonical_store_id=canonical_store_id,
+        coordinator=coordinator,
     )
-    build = service.build_mutable_stage(fixture_path)
-    stage = build.mutable_stage
-    if stage is None:
-        raise RuntimeError("oracle stage build produced no mutable stage")
-    if build.reused_completed_revision is not None:
-        raise RuntimeError("oracle stage unexpectedly reused a revision")
-    if build.preflight.invalid_count != 0:
-        raise RuntimeError("oracle stage preflight reported invalid rows")
-    if build.preflight.valid_count < 1:
-        raise RuntimeError("oracle stage preflight reported no valid rows")
-    sealed = coordinator._seal_stage(
-        stage,
-        canonical_store_id=canonical_store_id,
-        expected_prior_generation=None,
-    )
-    if not sealed.evidence.integrity_ok:
-        raise RuntimeError("oracle stage seal integrity failed")
-    prepared = coordinator.activate(sealed)
-    journal = coordinator.publish_prepared_activation(prepared)
-    coordinator.publish_activation(prepared, journal)
+    outcome = service.activate_initial(fixture_path, resource_id)
+    if type(outcome) is not MigrationReport:
+        raise RuntimeError("oracle initial activation failed")
+    if outcome.migrated_count < 1 or outcome.activated_generation != 0:
+        raise RuntimeError("oracle activation facts are invalid")
     fresh = ResourceStoreCoordinator(
         canonical_store_id=canonical_store_id,
         resource_identity=identity,
     )
-    report = fresh.rehydrate_runtime_authority()
+    if sys.platform == "win32":
+        fresh_service = TMMigrationService(
+            resource_identity=identity,
+            canonical_store_id=canonical_store_id,
+            coordinator=fresh,
+        )
+        report = fresh_service.rehydrate_completed_portable_activation()
+    else:
+        report = fresh.rehydrate_runtime_authority()
     if report is None:
         raise RuntimeError("oracle store rehydration failed")
     store = SQLiteTMStore.from_coordinator(fresh)
@@ -838,7 +845,8 @@ def _run_candidate_path(
     fixture_digest, fixture_count = _generate_fixture(fixture_path, records)
     if fixture_count != len(records):
         raise ValueError("fixture record count mismatch")
-    fixture_path = fixture_path.resolve()
+    if sys.platform != "win32":
+        fixture_path = fixture_path.resolve()
 
     expected_index_kind = expected_store_index_kind(execution_path)
     force_fallback = execution_path is BenchmarkExecutionPath.GRAM_FALLBACK
@@ -2048,7 +2056,11 @@ def run_oracle_recall_suite(
     ):
         if type(root) is not _NATIVE_PATH_TYPE:
             raise TypeError(f"{label} must be a native pathlib.Path")
-    if fts5_run_root.resolve() == fallback_run_root.resolve():
+    if (
+        fts5_run_root == fallback_run_root
+        if sys.platform == "win32"
+        else fts5_run_root.resolve() == fallback_run_root.resolve()
+    ):
         raise ValueError("oracle path run roots must be distinct")
     implementation_fingerprint = benchmark_implementation_fingerprint()
     records = tuple(
