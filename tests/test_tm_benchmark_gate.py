@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 from datetime import datetime, timezone
 import tempfile
@@ -1654,17 +1655,42 @@ class GateDRunnerTests(unittest.TestCase):
 
     def test_runner_refuses_symlink_final_and_preserves_target(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
-        target = evidence_path.parent / "foreign-target.txt"
-        target.write_text("target-content", encoding="utf-8")
-        evidence_path.symlink_to(target)
+        if sys.platform == "win32":
+            target = evidence_path.parent / "foreign-target-dir"
+            target.mkdir()
+            marker = target / "marker.txt"
+            marker.write_text("target-content", encoding="utf-8")
+            created = subprocess.run(
+                [
+                    "cmd.exe",
+                    "/d",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(evidence_path),
+                    str(target),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+        else:
+            target = evidence_path.parent / "foreign-target.txt"
+            target.write_text("target-content", encoding="utf-8")
+            evidence_path.symlink_to(target)
         with self.assertRaises(BenchmarkGateDError) as ctx:
             self._run(work_root, evidence_path)
         self.assertEqual(ctx.exception.error_code, "GATE_D.EVIDENCE_EXISTS")
-        self.assertTrue(evidence_path.is_symlink())
-        self.assertEqual(
-            target.read_text(encoding="utf-8"),
-            "target-content",
-        )
+        if sys.platform == "win32":
+            self.assertTrue(evidence_path.is_junction())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "target-content")
+        else:
+            self.assertTrue(evidence_path.is_symlink())
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "target-content",
+            )
         self._assert_clean_work_root(work_root)
 
     @unittest.skipIf(sys.platform == "win32", "POSIX evidence publisher fault seam")
@@ -1820,7 +1846,24 @@ class GateDRunnerTests(unittest.TestCase):
         def sabotage(record: dict[str, list[object]]) -> None:
             root = Path(str(record["oracle_roots"][1]))
             os.rmdir(root)
-            os.symlink(target_dir, root)
+            if sys.platform == "win32":
+                created = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(root),
+                        str(target_dir),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+            else:
+                os.symlink(target_dir, root)
 
         ports, record = _runner_ports(combine_side_effect=sabotage)
         with self.assertRaises(BenchmarkGateDError) as ctx:
@@ -1835,7 +1878,10 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertEqual(ctx.exception.error_code, "GATE_D.CLEANUP_PENDING")
         self.assertTrue(evidence_path.is_file())
         replaced = Path(str(record["oracle_roots"][1]))
-        self.assertTrue(replaced.is_symlink())
+        if sys.platform == "win32":
+            self.assertTrue(replaced.is_junction())
+        else:
+            self.assertTrue(replaced.is_symlink())
         self.assertEqual(
             (target_dir / "marker.txt").read_text(encoding="utf-8"),
             "foreign",
