@@ -72,6 +72,10 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_snapshot_recovery import (
+    _BoundRefreshHandoffFacts,
+    BoundConfiguredArtifactExpectation,
+    BoundConfiguredPairFacts,
+    IssuedReceiptFacts,
     IssuedReceiptRecovery,
     RecoveryError,
     RefreshRecoveryOutcome,
@@ -122,6 +126,7 @@ from platform_fs_contracts import (
     CandidateContentFacts,
     CandidateFile,
     EntrySnapshot,
+    ExistingCandidateRecovery,
     ExistingFileRetirement,
     ExistingFileMutationGuard,
     FileObjectIdentity,
@@ -136,6 +141,7 @@ from platform_fs_contracts import (
     PublishFacts,
     PublishMode,
     LockedDescendantNamespaceInspection,
+    LedgerEnumerationLimits,
     RetainedRetirement,
     RetirementDirectoryAuthority,
     RootedDirectoryAuthority,
@@ -1877,6 +1883,682 @@ def _export_error_code(error: Exception) -> str:
 def _export_retryable(error: Exception) -> bool:
     retryable = getattr(error, "retryable", None)
     return retryable if type(retryable) is bool else False
+
+
+_BOUND_REFRESH_RETIREMENT_ROOT = ".localcat-snapshot-refresh-retirement-v1"
+
+
+def _before_bound_refresh_retire_role(snapshot_id: str, role: str) -> None:
+    del snapshot_id, role
+
+
+def _after_bound_refresh_retire_role(snapshot_id: str, role: str) -> None:
+    del snapshot_id, role
+
+
+def _after_bound_refresh_terminal_cleanup(snapshot_id: str) -> None:
+    del snapshot_id
+
+
+class _BoundConfiguredRefreshRecoveryFamily:
+    """Live Windows family authority retained under one W1 reservation."""
+
+    def __init__(
+        self,
+        *,
+        reservation: _InitialActivationResourceReservation,
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        sidecar_guard: BoundExistingFileMutationGuard,
+        identity: CanonicalResourceIdentity,
+        canonical_store_id: str,
+        generation: int,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        existing_retirement: ExistingFileRetirement,
+        existing_candidate_recovery: ExistingCandidateRecovery,
+    ) -> None:
+        self._reservation = reservation
+        self._backend = backend
+        self._root = root
+        self._lease = lease
+        self._sidecar_guard = sidecar_guard
+        self._identity = identity
+        self._canonical_store_id = canonical_store_id
+        self._generation = generation
+        self._descendant_inspection = descendant_inspection
+        self._existing_retirement = existing_retirement
+        self._existing_candidate_recovery = existing_candidate_recovery
+        self._reconstructed: PendingPublication | None = None
+
+    def _normalize(self, error: Exception, code: str) -> RecoveryError:
+        retryable = getattr(error, "retryable", False)
+        return RecoveryError(code, retryable=bool(retryable))
+
+    def reprove_owner(self) -> None:
+        try:
+            self._reservation.reprove_bound_refresh_owner(
+                self._canonical_store_id, self._generation
+            )
+            self._sidecar_guard.reprove()
+            self._lease.reprove()
+            self._root.reprove()
+        except (
+            _InitialActivationReservationError,
+            ActivationPreparationError,
+            PlatformFileError,
+            OSError,
+        ) as error:
+            raise self._normalize(error, "RECOVERY.OWNER_UNPROVEN") from error
+
+    def _capture_member(
+        self, name: str
+    ) -> tuple[str, str | None, int | None]:
+        authority: BoundRegularFile | None = None
+        try:
+            snapshot = self._root.inspect_entry(name)
+            if snapshot is None:
+                return "absent", None, None
+            if (
+                snapshot.identity.kind != "regular"
+                or snapshot.identity.link_count != 1
+                or not snapshot.reparse_free
+            ):
+                return "unsafe", None, None
+            authority = self._backend.open_regular(self._root, PurePath(name))
+            facts = authority.content_facts()
+            if facts.snapshot != snapshot or self._root.inspect_entry(name) != snapshot:
+                return "unsafe", None, None
+            return (
+                "present",
+                facts.content_sha256.hex(),
+                facts.snapshot.byte_count,
+            )
+        except PlatformFileError as error:
+            if error.code in {
+                PlatformFileErrorCode.REPARSE_REJECTED.value,
+                PlatformFileErrorCode.IDENTITY_STALE.value,
+                PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+            }:
+                return "unsafe", None, None
+            raise self._normalize(error, "RECOVERY.PAIR_UNOBSERVABLE") from error
+        finally:
+            _close_bound_export_authorities(authority)
+
+    def capture_pair(self) -> BoundConfiguredPairFacts:
+        self.reprove_owner()
+        jsonl = self._capture_member(self._identity.configured_jsonl_path.name)
+        manifest = self._capture_member(self._identity.snapshot_manifest_path.name)
+        self.reprove_owner()
+        return BoundConfiguredPairFacts(
+            jsonl_state=jsonl[0],
+            jsonl_digest=jsonl[1],
+            jsonl_size=jsonl[2],
+            manifest_state=manifest[0],
+            manifest_digest=manifest[1],
+            manifest_size=manifest[2],
+        )
+
+    def internal_artifacts_absent(self) -> bool:
+        """Prove that no deterministic unjournaled refresh member remains."""
+
+        paths = _export_artifact_paths(
+            self._identity.configured_jsonl_path
+        )
+        self.reprove_owner()
+        states = tuple(
+            self._capture_member(path.name)[0]
+            for path in (
+                paths.jsonl_temp,
+                paths.manifest_temp,
+                paths.jsonl_recovery,
+                paths.manifest_recovery,
+            )
+        )
+        self.reprove_owner()
+        return all(state == "absent" for state in states)
+
+    def reprove_pair_for_receipt(self, receipt: SnapshotReceipt) -> None:
+        pair = self.capture_pair()
+        manifest = SnapshotManifest(
+            manifest_version=SNAPSHOT_MANIFEST_VERSION,
+            snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+            receipt=receipt,
+            receipt_digest=snapshot_receipt_digest(receipt),
+        )
+        if (
+            pair.jsonl_state != "present"
+            or pair.jsonl_digest != receipt.jsonl_digest
+            or pair.manifest_state != "present"
+            or pair.manifest_digest
+            != hashlib.sha256(contract_to_json(manifest).encode("utf-8")).hexdigest()
+        ):
+            raise RecoveryError("RECOVERY.PAIR_CHANGED", retryable=True)
+
+    def reprove_pair_for_cancel(self, binding: SnapshotBinding) -> None:
+        pair = self.capture_pair()
+        if (
+            pair.jsonl_state != "present"
+            or pair.jsonl_digest != binding.receipt.jsonl_digest
+            or pair.manifest_state != "present"
+            or pair.manifest_digest
+            != hashlib.sha256(
+                contract_to_json(binding.manifest).encode("utf-8")
+            ).hexdigest()
+        ):
+            raise RecoveryError("RECOVERY.PAIR_CHANGED", retryable=True)
+
+    @staticmethod
+    def _retirement_leaf(receipt: SnapshotReceipt) -> str:
+        return snapshot_receipt_digest(receipt)
+
+    def _terminal_artifact_scope(
+        self,
+        receipt: IssuedReceiptFacts,
+        expectations: tuple[BoundConfiguredArtifactExpectation, ...],
+    ) -> tuple[str, frozenset[str]]:
+        if type(receipt) is not IssuedReceiptFacts:
+            raise TypeError("receipt must be exact IssuedReceiptFacts")
+        expected_paths = _export_artifact_paths(
+            self._identity.configured_jsonl_path
+        )
+        expected_role_names = {
+            "jsonl_temp": expected_paths.jsonl_temp.name,
+            "manifest_temp": expected_paths.manifest_temp.name,
+            "jsonl_recovery": expected_paths.jsonl_recovery.name,
+            "manifest_recovery": expected_paths.manifest_recovery.name,
+        }
+        if (
+            type(expectations) is not tuple
+            or len(expectations) != len(expected_role_names)
+            or any(
+                type(item) is not BoundConfiguredArtifactExpectation
+                for item in expectations
+            )
+            or {item.role for item in expectations} != set(expected_role_names)
+            or {item.source_name for item in expectations}
+            != set(expected_role_names.values())
+            or any(
+                item.source_name != expected_role_names[item.role]
+                for item in expectations
+            )
+        ):
+            raise RecoveryError("RECOVERY.ARTIFACT_SCOPE_INVALID", retryable=False)
+        return (
+            self._retirement_leaf(receipt.receipt),
+            frozenset(item.source_name for item in expectations),
+        )
+
+    def _capture_relative_content(
+        self, relative: PurePath
+    ) -> CandidateContentFacts | None:
+        authority: BoundRegularFile | None = None
+        try:
+            authority = self._backend.open_regular(self._root, relative)
+            facts = authority.content_facts()
+            return CandidateContentFacts(
+                facts.snapshot.byte_count, facts.content_sha256
+            )
+        except PlatformFileError as error:
+            if error.code == PlatformFileErrorCode.ENTRY_UNAVAILABLE.value:
+                return None
+            raise
+        finally:
+            _close_bound_export_authorities(authority)
+
+    def _capture_retirement_member(
+        self,
+        observer: BoundDirectoryAuthority,
+        relative: PurePath,
+        name: str,
+    ) -> tuple[str, str | None]:
+        authority: BoundRegularFile | None = None
+        try:
+            snapshot = observer.inspect_entry(name)
+            if snapshot is None:
+                return "absent", None
+            if (
+                snapshot.identity.kind != "regular"
+                or snapshot.identity.link_count != 1
+                or not snapshot.reparse_free
+            ):
+                return "unsafe", None
+            authority = self._backend.open_regular(self._root, relative)
+            content = authority.content_facts()
+            if (
+                content.snapshot != snapshot
+                or observer.inspect_entry(name) != snapshot
+            ):
+                return "unsafe", None
+            return "present", content.content_sha256.hex()
+        except PlatformFileError as error:
+            if error.code in {
+                PlatformFileErrorCode.REPARSE_REJECTED.value,
+                PlatformFileErrorCode.IDENTITY_STALE.value,
+                PlatformFileErrorCode.ENTRY_UNAVAILABLE.value,
+            }:
+                return "unsafe", None
+            raise
+        finally:
+            _close_bound_export_authorities(authority)
+
+    def preflight_terminal_artifacts(
+        self,
+        facts: object,
+        receipt: IssuedReceiptFacts,
+        expectations: tuple[BoundConfiguredArtifactExpectation, ...],
+    ) -> None:
+        """Prove the receipt-scoped source/retirement closure without mutation."""
+
+        del facts
+        leaf_name, allowed_names = self._terminal_artifact_scope(
+            receipt, expectations
+        )
+        retirement_root = None
+        observer = None
+        leaf_snapshot = None
+        try:
+            self.reprove_owner()
+            root_snapshot = self._root.inspect_entry(
+                _BOUND_REFRESH_RETIREMENT_ROOT
+            )
+            leaf_present = False
+            if root_snapshot is not None:
+                if (
+                    root_snapshot.identity.kind != "directory"
+                    or not root_snapshot.reparse_free
+                ):
+                    raise RecoveryError(
+                        "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                    )
+                retirement_root = self._backend.bind_parent(
+                    self._root,
+                    PurePath(_BOUND_REFRESH_RETIREMENT_ROOT, "member"),
+                )
+                leaf_snapshot = retirement_root.inspect_entry(leaf_name)
+                if leaf_snapshot is not None:
+                    if (
+                        leaf_snapshot.identity.kind != "directory"
+                        or not leaf_snapshot.reparse_free
+                    ):
+                        raise RecoveryError(
+                            "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                        )
+                    observer = self._backend.bind_parent(
+                        self._root,
+                        PurePath(
+                            _BOUND_REFRESH_RETIREMENT_ROOT,
+                            leaf_name,
+                            "member",
+                        ),
+                    )
+                    observed = (
+                        self._descendant_inspection.observe_descendant_entries(
+                            self._root,
+                            self._lease,
+                            observer,
+                            LedgerEnumerationLimits(
+                                maximum_entries=4,
+                                maximum_name_bytes=max(
+                                    len(name.encode("utf-8"))
+                                    for name in allowed_names
+                                ),
+                                maximum_total_bytes=(1 << 63) - 1,
+                            ),
+                        )
+                    )
+                    if any(item.name not in allowed_names for item in observed):
+                        raise RecoveryError(
+                            "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                        )
+                    leaf_present = True
+
+            for expectation in expectations:
+                source_state, source_digest, _source_size = self._capture_member(
+                    expectation.source_name
+                )
+                target_state = "absent"
+                target_digest = None
+                if leaf_present:
+                    assert observer is not None
+                    target_state, target_digest = (
+                        self._capture_retirement_member(
+                            observer,
+                            PurePath(
+                                _BOUND_REFRESH_RETIREMENT_ROOT,
+                                leaf_name,
+                                expectation.source_name,
+                            ),
+                            expectation.source_name,
+                        )
+                    )
+                if (
+                    source_state == "unsafe"
+                    or target_state == "unsafe"
+                    or (
+                        source_state == "present"
+                        and target_state == "present"
+                    )
+                    or (
+                        source_state == "present"
+                        and source_digest != expectation.expected_digest
+                    )
+                    or (
+                        target_state == "present"
+                        and target_digest != expectation.expected_digest
+                    )
+                ):
+                    raise RecoveryError(
+                        "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                    )
+            def reprove_scope() -> None:
+                current_root = self._root.inspect_entry(
+                    _BOUND_REFRESH_RETIREMENT_ROOT
+                )
+                if root_snapshot is None:
+                    if current_root is not None:
+                        raise RecoveryError(
+                            "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                        )
+                    return
+                assert retirement_root is not None
+                retirement_root.reprove()
+                if current_root != root_snapshot:
+                    raise RecoveryError(
+                        "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                    )
+                current_leaf = retirement_root.inspect_entry(leaf_name)
+                if current_leaf != leaf_snapshot:
+                    raise RecoveryError(
+                        "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                    )
+                if observer is not None:
+                    observer.reprove()
+
+            reprove_scope()
+            self.reprove_owner()
+            reprove_scope()
+        except RecoveryError:
+            raise
+        except (PlatformFileError, OSError) as error:
+            raise self._normalize(error, "RECOVERY.ARTIFACT_UNPROVEN") from error
+        finally:
+            _close_bound_export_authorities(observer, retirement_root)
+
+    def _retire_role(
+        self,
+        *,
+        snapshot_id: str,
+        expectation: BoundConfiguredArtifactExpectation,
+        leaf: RetirementDirectoryAuthority,
+        leaf_name: str,
+    ) -> None:
+        expected_digest = expectation.expected_digest
+        source_snapshot = self._root.inspect_entry(expectation.source_name)
+        target_snapshot = leaf.inspect_entry(expectation.source_name)
+        if source_snapshot is not None and target_snapshot is not None:
+            raise RecoveryError("RECOVERY.ARTIFACT_CONFLICT", retryable=False)
+        if source_snapshot is None and target_snapshot is None:
+            return
+        _before_bound_refresh_retire_role(snapshot_id, expectation.role)
+        retained: RetainedRetirement | None = None
+        source_parent = None
+        source = None
+        try:
+            if source_snapshot is not None:
+                content = self._capture_relative_content(
+                    PurePath(expectation.source_name)
+                )
+                if (
+                    content is None
+                    or content.content_sha256.hex() != expected_digest
+                ):
+                    raise RecoveryError(
+                        "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                    )
+                source_parent = (
+                    self._existing_retirement
+                    .bind_retirement_source_directory(
+                        self._root, PurePath(expectation.source_name)
+                    )
+                )
+                source = self._existing_retirement.open_existing_retirement_source(
+                    source_parent, content
+                )
+                retained = self._existing_retirement.retire_existing_exclusive(
+                    source_parent,
+                    source,
+                    leaf,
+                    expectation.source_name,
+                )
+                source = None
+            else:
+                content = self._capture_relative_content(
+                    PurePath(
+                        _BOUND_REFRESH_RETIREMENT_ROOT,
+                        leaf_name,
+                        expectation.source_name,
+                    )
+                )
+                if (
+                    content is None
+                    or content.content_sha256.hex() != expected_digest
+                ):
+                    raise RecoveryError(
+                        "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                    )
+                source_parent = self._backend.bind_parent(
+                    self._root,
+                    PurePath(expectation.source_name),
+                )
+                retained = self._existing_retirement.rebind_existing_retirement(
+                    source_parent,
+                    expectation.source_name,
+                    leaf,
+                    expectation.source_name,
+                    content,
+                )
+            retained.reprove()
+            if self._root.inspect_entry(expectation.source_name) is not None:
+                raise RecoveryError(
+                    "RECOVERY.ARTIFACT_RETIRE_FAILED", retryable=True
+                )
+            _after_bound_refresh_retire_role(snapshot_id, expectation.role)
+        except RecoveryError:
+            raise
+        except (PlatformFileError, OSError) as error:
+            raise self._normalize(
+                error,
+                "RECOVERY.ARTIFACT_RETIRE_FAILED",
+            ) from error
+        finally:
+            _close_bound_export_authorities(retained, source, source_parent)
+
+    def retire_terminal_artifacts(
+        self,
+        facts: object,
+        receipt: IssuedReceiptFacts,
+        expectations: tuple[BoundConfiguredArtifactExpectation, ...],
+    ) -> None:
+        del facts
+        snapshot_id = receipt.snapshot_id
+        leaf_name, allowed_names = self._terminal_artifact_scope(
+            receipt, expectations
+        )
+        self.reprove_owner()
+        retirement_root = None
+        leaf = None
+        observer = None
+        try:
+            retirement_root = self._backend.bind_or_create_child_directory(
+                self._root, _BOUND_REFRESH_RETIREMENT_ROOT
+            )
+            leaf = self._backend.bind_or_create_child_directory(
+                retirement_root, leaf_name
+            )
+            observer = self._backend.bind_parent(
+                self._root,
+                PurePath(
+                    _BOUND_REFRESH_RETIREMENT_ROOT,
+                    leaf_name,
+                    "member",
+                ),
+            )
+            limits = LedgerEnumerationLimits(
+                maximum_entries=4,
+                maximum_name_bytes=max(
+                    len(name.encode("utf-8")) for name in allowed_names
+                ),
+                maximum_total_bytes=(1 << 63) - 1,
+            )
+            observed = self._descendant_inspection.observe_descendant_entries(
+                self._root, self._lease, observer, limits
+            )
+            if any(item.name not in allowed_names for item in observed):
+                raise RecoveryError(
+                    "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                )
+            observer.close()
+            observer = None
+            for expectation in expectations:
+                self.reprove_owner()
+                self._retire_role(
+                    snapshot_id=snapshot_id,
+                    expectation=expectation,
+                    leaf=leaf,
+                    leaf_name=leaf_name,
+                )
+            observer = self._backend.bind_parent(
+                self._root,
+                PurePath(
+                    _BOUND_REFRESH_RETIREMENT_ROOT,
+                    leaf_name,
+                    "member",
+                ),
+            )
+            observed = self._descendant_inspection.observe_descendant_entries(
+                self._root, self._lease, observer, limits
+            )
+            if any(item.name not in allowed_names for item in observed):
+                raise RecoveryError(
+                    "RECOVERY.ARTIFACT_CONFLICT", retryable=False
+                )
+            self.reprove_owner()
+            _after_bound_refresh_terminal_cleanup(snapshot_id)
+        except RecoveryError:
+            raise
+        except (PlatformFileError, OSError) as error:
+            raise self._normalize(error, "RECOVERY.ARTIFACT_UNPROVEN") from error
+        finally:
+            _close_bound_export_authorities(observer, leaf, retirement_root)
+
+    def reconstruct_manifest(self, receipt: SnapshotReceipt) -> None:
+        manifest = SnapshotManifest(
+            manifest_version=SNAPSHOT_MANIFEST_VERSION,
+            snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+            receipt=receipt,
+            receipt_digest=snapshot_receipt_digest(receipt),
+        )
+        payload = contract_to_json(manifest).encode("utf-8")
+        paths = _export_artifact_paths(self._identity.configured_jsonl_path)
+        current = self.capture_pair()
+        prior = _BoundExportPrior(
+            self._root.inspect_entry(paths.manifest.name),
+            current.manifest_digest,
+        )
+        expected_content = CandidateContentFacts(
+            len(payload),
+            hashlib.sha256(payload).digest(),
+        )
+        existing_temp = self._root.inspect_entry(paths.manifest_temp.name)
+        leaf_name = self._retirement_leaf(receipt)
+        retirement_root: RetirementDirectoryAuthority | None = None
+        leaf: RetirementDirectoryAuthority | None = None
+        try:
+            retirement_root = self._backend.bind_or_create_child_directory(
+                self._root, _BOUND_REFRESH_RETIREMENT_ROOT
+            )
+            leaf = self._backend.bind_or_create_child_directory(
+                retirement_root, leaf_name
+            )
+            existing_retirement = leaf.inspect_entry(paths.manifest_temp.name)
+            if existing_temp is not None or existing_retirement is not None:
+                candidate = (
+                    self._existing_candidate_recovery.recover_existing_candidate(
+                        self._root,
+                        paths.manifest_temp.name,
+                        leaf,
+                        paths.manifest_temp.name,
+                        expected_content,
+                        owner_lease=self._lease,
+                        mutation_guard=self._sidecar_guard,
+                    )
+                )
+                content = expected_content
+                candidate_identity = candidate.identity()
+            else:
+                candidate, content, candidate_identity = _bound_candidate_from_chunks(
+                    self._root,
+                    paths.manifest_temp.name,
+                    _bound_export_chunks(payload),
+                    maximum_bytes=len(payload),
+                )
+        finally:
+            _close_bound_export_authorities(leaf, retirement_root)
+        publication = _BoundExportPublication(
+            name=paths.manifest.name,
+            candidate_name=paths.manifest_temp.name,
+            content=content,
+            candidate_identity=candidate_identity,
+            candidate=candidate,
+        )
+        self._reconstructed = _bound_publish_candidate(
+            self._root, self._lease, publication, prior
+        )
+        self.reprove_pair_for_receipt(receipt)
+        if (
+            self._reconstructed.terminal_reproof()
+            != self._reconstructed.preliminary_facts()
+        ):
+            raise RecoveryError(
+                "RECOVERY.MANIFEST_PUBLISH_FAILED", retryable=True
+            )
+
+    def finalize_reconstructed_manifest(self) -> None:
+        pending = self._reconstructed
+        if pending is None:
+            return
+        active_error: BaseException | None = None
+        try:
+            if pending.terminal_reproof() != pending.preliminary_facts():
+                raise RecoveryError(
+                    "RECOVERY.TERMINAL_REPROOF_FAILED", retryable=True
+                )
+        except BaseException as error:
+            active_error = error
+        close_error = _close_bound_export_authorities(pending)
+        if close_error is None:
+            self._reconstructed = None
+        if active_error is not None:
+            if isinstance(active_error, (PlatformFileError, OSError)):
+                raise self._normalize(
+                    active_error, "RECOVERY.TERMINAL_REPROOF_FAILED"
+                ) from active_error
+            raise active_error
+        if close_error is not None:
+            if isinstance(close_error, (PlatformFileError, OSError)):
+                raise self._normalize(
+                    close_error, "RECOVERY.AUTHORITY_CLOSE_FAILED"
+                ) from close_error
+            raise close_error
+
+    def close(self) -> None:
+        error = _close_bound_export_authorities(self._reconstructed)
+        self._reconstructed = None
+        if error is not None:
+            if isinstance(error, (PlatformFileError, OSError)):
+                raise self._normalize(error, "RECOVERY.AUTHORITY_CLOSE_FAILED")
+            raise error
 
 
 class TMMigrationService:
@@ -3645,6 +4327,79 @@ class TMMigrationService:
                 destination_observed=None,
             )
 
+    def _acquire_bound_refresh_sidecar_guard(
+        self,
+        *,
+        reservation: _InitialActivationResourceReservation,
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+    ) -> BoundExistingFileMutationGuard:
+        if not isinstance(backend, ExistingFileMutationGuard):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+        deadline = time.monotonic() + _BOUND_REFRESH_GUARD_RETRY_SECONDS
+        while True:
+            reservation.reprove()
+            try:
+                guard = backend.guard_existing_for_mutation(
+                    root,
+                    PurePath(
+                        self._resource_identity.canonical_sidecar_path.name
+                    ),
+                )
+                guard.reprove()
+                return guard
+            except PlatformFileError as error:
+                if (
+                    error.code
+                    != PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+                time.sleep(0.05)
+
+    def _compose_bound_refresh_recovery_family(
+        self,
+        *,
+        reservation: _InitialActivationResourceReservation,
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        sidecar_guard: BoundExistingFileMutationGuard,
+        generation: int,
+    ) -> _BoundConfiguredRefreshRecoveryFamily:
+        probe_root = self._resource_identity.canonical_sidecar_path.parent
+        descendant = narrow_windows_locked_descendant_namespace_inspection(
+            backend, probe_root
+        )
+        retirement = narrow_windows_existing_file_retirement(
+            backend, probe_root
+        )
+        if not (
+            isinstance(descendant, LockedDescendantNamespaceInspection)
+            and isinstance(retirement, ExistingFileRetirement)
+            and isinstance(retirement, ExistingCandidateRecovery)
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+        return _BoundConfiguredRefreshRecoveryFamily(
+            reservation=reservation,
+            backend=backend,
+            root=root,
+            lease=lease,
+            sidecar_guard=sidecar_guard,
+            identity=self._resource_identity,
+            canonical_store_id=self._canonical_store_id,
+            generation=generation,
+            descendant_inspection=descendant,
+            existing_retirement=retirement,
+            existing_candidate_recovery=retirement,
+        )
+
     def _run_bound_configured_refresh(
         self,
         store: SQLiteTMStore,
@@ -3657,7 +4412,9 @@ class TMMigrationService:
         manifest_prior = _BoundExportPrior(None, None)
         reservation: _InitialActivationResourceReservation | None = None
         sidecar_guard: BoundExistingFileMutationGuard | None = None
+        recovery_family: _BoundConfiguredRefreshRecoveryFamily | None = None
         outcome: ExportOutcome | None = None
+        prior_binding: SnapshotBinding | None = None
         try:
             # W1 is deliberately acquired before the in-process configured
             # refresh reservation.  Replacement/recovery paths use this same
@@ -3696,36 +4453,11 @@ class TMMigrationService:
                         self._canonical_store_id,
                         owner_revision.generation,
                     )
-                    if not isinstance(backend, ExistingFileMutationGuard):
-                        raise ActivationPreparationError(
-                            "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
-                            retryable=False,
-                        )
-                    guard_deadline = (
-                        time.monotonic()
-                        + _BOUND_REFRESH_GUARD_RETRY_SECONDS
+                    sidecar_guard = self._acquire_bound_refresh_sidecar_guard(
+                        reservation=reservation,
+                        backend=backend,
+                        root=root,
                     )
-                    while True:
-                        reservation.reprove()
-                        try:
-                            sidecar_guard = (
-                                backend.guard_existing_for_mutation(
-                                    root,
-                                    PurePath(
-                                        identity.canonical_sidecar_path.name
-                                    ),
-                                )
-                            )
-                            break
-                        except PlatformFileError as error:
-                            if (
-                                error.code
-                                != PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value
-                                or time.monotonic() >= guard_deadline
-                            ):
-                                raise
-                            time.sleep(0.05)
-                    sidecar_guard.reprove()
 
                     def reprove_refresh_owner() -> None:
                         try:
@@ -3785,6 +4517,7 @@ class TMMigrationService:
                         raise
 
                     def bound_prior_matches(binding: SnapshotBinding) -> bool:
+                        nonlocal prior_binding
                         if (
                             binding.configured_jsonl_path
                             != paths.destination
@@ -3798,10 +4531,13 @@ class TMMigrationService:
                         manifest_bytes = contract_to_json(
                             binding.manifest
                         ).encode("utf-8")
-                        return (
+                        matches = (
                             manifest_prior.digest
                             == hashlib.sha256(manifest_bytes).hexdigest()
                         )
+                        if matches:
+                            prior_binding = binding
+                        return matches
 
                     try:
                         observation = store.validate_bound_refresh_preflight(
@@ -3826,6 +4562,10 @@ class TMMigrationService:
                         raise ExportPreflightError(
                             "REFRESH.STORE_IDENTITY_MISMATCH"
                         )
+                    if prior_binding is None:
+                        raise ExportPreflightError(
+                            "REFRESH.SOURCE_DIVERGED"
+                        )
                     for artifact, code in (
                         (paths.jsonl_temp, "REFRESH.TEMP_CONFLICT"),
                         (paths.manifest_temp, "REFRESH.TEMP_CONFLICT"),
@@ -3846,6 +4586,61 @@ class TMMigrationService:
                         raise ExportPreflightError(
                             "REFRESH.STORE_IDENTITY_MISMATCH"
                         )
+
+                    recovery_family = (
+                        self._compose_bound_refresh_recovery_family(
+                            reservation=reservation,
+                            backend=backend,
+                            root=root,
+                            lease=lease,
+                            sidecar_guard=sidecar_guard,
+                            generation=owner_revision.generation,
+                        )
+                    )
+
+                    def register_bound_receipt(
+                        receipt: SnapshotReceipt,
+                    ) -> None:
+                        assert prior_binding is not None
+                        prior_manifest_digest = hashlib.sha256(
+                            contract_to_json(
+                                prior_binding.manifest
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        new_manifest = SnapshotManifest(
+                            manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                            snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                            receipt=receipt,
+                            receipt_digest=snapshot_receipt_digest(receipt),
+                        )
+                        store.register_issued_refresh_receipt(
+                            receipt,
+                            expected_generation=(
+                                snapshot.revision.generation
+                            ),
+                            bound_handoff=_BoundRefreshHandoffFacts(
+                                snapshot_id=receipt.snapshot_id,
+                                prior_snapshot_id=(
+                                    prior_binding.receipt.snapshot_id
+                                ),
+                                prior_snapshot_kind=(
+                                    prior_binding.manifest.snapshot_kind.value
+                                ),
+                                prior_jsonl_digest=(
+                                    prior_binding.receipt.jsonl_digest
+                                ),
+                                prior_manifest_digest=(
+                                    prior_manifest_digest
+                                ),
+                                new_jsonl_digest=receipt.jsonl_digest,
+                                new_manifest_digest=hashlib.sha256(
+                                    contract_to_json(new_manifest).encode(
+                                        "utf-8"
+                                    )
+                                ).hexdigest(),
+                            ),
+                        )
+
                     outcome = self._publish_bound_export_snapshot(
                         store,
                         backend=backend,
@@ -3860,14 +4655,7 @@ class TMMigrationService:
                         stage_prefix="REFRESH",
                         lock_name=lock_name,
                         lock_payload=lock_payload,
-                        register_receipt=lambda receipt: (
-                            store.register_issued_refresh_receipt(
-                                receipt,
-                                expected_generation=(
-                                    snapshot.revision.generation
-                                ),
-                            )
-                        ),
+                        register_receipt=register_bound_receipt,
                         complete_receipt=lambda receipt, reprove: (
                             store.complete_bound_issued_refresh_receipt(
                                 receipt.snapshot_id,
@@ -3896,6 +4684,17 @@ class TMMigrationService:
                         ),
                         owner_reprove=reprove_refresh_owner,
                     )
+                    recovery_outcome = store.recover_bound_configured_refresh(
+                        recovery_family
+                    )
+                    if recovery_outcome.state in {
+                        RefreshRecoveryState.BLOCKED,
+                        RefreshRecoveryState.DIVERGED,
+                    }:
+                        raise ExportPreflightError(
+                            recovery_outcome.error_code
+                            or "REFRESH.RECOVERY_REQUIRED"
+                        )
                     if isinstance(outcome, ExportReport) or (
                         isinstance(outcome, ExportFailure)
                         and outcome.publication_committed
@@ -3914,8 +4713,10 @@ class TMMigrationService:
                                 "REFRESH.STORE_IDENTITY_MISMATCH"
                             )
                 guard_close_error = _close_bound_export_authorities(
+                    recovery_family,
                     sidecar_guard
                 )
+                recovery_family = None
                 sidecar_guard = None
                 if guard_close_error is not None:
                     raise guard_close_error
@@ -3932,11 +4733,19 @@ class TMMigrationService:
             sqlite3.DatabaseError,
         ) as error:
             if outcome is not None:
-                if isinstance(outcome, ExportReport):
+                if isinstance(outcome, ExportReport) or (
+                    isinstance(outcome, ExportFailure)
+                    and outcome.publication_committed
+                ):
+                    observed_digest = (
+                        outcome.destination_digest
+                        if isinstance(outcome, ExportReport)
+                        else outcome.previous_destination_preservation.observed_digest
+                    )
                     return export_cleanup_pending_failure(
                         stage="REFRESH.LEDGER",
                         destination_before=destination_prior.digest,
-                        destination_observed=outcome.destination_digest,
+                        destination_observed=observed_digest,
                         diagnostics=(
                             _export_diagnostic(
                                 "REFRESH.CLEANUP_PENDING",
@@ -3944,11 +4753,6 @@ class TMMigrationService:
                             ),
                         ),
                     )
-                if (
-                    isinstance(outcome, ExportFailure)
-                    and outcome.publication_committed
-                ):
-                    return outcome
                 return export_ledger_ambiguous_failure(
                     stage="REFRESH.RECOVERY",
                     error_code="REFRESH.RECOVERY_REQUIRED",
@@ -3985,7 +4789,7 @@ class TMMigrationService:
                 destination_observed=observed,
             )
         finally:
-            _close_bound_export_authorities(sidecar_guard)
+            _close_bound_export_authorities(recovery_family, sidecar_guard)
             if reservation is not None:
                 try:
                     reservation.release()
@@ -4014,6 +4818,78 @@ class TMMigrationService:
 
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be exact SQLiteTMStore")
+        if sys.platform == "win32":
+            reservation: _InitialActivationResourceReservation | None = None
+            sidecar_guard: BoundExistingFileMutationGuard | None = None
+            family: _BoundConfiguredRefreshRecoveryFamily | None = None
+            try:
+                reservation = self._acquire_initial_reservation()
+                with reservation:
+                    backend, root, lease, _lock_name, _payload = (
+                        reservation.bound_family_inputs()
+                    )
+                    revision = store.canonical_revision()
+                    if (
+                        revision.resource_id
+                        != self._resource_identity.resource_id
+                        or revision.canonical_store_id
+                        != self._canonical_store_id
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RESOURCE_IDENTITY_MISMATCH"
+                        )
+                    reservation.reprove_bound_refresh_owner(
+                        self._canonical_store_id, revision.generation
+                    )
+                    sidecar_guard = (
+                        self._acquire_bound_refresh_sidecar_guard(
+                            reservation=reservation,
+                            backend=backend,
+                            root=root,
+                        )
+                    )
+                    family = self._compose_bound_refresh_recovery_family(
+                        reservation=reservation,
+                        backend=backend,
+                        root=root,
+                        lease=lease,
+                        sidecar_guard=sidecar_guard,
+                        generation=revision.generation,
+                    )
+                    outcome = store.recover_bound_configured_refresh(family)
+                    close_error = _close_bound_export_authorities(
+                        family, sidecar_guard
+                    )
+                    family = None
+                    sidecar_guard = None
+                    if close_error is not None:
+                        raise close_error
+                    return outcome
+            except (
+                _InitialActivationReservationError,
+                ActivationPreparationError,
+                PlatformFileError,
+                SQLiteStoreLifecycleError,
+                SQLiteStoreSchemaError,
+                sqlite3.DatabaseError,
+                OSError,
+            ) as error:
+                return RefreshRecoveryOutcome(
+                    state=RefreshRecoveryState.BLOCKED,
+                    error_code=_recovery_error_code(error),
+                    retryable=_recovery_retryable(error),
+                )
+            finally:
+                _close_bound_export_authorities(family, sidecar_guard)
+                if reservation is not None:
+                    try:
+                        reservation.release()
+                    except (
+                        _InitialActivationReservationError,
+                        PlatformFileError,
+                        OSError,
+                    ):
+                        pass
         try:
             return store.recover_configured_refresh()
         except (

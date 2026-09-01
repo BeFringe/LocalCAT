@@ -349,6 +349,20 @@ def open_canonical_tm_store(
         if coordinator.current_generation is None:
             raise ValueError(_CANONICAL_UNHEALTHY_CODE)
         store = SQLiteTMStore.from_coordinator(coordinator)
+        if sys.platform == "win32":
+            from tm_migration import TMMigrationService
+            from tm_snapshot_recovery import RefreshRecoveryState
+
+            recovery = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id=coordinator.canonical_store_id,
+                coordinator=coordinator,
+            ).recover_configured_refresh(store)
+            if recovery.state is RefreshRecoveryState.BLOCKED:
+                raise ValueError(
+                    f"{_CANONICAL_RECOVERY_FAILED_CODE}:"
+                    f"{recovery.error_code or 'RECOVERY.BLOCKED'}"
+                )
         _ = store.canonical_revision()
     except (
         ActivationPreparationError,

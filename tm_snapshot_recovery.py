@@ -40,10 +40,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import json
 import os
 from pathlib import Path
 import stat
-from typing import Protocol
+from typing import Callable, Protocol
 
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
@@ -211,6 +212,120 @@ class IssuedReceiptFacts:
         )
 
 
+_BOUND_REFRESH_HANDOFF_VERSION = "bound-refresh-handoff-v1"
+_BOUND_REFRESH_HANDOFF_META_PREFIX = "bound_refresh_handoff."
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundRefreshHandoffFacts:
+    """Portable receipt ownership facts; never pathname or file identity."""
+
+    snapshot_id: str
+    prior_snapshot_id: str
+    prior_snapshot_kind: str
+    prior_jsonl_digest: str
+    prior_manifest_digest: str
+    new_jsonl_digest: str
+    new_manifest_digest: str
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.snapshot_id, "snapshot_id"),
+            (self.prior_snapshot_id, "prior_snapshot_id"),
+        ):
+            if type(value) is not str or not value:
+                raise TypeError(f"{label} must be a non-empty string")
+        if self.prior_snapshot_kind not in {
+            kind.value for kind in SnapshotKind
+        }:
+            raise ValueError("prior_snapshot_kind is invalid")
+        for value, label in (
+            (self.prior_jsonl_digest, "prior_jsonl_digest"),
+            (self.prior_manifest_digest, "prior_manifest_digest"),
+            (self.new_jsonl_digest, "new_jsonl_digest"),
+            (self.new_manifest_digest, "new_manifest_digest"),
+        ):
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or value != value.lower()
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{label} must be lowercase SHA-256")
+
+
+def _bound_refresh_handoff_meta_key(snapshot_id: str) -> str:
+    if type(snapshot_id) is not str or not snapshot_id:
+        raise TypeError("snapshot id must be a non-empty string")
+    return f"{_BOUND_REFRESH_HANDOFF_META_PREFIX}{snapshot_id}"
+
+
+def _bound_refresh_handoff_meta_value(
+    facts: _BoundRefreshHandoffFacts,
+) -> str:
+    if type(facts) is not _BoundRefreshHandoffFacts:
+        raise TypeError("bound refresh handoff must be exact facts")
+    return json.dumps(
+        {
+            "version": _BOUND_REFRESH_HANDOFF_VERSION,
+            "snapshot_id": facts.snapshot_id,
+            "prior_snapshot_id": facts.prior_snapshot_id,
+            "prior_snapshot_kind": facts.prior_snapshot_kind,
+            "prior_jsonl_digest": facts.prior_jsonl_digest,
+            "prior_manifest_digest": facts.prior_manifest_digest,
+            "new_jsonl_digest": facts.new_jsonl_digest,
+            "new_manifest_digest": facts.new_manifest_digest,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _bound_refresh_handoff_from_meta(
+    key: str,
+    value: str,
+) -> _BoundRefreshHandoffFacts | None:
+    if not key.startswith(_BOUND_REFRESH_HANDOFF_META_PREFIX):
+        return None
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for name, item in pairs:
+            if name in result:
+                raise ValueError("duplicate handoff key")
+            result[name] = item
+        return result
+    try:
+        payload = json.loads(value, object_pairs_hook=reject_duplicate_keys)
+        if type(payload) is not dict or set(payload) != {
+            "version",
+            "snapshot_id",
+            "prior_snapshot_id",
+            "prior_snapshot_kind",
+            "prior_jsonl_digest",
+            "prior_manifest_digest",
+            "new_jsonl_digest",
+            "new_manifest_digest",
+        }:
+            return None
+        if payload["version"] != _BOUND_REFRESH_HANDOFF_VERSION:
+            return None
+        facts = _BoundRefreshHandoffFacts(
+            snapshot_id=payload["snapshot_id"],
+            prior_snapshot_id=payload["prior_snapshot_id"],
+            prior_snapshot_kind=payload["prior_snapshot_kind"],
+            prior_jsonl_digest=payload["prior_jsonl_digest"],
+            prior_manifest_digest=payload["prior_manifest_digest"],
+            new_jsonl_digest=payload["new_jsonl_digest"],
+            new_manifest_digest=payload["new_manifest_digest"],
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return facts if key == _bound_refresh_handoff_meta_key(facts.snapshot_id) else None
+
+
 _ArtifactHandoffFacts = snapshot_artifacts_module._ArtifactHandoffFacts
 """_ArtifactHandoffFacts late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 @dataclass(frozen=True)
@@ -234,6 +349,7 @@ class _RefreshRecoveryFacts:
     authority_paths: frozenset[Path] = frozenset()
     canonical_sidecar_path: Path | None = None
     target_identity_fragment: str | None = None
+    bound_refresh_handoffs: tuple[_BoundRefreshHandoffFacts, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.handoffs) is not tuple or any(
@@ -258,6 +374,86 @@ class _RefreshRecoveryFacts:
             raise TypeError(
                 "target identity fragment must be a non-empty string or None"
             )
+        if type(self.bound_refresh_handoffs) is not tuple or any(
+            type(item) is not _BoundRefreshHandoffFacts
+            for item in self.bound_refresh_handoffs
+        ):
+            raise TypeError("bound refresh handoffs must be exact facts")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundConfiguredPairFacts:
+    """Live rooted pair facts; observations, never persisted authority."""
+
+    jsonl_state: str
+    jsonl_digest: str | None
+    jsonl_size: int | None
+    manifest_state: str
+    manifest_digest: str | None
+    manifest_size: int | None
+
+    def __post_init__(self) -> None:
+        for state, digest, size, label in (
+            (self.jsonl_state, self.jsonl_digest, self.jsonl_size, "jsonl"),
+            (
+                self.manifest_state,
+                self.manifest_digest,
+                self.manifest_size,
+                "manifest",
+            ),
+        ):
+            if state not in {"absent", "present", "unsafe"}:
+                raise ValueError(f"{label} state is invalid")
+            if state == "present":
+                if (
+                    type(digest) is not str
+                    or len(digest) != 64
+                    or digest != digest.lower()
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in digest
+                    )
+                    or type(size) is not int
+                    or size < 0
+                ):
+                    raise ValueError(f"{label} present facts are invalid")
+            elif digest is not None or size is not None:
+                raise ValueError(f"{label} non-present facts must be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class BoundConfiguredArtifactExpectation:
+    """One receipt-owned internal artifact role and allowed exact bytes."""
+
+    role: str
+    source_name: str
+    expected_digest: str
+
+    def __post_init__(self) -> None:
+        if self.role not in {
+            "jsonl_temp",
+            "manifest_temp",
+            "jsonl_recovery",
+            "manifest_recovery",
+        }:
+            raise ValueError("artifact role is outside the closed set")
+        if (
+            type(self.source_name) is not str
+            or not self.source_name
+            or "/" in self.source_name
+            or "\\" in self.source_name
+        ):
+            raise TypeError("artifact source name must be one basename")
+        if (
+            type(self.expected_digest) is not str
+            or len(self.expected_digest) != 64
+            or self.expected_digest != self.expected_digest.lower()
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.expected_digest
+            )
+        ):
+            raise ValueError("artifact digest must be lowercase SHA-256")
 
 
 _RecoveryArtifactPaths = snapshot_artifacts_module._RecoveryArtifactPaths
@@ -512,6 +708,88 @@ class _SnapshotRecoveryPort(Protocol):
     def latch_source_divergence(self, expected_fingerprint: str) -> bool: ...
 
 
+class _BoundConfiguredRefreshStorePort(Protocol):
+    """SQLite effects used by the platform-neutral bound recovery owner."""
+
+    def read_recovery_facts(self) -> _RefreshRecoveryFacts: ...
+
+    def cancel_bound_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: IssuedReceiptFacts,
+        expected_handoff: _BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> None: ...
+
+    def complete_bound_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: IssuedReceiptFacts,
+        expected_handoff: _BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[SnapshotReceipt], None],
+    ) -> None: ...
+
+    def latch_bound_refresh_divergence(
+        self,
+        expected_fingerprint: str,
+        *,
+        expected_generation: int,
+        expected_receipt: IssuedReceiptFacts,
+        expected_handoff: _BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> bool: ...
+
+    def clear_bound_refresh_handoff(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: IssuedReceiptFacts,
+        expected_handoff: _BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> None: ...
+
+
+class _BoundConfiguredRefreshFamilyPort(Protocol):
+    """Live rooted family owned by the Windows service under one W1."""
+
+    def reprove_owner(self) -> None: ...
+
+    def capture_pair(self) -> BoundConfiguredPairFacts: ...
+
+    def internal_artifacts_absent(self) -> bool: ...
+
+    def reprove_pair_for_receipt(self, receipt: SnapshotReceipt) -> None: ...
+
+    def reprove_pair_for_cancel(self, binding: SnapshotBinding) -> None: ...
+
+    def preflight_terminal_artifacts(
+        self,
+        facts: _RefreshRecoveryFacts,
+        receipt: IssuedReceiptFacts,
+        expectations: tuple[BoundConfiguredArtifactExpectation, ...],
+    ) -> None: ...
+
+    def reconstruct_manifest(self, receipt: SnapshotReceipt) -> None: ...
+
+    def finalize_reconstructed_manifest(self) -> None: ...
+
+    def retire_terminal_artifacts(
+        self,
+        facts: _RefreshRecoveryFacts,
+        receipt: IssuedReceiptFacts,
+        expectations: tuple[BoundConfiguredArtifactExpectation, ...],
+    ) -> None: ...
+
+
 def _strict_file_state(
     path: Path,
     *,
@@ -731,6 +1009,106 @@ def _classify_refresh_receipts(
     if len(jsonl_matches) > 1:
         return _RefreshDecision(
             action="diverged",
+            receipts=issued,
+            error_code="RECOVERY.AMBIGUOUS_JSONL",
+        )
+    return _RefreshDecision(
+        action="diverged",
+        receipts=issued,
+        error_code="RECOVERY.PAIR_UNMATCHED",
+    )
+
+
+def _classify_bound_refresh_receipts(
+    facts: _RefreshRecoveryFacts,
+    issued: tuple[IssuedReceiptFacts, ...],
+    pair: BoundConfiguredPairFacts,
+) -> _RefreshDecision:
+    """Apply the existing refresh matrix to live rooted pair observations."""
+
+    if facts.binding_invalid:
+        return _RefreshDecision(
+            action="blocked",
+            receipts=issued,
+            error_code="RECOVERY.BINDING_INVALID",
+        )
+
+
+    for receipt in issued:
+        row_error = _refresh_receipt_row_error(facts, receipt)
+        if row_error is not None:
+            return _RefreshDecision(
+                action="blocked",
+                receipts=issued,
+                error_code=row_error,
+            )
+    if pair.jsonl_state == "unsafe" or pair.manifest_state == "unsafe":
+        return _RefreshDecision(
+            action="blocked",
+            receipts=issued,
+            error_code="RECOVERY.PAIR_UNSAFE",
+        )
+    old_manifest_digest = (
+        None
+        if facts.binding is None
+        else hashlib.sha256(_manifest_bytes(facts.binding.manifest)).hexdigest()
+    )
+    if (
+        facts.binding is not None
+        and pair.jsonl_state == "present"
+        and pair.jsonl_digest == facts.binding.receipt.jsonl_digest
+        and pair.manifest_state == "present"
+        and pair.manifest_digest == old_manifest_digest
+    ):
+        return _RefreshDecision(action="cancel", receipts=issued)
+    issued_manifest_digests = {
+        receipt.snapshot_id: _manifest_digest_for_receipt(receipt.receipt)
+        for receipt in issued
+    }
+    complete_matches = tuple(
+        receipt
+        for receipt in issued
+        if pair.jsonl_state == "present"
+        and pair.jsonl_digest == receipt.jsonl_digest
+        and pair.manifest_state == "present"
+        and pair.manifest_digest == issued_manifest_digests[receipt.snapshot_id]
+    )
+    if len(complete_matches) == 1:
+        return _RefreshDecision(action="complete", receipt=complete_matches[0])
+    if len(complete_matches) > 1:
+        return _RefreshDecision(
+            action="blocked",
+            receipts=issued,
+            error_code="RECOVERY.AMBIGUOUS_PAIR",
+        )
+    jsonl_matches = tuple(
+        receipt
+        for receipt in issued
+        if pair.jsonl_state == "present"
+        and pair.jsonl_digest == receipt.jsonl_digest
+    )
+    if len(jsonl_matches) == 1:
+        if pair.manifest_state == "absent" or (
+            pair.manifest_state == "present"
+            and pair.manifest_digest == old_manifest_digest
+        ):
+            return _RefreshDecision(
+                action="reconstruct",
+                receipt=jsonl_matches[0],
+                expected_manifest_digest=(
+                    None
+                    if pair.manifest_state == "absent"
+                    else old_manifest_digest
+                ),
+            )
+        return _RefreshDecision(
+            action="diverged",
+            receipts=issued,
+            error_code="RECOVERY.MANIFEST_FOREIGN",
+        )
+    if len(jsonl_matches) > 1:
+        return _RefreshDecision(
+            action="blocked",
             receipts=issued,
             error_code="RECOVERY.AMBIGUOUS_JSONL",
         )
@@ -2325,3 +2703,494 @@ def recover_snapshot_publication(
         error_code=read_error_code,
         retryable=read_error_retryable,
     )
+
+
+def _after_bound_refresh_recovery_classified(
+    snapshot_id: str, action: str
+) -> None:
+    del snapshot_id, action
+
+
+def _before_bound_refresh_recovery_effect(
+    snapshot_id: str, action: str
+) -> None:
+    del snapshot_id, action
+
+
+def _after_bound_refresh_recovery_effect(
+    snapshot_id: str, action: str
+) -> None:
+    del snapshot_id, action
+
+
+def _bound_refresh_handoff_for(
+    facts: _RefreshRecoveryFacts,
+    snapshot_id: str,
+) -> _BoundRefreshHandoffFacts | None:
+    matches = tuple(
+        item
+        for item in facts.bound_refresh_handoffs
+        if item.snapshot_id == snapshot_id
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _validate_bound_refresh_handoff(
+    facts: _RefreshRecoveryFacts,
+    receipt: IssuedReceiptFacts,
+    handoff: _BoundRefreshHandoffFacts,
+) -> str | None:
+    if facts.binding is None:
+        return "RECOVERY.BINDING_INVALID"
+    prior_manifest_digest = hashlib.sha256(
+        _manifest_bytes(facts.binding.manifest)
+    ).hexdigest()
+    if (
+        handoff.snapshot_id != receipt.snapshot_id
+        or handoff.prior_snapshot_id != facts.binding.receipt.snapshot_id
+        or handoff.prior_snapshot_kind
+        != facts.binding.manifest.snapshot_kind.value
+        or handoff.prior_jsonl_digest != facts.binding.receipt.jsonl_digest
+        or handoff.prior_manifest_digest != prior_manifest_digest
+        or handoff.new_jsonl_digest != receipt.jsonl_digest
+        or handoff.new_manifest_digest
+        != _manifest_digest_for_receipt(receipt.receipt)
+    ):
+        return "RECOVERY.BOUND_HANDOFF_INVALID"
+    return None
+
+
+def _validate_bound_terminal_handoff(
+    facts: _RefreshRecoveryFacts,
+    terminal: IssuedReceiptFacts,
+    handoff: _BoundRefreshHandoffFacts,
+) -> str | None:
+    if (
+        terminal.snapshot_id != handoff.snapshot_id
+        or terminal.status not in {"completed", "cancelled"}
+        or _refresh_receipt_row_error(facts, terminal) is not None
+        or terminal.jsonl_digest != handoff.new_jsonl_digest
+        or _manifest_digest_for_receipt(terminal.receipt)
+        != handoff.new_manifest_digest
+    ):
+        return "RECOVERY.BOUND_TERMINAL_INVALID"
+    priors = tuple(
+        row
+        for row in facts.receipts
+        if row.snapshot_id == handoff.prior_snapshot_id
+        and row.status == "completed"
+        and row.resource_id == facts.resource_id
+        and row.canonical_store_id == facts.canonical_store_id
+        and row.destination_jsonl_path == facts.configured_jsonl_path
+        and row.destination_manifest_path == facts.snapshot_manifest_path
+        and _refresh_receipt_row_error(facts, row) is None
+    )
+    if len(priors) != 1:
+        return "RECOVERY.BOUND_PRIOR_AMBIGUOUS"
+    prior = priors[0]
+    try:
+        prior_kind = SnapshotKind(handoff.prior_snapshot_kind)
+    except ValueError:
+        return "RECOVERY.BOUND_PRIOR_INVALID"
+    if (
+        prior.jsonl_digest != handoff.prior_jsonl_digest
+        or hashlib.sha256(
+            _manifest_bytes(_manifest_for_receipt(prior.receipt, prior_kind))
+        ).hexdigest()
+        != handoff.prior_manifest_digest
+        or facts.binding is None
+    ):
+        return "RECOVERY.BOUND_PRIOR_INVALID"
+    expected_binding_id = (
+        terminal.snapshot_id
+        if terminal.status == "completed"
+        else prior.snapshot_id
+    )
+    expected_jsonl = (
+        handoff.new_jsonl_digest
+        if terminal.status == "completed"
+        else handoff.prior_jsonl_digest
+    )
+    expected_manifest = (
+        handoff.new_manifest_digest
+        if terminal.status == "completed"
+        else handoff.prior_manifest_digest
+    )
+    if (
+        facts.binding.receipt.snapshot_id != expected_binding_id
+        or facts.binding.receipt.jsonl_digest != expected_jsonl
+        or hashlib.sha256(_manifest_bytes(facts.binding.manifest)).hexdigest()
+        != expected_manifest
+    ):
+        return "RECOVERY.BOUND_TERMINAL_BINDING_INVALID"
+    return None
+
+
+def _bound_refresh_artifact_expectations(
+    facts: _RefreshRecoveryFacts,
+    handoff: _BoundRefreshHandoffFacts,
+) -> tuple[BoundConfiguredArtifactExpectation, ...]:
+    paths = _recovery_artifact_paths(facts.configured_jsonl_path)
+    return (
+        BoundConfiguredArtifactExpectation(
+            "jsonl_temp",
+            paths.jsonl_temp.name,
+            handoff.new_jsonl_digest,
+        ),
+        BoundConfiguredArtifactExpectation(
+            "manifest_temp",
+            paths.manifest_temp.name,
+            handoff.new_manifest_digest,
+        ),
+        BoundConfiguredArtifactExpectation(
+            "jsonl_recovery",
+            paths.jsonl_recovery.name,
+            handoff.prior_jsonl_digest,
+        ),
+        BoundConfiguredArtifactExpectation(
+            "manifest_recovery",
+            paths.manifest_recovery.name,
+            handoff.prior_manifest_digest,
+        ),
+    )
+
+
+def recover_bound_configured_snapshot_publication(
+    port: _BoundConfiguredRefreshStorePort,
+    family: _BoundConfiguredRefreshFamilyPort,
+) -> RefreshRecoveryOutcome:
+    """Recover one receipt-scoped Windows configured-refresh handoff."""
+
+    try:
+        facts = port.read_recovery_facts()
+        family.reprove_owner()
+        issued = _issued_refresh_receipts(facts)
+        if facts.binding_invalid:
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.BLOCKED,
+                diagnostics=("RECOVERY.BINDING_INVALID",),
+                error_code="RECOVERY.BINDING_INVALID",
+            )
+        configured_receipt_ids = {
+            receipt.snapshot_id
+            for receipt in facts.receipts
+            if receipt.destination_jsonl_path == facts.configured_jsonl_path
+            and receipt.destination_manifest_path == facts.snapshot_manifest_path
+        }
+        legacy_handoff_ids = {
+            handoff.snapshot_id
+            for handoff in facts.handoffs
+            if handoff.snapshot_id in configured_receipt_ids
+        }
+        bound_handoff_ids = {
+            handoff.snapshot_id for handoff in facts.bound_refresh_handoffs
+        }
+        if (
+            len(facts.bound_refresh_handoffs) > 1
+            or len(issued) > 1
+            or (bool(legacy_handoff_ids) and bool(bound_handoff_ids))
+        ):
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.BLOCKED,
+                diagnostics=("RECOVERY.BOUND_HANDOFF_AMBIGUOUS",),
+                error_code="RECOVERY.BOUND_HANDOFF_AMBIGUOUS",
+            )
+        if facts.divergence_latched:
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.NOOP,
+                diagnostics=("RECOVERY.DIVERGENCE_PRESERVED",),
+            )
+        if not issued:
+            if not facts.bound_refresh_handoffs:
+                if family.internal_artifacts_absent():
+                    return RefreshRecoveryOutcome(
+                        state=RefreshRecoveryState.NOOP
+                    )
+                return RefreshRecoveryOutcome(
+                    state=RefreshRecoveryState.BLOCKED,
+                    diagnostics=("RECOVERY.UNJOURNALED_ARTIFACTS",),
+                    error_code="RECOVERY.UNJOURNALED_ARTIFACTS",
+                )
+            handoff = facts.bound_refresh_handoffs[0]
+            terminal = next(
+                (
+                    row
+                    for row in facts.receipts
+                    if row.snapshot_id == handoff.snapshot_id
+                    and row.status in {"completed", "cancelled"}
+                    and row.destination_jsonl_path == facts.configured_jsonl_path
+                    and row.destination_manifest_path
+                    == facts.snapshot_manifest_path
+                ),
+                None,
+            )
+            if terminal is None:
+                return RefreshRecoveryOutcome(
+                    state=RefreshRecoveryState.BLOCKED,
+                    diagnostics=("RECOVERY.BOUND_HANDOFF_ORPHANED",),
+                    error_code="RECOVERY.BOUND_HANDOFF_ORPHANED",
+                )
+            terminal_error = _validate_bound_terminal_handoff(
+                facts, terminal, handoff
+            )
+            if terminal_error is not None:
+                return RefreshRecoveryOutcome(
+                    state=RefreshRecoveryState.BLOCKED,
+                    diagnostics=(terminal_error,),
+                    error_code=terminal_error,
+                )
+            expectations = _bound_refresh_artifact_expectations(facts, handoff)
+            family.preflight_terminal_artifacts(
+                facts, terminal, expectations
+            )
+            pair = family.capture_pair()
+            expected_jsonl = (
+                handoff.new_jsonl_digest
+                if terminal.status == "completed"
+                else handoff.prior_jsonl_digest
+            )
+            expected_manifest = (
+                handoff.new_manifest_digest
+                if terminal.status == "completed"
+                else handoff.prior_manifest_digest
+            )
+            if not (
+                pair.jsonl_state == "present"
+                and pair.jsonl_digest == expected_jsonl
+                and pair.manifest_state == "present"
+                and pair.manifest_digest == expected_manifest
+            ):
+                if "unsafe" in {
+                    pair.jsonl_state,
+                    pair.manifest_state,
+                }:
+                    return RefreshRecoveryOutcome(
+                        state=RefreshRecoveryState.BLOCKED,
+                        diagnostics=("RECOVERY.PAIR_UNSAFE",),
+                        error_code="RECOVERY.PAIR_UNSAFE",
+                    )
+
+                def reprove_terminal_divergence() -> None:
+                    family.preflight_terminal_artifacts(
+                        facts, terminal, expectations
+                    )
+                    family.reprove_owner()
+                    if family.capture_pair() != pair:
+                        raise RecoveryError(
+                            "RECOVERY.PAIR_CHANGED", retryable=True
+                        )
+
+                if not port.latch_bound_refresh_divergence(
+                    facts.canonical_fingerprint,
+                    expected_generation=facts.generation,
+                    expected_receipt=terminal,
+                    expected_handoff=handoff,
+                    expected_binding=facts.binding,
+                    family_reprove=reprove_terminal_divergence,
+                ):
+                    raise RecoveryError(
+                        "RECOVERY.CANONICAL_CHANGED", retryable=True
+                    )
+                return RefreshRecoveryOutcome(
+                    state=RefreshRecoveryState.DIVERGED,
+                    snapshot_id=terminal.snapshot_id,
+                    diagnostics=("RECOVERY.PAIR_UNMATCHED",),
+                )
+            def reprove_terminal_cleanup() -> None:
+                family.retire_terminal_artifacts(
+                    facts,
+                    terminal,
+                    expectations,
+                )
+                family.preflight_terminal_artifacts(
+                    facts, terminal, expectations
+                )
+                family.reprove_owner()
+
+            _before_bound_refresh_recovery_effect(
+                terminal.snapshot_id, "clear"
+            )
+            port.clear_bound_refresh_handoff(
+                terminal.snapshot_id,
+                expected_generation=facts.generation,
+                expected_receipt=terminal,
+                expected_handoff=handoff,
+                expected_binding=facts.binding,
+                family_reprove=reprove_terminal_cleanup,
+            )
+            return RefreshRecoveryOutcome(state=RefreshRecoveryState.NOOP)
+
+        receipt = issued[0]
+        handoff = _bound_refresh_handoff_for(facts, receipt.snapshot_id)
+        if handoff is None:
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.BLOCKED,
+                diagnostics=("RECOVERY.BOUND_HANDOFF_MISSING",),
+                error_code="RECOVERY.BOUND_HANDOFF_MISSING",
+            )
+        handoff_error = _validate_bound_refresh_handoff(
+            facts, receipt, handoff
+        )
+        if handoff_error is not None:
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.BLOCKED,
+                diagnostics=(handoff_error,),
+                error_code=handoff_error,
+            )
+        expectations = _bound_refresh_artifact_expectations(facts, handoff)
+        family.preflight_terminal_artifacts(facts, receipt, expectations)
+        classified_pair = family.capture_pair()
+        decision = _classify_bound_refresh_receipts(
+            facts, issued, classified_pair
+        )
+        _after_bound_refresh_recovery_classified(
+            receipt.snapshot_id, decision.action
+        )
+        if decision.action == "blocked":
+            assert decision.error_code is not None
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.BLOCKED,
+                diagnostics=(decision.error_code,),
+                error_code=decision.error_code,
+            )
+        if decision.action == "diverged":
+            assert decision.error_code is not None
+            _before_bound_refresh_recovery_effect(
+                receipt.snapshot_id, "diverged"
+            )
+            def reprove_diverged_pair() -> None:
+                family.preflight_terminal_artifacts(
+                    facts, receipt, expectations
+                )
+                family.reprove_owner()
+                if family.capture_pair() != classified_pair:
+                    raise RecoveryError(
+                        "RECOVERY.PAIR_CHANGED", retryable=True
+                    )
+
+            if not port.latch_bound_refresh_divergence(
+                facts.canonical_fingerprint,
+                expected_generation=facts.generation,
+                expected_receipt=receipt,
+                expected_handoff=handoff,
+                expected_binding=facts.binding,
+                family_reprove=reprove_diverged_pair,
+            ):
+                raise RecoveryError("RECOVERY.CANONICAL_CHANGED", retryable=True)
+            _after_bound_refresh_recovery_effect(
+                receipt.snapshot_id, "diverged"
+            )
+            return RefreshRecoveryOutcome(
+                state=RefreshRecoveryState.DIVERGED,
+                snapshot_id=receipt.snapshot_id,
+                diagnostics=(decision.error_code,),
+            )
+        if decision.action == "reconstruct":
+            family.reconstruct_manifest(receipt.receipt)
+            repeated = _classify_bound_refresh_receipts(
+                facts, issued, family.capture_pair()
+            )
+            if repeated.action != "complete":
+                raise RecoveryError(
+                    "RECOVERY.MANIFEST_PUBLISH_FAILED", retryable=True
+                )
+        _before_bound_refresh_recovery_effect(
+            receipt.snapshot_id, decision.action
+        )
+        if decision.action == "cancel":
+            assert facts.binding is not None
+            def reprove_cancelled_pair() -> None:
+                family.preflight_terminal_artifacts(
+                    facts, receipt, expectations
+                )
+                family.reprove_pair_for_cancel(facts.binding)
+
+            port.cancel_bound_refresh_receipt(
+                receipt.snapshot_id,
+                expected_generation=facts.generation,
+                expected_receipt=receipt,
+                expected_handoff=handoff,
+                expected_binding=facts.binding,
+                family_reprove=reprove_cancelled_pair,
+            )
+            state = RefreshRecoveryState.CANCELLED
+        else:
+            def reprove_completed_pair(
+                completed_receipt: SnapshotReceipt,
+            ) -> None:
+                family.preflight_terminal_artifacts(
+                    facts, receipt, expectations
+                )
+                family.reprove_pair_for_receipt(completed_receipt)
+
+            port.complete_bound_refresh_receipt(
+                receipt.snapshot_id,
+                expected_generation=facts.generation,
+                expected_receipt=receipt,
+                expected_handoff=handoff,
+                expected_binding=facts.binding,
+                family_reprove=reprove_completed_pair,
+            )
+            state = RefreshRecoveryState.COMPLETED
+        _after_bound_refresh_recovery_effect(
+            receipt.snapshot_id, decision.action
+        )
+        if decision.action == "reconstruct":
+            family.finalize_reconstructed_manifest()
+        terminal_facts = port.read_recovery_facts()
+        terminal = next(
+            (
+                row
+                for row in terminal_facts.receipts
+                if row.snapshot_id == receipt.snapshot_id
+                and row.status in {"completed", "cancelled"}
+            ),
+            None,
+        )
+        if terminal is None:
+            raise RecoveryError(
+                "RECOVERY.BOUND_TERMINAL_MISSING", retryable=True
+            )
+        terminal_error = _validate_bound_terminal_handoff(
+            terminal_facts, terminal, handoff
+        )
+        if terminal_error is not None:
+            raise RecoveryError(terminal_error, retryable=False)
+        terminal_expectations = _bound_refresh_artifact_expectations(
+            terminal_facts, handoff
+        )
+        family.preflight_terminal_artifacts(
+            terminal_facts, terminal, terminal_expectations
+        )
+        def reprove_completed_cleanup() -> None:
+            family.retire_terminal_artifacts(
+                terminal_facts,
+                terminal,
+                terminal_expectations,
+            )
+            family.preflight_terminal_artifacts(
+                terminal_facts, terminal, terminal_expectations
+            )
+            family.reprove_owner()
+
+        _before_bound_refresh_recovery_effect(receipt.snapshot_id, "clear")
+        port.clear_bound_refresh_handoff(
+            receipt.snapshot_id,
+            expected_generation=facts.generation,
+            expected_receipt=terminal,
+            expected_handoff=handoff,
+            expected_binding=terminal_facts.binding,
+            family_reprove=reprove_completed_cleanup,
+        )
+        return RefreshRecoveryOutcome(
+            state=state,
+            receipts=(IssuedReceiptRecovery(receipt.snapshot_id, state),),
+            snapshot_id=receipt.snapshot_id,
+        )
+    except RecoveryError as error:
+        return RefreshRecoveryOutcome(
+            state=RefreshRecoveryState.BLOCKED,
+            diagnostics=(error.error_code,),
+            error_code=error.error_code,
+            retryable=error.retryable,
+        )

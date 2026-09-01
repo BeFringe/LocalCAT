@@ -1003,11 +1003,20 @@ class CandidateFile(OpaqueAuthority, ABC):
 
     __slots__ = ("__content_facts", "__flushed", "__write_started")
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        _recovered_content: CandidateContentFacts | None = None,
+    ) -> None:
         super().__init__()
-        self.__content_facts: CandidateContentFacts | None = None
-        self.__flushed = False
-        self.__write_started = False
+        if (
+            _recovered_content is not None
+            and type(_recovered_content) is not CandidateContentFacts
+        ):
+            raise TypeError("_recovered_content must be exact CandidateContentFacts")
+        self.__content_facts = _recovered_content
+        self.__flushed = _recovered_content is not None
+        self.__write_started = _recovered_content is not None
 
     def write_all(self, payload: bytes) -> None:
         if type(payload) is not bytes:
@@ -1812,6 +1821,79 @@ class ExistingFileRetirement(Protocol):
         target_name: str,
         expected_content: CandidateContentFacts,
     ) -> RetainedRetirement: ...
+
+
+@runtime_checkable
+class ExistingCandidateRecovery(Protocol):
+    """Recover one exact internal candidate under its live owner authorities.
+
+    The lease and mutation guard must bind the same owner parent/root chain as
+    ``source_parent``; the capability never authorizes a final replacement.
+    """
+
+    def recover_existing_candidate(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+        expected_content: CandidateContentFacts,
+        *,
+        owner_lease: LockLease,
+        mutation_guard: BoundExistingFileMutationGuard,
+    ) -> CandidateFile:
+        if not isinstance(source_parent, BoundDirectoryAuthority):
+            raise TypeError("source_parent must be BoundDirectoryAuthority")
+        if not isinstance(target_parent, RetirementDirectoryAuthority):
+            raise TypeError("target_parent must be RetirementDirectoryAuthority")
+        source_parent._require_open()
+        target_parent._require_open()
+        if not isinstance(owner_lease, LockLease):
+            raise TypeError("owner_lease must be LockLease")
+        if not isinstance(mutation_guard, BoundExistingFileMutationGuard):
+            raise TypeError(
+                "mutation_guard must be BoundExistingFileMutationGuard"
+            )
+        owner_lease._require_open()
+        mutation_guard._require_open()
+        checked_source = validate_relative_name(source_name)
+        checked_target = validate_relative_name(target_name)
+        if type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts")
+        authority = self._recover_existing_candidate(
+            source_parent,
+            checked_source,
+            target_parent,
+            checked_target,
+            expected_content,
+            owner_lease=owner_lease,
+            mutation_guard=mutation_guard,
+        )
+        try:
+            if not isinstance(authority, CandidateFile):
+                raise TypeError("backend recovery must return CandidateFile")
+            authority._require_publishable()
+            return authority
+        except BaseException:
+            if isinstance(authority, CandidateFile):
+                try:
+                    authority.close()
+                except BaseException:
+                    pass
+            raise
+
+    @abstractmethod
+    def _recover_existing_candidate(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+        expected_content: CandidateContentFacts,
+        *,
+        owner_lease: LockLease,
+        mutation_guard: BoundExistingFileMutationGuard,
+    ) -> CandidateFile: ...
 
 
 @runtime_checkable

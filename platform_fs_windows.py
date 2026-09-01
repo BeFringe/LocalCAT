@@ -32,6 +32,7 @@ from platform_fs_contracts import (
     ExistingFileDurability,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
+    ExistingCandidateRecovery,
     ExistingRetirementSource,
     RetirementSourceDirectoryAuthority,
     FileObjectIdentity,
@@ -933,6 +934,118 @@ def _open_retirement_target_record(
                 handle.close()
             except BaseException:
                 pass
+
+
+class _WindowsDirectoryRenameWindow:
+    """Temporary rename-compatible replacement for one authority record."""
+
+    __slots__ = (
+        "_api",
+        "_authority",
+        "_index",
+        "_expected_path",
+        "_expected_identity",
+        "_active",
+    )
+
+    def __init__(
+        self,
+        api: WindowsFileAPI,
+        authority: object,
+        index: int,
+        expected_path: str,
+        expected_identity: FileObjectIdentity,
+    ) -> None:
+        self._api = api
+        self._authority = authority
+        self._index = index
+        self._expected_path = expected_path
+        self._expected_identity = expected_identity
+        self._active = True
+
+    def restore(self) -> None:
+        if not self._active:
+            return
+        strict = None
+        try:
+            records = self._authority._records
+            if self._index >= len(records):
+                raise _identity_stale()
+            current = records[self._index]
+            if (
+                current.expected_final_path != self._expected_path
+                or current.identity != self._expected_identity
+            ):
+                raise _identity_stale()
+            strict = _open_directory_record(
+                self._api,
+                self._expected_path,
+                self._expected_path,
+                stale=True,
+                expected_volume_id=records[0].identity.volume_id,
+            )
+            if strict.identity != self._expected_identity:
+                raise _identity_stale()
+            updated = list(records)
+            updated[self._index] = strict
+            self._authority._records = tuple(updated)
+            strict = None
+            current.handle.close()
+            _reprove_directory_chain(self._api, self._authority._records)
+            self._active = False
+        finally:
+            if strict is not None:
+                try:
+                    strict.handle.close()
+                except BaseException:
+                    pass
+
+
+def _begin_directory_rename_window(
+    api: WindowsFileAPI,
+    authority: object,
+    expected: _WindowsDirectoryRecord,
+) -> _WindowsDirectoryRenameWindow:
+    records = authority._records
+    matches = tuple(
+        index
+        for index, record in enumerate(records)
+        if record.expected_final_path == expected.expected_final_path
+        and record.identity == expected.identity
+    )
+    if len(matches) != 1:
+        raise _identity_stale()
+    index = matches[0]
+    compatible = _open_retirement_target_record(
+        api,
+        expected.expected_final_path,
+        records[0].identity.volume_id,
+        stale=True,
+    )
+    if compatible.identity != expected.identity:
+        compatible.handle.close()
+        raise _identity_stale()
+    current = records[index]
+    updated = list(records)
+    updated[index] = compatible
+    authority._records = tuple(updated)
+    window = _WindowsDirectoryRenameWindow(
+        api,
+        authority,
+        index,
+        expected.expected_final_path,
+        expected.identity,
+    )
+    try:
+        current.handle.close()
+        _reprove_directory_chain(api, authority._records)
+    except BaseException:
+        try:
+            window.restore()
+        except BaseException:
+            pass
+        raise
+    return window
 
 
 def _open_entry_proof(
@@ -2449,6 +2562,7 @@ class _WindowsLockLease(LockLease):
     __slots__ = (
         "_api",
         "_issuer",
+        "_root_anchor",
         "_records",
         "_handle",
         "_entry_path",
@@ -2463,6 +2577,7 @@ class _WindowsLockLease(LockLease):
         self,
         api: WindowsFileAPI,
         issuer: object,
+        root_anchor: object,
         records: tuple[_WindowsDirectoryRecord, ...],
         handle: object,
         entry_path: str,
@@ -2475,6 +2590,7 @@ class _WindowsLockLease(LockLease):
         super().__init__()
         self._api = api
         self._issuer = issuer
+        self._root_anchor = root_anchor
         self._records = records
         self._handle = handle
         self._entry_path = entry_path
@@ -2543,6 +2659,24 @@ class _WindowsLockLease(LockLease):
             raise _lock_unavailable()
         if not self._matches_parent(parent._api, parent._issuer, parent._records):
             raise _lock_unavailable()
+
+    def _begin_directory_rename_window(
+        self,
+        parent: BoundDirectoryAuthority,
+    ) -> _WindowsDirectoryRenameWindow:
+        if (
+            type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}
+            or parent._api is not self._api
+            or parent._issuer is not self._issuer
+            or parent._root_anchor is not self._root_anchor
+            or not self._matches_parent(
+                parent._api, parent._issuer, parent._records
+            )
+        ):
+            raise _lock_unavailable()
+        return _begin_directory_rename_window(
+            self._api, self, parent._records[-1]
+        )
 
     def _close_authority(self) -> None:
         failed = False
@@ -2776,6 +2910,7 @@ class WindowsProcessFileLock(ProcessFileLock):
             return _WindowsLockLease(
                 api,
                 parent._issuer,
+                parent._root_anchor,
                 transferred_records,
                 transferred_handle,
                 entry_path,
@@ -3067,6 +3202,8 @@ class _WindowsBoundRegularFile(BoundRegularFile):
 class _WindowsExistingFileMutationGuard(BoundExistingFileMutationGuard):
     __slots__ = (
         "_api",
+        "_issuer",
+        "_root_anchor",
         "_records",
         "_handle",
         "_entry_path",
@@ -3076,6 +3213,8 @@ class _WindowsExistingFileMutationGuard(BoundExistingFileMutationGuard):
     def __init__(
         self,
         api: WindowsFileAPI,
+        issuer: object,
+        root_anchor: object,
         records: tuple[_WindowsDirectoryRecord, ...],
         handle: object,
         entry_path: str,
@@ -3083,6 +3222,8 @@ class _WindowsExistingFileMutationGuard(BoundExistingFileMutationGuard):
     ) -> None:
         super().__init__(entry_identity)
         self._api = api
+        self._issuer = issuer
+        self._root_anchor = root_anchor
         self._records = records
         self._handle = handle
         self._entry_path = entry_path
@@ -3132,6 +3273,43 @@ class _WindowsExistingFileMutationGuard(BoundExistingFileMutationGuard):
             raise
         except Exception:
             raise _identity_stale() from None
+
+    def _matches_parent(
+        self,
+        api: WindowsFileAPI,
+        issuer: object,
+        records: tuple[_WindowsDirectoryRecord, ...],
+    ) -> bool:
+        return (
+            api is self._api
+            and issuer is self._issuer
+            and len(records) == len(self._records)
+            and all(
+                left.expected_final_path == right.expected_final_path
+                and left.identity == right.identity
+                for left, right in zip(self._records, records, strict=True)
+            )
+        )
+
+    def _begin_directory_rename_window(
+        self,
+        parent: BoundDirectoryAuthority,
+    ) -> _WindowsDirectoryRenameWindow:
+        if (
+            type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}
+            or parent._api is not self._api
+            or parent._issuer is not self._issuer
+            or parent._root_anchor is not self._root_anchor
+            or not self._matches_parent(
+                parent._api, parent._issuer, parent._records
+            )
+        ):
+            raise _identity_stale()
+        self._reprove_guard()
+        parent._reprove()
+        return _begin_directory_rename_window(
+            self._api, self, parent._records[-1]
+        )
 
     def _close_authority(self) -> None:
         first_error: BaseException | None = None
@@ -3755,8 +3933,9 @@ class _WindowsCandidateFile(CandidateFile):
         fault_injector: _FaultInjector | None,
         *,
         private: bool,
+        recovered_content: CandidateContentFacts | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(_recovered_content=recovered_content)
         self._api = api
         self._records = records
         self._handle = handle
@@ -3765,10 +3944,18 @@ class _WindowsCandidateFile(CandidateFile):
         self._maximum_component_units = maximum_component_units
         self._fault_injector = fault_injector
         self._private = private
-        self._expected_digest: bytes | None = None
-        self._expected_count: int | None = None
-        self._flushed_digest: bytes | None = None
-        self._flushed_count: int | None = None
+        self._expected_digest = (
+            None if recovered_content is None else recovered_content.content_sha256
+        )
+        self._expected_count = (
+            None if recovered_content is None else recovered_content.byte_count
+        )
+        self._flushed_digest = (
+            None if recovered_content is None else recovered_content.content_sha256
+        )
+        self._flushed_count = (
+            None if recovered_content is None else recovered_content.byte_count
+        )
         self._named = False
         try:
             self._reprove_handle()
@@ -4005,6 +4192,7 @@ class WindowsRootedFileSystem(
     ExistingFileMutationGuard,
     LockedDescendantNamespaceInspection,
     ExistingFileRetirement,
+    ExistingCandidateRecovery,
 ):
     """Windows rooted reads, mutable reservations, and existing-file durability."""
 
@@ -4676,6 +4864,8 @@ class WindowsRootedFileSystem(
             handle = None
             return _WindowsExistingFileMutationGuard(
                 root._api,
+                root._issuer,
+                root._root_anchor,
                 transferred_records,
                 transferred_handle,
                 entry_path,
@@ -4829,6 +5019,7 @@ class WindowsRootedFileSystem(
         records: tuple[_WindowsDirectoryRecord, ...] | None = None
         leaf: _WindowsDirectoryRecord | None = None
         strict_parent: _WindowsDirectoryRecord | None = None
+        compatible_parent: _WindowsDirectoryRecord | None = None
         created = False
         try:
             parent._reprove()
@@ -4843,6 +5034,19 @@ class WindowsRootedFileSystem(
                 if strict_parent.identity != parent._records[-1].identity:
                     raise _identity_stale()
             records = _duplicate_directory_chain(parent._api, parent._records)
+            if type(parent) in {_WindowsRootedDirectory, _WindowsBoundDirectory}:
+                compatible_parent = _open_retirement_target_record(
+                    parent._api,
+                    parent._leaf_path,
+                    records[0].identity.volume_id,
+                    stale=True,
+                )
+                if compatible_parent.identity != records[-1].identity:
+                    raise _identity_stale()
+                replaced_parent = records[-1]
+                records = records[:-1] + (compatible_parent,)
+                compatible_parent = None
+                replaced_parent.handle.close()
             path = _append_component(
                 records[-1].expected_final_path,
                 component,
@@ -4897,6 +5101,11 @@ class WindowsRootedFileSystem(
             if strict_parent is not None:
                 try:
                     strict_parent.handle.close()
+                except BaseException:
+                    pass
+            if compatible_parent is not None:
+                try:
+                    compatible_parent.handle.close()
                 except BaseException:
                     pass
             if leaf is not None:
@@ -5409,6 +5618,326 @@ class WindowsRootedFileSystem(
                     _close_handles_reverse(
                         tuple(record.handle for record in records_to_close)
                     )
+
+    def _recover_existing_candidate(
+        self,
+        source_parent: BoundDirectoryAuthority,
+        source_name: str,
+        target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+        expected_content: CandidateContentFacts,
+        *,
+        owner_lease: LockLease,
+        mutation_guard: BoundExistingFileMutationGuard,
+    ) -> CandidateFile:
+        if (
+            type(source_parent)
+            not in {_WindowsRootedDirectory, _WindowsBoundDirectory}
+            or type(target_parent) is not _WindowsRetirementTargetDirectory
+            or source_parent._api is not target_parent._api
+            or source_parent._issuer is not self._authority_issuer
+            or target_parent._issuer is not self._authority_issuer
+            or source_parent._root_anchor is not target_parent._root_anchor
+            or not source_parent._records
+            or not target_parent._records
+            or source_parent._records[0].identity
+            != target_parent._records[0].identity
+            or type(owner_lease) is not _WindowsLockLease
+            or type(mutation_guard) is not _WindowsExistingFileMutationGuard
+            or owner_lease._api is not source_parent._api
+            or mutation_guard._api is not source_parent._api
+            or owner_lease._issuer is not source_parent._issuer
+            or mutation_guard._issuer is not source_parent._issuer
+            or owner_lease._root_anchor is not source_parent._root_anchor
+            or mutation_guard._root_anchor is not source_parent._root_anchor
+            or not owner_lease._matches_parent(
+                source_parent._api,
+                source_parent._issuer,
+                source_parent._records,
+            )
+            or not mutation_guard._matches_parent(
+                source_parent._api,
+                source_parent._issuer,
+                source_parent._records,
+            )
+        ):
+            raise _capability_unavailable()
+        source_path = _append_component(
+            source_parent._leaf_path,
+            source_name,
+            maximum_units=source_parent._maximum_component_units,
+        )
+        target_path = _append_component(
+            target_parent._leaf_path,
+            target_name,
+            maximum_units=target_parent._maximum_component_units,
+        )
+        records: tuple[_WindowsDirectoryRecord, ...] | None = None
+        handle = None
+        candidate: _WindowsCandidateFile | None = None
+        source_window: _WindowsDirectoryRenameWindow | None = None
+        lease_window: _WindowsDirectoryRenameWindow | None = None
+        guard_window: _WindowsDirectoryRenameWindow | None = None
+
+        def restore_owner_windows() -> None:
+            nonlocal source_window, lease_window, guard_window
+            first_error: BaseException | None = None
+            for window, label in (
+                (source_window, "source"),
+                (guard_window, "guard"),
+                (lease_window, "lease"),
+            ):
+                if window is None:
+                    continue
+                try:
+                    window.restore()
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+                else:
+                    if label == "source":
+                        source_window = None
+                    elif label == "guard":
+                        guard_window = None
+                    else:
+                        lease_window = None
+            if first_error is not None:
+                raise first_error
+            source_parent._reprove()
+            target_parent._reprove()
+            owner_lease._reprove_lock()
+            mutation_guard._reprove_guard()
+
+        try:
+            owner_lease._reprove_lock()
+            mutation_guard._reprove_guard()
+            source_parent._reprove()
+            target_parent._reprove()
+            source_snapshot = source_parent.inspect_entry(source_name)
+            target_snapshot = target_parent.inspect_entry(target_name)
+            if (source_snapshot is None) == (target_snapshot is None):
+                raise _recovery_required()
+            selected = (
+                source_snapshot if source_snapshot is not None else target_snapshot
+            )
+            if (
+                selected is None
+                or selected.identity.kind != "regular"
+                or selected.identity.link_count != 1
+                or not selected.reparse_free
+                or selected.byte_count != expected_content.byte_count
+            ):
+                raise _recovery_required()
+            selected_path = source_path if source_snapshot is not None else target_path
+            handle = source_parent._api.open_handle(
+                selected_path,
+                desired_access=(
+                    GENERIC_READ
+                    | DELETE
+                    | FILE_READ_ATTRIBUTES
+                    | SYNCHRONIZE
+                    if source_snapshot is None
+                    else GENERIC_READ
+                    | GENERIC_WRITE
+                    | DELETE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE
+                ),
+                share_mode=FILE_SHARE_READ if source_snapshot is None else 0,
+                creation_disposition=OPEN_EXISTING,
+                flags=(
+                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN
+                    if source_snapshot is None
+                    else FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH
+                ),
+            )
+            with handle.borrow() as raw:
+                opened = _capture_handle_proof(
+                    source_parent._api,
+                    raw,
+                    expected_final_path=selected_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            actual = _read_publish_facts(
+                source_parent._api,
+                handle,
+                opened.snapshot.byte_count,
+            )
+            with handle.borrow() as raw:
+                after_read = _capture_handle_proof(
+                    source_parent._api,
+                    raw,
+                    expected_final_path=selected_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            if (
+                selected != opened.snapshot
+                or opened.snapshot != after_read.snapshot
+                or opened.identity.link_count != 1
+                or actual != expected_content
+            ):
+                raise _recovery_required()
+            source_parent._reprove()
+            target_parent._reprove()
+            if source_snapshot is None:
+                if (
+                    source_parent.inspect_entry(source_name) is not None
+                    or target_parent.inspect_entry(target_name) != after_read.snapshot
+                ):
+                    raise _recovery_required()
+                lease_window = owner_lease._begin_directory_rename_window(
+                    source_parent
+                )
+                guard_window = mutation_guard._begin_directory_rename_window(
+                    source_parent
+                )
+                old_leaf = source_parent._records[-1]
+                source_window = _begin_directory_rename_window(
+                    source_parent._api,
+                    source_parent,
+                    old_leaf,
+                )
+                source_parent._reprove()
+                target_parent._reprove()
+                _hit_fault(
+                    self._fault_injector,
+                    "existing_candidate_recovery_before_restore",
+                )
+                with handle.borrow() as raw_candidate:
+                    with source_parent._records[-1].handle.borrow() as raw_source_parent:
+                        source_parent._api.rename_file_to_parent_exclusive(
+                            raw_candidate,
+                            raw_source_parent,
+                            source_name,
+                        )
+                selected_path = source_path
+                _hit_fault(
+                    self._fault_injector,
+                    "existing_candidate_recovery_after_restore",
+                )
+                handle.close()
+                handle = source_parent._api.open_handle(
+                    source_path,
+                    desired_access=(
+                        GENERIC_READ
+                        | GENERIC_WRITE
+                        | DELETE
+                        | FILE_READ_ATTRIBUTES
+                        | READ_CONTROL
+                        | SYNCHRONIZE
+                    ),
+                    share_mode=0,
+                    creation_disposition=OPEN_EXISTING,
+                    flags=FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+                )
+                restore_owner_windows()
+            elif (
+                source_parent.inspect_entry(source_name) != after_read.snapshot
+                or target_parent.inspect_entry(target_name) is not None
+            ):
+                raise _recovery_required()
+            try:
+                with handle.borrow() as raw:
+                    source_parent._api.checked_bool(
+                        "FlushFileBuffers",
+                        source_parent._api.FlushFileBuffers,
+                        raw,
+                    )
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                raise _durability_unavailable() from None
+            synchronized = _read_publish_facts(
+                source_parent._api,
+                handle,
+                expected_content.byte_count,
+            )
+            with handle.borrow() as raw:
+                terminal = _capture_handle_proof(
+                    source_parent._api,
+                    raw,
+                    expected_final_path=source_path,
+                    expected_kind="regular",
+                    stale=True,
+                )
+            terminal_source = source_parent.inspect_entry(source_name)
+            terminal_target = target_parent.inspect_entry(target_name)
+            if (
+                synchronized != expected_content
+                or terminal.identity != selected.identity
+                or terminal.identity.link_count != 1
+                or terminal_source != terminal.snapshot
+                or terminal_target is not None
+            ):
+                raise _recovery_required()
+            source_parent._reprove()
+            target_parent._reprove()
+            # No candidate authority may escape until both owner authorities
+            # are back on their strict directory records and every retained
+            # authority participating in the move has been reproved.
+            restore_owner_windows()
+            source_parent._reprove()
+            target_parent._reprove()
+            _hit_fault(
+                self._fault_injector,
+                "existing_candidate_recovery_before_terminal",
+            )
+            records = _duplicate_directory_chain(
+                source_parent._api,
+                source_parent._records,
+            )
+            candidate = _WindowsCandidateFile(
+                source_parent._api,
+                records,
+                handle,
+                source_path,
+                terminal.identity,
+                source_parent._maximum_component_units,
+                self._fault_injector,
+                private=False,
+                recovered_content=expected_content,
+            )
+            records = None
+            handle = None
+            result = candidate
+            candidate = None
+            return result
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError as error:
+            if error.code == PlatformFileErrorCode.DURABILITY_UNAVAILABLE.value:
+                raise
+            raise _recovery_required() from None
+        except Exception:
+            raise _recovery_required() from None
+        finally:
+            restore_error: BaseException | None = None
+            if (
+                source_window is not None
+                or lease_window is not None
+                or guard_window is not None
+            ):
+                try:
+                    restore_owner_windows()
+                except BaseException as error:
+                    restore_error = error
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except BaseException:
+                    pass
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+            if records is not None:
+                _close_handles_reverse(tuple(record.handle for record in records))
+            if restore_error is not None and sys.exception() is None:
+                raise _recovery_required() from None
 
     def _bind_parent(
         self,
