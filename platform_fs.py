@@ -9,6 +9,7 @@ import sys
 from typing import cast
 
 from platform_fs_contracts import (
+    ExactEmptyChildDirectoryRetirement,
     ExistingFileRetirement,
     LockedDescendantNamespaceInspection,
     PersistentPrivateProof,
@@ -21,6 +22,7 @@ from platform_fs_contracts import (
 
 __all__ = [
     "compose_platform_file_backend",
+    "narrow_windows_exact_empty_child_directory_retirement",
     "narrow_windows_existing_file_retirement",
     "narrow_windows_locked_descendant_namespace_inspection",
     "narrow_windows_persistent_private_proof",
@@ -236,5 +238,28 @@ def narrow_windows_existing_file_retirement(
             raise _capability_unavailable()
         _self_probe(backend, checked_root)
         return cast(ExistingFileRetirement, backend)
+    except Exception:
+        raise _capability_unavailable() from None
+
+
+def narrow_windows_exact_empty_child_directory_retirement(
+    backend: PlatformFileBackend,
+    probe_root: Path,
+) -> ExactEmptyChildDirectoryRetirement:
+    """Narrow one composed Windows backend to exact empty-child removal."""
+
+    try:
+        checked_root = validate_root_path(probe_root)
+        if sys.platform != "win32":
+            raise _capability_unavailable()
+        backend_type = _load_windows_backend_type()
+        if (
+            type(backend) is not backend_type
+            or not _backend_has_contract(backend)
+            or not isinstance(backend, ExactEmptyChildDirectoryRetirement)
+        ):
+            raise _capability_unavailable()
+        _self_probe(backend, checked_root)
+        return cast(ExactEmptyChildDirectoryRetirement, backend)
     except Exception:
         raise _capability_unavailable() from None

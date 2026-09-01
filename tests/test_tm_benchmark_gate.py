@@ -29,6 +29,12 @@ import unittest
 from unittest import mock
 
 import tm_benchmark_gate
+import platform_fs_windows
+from platform_fs import (
+    compose_platform_file_backend,
+    narrow_windows_exact_empty_child_directory_retirement,
+)
+from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
 
 from tm_benchmark import load_benchmark_contract
 from tm_benchmark_latency import (
@@ -50,6 +56,7 @@ from tm_benchmark_process import (
     artifact_snapshot_digest,
     worker_protocol_digest,
 )
+from tm_benchmark_platform_io import cleanup_windows_benchmark_artifact_family
 from tm_benchmark_query_process import (
     QUERY_PROCESS_EVIDENCE_SCHEMA_VERSION,
     ArtifactFileIdentity,
@@ -1551,30 +1558,46 @@ class GateDRunnerTests(unittest.TestCase):
         temp, work_root, evidence_path = self._fresh_run_env()
         ports, _ = _runner_ports()
         expected_bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
-        real_cleanup = tm_benchmark_gate._cleanup_private_run_dir
         observed: dict[str, object] = {}
+        if sys.platform == "win32":
+            real_cleanup = tm_benchmark_gate._cleanup_windows_gate_d_run_tree
 
-        def observing_cleanup(
-            private_dir: Path,
-            private_identity: tuple[int, int],
-            work_identity: tuple[int, int],
-            *,
-            expected_children: dict[str, tuple[int, int]],
-        ) -> None:
-            observed["evidence_bytes"] = evidence_path.read_bytes()
-            observed["private_dir_present"] = Path(private_dir).exists()
-            real_cleanup(
-                private_dir,
-                private_identity,
-                work_identity,
-                expected_children=expected_children,
+            def observing_cleanup(tree: Any, **facts: object) -> None:
+                observed["evidence_bytes"] = evidence_path.read_bytes()
+                observed["private_dir_present"] = tree.private_path.exists()
+                real_cleanup(tree, **facts)
+
+            cleanup_patch = mock.patch.object(
+                tm_benchmark_gate,
+                "_cleanup_windows_gate_d_run_tree",
+                side_effect=observing_cleanup,
+            )
+        else:
+            real_cleanup = tm_benchmark_gate._cleanup_private_run_dir
+
+            def observing_cleanup(
+                private_dir: Path,
+                private_identity: tuple[int, int],
+                work_identity: tuple[int, int],
+                *,
+                expected_children: dict[str, tuple[int, int]],
+            ) -> None:
+                observed["evidence_bytes"] = evidence_path.read_bytes()
+                observed["private_dir_present"] = Path(private_dir).exists()
+                real_cleanup(
+                    private_dir,
+                    private_identity,
+                    work_identity,
+                    expected_children=expected_children,
+                )
+
+            cleanup_patch = mock.patch.object(
+                tm_benchmark_gate,
+                "_cleanup_private_run_dir",
+                side_effect=observing_cleanup,
             )
 
-        with mock.patch.object(
-            tm_benchmark_gate,
-            "_cleanup_private_run_dir",
-            side_effect=observing_cleanup,
-        ):
+        with cleanup_patch:
             result = _run_benchmark_gate_d_test(
                 _ROOT / "benchmark_tm_contract.json",
                 work_root,
@@ -1805,6 +1828,7 @@ class GateDRunnerTests(unittest.TestCase):
             self.assertEqual(ctx.exception.error_code, "GATE_D.CLEANUP_PENDING")
             self.assertTrue(evidence_path.is_file())
 
+    @unittest.skipIf(sys.platform == "win32", "Windows retains the run-root handle")
     def test_runner_cleanup_refuses_foreign_root_replacement(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
 
@@ -1837,6 +1861,7 @@ class GateDRunnerTests(unittest.TestCase):
         )
         self.assertEqual(os.listdir(work_root), [replaced.parent.name])
 
+    @unittest.skipIf(sys.platform == "win32", "Windows retains the run-root handle")
     def test_runner_cleanup_refuses_symlink_root_replacement(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
         target_dir = work_root.parent / "foreign-target-dir"
@@ -1886,6 +1911,29 @@ class GateDRunnerTests(unittest.TestCase):
             (target_dir / "marker.txt").read_text(encoding="utf-8"),
             "foreign",
         )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows retained authority only")
+    def test_runner_retained_authority_blocks_root_replacement_then_cleans(self) -> None:
+        temp, work_root, evidence_path = self._fresh_run_env()
+
+        def assert_retained(record: dict[str, list[object]]) -> None:
+            for key, index in (("migration_roots", 0), ("oracle_roots", 1)):
+                root = Path(str(record[key][index]))
+                with self.subTest(root=root), self.assertRaises(PermissionError):
+                    os.rmdir(root)
+
+        ports, _record = _runner_ports(combine_side_effect=assert_retained)
+        result = _run_benchmark_gate_d_test(
+            _ROOT / "benchmark_tm_contract.json",
+            work_root,
+            evidence_path,
+            ports=ports,
+            test_record_count=_TEST_RECORD_COUNT,
+            test_seed=0,
+        )
+        self.assertTrue(evidence_path.is_file())
+        self.assertTrue(result.test_mode)
+        self._assert_clean_work_root(work_root)
 
     def test_runner_cleanup_refuses_extra_foreign_child(self) -> None:
         temp, work_root, evidence_path = self._fresh_run_env()
@@ -1956,6 +2004,240 @@ class GateDRunnerTests(unittest.TestCase):
         self.assertEqual(ctx.exception.error_code, "GATE_D.WORK_ROOT_INVALID")
         self.assertEqual(os.listdir(work_root), ["existing.txt"])
         self.assertFalse(evidence_path.exists())
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows run-tree cleanup only")
+class GateDWindowsRunTreeCreationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.work_root = Path(self.temporary.name) / "work"
+        self.work_root.mkdir()
+
+    def test_precreate_second_through_fourth_child_failures_remove_prior_empty_roots(self) -> None:
+        real_create = platform_fs_windows.WindowsPlatformAdapter._create_private_directory
+        for fail_call in (3, 4, 5):
+            calls = 0
+
+            def fail_before_create(
+                adapter: object,
+                parent: object,
+                name: str,
+            ) -> object:
+                nonlocal calls
+                calls += 1
+                if calls == fail_call:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                        retryable=False,
+                    )
+                return real_create(adapter, parent, name)
+
+            with self.subTest(fail_call=fail_call), mock.patch.object(
+                platform_fs_windows.WindowsPlatformAdapter,
+                "_create_private_directory",
+                new=fail_before_create,
+            ), self.assertRaises(BenchmarkGateDError) as caught:
+                tm_benchmark_gate._create_windows_gate_d_run_tree(self.work_root)
+            self.assertEqual(
+                caught.exception.error_code,
+                "GATE_D.RUN_ROOT_CREATION_FAILED",
+            )
+            self.assertEqual(tuple(self.work_root.iterdir()), ())
+
+    def test_private_postcreate_before_authority_return_is_cleanup_pending(
+        self,
+    ) -> None:
+        real_create = platform_fs_windows.WindowsPlatformAdapter._create_private_directory
+
+        def fail_after_private_create(
+            adapter: object,
+            parent: object,
+            name: str,
+        ) -> object:
+            authority = real_create(adapter, parent, name)
+            authority.close()
+            raise PlatformFileError(
+                PlatformFileErrorCode.RECOVERY_REQUIRED,
+                retryable=True,
+            )
+
+        with mock.patch.object(
+            platform_fs_windows.WindowsPlatformAdapter,
+            "_create_private_directory",
+            new=fail_after_private_create,
+        ), self.assertRaises(BenchmarkGateDError) as caught:
+            tm_benchmark_gate._create_windows_gate_d_run_tree(self.work_root)
+        self.assertEqual(caught.exception.error_code, "GATE_D.CLEANUP_PENDING")
+        private_entries = tuple(self.work_root.iterdir())
+        self.assertEqual(len(private_entries), 1)
+        self.assertTrue(private_entries[0].is_dir())
+        self.assertEqual(tuple(private_entries[0].iterdir()), ())
+
+    def test_postcreate_before_authority_return_leaves_uncertain_child_pending(self) -> None:
+        real_create = platform_fs_windows.WindowsPlatformAdapter._create_private_directory
+        calls = 0
+
+        def fail_after_create(
+            adapter: object,
+            parent: object,
+            name: str,
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            authority = real_create(adapter, parent, name)
+            if calls == 3:
+                authority.close()
+                raise RuntimeError("post-create proof failure")
+            return authority
+
+        with mock.patch.object(
+            platform_fs_windows.WindowsPlatformAdapter,
+            "_create_private_directory",
+            new=fail_after_create,
+        ), self.assertRaises(BenchmarkGateDError) as caught:
+            tm_benchmark_gate._create_windows_gate_d_run_tree(self.work_root)
+        self.assertEqual(caught.exception.error_code, "GATE_D.CLEANUP_PENDING")
+        private_entries = tuple(self.work_root.iterdir())
+        self.assertEqual(len(private_entries), 1)
+        self.assertTrue(any(private_entries[0].iterdir()))
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows run-tree cleanup only")
+class GateDWindowsRunTreeCleanupTests(unittest.TestCase):
+    fixture_name = "fixture.jsonl"
+    sidecar_name = "tm.sqlite3"
+    manifest_name = "tm.manifest.json"
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.run_root = Path(self.temporary.name) / "run-root"
+        self.run_root.mkdir()
+        self.backend = compose_platform_file_backend(self.run_root)
+        self.retirement = narrow_windows_exact_empty_child_directory_retirement(
+            self.backend,
+            self.run_root,
+        )
+        self.root = self.backend.bind_root(self.run_root)
+        self.addCleanup(lambda: None if self.root.closed else self.root.close())
+
+    def _populate_full_family(self) -> Path:
+        direct = {
+            self.fixture_name,
+            self.sidecar_name,
+            self.manifest_name,
+            f".{self.sidecar_name}.localcat-activated-lineage.json",
+            f".{self.sidecar_name}.localcat-initial-activation.lock",
+        }
+        for name in direct:
+            (self.run_root / name).write_bytes(name.encode("utf-8"))
+        private = self.run_root / ".localcat-activation-private-v1.test"
+        private.mkdir()
+        for name in (
+            "activation-journal-v3.json",
+            "activation-publication-db-replaced-v1.json",
+            "activation-publication-generation-published-v1.json",
+            "activation-publication-manifest-published-v1.json",
+            "device.key",
+        ):
+            (private / name).write_bytes(name.encode("utf-8"))
+        attempt = (
+            self.run_root
+            / ".localcat-activation-quarantine-v1"
+            / "initial-test"
+        )
+        attempt.mkdir(parents=True)
+        (attempt / "test.sqlite3.stage").write_bytes(b"stage")
+        (attempt / "test.manifest.tmp").write_bytes(b"manifest")
+        return private / "activation-journal-v3.json"
+
+    def _cleanup(self, **kwargs: object) -> None:
+        cleanup_windows_benchmark_artifact_family(
+            backend=self.backend,
+            retirement=self.retirement,
+            run_root_authority=self.root,
+            run_root=self.run_root,
+            fixture_name=self.fixture_name,
+            sidecar_name=self.sidecar_name,
+            manifest_name=self.manifest_name,
+            **kwargs,
+        )
+
+    def test_complete_family_is_removed_by_live_receipts_and_empty_directories(self) -> None:
+        self._populate_full_family()
+        self._cleanup()
+        self.assertEqual(tuple(self.run_root.iterdir()), ())
+        self.root.reprove()
+
+    def test_same_bytes_nested_replacement_after_capture_is_preserved(self) -> None:
+        target = self._populate_full_family()
+        original = target.read_bytes()
+        replaced = False
+
+        def replace_after_capture(point: str, path: Path) -> None:
+            nonlocal replaced
+            if point == "after_capture_close" and path == target and not replaced:
+                path.unlink()
+                path.write_bytes(original)
+                replaced = True
+
+        with self.assertRaises(PlatformFileError) as caught:
+            self._cleanup(_fault_injector=replace_after_capture)
+        self.assertEqual(
+            caught.exception.code,
+            PlatformFileErrorCode.RECOVERY_REQUIRED.value,
+        )
+        self.assertTrue(replaced)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_partial_or_foreign_family_is_preserved(self) -> None:
+        partial = self.run_root / self.fixture_name
+        partial.write_bytes(b"partial")
+        with self.assertRaisesRegex(
+            ValueError,
+            "Windows activation private directory is not closed",
+        ):
+            self._cleanup()
+        self.assertEqual(partial.read_bytes(), b"partial")
+
+        foreign = self.run_root / "foreign.txt"
+        foreign.write_bytes(b"foreign")
+        with self.assertRaisesRegex(
+            ValueError,
+            "Windows activation private directory is not closed",
+        ):
+            self._cleanup()
+        self.assertEqual(foreign.read_bytes(), b"foreign")
+
+    def test_junction_family_directory_is_rejected_without_touching_target(self) -> None:
+        self._populate_full_family()
+        private = self.run_root / ".localcat-activation-private-v1.test"
+        for entry in private.iterdir():
+            entry.unlink()
+        private.rmdir()
+        target = self.run_root.parent / "foreign-target"
+        target.mkdir()
+        marker = target / "marker.txt"
+        marker.write_text("foreign", encoding="utf-8")
+        junction = private
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        try:
+            with self.assertRaises(PlatformFileError) as caught:
+                self._cleanup()
+            self.assertEqual(
+                caught.exception.code,
+                PlatformFileErrorCode.REPARSE_REJECTED.value,
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "foreign")
+        finally:
+            os.rmdir(junction)
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows evidence publisher only")

@@ -29,6 +29,7 @@ from platform_fs_contracts import (
     DEVICE_SECRET_SIZE_BYTES,
     DeviceSecretAuthority,
     EntrySnapshot,
+    ExactEmptyChildDirectoryRetirement,
     ExistingFileDurability,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
@@ -936,6 +937,91 @@ def _open_retirement_target_record(
                 pass
 
 
+def _open_empty_child_record(
+    api: WindowsFileAPI,
+    path: str,
+    expected_volume_id: bytes,
+) -> _WindowsDirectoryRecord:
+    """Retain one no-follow directory with delete-compatible sharing."""
+
+    handle = None
+    try:
+        handle = api.open_handle(
+            path,
+            desired_access=FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            share_mode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            creation_disposition=OPEN_EXISTING,
+            flags=FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        with handle.borrow() as raw:
+            proof = _capture_handle_proof(
+                api,
+                raw,
+                expected_final_path=path,
+                expected_kind="directory",
+                stale=True,
+            )
+        _require_volume(proof.identity, expected_volume_id, stale=True)
+        result = _WindowsDirectoryRecord(handle, proof.final_path, proof.identity)
+        handle = None
+        return result
+    except (TypeError, AssertionError, AttributeError):
+        raise
+    except PlatformFileError:
+        raise
+    except Win32CallError:
+        raise _identity_stale() from None
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException:
+                pass
+
+
+def _directory_handle_is_empty(api: WindowsFileAPI, raw: int) -> bool:
+    """Return whether one fresh retained directory handle has no real entries."""
+
+    while True:
+        buffer = ctypes.create_string_buffer(_DIRECTORY_QUERY_BUFFER_BYTES)
+        if not api.GetFileInformationByHandleEx(
+            raw,
+            FILE_ID_EXTD_DIR_INFO_CLASS,
+            buffer,
+            len(buffer),
+        ):
+            error = api.last_error()
+            if error == ERROR_NO_MORE_FILES:
+                return True
+            raise Win32CallError("GetFileInformationByHandleEx", error)
+        offset = 0
+        while True:
+            if offset + _FILE_ID_EXTD_DIR_HEADER.size > len(buffer):
+                raise _identity_stale()
+            values = _FILE_ID_EXTD_DIR_HEADER.unpack_from(buffer.raw, offset)
+            next_offset = values[0]
+            name_length = values[9]
+            _validate_directory_record_bounds(
+                offset=offset,
+                name_length=name_length,
+                next_offset=next_offset,
+                buffer_size=len(buffer),
+            )
+            name_start = offset + _FILE_ID_EXTD_DIR_HEADER.size
+            try:
+                name = buffer.raw[name_start : name_start + name_length].decode(
+                    "utf-16-le",
+                    errors="strict",
+                )
+            except UnicodeDecodeError:
+                raise _identity_stale() from None
+            if name not in {".", ".."}:
+                return False
+            if next_offset == 0:
+                break
+            offset += next_offset
+
+
 class _WindowsDirectoryRenameWindow:
     """Temporary rename-compatible replacement for one authority record."""
 
@@ -1720,6 +1806,15 @@ class _WindowsBoundDirectory(
     _WindowsDirectoryAuthorityMixin,
     BoundDirectoryAuthority,
 ):
+    __slots__ = _WINDOWS_DIRECTORY_AUTHORITY_SLOTS
+
+
+class _WindowsEmptyChildDirectoryAuthority(
+    _WindowsDirectoryAuthorityMixin,
+    BoundDirectoryAuthority,
+):
+    """Delete-compatible, one-operation authority for an existing child."""
+
     __slots__ = _WINDOWS_DIRECTORY_AUTHORITY_SLOTS
 
 
@@ -4193,6 +4288,7 @@ class WindowsRootedFileSystem(
     LockedDescendantNamespaceInspection,
     ExistingFileRetirement,
     ExistingCandidateRecovery,
+    ExactEmptyChildDirectoryRetirement,
 ):
     """Windows rooted reads, mutable reservations, and existing-file durability."""
 
@@ -4210,6 +4306,180 @@ class WindowsRootedFileSystem(
         self._authority_issuer = object()
         self._fault_injector = _fault_injector
 
+    def _bind_existing_child_directory(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+    ) -> BoundDirectoryAuthority:
+        if type(parent) not in {
+            _WindowsRootedDirectory,
+            _WindowsBoundDirectory,
+            _WindowsEmptyChildDirectoryAuthority,
+        } or parent._issuer is not self._authority_issuer:
+            raise _capability_unavailable()
+        component = _validate_windows_component(
+            name,
+            maximum_units=parent._maximum_component_units,
+        )
+        records: tuple[_WindowsDirectoryRecord, ...] = ()
+        child_record = None
+        try:
+            parent._reprove()
+            records = _duplicate_directory_chain(parent._api, parent._records)
+            child_path = _append_component(
+                parent._leaf_path,
+                component,
+                maximum_units=parent._maximum_component_units,
+            )
+            child_record = _open_empty_child_record(
+                parent._api,
+                child_path,
+                records[0].identity.volume_id,
+            )
+            expanded = records + (child_record,)
+            child_record = None
+            records = ()
+            return _WindowsEmptyChildDirectoryAuthority(
+                parent._api,
+                parent._issuer,
+                parent._root_anchor,
+                expanded,
+                parent._maximum_component_units,
+                self._fault_injector,
+            )
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _identity_stale() from None
+        finally:
+            if child_record is not None:
+                try:
+                    child_record.handle.close()
+                except BaseException:
+                    pass
+            if records:
+                _close_handles_reverse(tuple(record.handle for record in records))
+
+    def _remove_empty_owned_directory(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        child: BoundDirectoryAuthority,
+    ) -> None:
+        if (
+            type(parent)
+            not in {
+                _WindowsRootedDirectory,
+                _WindowsBoundDirectory,
+                _WindowsEmptyChildDirectoryAuthority,
+            }
+            or type(child) is not _WindowsEmptyChildDirectoryAuthority
+            or parent._issuer is not self._authority_issuer
+            or parent._api is not child._api
+            or parent._issuer is not child._issuer
+            or parent._root_anchor is not child._root_anchor
+            or len(child._records) != len(parent._records) + 1
+            or any(
+                left.expected_final_path != right.expected_final_path
+                or left.identity != right.identity
+                for left, right in zip(
+                    parent._records,
+                    child._records[:-1],
+                    strict=True,
+                )
+            )
+        ):
+            raise _recovery_required()
+        component = _validate_windows_component(
+            name,
+            maximum_units=parent._maximum_component_units,
+        )
+        expected_path = _append_component(
+            parent._leaf_path,
+            component,
+            maximum_units=parent._maximum_component_units,
+        )
+        expected = child._records[-1]
+        if expected.expected_final_path != expected_path:
+            raise _recovery_required()
+        delete_handle = None
+        armed = False
+        try:
+            parent._reprove()
+            child._reprove()
+            with expected.handle.borrow() as raw_child:
+                if not _directory_handle_is_empty(child._api, raw_child):
+                    raise _recovery_required()
+            named = _open_entry_proof(
+                parent._api,
+                expected_path,
+                expected_path,
+                expected_kind="directory",
+                expected_volume_id=parent._records[0].identity.volume_id,
+                stale=True,
+            )
+            if named is None or named.identity != expected.identity:
+                raise _recovery_required()
+            delete_handle = parent._api.open_handle(
+                expected_path,
+                desired_access=DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                share_mode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                creation_disposition=OPEN_EXISTING,
+                flags=FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+            with delete_handle.borrow() as raw_delete:
+                deleting = _capture_handle_proof(
+                    parent._api,
+                    raw_delete,
+                    expected_final_path=expected_path,
+                    expected_kind="directory",
+                    stale=True,
+                )
+                if deleting.identity != expected.identity:
+                    raise _recovery_required()
+                parent._reprove()
+                named = _open_entry_proof(
+                    parent._api,
+                    expected_path,
+                    expected_path,
+                    expected_kind="directory",
+                    expected_volume_id=parent._records[0].identity.volume_id,
+                    stale=True,
+                )
+                if named is None or named.identity != expected.identity:
+                    raise _recovery_required()
+                disposition = FILE_DISPOSITION_INFO(DeleteFile=1)
+                parent._api.checked_bool(
+                    "SetFileInformationByHandle",
+                    parent._api.SetFileInformationByHandle,
+                    raw_delete,
+                    FILE_DISPOSITION_INFO_CLASS,
+                    ctypes.byref(disposition),
+                    ctypes.sizeof(disposition),
+                )
+                armed = True
+            child.close()
+            delete_handle.close()
+            delete_handle = None
+            parent._reprove()
+            if parent._inspect_entry(component) is not None:
+                raise _recovery_required()
+            parent._reprove()
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except PlatformFileError:
+            raise _recovery_required() from None
+        except Exception:
+            raise _recovery_required() from None
+        finally:
+            if delete_handle is not None:
+                try:
+                    delete_handle.close()
+                except BaseException:
+                    if armed and sys.exception() is None:
+                        raise _recovery_required() from None
     def _native_api(self) -> WindowsFileAPI:
         if self._api is None:
             self._api = WindowsFileAPI.load()
