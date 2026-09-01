@@ -125,7 +125,7 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 import re
 import stat
 import tempfile
@@ -188,6 +188,25 @@ from tm_retrieval_capability import (
     RetrievalCorrectnessCohortEvidence,
     _RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR,
     _validated_refresh_retrieval_capability,
+)
+from platform_fs import (
+    compose_platform_file_backend,
+    narrow_windows_persistent_private_proof,
+)
+from platform_fs_contracts import (
+    DEVICE_SECRET_SIZE_BYTES,
+    CandidateFile,
+    LockPolicy,
+    LockWait,
+    PendingPublication,
+    PlatformFileError,
+    PlatformFileErrorCode,
+    PrivateProofContext,
+    PrivateProofObjectRole,
+    PublishMode,
+    WindowsPrivateProof,
+    decode_windows_private_proof,
+    encode_windows_private_proof,
 )
 
 BENCHMARK_BUNDLE_SCHEMA_VERSION = "tm-benchmark-bundle-v2"
@@ -2572,9 +2591,14 @@ def _issue_benchmark_gate_d_run_result(
 
 
 _GATE_D_ATTESTATION_SCHEMA_VERSION = "localcat.gate-d-attestation.v1"
+_GATE_D_WINDOWS_ATTESTATION_SCHEMA_VERSION = "localcat.gate-d-attestation.v2"
 _GATE_D_ATTESTATION_KEY_NAME = "device.key"
 _GATE_D_ATTESTATION_FILE_NAME = "qualification.json"
 _GATE_D_ATTESTATION_MAX_BYTES = 64 * 1024 * 1024
+_GATE_D_WINDOWS_LOCK_NAME = ".localcat-gate-d-attestation.lock"
+_GATE_D_WINDOWS_LOCK_PAYLOAD = b"localcat.gate-d-attestation.lock.v1\n"
+_GATE_D_WINDOWS_KEY_CANDIDATE_NAME = ".device.key.candidate"
+_GATE_D_WINDOWS_ATTESTATION_CANDIDATE_NAME = ".qualification.json.candidate"
 
 
 def _gate_d_attestation_canonical_json(payload: Mapping[str, object]) -> str:
@@ -2780,7 +2804,7 @@ def _gate_d_device_key(state_root: Path, *, create: bool) -> bytes:
     return key
 
 
-def _persist_gate_d_attestation(
+def _persist_gate_d_attestation_posix(
     *,
     contract_path: Path,
     state_root: Path,
@@ -2869,7 +2893,7 @@ def _persist_gate_d_attestation(
             pass
 
 
-def _restore_gate_d_attestation(
+def _restore_gate_d_attestation_posix(
     *,
     contract_path: Path,
     state_root: Path,
@@ -2954,6 +2978,708 @@ def _restore_gate_d_attestation(
         artifact_digest=artifact_digest,
         test_mode=False,
     )
+
+
+def _close_gate_d_windows_authorities(authorities: list[Any]) -> None:
+    first: BaseException | None = None
+    for authority in reversed(authorities):
+        try:
+            authority.close()
+        except BaseException as error:
+            if first is None:
+                first = error
+    authorities.clear()
+    if first is not None:
+        raise first
+
+
+def _gate_d_windows_private_owner(
+    state_root: Path,
+    *,
+    create: bool,
+) -> tuple[Any, Any, Any, Any, Any, Any, list[Any]]:
+    if type(state_root) is not _NATIVE_PATH_TYPE or not state_root.is_absolute():
+        raise ValueError("Gate D attestation root must be absolute")
+    if not state_root.name or state_root.parent == state_root:
+        raise ValueError("Gate D attestation root must have a parent")
+
+    backend = compose_platform_file_backend(state_root.parent)
+    persistent_private = narrow_windows_persistent_private_proof(
+        backend,
+        state_root.parent,
+    )
+    authorities: list[Any] = []
+    try:
+        root = backend.bind_root(state_root.parent)
+        authorities.append(root)
+        creation_parent = backend.bind_parent(
+            root,
+            PurePath(state_root.name),
+        )
+        authorities.append(creation_parent)
+        creation_lease = backend.acquire(
+            root,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+            LockPolicy(LockWait.BLOCK),
+        )
+        authorities.append(creation_lease)
+        creation_lease.reprove_binding(
+            root,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+        )
+        observed = creation_parent.inspect_entry(state_root.name)
+        if observed is None:
+            if not create:
+                raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+            private_parent = backend.create_private_directory(
+                creation_parent,
+                state_root.name,
+            )
+        else:
+            if (
+                observed.identity.kind != "directory"
+                or not observed.reparse_free
+            ):
+                raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+            private_parent = backend.bind_parent(
+                root,
+                PurePath(state_root.name, "owner-placeholder"),
+            )
+        authorities.append(private_parent)
+        private_evidence = backend.prove_private(private_parent)
+        authorities.append(private_evidence)
+        lease = backend.acquire(
+            private_parent,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+            LockPolicy(LockWait.BLOCK),
+        )
+        authorities.append(lease)
+        lease.reprove_binding(
+            private_parent,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+        )
+        return (
+            backend,
+            persistent_private,
+            root,
+            lease,
+            private_parent,
+            private_evidence,
+            authorities,
+        )
+    except BaseException:
+        try:
+            _close_gate_d_windows_authorities(authorities)
+        except BaseException:
+            pass
+        raise
+
+
+def _gate_d_windows_device_secret(
+    *,
+    backend: Any,
+    persistent_private: Any,
+    root: Any,
+    private_parent: Any,
+    state_root: Path,
+    create: bool,
+    authorities: list[Any],
+) -> tuple[bytes, Any]:
+    observed = private_parent.inspect_entry(_GATE_D_ATTESTATION_KEY_NAME)
+    if observed is None:
+        if not create:
+            raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+        if (
+            private_parent.inspect_entry(_GATE_D_WINDOWS_KEY_CANDIDATE_NAME)
+            is not None
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        key_bytes = secrets.token_bytes(DEVICE_SECRET_SIZE_BYTES)
+        candidate: CandidateFile | None = None
+        pending: PendingPublication | None = None
+        candidate_identity = None
+        try:
+            candidate = private_parent.create_candidate(
+                _GATE_D_WINDOWS_KEY_CANDIDATE_NAME,
+                private=True,
+            )
+            candidate_identity = candidate.identity()
+            written = candidate.write_chunks(
+                (key_bytes,),
+                maximum_bytes=DEVICE_SECRET_SIZE_BYTES,
+            )
+            candidate.flush_content()
+            pending = private_parent.begin_publish(
+                candidate,
+                _GATE_D_ATTESTATION_KEY_NAME,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            candidate = None
+            candidate_identity = None
+            facts = pending.preliminary_facts()
+            key_file = pending.retained_destination()
+            snapshot = key_file.snapshot()
+            if (
+                written.byte_count != DEVICE_SECRET_SIZE_BYTES
+                or written.content_sha256 != hashlib.sha256(key_bytes).digest()
+                or facts.byte_count != DEVICE_SECRET_SIZE_BYTES
+                or facts.content_sha256 != written.content_sha256
+                or snapshot.identity != facts.destination_identity
+                or snapshot.identity.kind != "regular"
+                or snapshot.identity.link_count != 1
+                or not snapshot.reparse_free
+                or snapshot.byte_count != DEVICE_SECRET_SIZE_BYTES
+                or key_file.read_all() != key_bytes
+                or private_parent.inspect_entry(_GATE_D_ATTESTATION_KEY_NAME)
+                != snapshot
+            ):
+                raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+            key_evidence = backend.prove_private(key_file)
+            authorities.append(key_evidence)
+            secret = persistent_private.bind_device_secret(key_file)
+            authorities.append(secret)
+            secret.reprove()
+            if pending.terminal_reproof() != facts:
+                raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+            pending.close()
+            pending = None
+            return key_bytes, secret
+        finally:
+            active_error = sys.exception()
+            cleanup_error: BaseException | None = None
+            for authority in (pending, candidate):
+                if authority is None:
+                    continue
+                try:
+                    authority.close()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if candidate_identity is not None:
+                try:
+                    current = private_parent.inspect_entry(
+                        _GATE_D_WINDOWS_KEY_CANDIDATE_NAME
+                    )
+                    if (
+                        current is not None
+                        and current.identity == candidate_identity
+                    ):
+                        private_parent.unlink_owned(
+                            _GATE_D_WINDOWS_KEY_CANDIDATE_NAME,
+                            candidate_identity,
+                        )
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if active_error is None and cleanup_error is not None:
+                raise cleanup_error
+
+    if (
+        observed.identity.kind != "regular"
+        or observed.identity.link_count != 1
+        or not observed.reparse_free
+        or observed.byte_count != DEVICE_SECRET_SIZE_BYTES
+    ):
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+    key_file = backend.open_regular(
+        root,
+        PurePath(state_root.name, _GATE_D_ATTESTATION_KEY_NAME),
+    )
+    authorities.append(key_file)
+    snapshot = key_file.snapshot()
+    key_bytes = key_file.read_all()
+    if (
+        snapshot != observed
+        or snapshot.identity.kind != "regular"
+        or snapshot.identity.link_count != 1
+        or not snapshot.reparse_free
+        or len(key_bytes) != DEVICE_SECRET_SIZE_BYTES
+    ):
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+    key_evidence = backend.prove_private(key_file)
+    authorities.append(key_evidence)
+    secret = persistent_private.bind_device_secret(key_file)
+    authorities.append(secret)
+    secret.reprove()
+    return key_bytes, secret
+
+
+def _gate_d_windows_private_proof_payload(
+    proof: WindowsPrivateProof,
+) -> dict[str, object]:
+    encoded = encode_windows_private_proof(proof)
+    decoded = _parse_strict_json(encoded.decode("utf-8"))
+    if type(decoded) is not dict:
+        raise TypeError("Windows private proof codec returned a non-mapping")
+    return decoded
+
+
+def _gate_d_windows_owner_context(
+    unsigned_without_private_proof: Mapping[str, object],
+) -> PrivateProofContext:
+    return PrivateProofContext(
+        PrivateProofObjectRole.PRIVATE_DIRECTORY,
+        hashlib.sha256(
+            _gate_d_attestation_canonical_json(
+                unsigned_without_private_proof
+            ).encode("utf-8")
+        ).digest(),
+    )
+
+
+def _persist_gate_d_attestation_windows(
+    *,
+    contract_path: Path,
+    state_root: Path,
+    base_manifest: RetrievalCapabilityManifest,
+    run_result: BenchmarkGateDRunResult,
+    issued_at_utc: datetime,
+) -> None:
+    if type(run_result) is not BenchmarkGateDRunResult:
+        raise TypeError("Gate D attestation run result must be exact")
+    run_result.__post_init__()
+    if run_result.test_mode:
+        raise BenchmarkGateDError("GATE_D.TEST_EVIDENCE_FORBIDDEN")
+
+    issued = _require_utc_datetime(issued_at_utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+    authorities: list[Any] = []
+    candidate: CandidateFile | None = None
+    pending: PendingPublication | None = None
+    candidate_identity = None
+    try:
+        (
+            backend,
+            persistent_private,
+            root,
+            lease,
+            private_parent,
+            private_evidence,
+            authorities,
+        ) = _gate_d_windows_private_owner(state_root, create=True)
+        key, secret = _gate_d_windows_device_secret(
+            backend=backend,
+            persistent_private=persistent_private,
+            root=root,
+            private_parent=private_parent,
+            state_root=state_root,
+            create=True,
+            authorities=authorities,
+        )
+        bundle_json = benchmark_evidence_bundle_to_json(run_result.bundle)
+        owner_unsigned: dict[str, object] = {
+            "artifact_digest": run_result.artifact_digest,
+            "artifact_size": run_result.artifact_size,
+            "bundle_digest": run_result.bundle_digest,
+            "bundle_json": bundle_json,
+            "compatibility": _gate_d_attestation_compatibility(
+                contract_path=contract_path,
+                base_manifest=base_manifest,
+                bundle=run_result.bundle,
+                device_key=key,
+            ),
+            "issued_at_utc": issued,
+            "schema_version": _GATE_D_WINDOWS_ATTESTATION_SCHEMA_VERSION,
+        }
+        context = _gate_d_windows_owner_context(owner_unsigned)
+        proof = persistent_private.mint(private_evidence, secret, context)
+        unsigned = dict(owner_unsigned)
+        unsigned["windows_private_proof"] = (
+            _gate_d_windows_private_proof_payload(proof)
+        )
+        signature = hmac.new(
+            key,
+            _gate_d_attestation_canonical_json(unsigned).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        payload = dict(unsigned)
+        payload["signature"] = signature
+        encoded = (
+            _gate_d_attestation_canonical_json(payload) + "\n"
+        ).encode("utf-8")
+        if len(encoded) > _GATE_D_ATTESTATION_MAX_BYTES:
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+
+        if (
+            private_parent.inspect_entry(
+                _GATE_D_WINDOWS_ATTESTATION_CANDIDATE_NAME
+            )
+            is not None
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        prior = private_parent.inspect_entry(_GATE_D_ATTESTATION_FILE_NAME)
+        if prior is not None and (
+            prior.identity.kind != "regular"
+            or prior.identity.link_count != 1
+            or not prior.reparse_free
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+
+        candidate = private_parent.create_candidate(
+            _GATE_D_WINDOWS_ATTESTATION_CANDIDATE_NAME,
+            private=True,
+        )
+        candidate_identity = candidate.identity()
+        written = candidate.write_chunks(
+            (
+                encoded[offset : offset + 64 * 1024]
+                for offset in range(0, len(encoded), 64 * 1024)
+            ),
+            maximum_bytes=_GATE_D_ATTESTATION_MAX_BYTES,
+        )
+        candidate.flush_content()
+        lease.reprove_binding(
+            private_parent,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+        )
+        pending = private_parent.begin_publish(
+            candidate,
+            _GATE_D_ATTESTATION_FILE_NAME,
+            mode=(
+                PublishMode.CREATE_IF_ABSENT
+                if prior is None
+                else PublishMode.REPLACE_UNDER_LOCK
+            ),
+            lease=None if prior is None else lease,
+        )
+        candidate = None
+        candidate_identity = None
+        facts = pending.preliminary_facts()
+        retained = pending.retained_destination()
+        snapshot = retained.snapshot()
+        if (
+            written.byte_count != len(encoded)
+            or written.content_sha256 != hashlib.sha256(encoded).digest()
+            or facts.byte_count != len(encoded)
+            or facts.content_sha256 != written.content_sha256
+            or snapshot.identity != facts.destination_identity
+            or snapshot.identity.kind != "regular"
+            or snapshot.identity.link_count != 1
+            or not snapshot.reparse_free
+            or snapshot.byte_count != len(encoded)
+            or retained.read_all() != encoded
+            or private_parent.inspect_entry(_GATE_D_ATTESTATION_FILE_NAME)
+            != snapshot
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        attestation_evidence = backend.prove_private(retained)
+        authorities.append(attestation_evidence)
+        verified = persistent_private.verify(
+            private_evidence,
+            secret,
+            proof,
+            context,
+        )
+        authorities.append(verified)
+        lease.reprove_binding(
+            private_parent,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+        )
+        if pending.terminal_reproof() != facts:
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        terminal_attestation_evidence = backend.prove_private(retained)
+        authorities.append(terminal_attestation_evidence)
+        persistent_private.consume_verified(verified, context)
+        authorities.remove(verified)
+    finally:
+        active_error = sys.exception()
+        close_error: BaseException | None = None
+        for authority in (pending, candidate):
+            if authority is None:
+                continue
+            try:
+                authority.close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if candidate_identity is not None and authorities:
+            try:
+                current = private_parent.inspect_entry(
+                    _GATE_D_WINDOWS_ATTESTATION_CANDIDATE_NAME
+                )
+                if current is not None and current.identity == candidate_identity:
+                    private_parent.unlink_owned(
+                        _GATE_D_WINDOWS_ATTESTATION_CANDIDATE_NAME,
+                        candidate_identity,
+                    )
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        try:
+            _close_gate_d_windows_authorities(authorities)
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+        if active_error is None and close_error is not None:
+            raise close_error
+
+
+def _restore_gate_d_attestation_windows(
+    *,
+    contract_path: Path,
+    state_root: Path,
+    base_manifest: RetrievalCapabilityManifest,
+) -> BenchmarkGateDRunResult:
+    authorities: list[Any] = []
+    try:
+        (
+            backend,
+            persistent_private,
+            root,
+            lease,
+            private_parent,
+            private_evidence,
+            authorities,
+        ) = _gate_d_windows_private_owner(state_root, create=False)
+        key, secret = _gate_d_windows_device_secret(
+            backend=backend,
+            persistent_private=persistent_private,
+            root=root,
+            private_parent=private_parent,
+            state_root=state_root,
+            create=False,
+            authorities=authorities,
+        )
+        observed = private_parent.inspect_entry(_GATE_D_ATTESTATION_FILE_NAME)
+        if observed is None:
+            raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+        if (
+            observed.identity.kind != "regular"
+            or observed.identity.link_count != 1
+            or not observed.reparse_free
+            or observed.byte_count > _GATE_D_ATTESTATION_MAX_BYTES
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        attestation_file = backend.open_regular(
+            root,
+            PurePath(state_root.name, _GATE_D_ATTESTATION_FILE_NAME),
+        )
+        authorities.append(attestation_file)
+        snapshot = attestation_file.snapshot()
+        raw = attestation_file.read_all()
+        if (
+            snapshot != observed
+            or snapshot.identity.kind != "regular"
+            or snapshot.identity.link_count != 1
+            or not snapshot.reparse_free
+            or len(raw) != snapshot.byte_count
+            or len(raw) > _GATE_D_ATTESTATION_MAX_BYTES
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        attestation_evidence = backend.prove_private(attestation_file)
+        authorities.append(attestation_evidence)
+        lease.reprove_binding(
+            private_parent,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+        )
+
+        try:
+            decoded = raw.decode("utf-8")
+            parsed = _parse_strict_json(decoded)
+            if decoded != _gate_d_attestation_canonical_json(parsed) + "\n":
+                raise ValueError("attestation encoding is not canonical")
+            expected_fields = {
+                "artifact_digest",
+                "artifact_size",
+                "bundle_digest",
+                "bundle_json",
+                "compatibility",
+                "issued_at_utc",
+                "schema_version",
+                "signature",
+                "windows_private_proof",
+            }
+            if set(parsed) != expected_fields:
+                raise ValueError("attestation fields are invalid")
+            if (
+                parsed["schema_version"]
+                != _GATE_D_WINDOWS_ATTESTATION_SCHEMA_VERSION
+            ):
+                raise ValueError("attestation schema is unsupported")
+            signature = _as_digest(
+                parsed["signature"],
+                "attestation signature",
+            )
+            unsigned = dict(parsed)
+            del unsigned["signature"]
+            expected_signature = hmac.new(
+                key,
+                _gate_d_attestation_canonical_json(unsigned).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected_signature):
+                raise ValueError("attestation signature mismatch")
+            owner_unsigned = dict(unsigned)
+            private_payload = owner_unsigned.pop("windows_private_proof")
+            proof = decode_windows_private_proof(
+                _gate_d_attestation_canonical_json(private_payload).encode(
+                    "utf-8"
+                )
+            )
+            context = _gate_d_windows_owner_context(owner_unsigned)
+            _validate_evidence_utc_string(
+                _as_str(
+                    parsed["issued_at_utc"],
+                    "attestation issued instant",
+                ),
+                "issued_at_utc",
+            )
+            bundle_json = _as_str(parsed["bundle_json"], "attestation bundle")
+            bundle = benchmark_evidence_bundle_from_json(bundle_json)
+            artifact = bundle_json.encode("utf-8")
+            artifact_size = _as_int(
+                parsed["artifact_size"],
+                "attestation artifact size",
+                minimum=0,
+            )
+            artifact_digest = _as_digest(
+                parsed["artifact_digest"],
+                "attestation artifact digest",
+            )
+            bundle_digest = _as_digest(
+                parsed["bundle_digest"],
+                "attestation bundle digest",
+            )
+            if (
+                len(artifact) != artifact_size
+                or hashlib.sha256(artifact).hexdigest() != artifact_digest
+                or bundle.bundle_digest != bundle_digest
+            ):
+                raise ValueError("attestation artifact binding is invalid")
+            compatibility = _gate_d_attestation_compatibility(
+                contract_path=contract_path,
+                base_manifest=base_manifest,
+                bundle=bundle,
+                device_key=key,
+            )
+            if parsed["compatibility"] != compatibility:
+                raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+        except BenchmarkGateDError:
+            raise
+        except (UnicodeError, TypeError, ValueError) as error:
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID") from error
+
+        verified = persistent_private.verify(
+            private_evidence,
+            secret,
+            proof,
+            context,
+        )
+        authorities.append(verified)
+        private_parent.reprove()
+        secret.reprove()
+        if (
+            attestation_file.snapshot() != snapshot
+            or attestation_file.read_all() != raw
+            or private_parent.inspect_entry(_GATE_D_ATTESTATION_FILE_NAME)
+            != snapshot
+        ):
+            raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID")
+        lease.reprove_binding(
+            private_parent,
+            _GATE_D_WINDOWS_LOCK_NAME,
+            _GATE_D_WINDOWS_LOCK_PAYLOAD,
+        )
+        terminal_attestation_evidence = backend.prove_private(attestation_file)
+        authorities.append(terminal_attestation_evidence)
+        persistent_private.consume_verified(verified, context)
+        authorities.remove(verified)
+        return _issue_benchmark_gate_d_run_result(
+            bundle=bundle,
+            bundle_digest=bundle_digest,
+            artifact_size=artifact_size,
+            artifact_digest=artifact_digest,
+            test_mode=False,
+        )
+    finally:
+        active_error = sys.exception()
+        try:
+            _close_gate_d_windows_authorities(authorities)
+        except BaseException:
+            if active_error is None:
+                raise
+
+
+def _persist_gate_d_attestation(
+    *,
+    contract_path: Path,
+    state_root: Path,
+    base_manifest: RetrievalCapabilityManifest,
+    run_result: BenchmarkGateDRunResult,
+    issued_at_utc: datetime,
+) -> None:
+    if sys.platform != "win32":
+        return _persist_gate_d_attestation_posix(
+            contract_path=contract_path,
+            state_root=state_root,
+            base_manifest=base_manifest,
+            run_result=run_result,
+            issued_at_utc=issued_at_utc,
+        )
+    try:
+        return _persist_gate_d_attestation_windows(
+            contract_path=contract_path,
+            state_root=state_root,
+            base_manifest=base_manifest,
+            run_result=run_result,
+            issued_at_utc=issued_at_utc,
+        )
+    except BenchmarkGateDError:
+        raise
+    except PlatformFileError as error:
+        code = (
+            "GATE_D.REVALIDATION_REQUIRED"
+            if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value
+            else "GATE_D.ATTESTATION_UNAVAILABLE"
+        )
+        raise BenchmarkGateDError(code) from error
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_UNAVAILABLE") from error
+
+
+def _restore_gate_d_attestation(
+    *,
+    contract_path: Path,
+    state_root: Path,
+    base_manifest: RetrievalCapabilityManifest,
+) -> BenchmarkGateDRunResult:
+    if sys.platform != "win32":
+        return _restore_gate_d_attestation_posix(
+            contract_path=contract_path,
+            state_root=state_root,
+            base_manifest=base_manifest,
+        )
+    try:
+        return _restore_gate_d_attestation_windows(
+            contract_path=contract_path,
+            state_root=state_root,
+            base_manifest=base_manifest,
+        )
+    except BenchmarkGateDError:
+        raise
+    except PlatformFileError as error:
+        if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
+            code = "GATE_D.REVALIDATION_REQUIRED"
+        elif error.code in {
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+            PlatformFileErrorCode.LOCK_CONTENDED.value,
+            PlatformFileErrorCode.LOCK_UNAVAILABLE.value,
+        }:
+            code = "GATE_D.ATTESTATION_UNAVAILABLE"
+        else:
+            code = "GATE_D.ATTESTATION_INVALID"
+        raise BenchmarkGateDError(code) from error
+    except OSError as error:
+        raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID") from error
 
 
 @dataclass(frozen=True)

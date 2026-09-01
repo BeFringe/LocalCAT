@@ -312,6 +312,64 @@ class WindowsPortableRecoveryAttackTests(unittest.TestCase):
             _remove_long_quarantine(root)
             temporary.cleanup()
 
+    def test_nested_private_proof_tamper_fails_cold_open_without_fallback(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name).resolve()
+        try:
+            creator = _run_worker(root, "create", phase="DB_MUTATION_GUARD")
+            mutation = _run_worker(
+                root,
+                "mutate",
+                mutation="private-generation-owner-envelope",
+            )
+            cold_open = _run_worker(root, "cold-open-private-tamper")
+
+            for result in (creator, mutation, cold_open):
+                _assert_no_worker_exception(self, result)
+            _assert_complete(self, creator)
+            self.assertEqual(cold_open["failure_type"], "ValueError")
+            self.assertEqual(
+                cold_open["failure_message"],
+                "TM.CANONICAL_RECOVERY_FAILED:ACTIVATION.RECOVERY_REQUIRED",
+            )
+            self.assertEqual(cold_open["generic_fallback_calls"], 0)
+            self.assertEqual(cold_open["before_disk"], mutation["disk"])
+            self.assertEqual(cold_open["before_journal"], mutation["journal"])
+            self.assertEqual(cold_open["after_disk"], cold_open["before_disk"])
+            self.assertEqual(
+                cold_open["after_journal"],
+                cold_open["before_journal"],
+            )
+        finally:
+            _remove_long_quarantine(root)
+            temporary.cleanup()
+
+    def test_private_narrowing_failure_fails_cold_open_without_fallback(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name).resolve()
+        try:
+            creator = _run_worker(root, "create", phase="DB_MUTATION_GUARD")
+            cold_open = _run_worker(root, "cold-open-narrow-failure")
+
+            for result in (creator, cold_open):
+                _assert_no_worker_exception(self, result)
+            _assert_complete(self, creator)
+            self.assertEqual(cold_open["failure_type"], "ValueError")
+            self.assertEqual(
+                cold_open["failure_message"],
+                "TM.CANONICAL_RECOVERY_FAILED:"
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+            )
+            self.assertEqual(cold_open["generic_fallback_calls"], 0)
+            self.assertEqual(cold_open["after_disk"], cold_open["before_disk"])
+            self.assertEqual(
+                cold_open["after_journal"],
+                cold_open["before_journal"],
+            )
+        finally:
+            _remove_long_quarantine(root)
+            temporary.cleanup()
+
     def test_portable_journal_persists_no_historical_file_identity(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name).resolve()

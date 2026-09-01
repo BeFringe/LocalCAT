@@ -39,6 +39,7 @@ from tm_contracts import (
 from tm_engine import SourceUnit, TMEngine
 from tm_migration import TMMigrationService
 from tm_gate_b import GateBEvaluator
+from tm_snapshot_recovery import RefreshRecoveryOutcome, RefreshRecoveryState
 from tm_sqlite_store import ActivationPreparationError, ResourceStoreCoordinator
 
 
@@ -547,6 +548,13 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     "tm_engine.SQLiteTMStore.from_coordinator",
                     return_value=store,
                 ),
+                mock.patch.object(
+                    TMMigrationService,
+                    "recover_configured_refresh",
+                    return_value=RefreshRecoveryOutcome(
+                        state=RefreshRecoveryState.NOOP,
+                    ),
+                ) as refresh,
             ):
                 engine = TMEngine(
                     str(identity.configured_jsonl_path),
@@ -558,6 +566,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
             self.assertIs(engine.canonical_store, store)
             portable.assert_called_once_with()
             generic.assert_called_once_with()
+            refresh.assert_called_once_with(store)
 
     def test_corrupt_portable_cold_open_never_uses_generic_fallback(self) -> None:
         temporary = tempfile.TemporaryDirectory()
