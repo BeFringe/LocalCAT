@@ -1992,6 +1992,29 @@ class ActivationMarkerAtomicPublishTests(unittest.TestCase):
 class ActivationSingleLinkReadFsyncTests(unittest.TestCase):
     """Correction C: close the single-link chain on read/fsync/cleanup."""
 
+    def test_capture_and_read_preserve_crlf_and_substitute_bytes(self) -> None:
+        """Binary capture must describe the exact bytes Gate B sealed."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asset = Path(temporary) / "byte-exact-source.jsonl"
+            expected = (
+                b'{"source":"hello","target":"line one"}\r\n'
+                b'{"source":"world","target":"line two"}\r\n\x1a'
+            )
+            asset.write_bytes(expected)
+
+            capture = journal_module._capture_activation_file(
+                asset,
+                asset_kind="SOURCE",
+            )
+
+            self.assertEqual(capture.digest, hashlib.sha256(expected).hexdigest())
+            self.assertEqual(
+                journal_module._read_activation_file_bytes(capture),
+                expected,
+            )
+            self.assertEqual(asset.read_bytes(), expected)
+
     def test_hardlink_added_after_descriptor_read_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
