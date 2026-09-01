@@ -292,7 +292,6 @@ from tm_activation_recovery import (
     _recovery_mismatch,
     _recovery_prior_completed_binding,
     _portable_recovery_activation_digest,
-    _portable_recovery_binding,
     _recovery_receipt_row,
     _recovery_sealed_stage_digest,
     _replace_activation_database,
@@ -2422,19 +2421,22 @@ def _rehydrate_completed_portable_authority(
                     or receipt_row != binding.receipt
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
-                signed_binding = _portable_recovery_binding(
-                    identity,
-                    prepared,
-                    contract_to_json(binding.manifest).encode("utf-8"),
-                )
+                try:
+                    _validate_binding_identity(
+                        binding,
+                        identity=identity,
+                        canonical_store_id=port.canonical_store_id,
+                    )
+                except (TypeError, ValueError):
+                    raise port.store_schema_error(
+                        "STORE.ACTIVE_BINDING_INVALID"
+                    ) from None
                 record_count_at_revision = {0: 0}
                 record_count_at_revision.update(
                     facts.cumulative_record_counts
                 )
                 if (
-                    binding != signed_binding
-                    or binding.receipt.exported_revision
-                    > facts.head_revision
+                    binding.receipt.exported_revision > facts.head_revision
                     or record_count_at_revision.get(
                         binding.receipt.exported_revision
                     )
@@ -8781,7 +8783,14 @@ class SourceBindingMonitor:
         """
 
         if self._store is not None:
-            self._store.recover_configured_refresh()
+            if sys.platform == "win32":
+                self._store.require_bound_refresh_observation_ready()
+                return
+            outcome = self._store.recover_configured_refresh()
+            if outcome.state is snapshot_recovery_module.RefreshRecoveryState.BLOCKED:
+                raise SQLiteStoreSchemaError(
+                    "STORE.REFRESH_RECOVERY_REQUIRED"
+                )
 
     def observe(self) -> SourceBindingObservation:
         """Derive and latch source divergence in one generation lease.
@@ -9955,6 +9964,110 @@ class _SnapshotRecoveryPort:
             ) from error
 
 
+class _BoundSnapshotRecoveryPort(_SnapshotRecoveryPort):
+    """Store effects for portable configured-refresh recovery."""
+
+    def cancel_bound_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> None:
+        try:
+            self._store.cancel_bound_recovered_refresh_receipt(
+                snapshot_id,
+                expected_generation=expected_generation,
+                expected_receipt=expected_receipt,
+                expected_handoff=expected_handoff,
+                expected_binding=expected_binding,
+                family_reprove=family_reprove,
+            )
+        except (SQLiteStoreLifecycleError, SQLiteStoreSchemaError, sqlite3.DatabaseError) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def complete_bound_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[SnapshotReceipt], None],
+    ) -> None:
+        try:
+            self._store.complete_bound_recovered_refresh_receipt(
+                snapshot_id,
+                expected_generation=expected_generation,
+                expected_receipt=expected_receipt,
+                expected_handoff=expected_handoff,
+                expected_binding=expected_binding,
+                family_reprove=family_reprove,
+            )
+        except (SQLiteStoreLifecycleError, SQLiteStoreSchemaError, sqlite3.DatabaseError) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def latch_bound_refresh_divergence(
+        self,
+        expected_fingerprint: str,
+        *,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> bool:
+        try:
+            return self._store.latch_bound_refresh_divergence(
+                expected_fingerprint=expected_fingerprint,
+                expected_generation=expected_generation,
+                expected_receipt=expected_receipt,
+                expected_handoff=expected_handoff,
+                expected_binding=expected_binding,
+                family_reprove=family_reprove,
+            )
+        except (SQLiteStoreLifecycleError, SQLiteStoreSchemaError, sqlite3.DatabaseError) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+    def clear_bound_refresh_handoff(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> None:
+        try:
+            self._store.clear_bound_refresh_handoff(
+                snapshot_id,
+                expected_generation=expected_generation,
+                expected_receipt=expected_receipt,
+                expected_handoff=expected_handoff,
+                expected_binding=expected_binding,
+                family_reprove=family_reprove,
+            )
+        except (SQLiteStoreLifecycleError, SQLiteStoreSchemaError, sqlite3.DatabaseError) as error:
+            raise snapshot_recovery_module.RecoveryError(
+                _recovery_store_error_code(error),
+                retryable=_recovery_store_retryable(error),
+            ) from error
+
+
 def _recovery_store_error_code(error: Exception) -> str:
     code = getattr(error, "code", None)
     if type(code) is str and code:
@@ -9973,6 +10086,132 @@ def _recovery_store_error_code(error: Exception) -> str:
 def _recovery_store_retryable(error: Exception) -> bool:
     retryable = getattr(error, "retryable", None)
     return retryable if type(retryable) is bool else False
+
+
+def _require_bound_refresh_effect_snapshot(
+    connection: sqlite3.Connection,
+    lease: _SQLiteGenerationView,
+    *,
+    expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+    expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+    expected_binding: SnapshotBinding,
+) -> _SourceBindingFacts:
+    """Reprove the exact classified SQLite owner facts inside one write txn."""
+
+    if type(expected_receipt) is not snapshot_recovery_module.IssuedReceiptFacts:
+        raise TypeError("expected_receipt must be exact IssuedReceiptFacts")
+    if type(expected_handoff) is not snapshot_recovery_module._BoundRefreshHandoffFacts:
+        raise TypeError("expected_handoff must be exact bound refresh facts")
+    if type(expected_binding) is not SnapshotBinding:
+        raise TypeError("expected_binding must be exact SnapshotBinding")
+    if expected_receipt.snapshot_id != expected_handoff.snapshot_id:
+        raise ValueError("classified receipt and handoff disagree")
+    facts = _read_source_binding_facts_in_transaction(connection, lease)
+    receipt_columns = (
+        "snapshot_id, resource_id, canonical_store_id, "
+        "exported_revision, jsonl_digest, record_count, format_version, "
+        "destination_jsonl_path, destination_manifest_path, status"
+    )
+    receipt_row = connection.execute(
+        "SELECT snapshot_id, resource_id, canonical_store_id, "
+        "exported_revision, jsonl_digest, record_count, format_version, "
+        "destination_jsonl_path, destination_manifest_path, status "
+        "FROM tm_snapshot_receipt WHERE snapshot_id = ?",
+        (expected_receipt.snapshot_id,),
+    ).fetchone()
+    if receipt_row is None:
+        raise SQLiteStoreSchemaError(
+            "STORE.BOUND_REFRESH_CLASSIFICATION_CHANGED"
+        )
+    try:
+        observed_receipt = snapshot_recovery_module.IssuedReceiptFacts(
+            snapshot_id=str(receipt_row[0]),
+            resource_id=str(receipt_row[1]),
+            canonical_store_id=str(receipt_row[2]),
+            exported_revision=_row_int(receipt_row[3]),
+            jsonl_digest=str(receipt_row[4]),
+            record_count=_row_int(receipt_row[5]),
+            format_version=str(receipt_row[6]),
+            destination_jsonl_path=Path(str(receipt_row[7])),
+            destination_manifest_path=Path(str(receipt_row[8])),
+            status=str(receipt_row[9]),
+        )
+    except (TypeError, ValueError):
+        raise SQLiteStoreSchemaError(
+            "STORE.BOUND_REFRESH_CLASSIFICATION_CHANGED"
+        ) from None
+    configured_issued_rows = connection.execute(
+        f"SELECT {receipt_columns} FROM tm_snapshot_receipt "
+        "WHERE status = 'issued' AND destination_jsonl_path = ? "
+        "AND destination_manifest_path = ? ORDER BY snapshot_id",
+        (
+            Path.__str__(lease.stage.resource_identity.configured_jsonl_path),
+            Path.__str__(lease.stage.resource_identity.snapshot_manifest_path),
+        ),
+    ).fetchall()
+    try:
+        configured_issued = tuple(
+            snapshot_recovery_module.IssuedReceiptFacts(
+                snapshot_id=str(row[0]),
+                resource_id=str(row[1]),
+                canonical_store_id=str(row[2]),
+                exported_revision=_row_int(row[3]),
+                jsonl_digest=str(row[4]),
+                record_count=_row_int(row[5]),
+                format_version=str(row[6]),
+                destination_jsonl_path=Path(str(row[7])),
+                destination_manifest_path=Path(str(row[8])),
+                status=str(row[9]),
+            )
+            for row in configured_issued_rows
+        )
+    except (TypeError, ValueError):
+        raise SQLiteStoreSchemaError(
+            "STORE.BOUND_REFRESH_CLASSIFICATION_CHANGED"
+        ) from None
+    expected_configured_issued = (
+        (expected_receipt,) if expected_receipt.status == "issued" else ()
+    )
+    ancestry_counts = dict(facts.cumulative_record_counts)
+    ancestry_counts[0] = 0
+    bound_rows = connection.execute(
+        "SELECT key, value FROM tm_meta WHERE key LIKE ? ORDER BY key",
+        (
+            f"{snapshot_recovery_module._BOUND_REFRESH_HANDOFF_META_PREFIX}%",
+        ),
+    ).fetchall()
+    observed_handoff = None
+    if len(bound_rows) == 1:
+        observed_handoff = snapshot_recovery_module._bound_refresh_handoff_from_meta(
+            str(bound_rows[0][0]),
+            str(bound_rows[0][1]),
+        )
+    configured_legacy_row = connection.execute(
+        "SELECT 1 FROM tm_meta AS m "
+        "JOIN tm_snapshot_receipt AS r "
+        "ON m.key = ? || r.snapshot_id "
+        "WHERE r.destination_jsonl_path = ? "
+        "AND r.destination_manifest_path = ? LIMIT 1",
+        (
+            _ARTIFACT_HANDOFF_META_PREFIX,
+            Path.__str__(lease.stage.resource_identity.configured_jsonl_path),
+            Path.__str__(lease.stage.resource_identity.snapshot_manifest_path),
+        ),
+    ).fetchone()
+    if (
+        facts.binding != expected_binding
+        or observed_receipt != expected_receipt
+        or observed_handoff != expected_handoff
+        or configured_issued != expected_configured_issued
+        or facts.diagnostic_codes
+        or ancestry_counts.get(expected_receipt.exported_revision)
+        != expected_receipt.record_count
+        or configured_legacy_row is not None
+    ):
+        raise SQLiteStoreSchemaError(
+            "STORE.BOUND_REFRESH_CLASSIFICATION_CHANGED"
+        )
+    return facts
 
 
 
@@ -10636,6 +10875,7 @@ class SQLiteTMStore:
         prior_manifest_identity: tuple[int, int] | None = None,
         prior_manifest_digest: str | None = None,
         prior_manifest_absent: bool | None = None,
+        bound_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts | None = None,
     ) -> None:
         """Atomically register one configured-path issued refresh receipt.
 
@@ -10656,6 +10896,16 @@ class SQLiteTMStore:
         """
 
         private_receipt = _snapshot_receipt(receipt)
+        if bound_handoff is not None and type(bound_handoff) is not (
+            snapshot_recovery_module._BoundRefreshHandoffFacts
+        ):
+            raise TypeError("bound_handoff must be exact facts or None")
+        if bound_handoff is not None and (
+            bound_handoff.snapshot_id != private_receipt.snapshot_id
+            or bound_handoff.new_jsonl_digest != private_receipt.jsonl_digest
+            or jsonl_temp_identity is not None
+        ):
+            raise ValueError("bound refresh handoff does not match receipt")
         if (
             type(expected_generation) is not int
             or isinstance(expected_generation, bool)
@@ -10803,6 +11053,63 @@ class SQLiteTMStore:
                             datetime.now(UTC).isoformat(),
                         ),
                     )
+                    if bound_handoff is not None:
+                        existing_bound_handoff = connection.execute(
+                            "SELECT 1 FROM tm_meta WHERE key LIKE ? LIMIT 1",
+                            (
+                                f"{snapshot_recovery_module._BOUND_REFRESH_HANDOFF_META_PREFIX}%",
+                            ),
+                        ).fetchone()
+                        if existing_bound_handoff is not None:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.BOUND_REFRESH_HANDOFF_PENDING"
+                            )
+                        binding_facts = _read_source_binding_facts_in_transaction(
+                            connection, lease
+                        )
+                        binding = binding_facts.binding
+                        if (
+                            binding is None
+                            or binding.receipt.snapshot_id
+                            != bound_handoff.prior_snapshot_id
+                            or binding.manifest.snapshot_kind.value
+                            != bound_handoff.prior_snapshot_kind
+                            or binding.receipt.jsonl_digest
+                            != bound_handoff.prior_jsonl_digest
+                            or hashlib.sha256(
+                                contract_to_json(binding.manifest).encode("utf-8")
+                            ).hexdigest()
+                            != bound_handoff.prior_manifest_digest
+                            or bound_handoff.new_manifest_digest
+                            != hashlib.sha256(
+                                contract_to_json(
+                                    SnapshotManifest(
+                                        manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                                        snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                                        receipt=private_receipt,
+                                        receipt_digest=snapshot_receipt_digest(
+                                            private_receipt
+                                        ),
+                                    )
+                                ).encode("utf-8")
+                            ).hexdigest()
+                        ):
+                            raise SQLiteStoreSchemaError(
+                                "STORE.BOUND_REFRESH_PRIOR_MISMATCH"
+                            )
+                        connection.execute(
+                            "INSERT INTO tm_meta(key, value) VALUES (?, ?)",
+                            (
+                                snapshot_recovery_module
+                                ._bound_refresh_handoff_meta_key(
+                                    private_receipt.snapshot_id
+                                ),
+                                snapshot_recovery_module
+                                ._bound_refresh_handoff_meta_value(
+                                    bound_handoff
+                                ),
+                            ),
+                        )
                     if jsonl_temp_identity is not None:
                         assert manifest_temp_identity is not None
                         parent_descriptor = _artifact_parent_dirfd(
@@ -11345,6 +11652,332 @@ class SQLiteTMStore:
                     connection.commit()
                 except Exception:
                     connection.rollback()
+                    raise
+
+    def complete_bound_recovered_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[SnapshotReceipt], None],
+    ) -> None:
+        """Complete one history-valid refresh through its portable handoff."""
+
+        if type(snapshot_id) is not str or not snapshot_id:
+            raise ValueError("snapshot id must be a non-empty string")
+        if not callable(family_reprove):
+            raise TypeError("family_reprove must be callable")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=identity.resource_id,
+                    generation=lease.generation,
+                    retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    _require_bound_refresh_effect_snapshot(
+                        connection,
+                        lease,
+                        expected_receipt=expected_receipt,
+                        expected_handoff=expected_handoff,
+                        expected_binding=expected_binding,
+                    )
+                    row = connection.execute(
+                        "SELECT resource_id, canonical_store_id, status, "
+                        "destination_jsonl_path, destination_manifest_path, "
+                        "exported_revision, jsonl_digest, record_count, "
+                        "format_version FROM tm_snapshot_receipt "
+                        "WHERE snapshot_id = ?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None or str(row[2]) != "issued":
+                        raise SQLiteStoreSchemaError("STORE.RECEIPT_STALE")
+                    if (
+                        str(row[0]) != identity.resource_id
+                        or str(row[1]) != lease.canonical_store_id
+                        or str(row[3])
+                        != Path.__str__(identity.configured_jsonl_path)
+                        or str(row[4])
+                        != Path.__str__(identity.snapshot_manifest_path)
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_IDENTITY_MISMATCH"
+                        )
+                    receipt = SnapshotReceipt(
+                        snapshot_id=snapshot_id,
+                        resource_id=str(row[0]),
+                        canonical_store_id=str(row[1]),
+                        exported_revision=_row_int(row[5]),
+                        jsonl_digest=str(row[6]),
+                        record_count=_row_int(row[7]),
+                        format_version=str(row[8]),
+                    )
+                    revision = _canonical_revision_from_transaction(
+                        connection, lease
+                    )
+                    counts = _revision_record_counts(
+                        connection,
+                        head_revision=revision.head_revision,
+                        record_count=revision.record_count,
+                    )
+                    if counts.get(receipt.exported_revision) != receipt.record_count:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_ANCESTRY_INVALID"
+                        )
+                    meta = _read_meta(connection)
+                    if _meta_bool(meta, "divergence_latched"):
+                        raise SQLiteStoreSchemaError("STORE.DIVERGENCE_LATCHED")
+                    handoff_key = (
+                        snapshot_recovery_module._bound_refresh_handoff_meta_key(
+                            snapshot_id
+                        )
+                    )
+                    handoff_row = connection.execute(
+                        "SELECT value FROM tm_meta WHERE key = ?",
+                        (handoff_key,),
+                    ).fetchone()
+                    handoff = (
+                        None
+                        if handoff_row is None
+                        else snapshot_recovery_module
+                        ._bound_refresh_handoff_from_meta(
+                            handoff_key, str(handoff_row[0])
+                        )
+                    )
+                    manifest = SnapshotManifest(
+                        manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                        snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
+                        receipt=receipt,
+                        receipt_digest=snapshot_receipt_digest(receipt),
+                    )
+                    if (
+                        handoff is None
+                        or handoff.new_jsonl_digest != receipt.jsonl_digest
+                        or handoff.new_manifest_digest
+                        != hashlib.sha256(
+                            contract_to_json(manifest).encode("utf-8")
+                        ).hexdigest()
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.BOUND_REFRESH_HANDOFF_INVALID"
+                        )
+                    family_reprove(receipt)
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status = 'completed' "
+                        "WHERE snapshot_id = ? AND status = 'issued'",
+                        (snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
+                    connection.execute(
+                        "INSERT INTO tm_snapshot_binding("
+                        "binding_id, configured_jsonl_path, manifest_path, "
+                        "snapshot_kind, snapshot_id, binding_version) "
+                        "VALUES (1, ?, ?, 'EXPLICIT_EXPORT', ?, ?) "
+                        "ON CONFLICT(binding_id) DO UPDATE SET "
+                        "configured_jsonl_path=excluded.configured_jsonl_path, "
+                        "manifest_path=excluded.manifest_path, "
+                        "snapshot_kind=excluded.snapshot_kind, "
+                        "snapshot_id=excluded.snapshot_id, "
+                        "binding_version=excluded.binding_version",
+                        (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                            snapshot_id,
+                            SNAPSHOT_BINDING_VERSION,
+                        ),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def cancel_bound_recovered_refresh_receipt(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> None:
+        if not callable(family_reprove):
+            raise TypeError("family_reprove must be callable")
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED", resource_id=identity.resource_id,
+                    generation=lease.generation, retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _validate_store_identity(
+                        connection, resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    _require_bound_refresh_effect_snapshot(
+                        connection,
+                        lease,
+                        expected_receipt=expected_receipt,
+                        expected_handoff=expected_handoff,
+                        expected_binding=expected_binding,
+                    )
+                    row = connection.execute(
+                        "SELECT status, destination_jsonl_path, "
+                        "destination_manifest_path FROM tm_snapshot_receipt "
+                        "WHERE snapshot_id=?", (snapshot_id,),
+                    ).fetchone()
+                    if (
+                        row is None or str(row[0]) != "issued"
+                        or str(row[1]) != str(identity.configured_jsonl_path)
+                        or str(row[2]) != str(identity.snapshot_manifest_path)
+                    ):
+                        raise SQLiteStoreSchemaError("STORE.RECEIPT_STALE")
+                    key = snapshot_recovery_module._bound_refresh_handoff_meta_key(
+                        snapshot_id
+                    )
+                    meta_row = connection.execute(
+                        "SELECT value FROM tm_meta WHERE key=?", (key,)
+                    ).fetchone()
+                    if meta_row is None or (
+                        snapshot_recovery_module._bound_refresh_handoff_from_meta(
+                            key, str(meta_row[0])
+                        ) is None
+                    ):
+                        raise SQLiteStoreSchemaError(
+                            "STORE.BOUND_REFRESH_HANDOFF_INVALID"
+                        )
+                    family_reprove()
+                    updated = connection.execute(
+                        "UPDATE tm_snapshot_receipt SET status='cancelled' "
+                        "WHERE snapshot_id=? AND status='issued'", (snapshot_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.RECEIPT_TRANSITION_FAILED"
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def clear_bound_refresh_handoff(
+        self,
+        snapshot_id: str,
+        *,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> None:
+        if not callable(family_reprove):
+            raise TypeError("family_reprove must be callable")
+        with self._coordinator._operation_lease() as lease:
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=lease.stage.resource_identity.resource_id,
+                    generation=lease.generation, retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _require_bound_refresh_effect_snapshot(
+                        connection,
+                        lease,
+                        expected_receipt=expected_receipt,
+                        expected_handoff=expected_handoff,
+                        expected_binding=expected_binding,
+                    )
+                    row = connection.execute(
+                        "SELECT status FROM tm_snapshot_receipt WHERE snapshot_id=?",
+                        (snapshot_id,),
+                    ).fetchone()
+                    if row is None or str(row[0]) not in {"completed", "cancelled"}:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.HANDOFF_RECEIPT_NOT_TERMINAL"
+                        )
+                    family_reprove()
+                    deleted = connection.execute(
+                        "DELETE FROM tm_meta WHERE key=?",
+                        (snapshot_recovery_module._bound_refresh_handoff_meta_key(snapshot_id),),
+                    )
+                    if deleted.rowcount != 1:
+                        raise SQLiteStoreSchemaError(
+                            "STORE.BOUND_REFRESH_HANDOFF_MISSING"
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    def latch_bound_refresh_divergence(
+        self,
+        *,
+        expected_fingerprint: str,
+        expected_generation: int,
+        expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
+        expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
+        expected_binding: SnapshotBinding,
+        family_reprove: Callable[[], None],
+    ) -> bool:
+        if not callable(family_reprove):
+            raise TypeError("family_reprove must be callable")
+        with self._coordinator._operation_lease() as lease:
+            if lease.generation != expected_generation:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.GENERATION_CHANGED",
+                    resource_id=lease.stage.resource_identity.resource_id,
+                    generation=lease.generation, retryable=True,
+                )
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    facts = _require_bound_refresh_effect_snapshot(
+                        connection,
+                        lease,
+                        expected_receipt=expected_receipt,
+                        expected_handoff=expected_handoff,
+                        expected_binding=expected_binding,
+                    )
+                    if facts.canonical_fingerprint != expected_fingerprint:
+                        connection.rollback()
+                        return False
+                    family_reprove()
+                    if not facts.divergence_latched:
+                        updated = connection.execute(
+                            "UPDATE tm_meta SET value='1' "
+                            "WHERE key='divergence_latched'"
+                        )
+                        if updated.rowcount != 1:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.DIVERGENCE_LATCH_MISSING"
+                            )
+                    connection.commit()
+                    return True
+                except Exception:
+                    if connection.in_transaction:
+                        connection.rollback()
                     raise
 
     def _complete_issued_export_receipt_strict(
@@ -12173,6 +12806,13 @@ class SQLiteTMStore:
                         "WHERE key LIKE ? ORDER BY key",
                         (f"{_ARTIFACT_HANDOFF_META_PREFIX}%",),
                     ).fetchall()
+                    bound_handoff_rows = connection.execute(
+                        "SELECT key, value FROM tm_meta "
+                        "WHERE key LIKE ? ORDER BY key",
+                        (
+                            f"{snapshot_recovery_module._BOUND_REFRESH_HANDOFF_META_PREFIX}%",
+                        ),
+                    ).fetchall()
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -12206,12 +12846,32 @@ class SQLiteTMStore:
             for handoff in parsed_handoffs
             if handoff is not None
         )
+        parsed_bound_handoffs = tuple(
+            snapshot_recovery_module._bound_refresh_handoff_from_meta(
+                str(row[0]), str(row[1])
+            )
+            for row in bound_handoff_rows
+        )
+        if any(handoff is None for handoff in parsed_bound_handoffs):
+            raise SQLiteStoreSchemaError("STORE.BOUND_REFRESH_HANDOFF_CORRUPT")
+        bound_handoffs = tuple(
+            handoff
+            for handoff in parsed_bound_handoffs
+            if handoff is not None
+        )
         receipt_ids = {receipt.snapshot_id for receipt in receipts}
         if any(
             handoff.snapshot_id not in receipt_ids
             for handoff in handoffs
         ):
             raise SQLiteStoreSchemaError("STORE.HANDOFF_ORPHANED")
+        if any(
+            handoff.snapshot_id not in receipt_ids
+            for handoff in bound_handoffs
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.BOUND_REFRESH_HANDOFF_ORPHANED"
+            )
         binding_invalid = bool(
             set(facts.diagnostic_codes)
             & {
@@ -12272,6 +12932,7 @@ class SQLiteTMStore:
             authority_paths=authority_paths,
             canonical_sidecar_path=identity.canonical_sidecar_path,
             target_identity_fragment=identity.target_identity[:16],
+            bound_refresh_handoffs=bound_handoffs,
         )
 
     def probe_bound_issued_refresh_receipt_completed(
@@ -12541,6 +13202,64 @@ class SQLiteTMStore:
         ):
             return snapshot_recovery_module.recover_snapshot_publication(
                 _SnapshotRecoveryPort(self)
+            )
+
+    def recover_bound_configured_refresh(
+        self,
+        family: snapshot_recovery_module._BoundConfiguredRefreshFamilyPort,
+    ) -> snapshot_recovery_module.RefreshRecoveryOutcome:
+        """Run portable configured recovery under the shared refresh gate."""
+
+        with self._coordinator._refresh_observation_gate(
+            require_ready_resource=True,
+        ):
+            return snapshot_recovery_module.recover_bound_configured_snapshot_publication(
+                _BoundSnapshotRecoveryPort(self), family
+            )
+
+    def require_bound_refresh_observation_ready(self) -> None:
+        """Reject a Windows observation until its bound owner is terminal."""
+
+        with self._coordinator._operation_lease() as lease:
+            identity = lease.stage.resource_identity
+            with _open_leased_connection(lease) as connection:
+                connection.execute("BEGIN")
+                try:
+                    _validate_store_identity(
+                        connection,
+                        resource_id=identity.resource_id,
+                        canonical_store_id=lease.canonical_store_id,
+                        target_identity=identity.target_identity,
+                    )
+                    meta = _read_meta(connection)
+                    divergence_latched = _meta_bool(
+                        meta, "divergence_latched"
+                    )
+                    issued = connection.execute(
+                        "SELECT 1 FROM tm_snapshot_receipt "
+                        "WHERE status='issued' "
+                        "AND destination_jsonl_path=? "
+                        "AND destination_manifest_path=? LIMIT 1",
+                        (
+                            Path.__str__(identity.configured_jsonl_path),
+                            Path.__str__(identity.snapshot_manifest_path),
+                        ),
+                    ).fetchone()
+                    handoff = connection.execute(
+                        "SELECT 1 FROM tm_meta WHERE key LIKE ? LIMIT 1",
+                        (
+                            f"{snapshot_recovery_module._BOUND_REFRESH_HANDOFF_META_PREFIX}%",
+                        ),
+                    ).fetchone()
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+        if not divergence_latched and (
+            issued is not None or handoff is not None
+        ):
+            raise SQLiteStoreSchemaError(
+                "STORE.REFRESH_RECOVERY_REQUIRED"
             )
 
     def register_completed_snapshot_binding(
