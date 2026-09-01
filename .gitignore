@@ -10,3 +10,4 @@
 *.pyc
 speaker_avatars/*
 artifacts/windows/
+.localcat-release-evidence.lock

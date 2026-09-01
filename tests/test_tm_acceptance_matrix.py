@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
+import sys
 import tempfile
 from typing import Any, cast
 import unittest
@@ -93,7 +95,9 @@ class AcceptanceMatrixRegistryTests(unittest.TestCase):
 
     def test_every_bound_source_file_exists_inside_repository(self) -> None:
         root = _ROOT.resolve(strict=True)
-        for relative in acceptance_matrix_source_paths():
+        paths = acceptance_matrix_source_paths()
+        self.assertIn("tools/tm_release_evidence_io.py", paths)
+        for relative in paths:
             path = (root / relative).resolve(strict=True)
             self.assertIn(root, path.parents)
             self.assertTrue(path.is_file(), relative)
@@ -262,10 +266,45 @@ class AcceptanceMatrixEvidenceTests(unittest.TestCase):
             self.assertEqual(calls, 2)
             self.assertEqual(target.read_bytes(), b"{}\n")
 
+    def test_atomic_write_does_not_normalize_programmer_failures(self) -> None:
+        for error_type in (TypeError, AssertionError):
+            with self.subTest(error_type=error_type.__name__):
+                with tempfile.TemporaryDirectory() as temporary:
+                    target = Path(temporary) / "evidence.json"
+
+                    def reject() -> None:
+                        raise error_type("programmer failure")
+
+                    with self.assertRaisesRegex(error_type, "programmer failure"):
+                        validator._atomic_write(target, b"{}\n", reject)
+                    self.assertFalse(target.exists())
+                    self.assertFalse(
+                        (
+                            Path(temporary)
+                            / ".tm-acceptance-matrix-evidence.json.tmp"
+                        ).exists()
+                    )
+
     def test_atomic_write_rejects_readback_hardlink_race(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "evidence.json"
             hardlink = Path(temporary) / "evidence-hardlink.json"
+            if sys.platform == "win32":
+                calls = 0
+
+                def link_before_terminal_reproof() -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        os.link(target, hardlink)
+
+                with self.assertRaisesRegex(ValueError, "readback|platform"):
+                    validator._atomic_write(
+                        target,
+                        b"{}\n",
+                        link_before_terminal_reproof,
+                    )
+                return
             original_open = os.open
 
             def link_before_readback(
@@ -295,28 +334,81 @@ class AcceptanceMatrixEvidenceTests(unittest.TestCase):
             real.mkdir()
             source = real / "source.py"
             source.write_text("pass\n", encoding="utf-8")
-            final_alias = root / "alias.py"
-            final_alias.symlink_to(source)
-            parent_alias = root / "alias-parent"
-            parent_alias.symlink_to(real, target_is_directory=True)
-
             self.assertEqual(
                 validator._strict_source_file(root, "real/source.py"),
                 source,
             )
             self.assertTrue(stat.S_ISREG(os.lstat(source).st_mode))
-            with self.assertRaisesRegex(ValueError, "source"):
-                validator._strict_source_file(root, "alias.py")
-            with self.assertRaisesRegex(ValueError, "source"):
-                validator._strict_source_file(
-                    root,
-                    "alias-parent/source.py",
+            final_alias = root / "alias.py"
+            parent_alias = root / "alias-parent"
+            if sys.platform == "win32":
+                os.link(source, final_alias)
+                completed = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(parent_alias),
+                        str(real),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            else:
+                final_alias.symlink_to(source)
+                parent_alias.symlink_to(real, target_is_directory=True)
+            try:
+                with self.assertRaisesRegex(ValueError, "source"):
+                    validator._strict_source_file(root, "alias.py")
+                with self.assertRaisesRegex(ValueError, "source"):
+                    validator._strict_source_file(
+                        root,
+                        "alias-parent/source.py",
+                    )
+            finally:
+                if sys.platform == "win32":
+                    parent_alias.rmdir()
             with self.assertRaisesRegex(ValueError, "canonical"):
                 validator._strict_source_file(
                     root,
                     "real/../real/source.py",
                 )
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows W1")
+    def test_windows_atomic_write_serializes_fresh_process_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "evidence.json"
+            target.write_bytes(b"old\n")
+            script = (
+                "from pathlib import Path; import sys; "
+                "from tools.tm_release_evidence_io import atomic_write; "
+                "atomic_write(Path(sys.argv[1]), sys.argv[2].encode('ascii'), "
+                "lambda: None, candidate_prefix='.race-', "
+                "identity_error='identity', readback_error='readback', "
+                "platform_error='platform')"
+            )
+            processes = tuple(
+                subprocess.Popen(
+                    [sys.executable, "-B", "-c", script, str(target), payload],
+                    cwd=_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for payload in ("first\n", "second\n")
+            )
+            results = tuple(process.communicate(timeout=60) for process in processes)
+            for process, (_stdout, stderr) in zip(processes, results, strict=True):
+                self.assertEqual(process.returncode, 0, stderr)
+            self.assertIn(target.read_bytes(), {b"first\n", b"second\n"})
+            self.assertTrue(
+                (Path(temporary) / ".localcat-release-evidence.lock").is_file()
+            )
+            self.assertFalse((Path(temporary) / ".race-evidence.json.tmp").exists())
 
     def test_validator_rejects_nonregular_evidence_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -324,13 +416,17 @@ class AcceptanceMatrixEvidenceTests(unittest.TestCase):
             ordinary = root / "ordinary.json"
             ordinary.write_text("{}\n", encoding="utf-8")
             alias = root / "evidence.json"
-            alias.symlink_to(ordinary)
+            if sys.platform == "win32":
+                os.link(ordinary, alias)
+            else:
+                alias.symlink_to(ordinary)
             with self.assertRaisesRegex(ValueError, "regular"):
                 validator._validate_evidence_target(alias)
             with self.assertRaisesRegex(ValueError, "regular"):
                 validator._validate_evidence_target(root)
-            hardlink = root / "hardlink.json"
-            os.link(ordinary, hardlink)
+            if sys.platform != "win32":
+                hardlink = root / "hardlink.json"
+                os.link(ordinary, hardlink)
             with self.assertRaisesRegex(ValueError, "regular"):
                 validator._validate_evidence_target(ordinary)
 

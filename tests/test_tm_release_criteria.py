@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 from typing import Any, cast
@@ -81,12 +83,17 @@ class ReleaseCriteriaRegistryTests(unittest.TestCase):
     def test_release_owner_source_inventory_is_closed(self) -> None:
         paths = release_criteria_source_paths()
         self.assertEqual(paths, tuple(sorted(set(paths))))
+        self.assertIn("tools/tm_release_evidence_io.py", paths)
         self.assertIn("tools/validate_tm_release_criteria.py", paths)
         self.assertIn("tests/release_criteria_registry.py", paths)
         self.assertIn("tests/test_editor_controller_writes.py", paths)
         source_files = tuple(
             (path, hashlib.sha256((_ROOT / path).read_bytes()).hexdigest())
             for path in paths
+        )
+        self.assertEqual(
+            validator._release_source_file_digests(_ROOT),
+            source_files,
         )
         fingerprint = release_criteria_source_fingerprint(
             release_criteria_registry_digest(),
@@ -479,12 +486,7 @@ class ReleaseCriteriaValidatorTests(unittest.TestCase):
             real = root / "real"
             real.mkdir()
             source = real / "source.json"
-            source.write_text("{}\n", encoding="utf-8")
-            final_alias = root / "alias.json"
-            final_alias.symlink_to(source)
-            parent_alias = root / "alias-parent"
-            parent_alias.symlink_to(real, target_is_directory=True)
-
+            source.write_bytes(b"{}\n")
             observed, digest = validator._read_strict_regular(
                 root,
                 "real/source.json",
@@ -492,13 +494,39 @@ class ReleaseCriteriaValidatorTests(unittest.TestCase):
             self.assertEqual(observed, b"{}\n")
             self.assertEqual(digest, hashlib.sha256(observed).hexdigest())
             self.assertTrue(stat.S_ISREG(os.lstat(source).st_mode))
-            with self.assertRaisesRegex(ValueError, "source"):
-                validator._read_strict_regular(root, "alias.json")
-            with self.assertRaisesRegex(ValueError, "source"):
-                validator._read_strict_regular(
-                    root,
-                    "alias-parent/source.json",
+            final_alias = root / "alias.json"
+            parent_alias = root / "alias-parent"
+            if sys.platform == "win32":
+                os.link(source, final_alias)
+                completed = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(parent_alias),
+                        str(real),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            else:
+                final_alias.symlink_to(source)
+                parent_alias.symlink_to(real, target_is_directory=True)
+            try:
+                with self.assertRaisesRegex(ValueError, "source"):
+                    validator._read_strict_regular(root, "alias.json")
+                with self.assertRaisesRegex(ValueError, "source"):
+                    validator._read_strict_regular(
+                        root,
+                        "alias-parent/source.json",
+                    )
+            finally:
+                if sys.platform == "win32":
+                    parent_alias.rmdir()
             with self.assertRaisesRegex(ValueError, "canonical"):
                 validator._read_strict_regular(
                     root,
@@ -511,13 +539,17 @@ class ReleaseCriteriaValidatorTests(unittest.TestCase):
             ordinary = root / "ordinary.json"
             ordinary.write_text("{}\n", encoding="utf-8")
             alias = root / "evidence.json"
-            alias.symlink_to(ordinary)
+            if sys.platform == "win32":
+                os.link(ordinary, alias)
+            else:
+                alias.symlink_to(ordinary)
             with self.assertRaisesRegex(ValueError, "regular"):
                 validator._validate_evidence_target(alias)
             with self.assertRaisesRegex(ValueError, "regular"):
                 validator._validate_evidence_target(root)
-            hardlink = root / "hardlink.json"
-            os.link(ordinary, hardlink)
+            if sys.platform != "win32":
+                hardlink = root / "hardlink.json"
+                os.link(ordinary, hardlink)
             with self.assertRaisesRegex(ValueError, "regular"):
                 validator._validate_evidence_target(ordinary)
 

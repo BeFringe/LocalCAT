@@ -353,6 +353,7 @@ def release_criteria_source_paths(
     paths = {
         "tests/release_criteria_registry.py",
         "tests/test_tm_release_criteria.py",
+        "tools/tm_release_evidence_io.py",
         "tools/validate_tm_release_criteria.py",
     }
     for binding in bindings:

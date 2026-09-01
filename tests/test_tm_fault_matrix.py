@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
+import sys
 import tempfile
 from typing import cast
 import unittest
@@ -126,7 +128,9 @@ class FaultMatrixRegistryTests(unittest.TestCase):
 
     def test_every_bound_source_file_exists_inside_repository(self) -> None:
         root = _ROOT.resolve(strict=True)
-        for relative in fault_matrix_source_paths():
+        paths = fault_matrix_source_paths()
+        self.assertIn("tools/tm_release_evidence_io.py", paths)
+        for relative in paths:
             path = (root / relative).resolve(strict=True)
             self.assertIn(root, path.parents)
             self.assertTrue(path.is_file(), relative)
@@ -298,23 +302,44 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
             real.mkdir()
             source = real / "source.py"
             source.write_text("pass\n", encoding="utf-8")
-            final_alias = root / "alias.py"
-            final_alias.symlink_to(source)
-            parent_alias = root / "alias-parent"
-            parent_alias.symlink_to(real, target_is_directory=True)
-
             self.assertEqual(
                 validator._strict_source_file(root, "real/source.py"),
                 source,
             )
             self.assertTrue(stat.S_ISREG(os.lstat(source).st_mode))
-            with self.assertRaisesRegex(ValueError, "source"):
-                validator._strict_source_file(root, "alias.py")
-            with self.assertRaisesRegex(ValueError, "source"):
-                validator._strict_source_file(
-                    root,
-                    "alias-parent/source.py",
+            final_alias = root / "alias.py"
+            parent_alias = root / "alias-parent"
+            if sys.platform == "win32":
+                os.link(source, final_alias)
+                completed = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(parent_alias),
+                        str(real),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            else:
+                final_alias.symlink_to(source)
+                parent_alias.symlink_to(real, target_is_directory=True)
+            try:
+                with self.assertRaisesRegex(ValueError, "source"):
+                    validator._strict_source_file(root, "alias.py")
+                with self.assertRaisesRegex(ValueError, "source"):
+                    validator._strict_source_file(
+                        root,
+                        "alias-parent/source.py",
+                    )
+            finally:
+                if sys.platform == "win32":
+                    parent_alias.rmdir()
             with self.assertRaisesRegex(ValueError, "canonical"):
                 validator._strict_source_file(root, "real/../real/source.py")
 
@@ -326,13 +351,17 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
             ordinary = root / "ordinary.json"
             ordinary.write_text("{}\n", encoding="utf-8")
             alias = root / "evidence.json"
-            alias.symlink_to(ordinary)
+            if sys.platform == "win32":
+                os.link(ordinary, alias)
+            else:
+                alias.symlink_to(ordinary)
             with self.assertRaisesRegex(ValueError, "regular file"):
                 validator._validate_evidence_target(alias)
             with self.assertRaisesRegex(ValueError, "regular file"):
                 validator._validate_evidence_target(root)
-            hardlink = root / "hardlink.json"
-            os.link(ordinary, hardlink)
+            if sys.platform != "win32":
+                hardlink = root / "hardlink.json"
+                os.link(ordinary, hardlink)
             with self.assertRaisesRegex(ValueError, "regular file"):
                 validator._validate_evidence_target(ordinary)
 
