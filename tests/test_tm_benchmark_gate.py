@@ -108,6 +108,8 @@ from tm_retrieval_capability import (
 _ROOT = Path(__file__).resolve().parent.parent
 _CONTRACT = load_benchmark_contract(_ROOT / "benchmark_tm_contract.json")
 _IMPLEMENTATION_FINGERPRINT = benchmark_implementation_fingerprint(_ROOT)
+_RUN_ROOT = str((_ROOT / "artifacts" / "benchmark-run-root").resolve())
+_FIXTURE_PATH = str((Path(_RUN_ROOT) / "fixture.jsonl").resolve())
 
 _FTS5 = BenchmarkExecutionPath.FTS5_TRIGRAM
 _FALLBACK = BenchmarkExecutionPath.GRAM_FALLBACK
@@ -531,9 +533,9 @@ def _process_evidence(
         corpus_digest=_CONTRACT.corpus_digest,
         corpus_record_count=100_000,
         fixture_digest=_digest("d"),
-        fixture_path="/tmp/benchmark-run-root/fixture.jsonl",
+        fixture_path=_FIXTURE_PATH,
         fixture_record_count=100_000,
-        run_root="/tmp/benchmark-run-root",
+        run_root=_RUN_ROOT,
         resource_id="tm.benchmark",
         canonical_store_id="store.benchmark",
         execution_path=path,
@@ -554,9 +556,9 @@ def _process_evidence(
             corpus_digest=_CONTRACT.corpus_digest,
             corpus_record_count=100_000,
             fixture_digest=_digest("d"),
-            fixture_path="/tmp/benchmark-run-root/fixture.jsonl",
+            fixture_path=_FIXTURE_PATH,
             fixture_record_count=100_000,
-            run_root="/tmp/benchmark-run-root",
+            run_root=_RUN_ROOT,
             execution_path=path,
             resource_id="tm.benchmark",
             canonical_store_id="store.benchmark",
