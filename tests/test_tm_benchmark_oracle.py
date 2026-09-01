@@ -1188,6 +1188,7 @@ class ModuleBoundaryTests(unittest.TestCase):
         stdlib = set(sys.stdlib_module_names)
         allowed = {
             "tm_benchmark",
+            "tm_benchmark_platform_io",
             "tm_candidate_index",
             "tm_contracts",
             "tm_migration",

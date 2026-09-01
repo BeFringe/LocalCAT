@@ -1460,7 +1460,11 @@ class CapabilityHostGateDTests(unittest.TestCase):
         self.assertEqual(started.state.value, "RUNNING")
         finished = _gate_d_owner(composition).wait(timeout=5.0)
 
-        self.assertEqual(finished.state.value, "SUCCEEDED")
+        self.assertEqual(
+            finished.state.value,
+            "SUCCEEDED",
+            finished.safe_code,
+        )
         self.assertIsNone(finished.safe_code)
         self.assertEqual(len(execution.calls), 1)
         call = execution.calls[0]
@@ -1474,7 +1478,22 @@ class CapabilityHostGateDTests(unittest.TestCase):
             Path(host_module.__file__).resolve().parent
             / "benchmark_tm_contract.json",
         )
-        self.assertEqual(call["mode"], 0o700)
+        if sys.platform == "win32":
+            from platform_fs import compose_platform_file_backend
+
+            backend = compose_platform_file_backend(cast(Path, call["work_root"]))
+            authority = evidence = None
+            try:
+                authority = backend.bind_root(cast(Path, call["work_root"]))
+                evidence = backend.prove_private(authority)
+                authority.reprove()
+            finally:
+                if evidence is not None:
+                    evidence.close()
+                if authority is not None:
+                    authority.close()
+        else:
+            self.assertEqual(call["mode"], 0o700)
         self.assertIs(call["evidence_existed"], False)
         self.assertEqual(
             call["evidence_path"],
