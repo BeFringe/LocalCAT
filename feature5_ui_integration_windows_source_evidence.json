@@ -1,0 +1,188 @@
+{
+  "schema_version": "feature5-ui-integration-windows-source-evidence-v1",
+  "generated_at_utc": "2026-09-02T18:45:02Z",
+  "implementation_anchor": "9b9d585fd180d70b18d2da029e39bfeb5c8000eb",
+  "implementation_tree": "fd5dc0874ae7cc1a3905f7dfa47a1c22e4127759",
+  "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "architecture": "AMD64",
+    "python": "3.14.7",
+    "runtime": "E:\\Archives\\Project\\CAT\\.validation-ui-mvp\\venv\\Scripts\\python.exe",
+    "temporary_root": "E:\\SDK\\tmp"
+  },
+  "scope": {
+    "owner": "feature5-ui-integration",
+    "amendment": "WA-07",
+    "delivery_phase": "source",
+    "status": "PASS",
+    "excluded": [
+      "user-managed launcher",
+      "WA-08 visible product journey",
+      "frozen bootstrap",
+      "packaged release"
+    ]
+  },
+  "prerequisites": {
+    "windows_tm_current_source_anchor": "e7bab7a57283964e9424ea458b222f5b5f65a7fb",
+    "active_tm_tmx_integration_anchor": "7e28b2b62a0a1c99aff87a3b055463d169a6c9d3",
+    "windows_tm_current_source_evidence_sha256": "c8a6dff7d064062fa8cde58bbac7567cdab768b9033be51b2d96940cd28fa94d"
+  },
+  "matrix": [
+    {
+      "id": "source_bootstrap_and_current_source",
+      "anchor": "6b0e48f6019d624b48f9b3bfb38e587c48fa25fe",
+      "command": "python -m unittest tests.test_qt_bootstrap tests.test_platform_source_authority tests.test_tm_snapshot_artifacts_windows tests.test_tm_current_source_retrieval_windows tests.test_validate_windows_tm_current_source_release tests.test_windows_tm_current_source_registry",
+      "tests": 23,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 676.595,
+      "result": "PASS"
+    },
+    {
+      "id": "feature5_runtime_activation_and_ui",
+      "anchor": "6b0e48f6019d624b48f9b3bfb38e587c48fa25fe",
+      "command": "python -m unittest tests.test_tm_resource_resolver tests.test_tm_resource_lifecycle tests.test_editor_tm_adapter_legacy tests.test_editor_tm_adapter_mixed tests.test_editor_tm_adapter_append tests.test_editor_controller_tm_activation_completion tests.test_editor_controller_tm_apply tests.test_editor_controller_tm_query_session tests.test_cluster_e_remediation tests.test_qt_settings_tm_lifecycle.QtSettingsTMLifecycleTests.test_real_activation_and_explicit_rebuild_refresh_canonical_state tests.test_qt_settings_tm_lifecycle.QtSettingsTMLifecycleTests.test_busy_disables_duplicate_actions_then_proven_failure_keeps_legacy",
+      "tests": 118,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 197.230,
+      "result": "PASS"
+    },
+    {
+      "id": "capability_host_gate_regression",
+      "anchor": "6b0e48f6019d624b48f9b3bfb38e587c48fa25fe",
+      "command": "python -m unittest tests.test_capability_host_matcher_gate tests.test_capability_host_gate_c tests.test_capability_host_gate_d tests.test_capability_host_gate_d_attestation",
+      "tests": 76,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 215.539,
+      "result": "PASS"
+    },
+    {
+      "id": "windows_portable_v3_ui_projection",
+      "anchor": "6b0e48f6019d624b48f9b3bfb38e587c48fa25fe",
+      "command": "python -m unittest tests.test_qt_settings_tm_lifecycle.QtSettingsTMLifecycleTests.test_platform_requalification_action_is_separate_from_fuzzy tests.test_qt_settings_tm_lifecycle.QtSettingsTMLifecycleTests.test_real_activation_and_explicit_rebuild_refresh_canonical_state",
+      "tests": 2,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 16.089,
+      "result": "PASS"
+    },
+    {
+      "id": "windows_recovery_lock_controller_qt_cumulative",
+      "anchor": "9b9d585fd180d70b18d2da029e39bfeb5c8000eb",
+      "command": "python -B -m unittest tests.test_platform_fs_windows_lock tests.test_tm_migration.TMMigrationPreflightTests tests.test_editor_controller_tm_activation_completion tests.test_feature5_ui_windows_fresh_process tests.test_qt_bootstrap",
+      "tests": 59,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 139.476,
+      "result": "PASS"
+    },
+    {
+      "id": "source_local_business_regression",
+      "anchor": "9b9d585fd180d70b18d2da029e39bfeb5c8000eb",
+      "command": "python -B -m unittest tests.test_feature5_ui_canonical_fixture tests.test_feature5_ui_canonical_retrieval tests.test_editor_tm_adapter_legacy tests.test_text_matcher_application_handoff tests.test_editor_controller_resources tests.test_qt_tm_suggestions tests.test_qt_bootstrap tests.test_editor_project tests.test_tmx_windows_compatibility tests.test_qt_settings_import tests.test_excel_adapter_contract.ExcelAdapterContractTest.test_headless_file_adapter_preserves_three_status_contract tests.test_excel_adapter_contract.ExcelAdapterContractTest.test_interactive_adapter_compiles_and_only_reaches_engine_via_logic",
+      "tests": 73,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 97.734,
+      "result": "PASS"
+    },
+    {
+      "id": "windows_source_qualification_and_drift",
+      "anchor": "9b9d585fd180d70b18d2da029e39bfeb5c8000eb",
+      "command": "python -B -m unittest tests.test_platform_source_authority tests.test_tm_gate_d_attestation.GateDAttestationTests.test_windows_fresh_process_restores_v2_private_qualification tests.test_tm_gate_d_attestation.GateDAttestationTests.test_windows_v1_and_nested_private_proof_tamper_fail_closed tests.test_tm_gate_d_attestation.GateDAttestationTests.test_tamper_and_compatibility_drift_fail_closed tests.test_capability_host_gate_d_attestation tests.test_capability_host_gate_d.CapabilityHostGateDTests.test_identity_drift_before_publication_preserves_gate_c_graph",
+      "tests": 11,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 33.510,
+      "result": "PASS"
+    },
+    {
+      "id": "windows_current_source_gate_d_cold_reopen",
+      "anchor": "9b9d585fd180d70b18d2da029e39bfeb5c8000eb",
+      "command": "python -B -m unittest tests.test_tm_current_source_retrieval_windows.WindowsCurrentSourceRetrievalTests.test_public_activation_cold_reopen_and_real_gate_d_queries",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 652.834,
+      "result": "PASS"
+    },
+    {
+      "id": "windows_real_fts5_two_cold_queries",
+      "anchor": "9b9d585fd180d70b18d2da029e39bfeb5c8000eb",
+      "command": "python -B -m unittest tests.test_tm_portable_recovery_windows.WindowsPortableFreshProcessRecoveryTests.test_real_fts5_publish_and_two_cold_queries_close_identically",
+      "tests": 1,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 3.631,
+      "result": "PASS"
+    },
+    {
+      "id": "legacy_excel_optional_dependency",
+      "anchor": "9b9d585fd180d70b18d2da029e39bfeb5c8000eb",
+      "command": "python -B excel_adapter.py",
+      "expected_exit": 1,
+      "expected_message": "Error: xlwings not installed. Please install it to run this adapter.",
+      "result": "PASS"
+    }
+  ],
+  "task_mapping": {
+    "3.5a": [
+      "source_bootstrap_and_current_source",
+      "windows_recovery_lock_controller_qt_cumulative"
+    ],
+    "3.8a": [
+      "feature5_runtime_activation_and_ui",
+      "windows_current_source_gate_d_cold_reopen"
+    ],
+    "5.4a": [
+      "windows_recovery_lock_controller_qt_cumulative"
+    ],
+    "5.5a": [
+      "windows_recovery_lock_controller_qt_cumulative",
+      "windows_real_fts5_two_cold_queries"
+    ],
+    "6.6a": [
+      "capability_host_gate_regression",
+      "windows_source_qualification_and_drift"
+    ],
+    "6.7a": [
+      "windows_recovery_lock_controller_qt_cumulative",
+      "windows_real_fts5_two_cold_queries"
+    ],
+    "7.2a": [
+      "windows_current_source_gate_d_cold_reopen",
+      "windows_real_fts5_two_cold_queries"
+    ],
+    "7.4a": [
+      "windows_recovery_lock_controller_qt_cumulative",
+      "source_local_business_regression",
+      "windows_source_qualification_and_drift"
+    ],
+    "7.6a": [
+      "source_local_business_regression",
+      "legacy_excel_optional_dependency"
+    ]
+  },
+  "known_nonblocking_limitations": [
+    "The legacy xlwings adapter remains an optional conditional workflow and is not imported by the Qt source graph.",
+    "Activated-canonical parity for the legacy Excel adapter requires an explicit resource identity owner integration and is outside the approved Excel-optional source lane."
+  ],
+  "review": {
+    "cumulative": "APPROVED",
+    "p0": 0,
+    "p1": 0,
+    "p2": 0,
+    "boundary": "Source composition, fresh-process Controller/Qt recovery, Windows cold-open private reproof and source-local business regression are verified. Launcher, WA-08 visible journey and frozen authority remain downstream."
+  }
+}
