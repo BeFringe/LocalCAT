@@ -332,7 +332,7 @@
 
 - [ ] 6. 集成TM Core/Feature5 UI amendments并完成activation/FTS5恢复
 
-- [ ] 6.1 验证并集成 WA-06 TM Core amendment
+- [x] 6.1 验证并集成 WA-06 TM Core amendment
   - 核对W1/W2及ADR-023/024/025 superseding映射、当前approved R/D/T request revision与task suffix、feature5 commit可达性和activation/attestation/recovery evidence；任何非current revision或V1 private profile实现不得进入集成
   - 重跑Core frozen contracts、canonical migration/retrieval、FileId reuse、ACL token、two-process/instruction-fault/process-termination/正常OS reboot和WR-01 module-extraction regression
   - 完成时，Core business authority仍归`tm-storage-retrieval-index`，Windows分支只提供platform能力和source integration evidence；ledger记录`SOURCE_MERGED_PASS`，frozen复验后才可进入terminal状态

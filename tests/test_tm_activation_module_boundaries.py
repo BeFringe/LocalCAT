@@ -70,6 +70,7 @@ class TMActivationModuleBoundariesTest(unittest.TestCase):
         self.assertIn("tm_activation_journal", modules)
         for module in modules:
             if module in {
+                "platform_fs_contracts",
                 "tm_contracts",
                 "tm_activation_journal",
                 "tm_content_attestation",
@@ -79,8 +80,8 @@ class TMActivationModuleBoundariesTest(unittest.TestCase):
                 continue
             self.assertIn(module, sys.stdlib_module_names, module)
         # Literal dynamic imports (importlib.import_module) are forbidden
-        # too: recovery depends only on contracts, journal, the leaf content
-        # attestation codec, stdlib, and the explicit store validation port.
+        # too: recovery depends only on TM/platform contracts, journal, the
+        # leaf content attestation codec, stdlib, and the explicit store port.
         self.assertEqual(_dynamic_imported_modules(path), set())
 
     def test_recovery_module_has_no_stage_sealer_reference(self) -> None:
