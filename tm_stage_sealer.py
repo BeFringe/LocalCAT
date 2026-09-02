@@ -73,6 +73,7 @@ from tm_sqlite_store import (
     _legacy_completed_origin_blocks,
     _legacy_revision_ancestry,
     _schema_digest,
+    _sqlite_uri_connection_target,
     _validate_candidate_proof_index_with_digest,
     inspect_stage_schema,
 )
@@ -1462,9 +1463,13 @@ def _accepted_jsonl_row(
 
 
 def _open_stage_read_connection(database_path: Path) -> sqlite3.Connection:
+    database, uri = _sqlite_uri_connection_target(
+        database_path,
+        mode="ro",
+    )
     connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro",
-        uri=True,
+        database,
+        uri=uri,
         timeout=5.0,
         isolation_level=None,
     )
@@ -1477,9 +1482,13 @@ def _open_stage_read_connection(database_path: Path) -> sqlite3.Connection:
 
 
 def _open_stage_write_connection(database_path: Path) -> sqlite3.Connection:
+    database, uri = _sqlite_uri_connection_target(
+        database_path,
+        mode="rw",
+    )
     connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=rw",
-        uri=True,
+        database,
+        uri=uri,
         timeout=5.0,
         isolation_level=None,
     )
@@ -2795,9 +2804,13 @@ def _restore_stage_unpublished(
         unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
     )
     try:
+        database, uri = _sqlite_uri_connection_target(
+            path,
+            mode="rw",
+        )
         connection = sqlite3.connect(
-            f"{path.as_uri()}?mode=rw",
-            uri=True,
+            database,
+            uri=uri,
             timeout=5.0,
             isolation_level=None,
         )

@@ -10819,7 +10819,7 @@ def _write_reserved_initial_manifest(
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
             )
-        with path.open("r+b") as stream:
+        with _native_external_writer_path(path).open("r+b") as stream:
             stream.seek(0)
             stream.truncate(0)
             stream.write(payload)
@@ -10841,6 +10841,21 @@ def _write_reserved_initial_manifest(
         raise MigrationPreflightError(
             "MIGRATION.MANIFEST_TEMP_CONFLICT"
         ) from error
+
+
+def _native_external_writer_path(path: Path) -> Path:
+    """Use the native extended spelling for one retained Windows file."""
+
+    if sys.platform != "win32":
+        return path
+    raw = str(path)
+    if raw.startswith("\\\\?\\"):
+        return path
+    if raw.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{raw[2:]}")
+    if len(raw) >= 3 and raw[0].isalpha() and raw[1:3] == ":\\":
+        return Path(f"\\\\?\\{raw}")
+    return path
 
 
 def _remove_created_file(
