@@ -319,7 +319,7 @@
   - _Requirements: 8.1, 8.2_
   - _Boundary: QtBootstrap_
 
-- [ ] 4.8a 接入 Windows source 项目保存/重开 journey
+- [x] 4.8a 接入 Windows source 项目保存/重开 journey
   - 通过 production Controller/Qt 完成项目打开、编辑、保存、关闭与 fresh-process 重开，并消费 WA-03 的 identity/receipt/recovery 投影；Qt 不实现 filesystem、package 或 writer authority。
   - _Amendment: WA-08_
   - _Depends: 4.8, WA-03_
