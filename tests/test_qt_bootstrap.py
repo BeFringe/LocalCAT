@@ -322,6 +322,7 @@ class QtBootstrapTest(unittest.TestCase):
         app.setWindowIcon(QIcon())
         captured: dict[str, QIcon] = {}
         captured_identity: dict[str, str] = {}
+        captured_catalog: list[object | None] = []
 
         class CapturingWindow(QWidget):
             def __init__(
@@ -329,9 +330,12 @@ class QtBootstrapTest(unittest.TestCase):
                 _controller: object,
                 *,
                 chunk_controller: object | None = None,
+                speaker_avatar_catalog: object | None = None,
             ) -> None:
                 super().__init__()
                 self.chunk_controller = chunk_controller
+                self.speaker_avatar_catalog = speaker_avatar_catalog
+                captured_catalog.append(speaker_avatar_catalog)
                 self.pages = SimpleNamespace(
                     currentWidget=lambda: SimpleNamespace(
                         objectName=lambda: "editorPage"
@@ -388,6 +392,10 @@ class QtBootstrapTest(unittest.TestCase):
             },
         )
         self.assertEqual(set(captured), {"application", "window", "dialog"})
+        from qt_speaker_avatar import SpeakerAvatarCatalog
+
+        self.assertEqual(len(captured_catalog), 1)
+        self.assertIs(type(captured_catalog[0]), SpeakerAvatarCatalog)
         for name, icon in captured.items():
             with self.subTest(name=name):
                 self.assertFalse(icon.isNull())
