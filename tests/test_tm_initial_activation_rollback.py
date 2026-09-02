@@ -328,7 +328,7 @@ class InitialActivationRollbackTests(unittest.TestCase):
             with (
                 patch.object(
                     SQLiteTMStore,
-                    "append_streamed_batch",
+                    "_append_streamed_batch_for_immediate_seal",
                     side_effect=OSError("sensitive primary build payload"),
                 ),
                 patch(
@@ -464,7 +464,7 @@ class InitialActivationRollbackTests(unittest.TestCase):
         identity, coordinator, service = _fixture(root)
         with patch.object(
             SQLiteTMStore,
-            "append_streamed_batch",
+            "_append_streamed_batch_for_immediate_seal",
             side_effect=OSError("sensitive source payload"),
         ):
             outcome = service.activate_initial(

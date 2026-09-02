@@ -84,7 +84,7 @@ _EXPECTED_MODULE_PATCH_SEAMS = Counter(
         ): 1,
         (
             "tests/test_tm_sqlite_store.py",
-            "tm_sqlite_store.character_ngram_frequencies",
+            "tm_sqlite_candidate_projection.character_ngram_frequencies",
         ): 1,
     }
 )
@@ -143,15 +143,15 @@ _EXPECTED_INSTANCE_PATCH_SEAMS = Counter(
         ): 2,
     }
 )
-_FULL_MODULE_PATCH_ENTRY_COUNT = 61
-_FULL_MODULE_PATCH_CALL_COUNT = 306
+_FULL_MODULE_PATCH_ENTRY_COUNT = 67
+_FULL_MODULE_PATCH_CALL_COUNT = 333
 _FULL_MODULE_PATCH_DIGEST = (
-    "ce059addd6233cf8ae9f2d455606ef49167964001d307dd2da309f885e4f035a"
+    "71a4f02bab61ce845ea5702fda4be63d240145bef3d63bd18819530d8fe0899d"
 )
-_FULL_INSTANCE_PATCH_ENTRY_COUNT = 36
-_FULL_INSTANCE_PATCH_CALL_COUNT = 83
+_FULL_INSTANCE_PATCH_ENTRY_COUNT = 59
+_FULL_INSTANCE_PATCH_CALL_COUNT = 137
 _FULL_INSTANCE_PATCH_DIGEST = (
-    "ac027645e9edf0089bf01e238859b71316502a8899a4d61a7b57dc50e09e1f59"
+    "63a6169c3ba3933d07eb345b94121aa8d5474902012c0f413c6c35613a077d41"
 )
 
 _SQL_TOKENS = (
@@ -178,6 +178,10 @@ _EXPECTED_SQL_OWNERS = {
     ),
     "tm_sqlite_candidate_projection.py": frozenset(
         {
+            "_insert_generated_streamed_candidate_gram_rows",
+            "_insert_prepared_streamed_candidate_fts_rows",
+            "_insert_prepared_streamed_candidate_gram_rows",
+            "_insert_prepared_streamed_candidate_proof_rows",
             "_update_candidate_gram_projection_digest",
             "_validate_candidate_proof_index_core",
             "bounded_seed_stages",
@@ -193,9 +197,6 @@ _EXPECTED_SQL_OWNERS = {
             "gram_candidate_overlaps",
             "insert_candidate_fts_rows",
             "insert_candidate_gram_rows",
-            "insert_streamed_candidate_fts_rows",
-            "insert_streamed_candidate_gram_rows",
-            "insert_streamed_candidate_proof_rows",
             "maintain_candidate_proof_summaries",
             "restore_streamed_stage_secondary_indexes",
             "streamed_stage_secondary_index_inventory",
@@ -882,7 +883,7 @@ def getattr_query(connection, caller_query):
         )
         self.assertEqual(
             benchmark["implementation_fingerprint"],
-            "0a71eca62f427b747db08384af6514a43c07d08b8be4641007ed7c15cf2e7217",
+            "b20a470e8356aecc0762cb05ea48f48a8eb1fb7b1bfc4338e6a62cf9486f3244",
         )
         self.assertEqual(
             release["source_fingerprint"],

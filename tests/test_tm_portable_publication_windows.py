@@ -6,10 +6,12 @@ import hashlib
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import ExitStack
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from unittest import mock
 
 import tm_activation_journal
@@ -19,12 +21,16 @@ import platform_fs_windows
 import tm_sqlite_store
 import tm_stage_sealer
 from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+from tm_candidate_store_contracts import SQLiteStoreSchemaError
 from tm_contracts import (
     ActivationCapabilityState,
     CanonicalResourceIdentity,
     SnapshotManifest,
+    SourceBindingState,
+    TMRecordDraft,
     contract_from_json,
 )
+from tm_content_attestation import ContentAttestationError
 from tm_migration import MigrationFailure, MigrationReport, TMMigrationService
 from tm_sqlite_store import (
     ActivationPreparationError,
@@ -63,6 +69,71 @@ def _fixture(
         coordinator=coordinator,
     )
     return identity, coordinator, service
+
+
+def _fresh_completed_rehydrate(
+    identity: CanonicalResourceIdentity,
+    *,
+    platform_backend: platform_fs_windows.WindowsPlatformAdapter | None = None,
+) -> tuple[ResourceStoreCoordinator, object]:
+    coordinator = ResourceStoreCoordinator(
+        canonical_store_id="store.primary",
+        resource_identity=identity,
+    )
+    service = TMMigrationService(
+        resource_identity=identity,
+        canonical_store_id="store.primary",
+        coordinator=coordinator,
+        platform_backend=platform_backend,
+    )
+    with service._acquire_initial_reservation() as reservation:
+        outcome = coordinator.rehydrate_completed_portable_activation(
+            **reservation.portable_runtime_inputs()
+        )
+        reservation.reprove()
+    return coordinator, outcome
+
+
+@contextmanager
+def _observe_completed_integrity_checks(
+    checks: list[str],
+    *,
+    reject_checks: bool,
+) -> Iterator[None]:
+    real_open = tm_sqlite_store._open_completed_authority_read_connection
+
+    @contextmanager
+    def observed_open(
+        database_path: Path,
+    ) -> Iterator[sqlite3.Connection]:
+        with real_open(database_path) as connection:
+            def authorize(
+                action: int,
+                argument_one: str | None,
+                _argument_two: str | None,
+                _database: str | None,
+                _trigger: str | None,
+            ) -> int:
+                if (
+                    action == sqlite3.SQLITE_PRAGMA
+                    and type(argument_one) is str
+                    and argument_one.lower()
+                    in {"integrity_check", "foreign_key_check"}
+                ):
+                    checks.append(f"PRAGMA {argument_one.upper()}")
+                    if reject_checks:
+                        return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            connection.set_authorizer(authorize)
+            yield connection
+
+    with mock.patch.object(
+        tm_sqlite_store,
+        "_open_completed_authority_read_connection",
+        new=observed_open,
+    ):
+        yield
 
 
 def _private_root(root: Path, identity: CanonicalResourceIdentity) -> Path:
@@ -134,6 +205,597 @@ def _publication_phase_set(
 
 @unittest.skipUnless(sys.platform == "win32", "requires real Windows")
 class WindowsPortableInitialPublicationTests(unittest.TestCase):
+    def test_completed_rehydrate_reuses_exact_attested_semantic_facts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                checks: list[str] = []
+                with (
+                    _observe_completed_integrity_checks(
+                        checks,
+                        reject_checks=True,
+                    ),
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "validate_candidate_proof_index",
+                        side_effect=AssertionError(
+                            "exact completed rehydrate must reuse index facts"
+                        ),
+                    ) as validator,
+                ):
+                    fresh, outcome = _fresh_completed_rehydrate(identity)
+                self.assertEqual(checks, [])
+                validator.assert_not_called()
+                self.assertEqual(outcome.action, "COMPLETED")
+                self.assertEqual(fresh.current_generation, 0)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_validates_after_legal_database_append(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                SQLiteTMStore.from_coordinator(coordinator).append(
+                    TMRecordDraft(
+                        source_raw="appended source",
+                        target_raw="appended target",
+                        speaker_raw=None,
+                        context_prev_raw=None,
+                        context_next_raw=None,
+                        file_source=None,
+                        provenance=(("source", "rehydrate-test"),),
+                    )
+                )
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                checks: list[str] = []
+                with (
+                    _observe_completed_integrity_checks(
+                        checks,
+                        reject_checks=False,
+                    ),
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "validate_candidate_proof_index",
+                        wraps=real_validator,
+                    ) as validator,
+                ):
+                    fresh, outcome = _fresh_completed_rehydrate(identity)
+                self.assertEqual(
+                    checks,
+                    ["PRAGMA INTEGRITY_CHECK", "PRAGMA FOREIGN_KEY_CHECK"],
+                )
+                validator.assert_called_once()
+                self.assertEqual(outcome.action, "COMPLETED")
+                self.assertEqual(fresh.current_generation, 0)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_keeps_source_divergence_classification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                identity.configured_jsonl_path.write_bytes(
+                    _SOURCE_BYTES
+                    + b'{"source":"changed","target":"outside"}\n'
+                )
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                checks: list[str] = []
+                with (
+                    _observe_completed_integrity_checks(
+                        checks,
+                        reject_checks=False,
+                    ),
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "validate_candidate_proof_index",
+                        wraps=real_validator,
+                    ) as validator,
+                ):
+                    fresh, outcome = _fresh_completed_rehydrate(identity)
+                self.assertEqual(
+                    checks,
+                    ["PRAGMA INTEGRITY_CHECK", "PRAGMA FOREIGN_KEY_CHECK"],
+                )
+                validator.assert_called_once()
+                self.assertEqual(outcome.action, "COMPLETED")
+                observation = (
+                    SQLiteTMStore.from_coordinator(fresh)
+                    .source_binding_monitor.observe()
+                )
+                self.assertIs(
+                    observation.state,
+                    SourceBindingState.SOURCE_DIVERGED,
+                )
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_validates_after_manifest_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                identity.snapshot_manifest_path.write_bytes(
+                    identity.snapshot_manifest_path.read_bytes() + b"\n"
+                )
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                checks: list[str] = []
+                with (
+                    _observe_completed_integrity_checks(
+                        checks,
+                        reject_checks=False,
+                    ),
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "validate_candidate_proof_index",
+                        wraps=real_validator,
+                    ) as validator,
+                ):
+                    fresh, outcome = _fresh_completed_rehydrate(identity)
+                self.assertEqual(
+                    checks,
+                    ["PRAGMA INTEGRITY_CHECK", "PRAGMA FOREIGN_KEY_CHECK"],
+                )
+                validator.assert_called_once()
+                self.assertEqual(outcome.action, "COMPLETED")
+                self.assertEqual(fresh.state, "READY")
+                self.assertEqual(fresh.current_generation, 0)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_treats_stable_missing_source_as_reuse_miss(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                identity.configured_jsonl_path.unlink()
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                with mock.patch.object(
+                    tm_sqlite_store,
+                    "validate_candidate_proof_index",
+                    wraps=real_validator,
+                ) as validator:
+                    fresh, outcome = _fresh_completed_rehydrate(identity)
+                validator.assert_called_once()
+                self.assertEqual(outcome.action, "COMPLETED")
+                observation = (
+                    SQLiteTMStore.from_coordinator(fresh)
+                    .source_binding_monitor.observe()
+                )
+                self.assertIs(
+                    observation.state,
+                    SourceBindingState.SOURCE_DIVERGED,
+                )
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_falls_back_for_source_hardlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            alias = root / "source-hardlink-alias"
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                os.link(identity.configured_jsonl_path, alias)
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                with mock.patch.object(
+                    tm_sqlite_store,
+                    "validate_candidate_proof_index",
+                    wraps=real_validator,
+                ) as validator:
+                    fresh, outcome = _fresh_completed_rehydrate(identity)
+                validator.assert_called_once()
+                self.assertEqual(outcome.action, "COMPLETED")
+                observation = (
+                    SQLiteTMStore.from_coordinator(fresh)
+                    .source_binding_monitor.observe()
+                )
+                self.assertIs(
+                    observation.state,
+                    SourceBindingState.SOURCE_DIVERGED,
+                )
+            finally:
+                if alias.exists():
+                    alias.unlink()
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_falls_back_for_source_reparse_point(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            junction_target = root / "source-junction-target"
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                identity.configured_jsonl_path.unlink()
+                junction_target.mkdir()
+                completed = subprocess.run(
+                    [
+                        "cmd.exe",
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(identity.configured_jsonl_path),
+                        str(junction_target),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr or completed.stdout,
+                )
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                with mock.patch.object(
+                    tm_sqlite_store,
+                    "validate_candidate_proof_index",
+                    wraps=real_validator,
+                ) as validator:
+                    fresh, outcome = _fresh_completed_rehydrate(identity)
+                validator.assert_called_once()
+                self.assertEqual(outcome.action, "COMPLETED")
+                observation = (
+                    SQLiteTMStore.from_coordinator(fresh)
+                    .source_binding_monitor.observe()
+                )
+                self.assertIs(
+                    observation.state,
+                    SourceBindingState.SOURCE_DIVERGED,
+                )
+            finally:
+                if identity.configured_jsonl_path.exists():
+                    os.rmdir(identity.configured_jsonl_path)
+                if junction_target.exists():
+                    junction_target.rmdir()
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_falls_back_for_optional_authority_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                real_open = platform_fs_windows.WindowsPlatformAdapter._open_regular
+
+                def reject_source_authority(
+                    backend: object,
+                    rooted: object,
+                    relative: object,
+                ) -> object:
+                    if Path(str(relative)).name == identity.configured_jsonl_path.name:
+                        raise PlatformFileError(
+                            PlatformFileErrorCode.IDENTITY_STALE,
+                            retryable=True,
+                        )
+                    return real_open(backend, rooted, relative)
+
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                with (
+                    mock.patch.object(
+                        platform_fs_windows.WindowsPlatformAdapter,
+                        "_open_regular",
+                        new=reject_source_authority,
+                    ),
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "validate_candidate_proof_index",
+                        wraps=real_validator,
+                    ) as validator,
+                    fresh_service._acquire_initial_reservation() as reservation,
+                ):
+                    outcome = fresh.rehydrate_completed_portable_activation(
+                        **reservation.portable_runtime_inputs()
+                    )
+                validator.assert_called_once()
+                self.assertEqual(outcome.action, "COMPLETED")
+                self.assertEqual(fresh.state, "READY")
+                self.assertEqual(fresh.current_generation, 0)
+                self.assertEqual(
+                    fresh.active_store_path,
+                    identity.canonical_sidecar_path,
+                )
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_rehydrate_rejects_corrupt_database_after_reuse_miss(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                payload = bytearray(identity.canonical_sidecar_path.read_bytes())
+                payload[0] ^= 0xFF
+                identity.canonical_sidecar_path.write_bytes(payload)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                with fresh_service._acquire_initial_reservation() as reservation:
+                    with self.assertRaisesRegex(
+                        ActivationPreparationError,
+                        "^ACTIVATION.RECOVERY_REQUIRED$",
+                    ):
+                        fresh.rehydrate_completed_portable_activation(
+                            **reservation.portable_runtime_inputs()
+                        )
+                    reservation.reprove()
+                self.assertNotEqual(fresh.state, "READY")
+                self.assertIsNone(fresh.current_generation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_normal_portable_activation_reuses_sealer_projection_digest(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, coordinator, service = _fixture(root)
+            real_full_validate = (
+                tm_stage_sealer._validate_candidate_proof_index_with_digest
+            )
+            real_projection_digest = (
+                tm_sqlite_store._candidate_proof_projection_digest
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        tm_stage_sealer,
+                        "_validate_candidate_proof_index_with_digest",
+                        wraps=real_full_validate,
+                    ) as full_validate,
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "_validate_activation_indexes",
+                        side_effect=AssertionError(
+                            "normal activation must use the sealed projection digest"
+                        ),
+                    ) as active_full_validate,
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "_candidate_proof_projection_digest",
+                        wraps=real_projection_digest,
+                    ) as active_projection_digest,
+                ):
+                    outcome = service.activate_initial(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+                self.assertIs(
+                    type(outcome),
+                    MigrationReport,
+                    getattr(outcome, "error_code", None),
+                )
+                full_validate.assert_called_once()
+                active_full_validate.assert_not_called()
+                active_projection_digest.assert_called_once()
+                self.assertEqual(coordinator.current_generation, 0)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_projection_digest_mismatch_never_publishes_active_view(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, coordinator, service = _fixture(root)
+            try:
+                with mock.patch.object(
+                    tm_sqlite_store,
+                    "_candidate_proof_projection_digest",
+                    return_value="0" * 64,
+                ):
+                    outcome = service.activate_initial(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+                self.assertIs(type(outcome), MigrationFailure)
+                self.assertIsNone(coordinator.current_generation)
+                self.assertNotEqual(coordinator.state, "READY")
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_portable_health_rebinds_three_files_and_falls_back_after_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, coordinator, service = _fixture(root)
+            try:
+                outcome = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(
+                    type(outcome),
+                    MigrationReport,
+                    getattr(outcome, "error_code", None),
+                )
+                store = SQLiteTMStore.from_coordinator(coordinator)
+                real_capture = tm_sqlite_store._capture_platform_content_file
+                with (
+                    mock.patch(
+                        "tm_sqlite_store._capture_platform_content_file",
+                        wraps=real_capture,
+                    ) as capture,
+                    mock.patch(
+                        "tm_sqlite_store.validate_candidate_proof_index",
+                        side_effect=AssertionError(
+                            "matched portable bytes must reuse semantic facts"
+                        ),
+                    ),
+                ):
+                    health = store.health()
+                self.assertTrue(health.healthy)
+                self.assertEqual(capture.call_count, 3)
+
+                with mock.patch(
+                    "tm_sqlite_store._capture_platform_content_file",
+                    side_effect=ContentAttestationError(
+                        "CONTENT_ATTESTATION.FILE_UNSAFE"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        SQLiteStoreSchemaError,
+                        "^STORE.ACTIVE_ATTESTATION_INVALID$",
+                    ):
+                        store.health()
+
+                store.append(
+                    TMRecordDraft(
+                        source_raw="new source",
+                        target_raw="new target",
+                        speaker_raw=None,
+                        context_prev_raw=None,
+                        context_next_raw=None,
+                        file_source=None,
+                        provenance=(("source", "health-test"),),
+                    )
+                )
+                real_validate = tm_sqlite_store.validate_candidate_proof_index
+                with mock.patch(
+                    "tm_sqlite_store.validate_candidate_proof_index",
+                    wraps=real_validate,
+                ) as validate:
+                    changed = store.health()
+                validate.assert_called_once()
+                self.assertEqual(changed.record_count, 4)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_portable_health_treats_optional_pair_capture_failure_as_cache_miss(
+        self,
+    ) -> None:
+        cases = (
+            ("manifest", "CONTENT_ATTESTATION.FILE_MISSING"),
+            ("source", "CONTENT_ATTESTATION.FILE_UNSAFE"),
+        )
+        for role, error_code in cases:
+            with self.subTest(role=role, error_code=error_code):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    identity, coordinator, service = _fixture(root)
+                    try:
+                        outcome = service.activate_initial(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
+                        self.assertIs(
+                            type(outcome),
+                            MigrationReport,
+                            getattr(outcome, "error_code", None),
+                        )
+                        rejected_name = (
+                            identity.snapshot_manifest_path.name
+                            if role == "manifest"
+                            else identity.configured_jsonl_path.name
+                        )
+                        real_capture = (
+                            tm_sqlite_store._capture_platform_content_file
+                        )
+
+                        def reject_optional_pair(
+                            backend: object,
+                            root_path: Path,
+                            relative: object,
+                        ) -> object:
+                            if Path(str(relative)).name == rejected_name:
+                                raise ContentAttestationError(error_code)
+                            return real_capture(backend, root_path, relative)
+
+                        real_validator = (
+                            tm_sqlite_store.validate_candidate_proof_index
+                        )
+                        with (
+                            mock.patch.object(
+                                tm_sqlite_store,
+                                "_capture_platform_content_file",
+                                side_effect=reject_optional_pair,
+                            ),
+                            mock.patch.object(
+                                tm_sqlite_store,
+                                "validate_candidate_proof_index",
+                                wraps=real_validator,
+                            ) as validator,
+                        ):
+                            health = SQLiteTMStore.from_coordinator(
+                                coordinator
+                            ).health()
+                        self.assertTrue(health.healthy)
+                        validator.assert_called_once()
+                    finally:
+                        _remove_long_quarantine(root)
+
     def test_public_activation_publishes_exact_generation_zero_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
