@@ -369,7 +369,7 @@
   - _Boundary: Windows SQLite FTS5 Runtime_
   - _Depends: 6.2_
 
-- [ ] 6.5 验证并集成 WA-07 Feature5/UI source阶段
+- [x] 6.5 验证并集成 WA-07 Feature5/UI source阶段
   - 核对Feature5/UI owning Spec route tasks、commit可达性与evidence；source composition先由Windows platform factory建立rooted source、lock与private-proof ports，再进入CapabilityHost/Controller，不消费ADR-022 `TrustedSourceAuthority`
   - 运行activation/restart projections、resource-local safe state、source bootstrap-before-business-import、no raw proof/path UI和existing Gate A/C/D contract regression
   - 完成时，source UI可激活TM、重启恢复并查询FTS5；ledger只记录`SOURCE_MERGED_PASS`，不得提前记录terminal `MERGED_PASS`
