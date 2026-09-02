@@ -46,6 +46,7 @@ from tm_retrieval_capability import (
     RetrievalFuzzyCoreDecision,
     RetrievalFuzzyPathDecision,
 )
+from tests.source_authority_support import current_source_authority
 
 
 _GENERATED_AT = datetime(2030, 1, 1, tzinfo=timezone.utc)
@@ -299,6 +300,7 @@ class _FakeGateDExecution:
         evidence_path: Path,
         publication_owner_identity: object,
         publication_graph_nonce: object,
+        rooted_binding: object | None = None,
     ) -> object:
         self.calls.append(
             {
@@ -322,7 +324,9 @@ class _FakeGateDExecution:
                 "GATE_D.EVIDENCE_PATH_EXISTS"
             )
         evidence_path.write_text("audit", encoding="utf-8")
-        binding = cast(Any, host_module)._CoreGateDBinding.capture()
+        binding = rooted_binding
+        if binding is None:
+            raise AssertionError("Gate D test execution requires rooted anchors")
         object.__setattr__(binding, "run_result_type", object)
         self.bindings.append(binding)
         receipt = cast(Any, host_module)._CoreGateDPublication(
@@ -413,6 +417,7 @@ class _StructuralGateDExecution(_FakeGateDExecution):
         evidence_path: Path,
         publication_owner_identity: object,
         publication_graph_nonce: object,
+        rooted_binding: object | None = None,
     ) -> object:
         super().run(
             contract_path=contract_path,
@@ -420,8 +425,39 @@ class _StructuralGateDExecution(_FakeGateDExecution):
             evidence_path=evidence_path,
             publication_owner_identity=publication_owner_identity,
             publication_graph_nonce=publication_graph_nonce,
+            rooted_binding=rooted_binding,
         )
         return self
+
+
+def _gate_d_binding(
+    composition: CapabilityHostComposition,
+) -> object:
+    owner = cast(Any, composition).retrieval_gate_d_owner
+    execute = cast(Any, owner)._RetrievalGateDOwner__execute
+    restore = cast(Any, owner)._RetrievalGateDOwner__restore
+    execution = getattr(restore, "__self__", None)
+    execute_owner = getattr(execute, "__self__", None)
+    if (
+        type(execution) is not cast(Any, host_module)._RealGateDExecution
+        or (
+            execute_owner is not None
+            and execute_owner is not execution
+        )
+        or cast(Any, owner)._RetrievalGateDOwner__contract_path
+        != execution.contract_path
+    ):
+        raise AssertionError("composition must retain real rooted Gate D execution")
+    return cast(Any, host_module)._CoreGateDBinding.capture(
+        module_anchors=getattr(
+            execution,
+            "_RealGateDExecution__module_anchors",
+        ),
+        contract_anchor=getattr(
+            execution,
+            "_RealGateDExecution__contract_anchor",
+        ),
+    )
 
 
 def _composition(
@@ -429,13 +465,19 @@ def _composition(
     execution: _FakeGateDExecution,
 ) -> CapabilityHostComposition:
     composition = cast(Any, host_module).compose_capability_host(
+        source_authority=current_source_authority(),
         evaluated_at_utc=_EVALUATED_AT,
     )
+    rooted_binding = _gate_d_binding(composition)
     owner = cast(Any, composition).retrieval_gate_d_owner
+
+    def execute_from_composition(**kwargs: object) -> object:
+        return execution.run(rooted_binding=rooted_binding, **kwargs)
+
     object.__setattr__(
         owner,
         "_RetrievalGateDOwner__execute",
-        execution.run,
+        execute_from_composition,
     )
 
     def publish_from_authentic_binding(
@@ -532,7 +574,11 @@ class CapabilityHostGateDTests(unittest.TestCase):
     def test_real_binding_pins_core_runner_publication_and_source_graph(
         self,
     ) -> None:
-        binding = cast(Any, host_module)._CoreGateDBinding.capture()
+        composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
+            evaluated_at_utc=_EVALUATED_AT,
+        )
+        binding = _gate_d_binding(composition)
         self.assertTrue(binding.is_current())
         gate_module = binding.gate_module
 
@@ -549,7 +595,11 @@ class CapabilityHostGateDTests(unittest.TestCase):
     def test_binding_rejects_foreign_retrieval_publication_helper(
         self,
     ) -> None:
-        binding = cast(Any, host_module)._CoreGateDBinding.capture()
+        composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
+            evaluated_at_utc=_EVALUATED_AT,
+        )
+        binding = _gate_d_binding(composition)
         gate_module = binding.gate_module
 
         def foreign_validated_refresh(*_args: object, **_kwargs: object) -> object:
@@ -566,7 +616,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
         ):
             self.assertFalse(binding.is_current())
             with self.assertRaises(RuntimeError):
-                cast(Any, host_module)._CoreGateDBinding.capture()
+                _gate_d_binding(composition)
             with tempfile.TemporaryDirectory() as raw_root:
                 work_root = Path(raw_root)
                 with self.assertRaises(
@@ -608,6 +658,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
         self,
     ) -> None:
         composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
             evaluated_at_utc=_EVALUATED_AT,
         )
         gate_c_handoff = _gate_c(composition)
@@ -626,7 +677,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
             owner_identity=owner_identity,
         )
         self.assertIsNotNone(graph)
-        binding = cast(Any, host_module)._CoreGateDBinding.capture()
+        binding = _gate_d_binding(composition)
         benchmark_tests = cast(
             Any,
             importlib.import_module("tests.test_tm_benchmark_gate"),
@@ -804,6 +855,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
 
     def test_late_host_cast_cannot_fail_after_formal_commit(self) -> None:
         composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
             evaluated_at_utc=_EVALUATED_AT,
         )
         gate_c_handoff = _gate_c(composition)
@@ -822,7 +874,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
             owner_identity=owner_identity,
         )
         self.assertIsNotNone(graph)
-        binding = cast(Any, host_module)._CoreGateDBinding.capture()
+        binding = _gate_d_binding(composition)
         benchmark_tests = cast(
             Any,
             importlib.import_module("tests.test_tm_benchmark_gate"),
@@ -1011,13 +1063,14 @@ class CapabilityHostGateDTests(unittest.TestCase):
         self,
     ) -> None:
         composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
             evaluated_at_utc=_EVALUATED_AT,
         )
         gate_c_handoff = _gate_c(composition)
         service = _private_service(gate_c_handoff)
         publisher = cast(Any, service)._capability_publisher
         old_capability = publisher.snapshot()
-        binding = cast(Any, host_module)._CoreGateDBinding.capture()
+        binding = _gate_d_binding(composition)
         benchmark_tests = cast(
             Any,
             importlib.import_module("tests.test_tm_benchmark_gate"),
@@ -1193,6 +1246,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
         self,
     ) -> None:
         composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
             evaluated_at_utc=_EVALUATED_AT,
         )
         handoff = _gate_c(composition)
@@ -1202,7 +1256,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
             Any,
             composition.host,
         )._CapabilityHost__retrieval_base_manifest
-        binding = cast(Any, host_module)._CoreGateDBinding.capture()
+        binding = _gate_d_binding(composition)
         run_result = object()
 
         def fake_run(*_args: object) -> object:
@@ -1323,7 +1377,11 @@ class CapabilityHostGateDTests(unittest.TestCase):
                     host_module.compose_capability_host
                 ).parameters
             ),
-            ("evaluated_at_utc", "gate_d_attestation_root"),
+            (
+                "source_authority",
+                "evaluated_at_utc",
+                "gate_d_attestation_root",
+            ),
         )
         self.assertFalse(
             hasattr(host_module, "_compose_capability_host_for_gate_d_test")
@@ -1395,15 +1453,14 @@ class CapabilityHostGateDTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as raw_root:
             work_root = Path(raw_root)
+            first_binding = _gate_d_binding(first)
             receipt = cast(Any, execution.run(
-                contract_path=(
-                    Path(host_module.__file__).resolve().parent
-                    / "benchmark_tm_contract.json"
-                ),
+                contract_path=cast(Any, first_binding).contract_anchor.path,
                 work_root=work_root,
                 evidence_path=work_root / "benchmark_tm_evidence.json",
                 publication_owner_identity=first_owner,
                 publication_graph_nonce=first_graph.publication_nonce,
+                rooted_binding=first_binding,
             ))
 
             second_capability = second_graph.publisher.snapshot()

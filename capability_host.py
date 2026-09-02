@@ -21,7 +21,6 @@ from dataclasses import (
 )
 from datetime import datetime, timezone
 from enum import Enum
-import hashlib
 import importlib
 from importlib.machinery import ModuleSpec, SourceFileLoader
 import json
@@ -47,6 +46,10 @@ from typing import (
 from capability_gated_text_matcher import CapabilityGatedTextMatcherV1
 from editor_contracts import RetrievalDisplayState, TextMatcherDisplayState
 from matcher_validation import build_validated_matcher_v1
+from platform_source_authority import (
+    RootedSourceAuthority,
+    RootedSourceFile,
+)
 from tm_contracts import (
     CapabilityGatedTextMatcher,
     QueryReport,
@@ -104,117 +107,92 @@ def _require_generation(value: object) -> None:
         raise ValueError("capability generation must be non-negative")
 
 
+def _absolute_locator(value: object) -> Path | None:
+    """Normalize interpreter metadata as a locator, never as authority."""
+
+    if type(value) is not str:
+        return None
+    try:
+        path = Path(cast(str, value))
+        return path if path.is_absolute() else path.absolute()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class _PathIdentity:
     path: Path
-    device: int
-    inode: int
     directory: bool
+    source_authority: RootedSourceAuthority
+    source_file: RootedSourceFile | None
 
     @classmethod
-    def capture(cls, path: Path, *, directory: bool) -> _PathIdentity:
-        resolved = path.resolve(strict=True)
-        path_stat = resolved.lstat()
-        expected_kind = (
-            stat.S_ISDIR(path_stat.st_mode)
-            if directory
-            else stat.S_ISREG(path_stat.st_mode)
-        )
-        if not expected_kind:
-            kind = "directory" if directory else "regular file"
-            raise RuntimeError(f"application checkout identity requires {kind}")
+    def capture(
+        cls,
+        path: Path,
+        *,
+        directory: bool,
+        source_authority: RootedSourceAuthority,
+    ) -> _PathIdentity:
+        if type(source_authority) is not RootedSourceAuthority:
+            raise TypeError("path identity requires rooted source authority")
+        if type(path) is not type(Path()) or not path.is_absolute():
+            raise TypeError("path identity locator must be an absolute Path")
+        if directory:
+            if path != source_authority.root_path:
+                raise RuntimeError("source directory identity must be the rooted checkout")
+            source_authority.reprove()
+            source_file = None
+        else:
+            source_file = source_authority.bind_path(path)
         return cls(
-            path=resolved,
-            device=path_stat.st_dev,
-            inode=path_stat.st_ino,
+            path=path,
             directory=directory,
+            source_authority=source_authority,
+            source_file=source_file,
         )
 
     def is_current(self) -> bool:
-        try:
-            if self.path.resolve(strict=True) != self.path:
+        if self.directory:
+            try:
+                self.source_authority.reprove()
+            except (OSError, RuntimeError):
                 return False
-            path_stat = self.path.lstat()
-        except OSError:
-            return False
-        expected_kind = (
-            stat.S_ISDIR(path_stat.st_mode)
-            if self.directory
-            else stat.S_ISREG(path_stat.st_mode)
-        )
-        return (
-            expected_kind
-            and path_stat.st_dev == self.device
-            and path_stat.st_ino == self.inode
-        )
-
-
-def _read_regular_file_no_follow(
-    path: Path,
-) -> tuple[int, int, bytes]:
-    """Read one exact regular file without following its final path entry."""
-
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise RuntimeError("trusted checkout anchor must be a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    if (
-        before.st_dev != after.st_dev
-        or before.st_ino != after.st_ino
-        or before.st_size != after.st_size
-        or before.st_mtime_ns != after.st_mtime_ns
-    ):
-        raise RuntimeError("trusted checkout anchor changed while reading")
-    return before.st_dev, before.st_ino, b"".join(chunks)
+            return self.path == self.source_authority.root_path
+        return self.source_file is not None and self.source_file.is_current()
 
 
 @dataclass(frozen=True, slots=True)
 class _TrackedFileAnchor:
-    """Import-time bytes and file identity for a fixed checkout artifact."""
+    """Exact bytes retained under one injected rooted source authority."""
 
     path: Path
-    device: int
-    inode: int
     digest: str
     content: bytes
+    source_file: RootedSourceFile
 
     @classmethod
-    def capture(cls, path: Path) -> _TrackedFileAnchor:
-        absolute = path.absolute()
-        if absolute.resolve(strict=True) != absolute:
-            raise RuntimeError("trusted checkout anchor must not be a symlink")
-        device, inode, content = _read_regular_file_no_follow(absolute)
+    def capture(
+        cls,
+        path: Path,
+        source_authority: RootedSourceAuthority,
+    ) -> _TrackedFileAnchor:
+        if type(source_authority) is not RootedSourceAuthority:
+            raise TypeError("tracked source requires rooted source authority")
+        source = source_authority.bind_path(path)
         return cls(
-            path=absolute,
-            device=device,
-            inode=inode,
-            digest=hashlib.sha256(content).hexdigest(),
-            content=content,
+            path=source.path,
+            digest=source.content_sha256.hex(),
+            content=source.content,
+            source_file=source,
         )
 
     def is_current(self) -> bool:
-        try:
-            if self.path.resolve(strict=True) != self.path:
-                return False
-            device, inode, content = _read_regular_file_no_follow(self.path)
-        except (OSError, RuntimeError):
-            return False
         return (
-            device == self.device
-            and inode == self.inode
-            and hashlib.sha256(content).hexdigest() == self.digest
-            and content == self.content
+            self.source_file.is_current()
+            and self.source_file.path == self.path
+            and self.source_file.content_sha256.hex() == self.digest
+            and self.source_file.content == self.content
         )
 
 
@@ -229,9 +207,14 @@ class _ApplicationCheckoutIdentity:
         cls,
         factory_source: _PathIdentity,
         approved_roots: _PathIdentity,
+        source_authority: RootedSourceAuthority,
     ) -> _ApplicationCheckoutIdentity:
-        host_path = Path(__file__).resolve(strict=True)
-        root_path = host_path.parent
+        host_path = _absolute_locator(__file__)
+        if host_path is None:
+            raise RuntimeError("capability host source locator is unavailable")
+        root_path = source_authority.root_path
+        if host_path.parent != root_path:
+            raise RuntimeError("capability host must be loaded from the rooted checkout")
         if factory_source.path.parent != root_path:
             raise RuntimeError(
                 "matcher factory must be loaded from the application checkout"
@@ -243,8 +226,16 @@ class _ApplicationCheckoutIdentity:
                 "matcher approved roots must belong to the application checkout"
             ) from None
         return cls(
-            root=_PathIdentity.capture(root_path, directory=True),
-            host_module=_PathIdentity.capture(host_path, directory=False),
+            root=_PathIdentity.capture(
+                root_path,
+                directory=True,
+                source_authority=source_authority,
+            ),
+            host_module=_PathIdentity.capture(
+                host_path,
+                directory=False,
+                source_authority=source_authority,
+            ),
             matcher_factory_source=factory_source,
         )
 
@@ -844,9 +835,10 @@ class _ModuleSourceCodeAnchor:
         *,
         module_name: str,
         path: Path,
+        source_authority: RootedSourceAuthority,
         named_defaults: dict[str, object] | None = None,
     ) -> _ModuleSourceCodeAnchor:
-        source = _TrackedFileAnchor.capture(path)
+        source = _TrackedFileAnchor.capture(path, source_authority)
         functions, classes, defaults, core_imports, dataclass_shapes = (
             _source_declarations(
                 source.content,
@@ -894,13 +886,10 @@ class _ModuleSourceCodeAnchor:
         loader = module.__loader__
         if type(spec) is not ModuleSpec or type(loader) is not SourceFileLoader:
             return False
-        try:
-            module_path = Path(cast(str, module.__file__)).resolve(strict=True)
-            spec_origin = Path(cast(str, spec.origin)).resolve(strict=True)
-            loader_path = Path(
-                cast(str, loader.path)
-            ).resolve(strict=True)
-        except (AttributeError, OSError, TypeError, ValueError):
+        module_path = _absolute_locator(getattr(module, "__file__", None))
+        spec_origin = _absolute_locator(spec.origin)
+        loader_path = _absolute_locator(getattr(loader, "path", None))
+        if module_path is None or spec_origin is None or loader_path is None:
             return False
         return (
             self.source.is_current()
@@ -1010,9 +999,8 @@ class _RuntimeFunctionIdentity:
         expected_codes = anchor.expected_codes(self.qualname)
         expected_defaults = anchor.expected_defaults(self.qualname)
         function = self.function
-        try:
-            code_path = Path(function.__code__.co_filename).resolve(strict=True)
-        except (OSError, TypeError, ValueError):
+        code_path = _absolute_locator(function.__code__.co_filename)
+        if code_path is None:
             return False
         return (
             expected_codes is not None
@@ -1427,12 +1415,6 @@ class _RuntimeModuleCodeBinding:
         return all(identity.is_current(self.anchor) for identity in self.classes)
 
 
-_CAPABILITY_HOST_ROOT = Path(__file__).resolve(strict=True).parent
-_RETRIEVAL_APPROVED_ROOTS_ANCHOR = _TrackedFileAnchor.capture(
-    _CAPABILITY_HOST_ROOT / _RETRIEVAL_APPROVED_ROOTS_RELATIVE_PATH
-)
-
-
 def _retrieval_build_modules(anchor: _TrackedFileAnchor) -> tuple[str, ...]:
     try:
         payload = json.loads(anchor.content)
@@ -1460,18 +1442,6 @@ def _retrieval_build_modules(anchor: _TrackedFileAnchor) -> tuple[str, ...]:
     return tuple(modules)
 
 
-_RETRIEVAL_BUILD_MODULE_NAMES = _retrieval_build_modules(
-    _RETRIEVAL_APPROVED_ROOTS_ANCHOR
-)
-_RETRIEVAL_VALIDATION_MODULE_ANCHOR = _ModuleSourceCodeAnchor.capture(
-    module_name=_RETRIEVAL_VALIDATION_MODULE_NAME,
-    path=_CAPABILITY_HOST_ROOT / f"{_RETRIEVAL_VALIDATION_MODULE_NAME}.py",
-    named_defaults={
-        "_DEFAULT_APPROVED_ROOTS": _RETRIEVAL_APPROVED_ROOTS_ANCHOR.path,
-    },
-)
-
-
 def _loaded_module_binding(
     anchor: _ModuleSourceCodeAnchor,
 ) -> _RuntimeModuleCodeBinding:
@@ -1479,54 +1449,6 @@ def _loaded_module_binding(
     if type(module) is not ModuleType:
         raise RuntimeError("required Core runtime module is not loaded")
     return _RuntimeModuleCodeBinding.capture(module, anchor)
-
-
-_RETRIEVAL_BUILD_MODULE_ANCHORS = tuple(
-    _RETRIEVAL_VALIDATION_MODULE_ANCHOR
-    if module_name == _RETRIEVAL_VALIDATION_MODULE_NAME
-    else _ModuleSourceCodeAnchor.capture(
-        module_name=module_name,
-        path=_CAPABILITY_HOST_ROOT / f"{module_name}.py",
-        named_defaults=(
-            {
-                "_DEFAULT_APPROVED_ROOTS": (
-                    _CAPABILITY_HOST_ROOT
-                    / "tests"
-                    / "fixtures"
-                    / "feature5_gate_a_v1.json"
-                )
-            }
-            if module_name == "tm_gate_a"
-            else None
-        ),
-    )
-    for module_name in _RETRIEVAL_BUILD_MODULE_NAMES
-)
-_RETRIEVAL_RUNTIME_MODULE_BINDINGS = tuple(
-    _loaded_module_binding(anchor)
-    for anchor in _RETRIEVAL_BUILD_MODULE_ANCHORS
-    if anchor.module_name != _RETRIEVAL_VALIDATION_MODULE_NAME
-)
-
-_GATE_D_CONTRACT_ANCHOR = _TrackedFileAnchor.capture(
-    _CAPABILITY_HOST_ROOT / _GATE_D_CONTRACT_RELATIVE_PATH
-)
-_GATE_D_MODULE_ANCHORS = tuple(
-    _ModuleSourceCodeAnchor.capture(
-        module_name=module_name,
-        path=_CAPABILITY_HOST_ROOT / f"{module_name}.py",
-        named_defaults=(
-            {
-                "BENCHMARK_PERCENTILE_METHOD": "nearest-rank",
-                "DEFAULT_TIMING_CLOCK_NAME": "perf_counter_ns",
-                "time.perf_counter_ns": time.perf_counter_ns,
-            }
-            if module_name == "tm_benchmark_latency"
-            else None
-        ),
-    )
-    for module_name in _GATE_D_MODULE_NAMES
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1549,7 +1471,11 @@ class _CoreMatcherFactoryBinding:
     approved_roots: _PathIdentity
 
     @classmethod
-    def capture(cls, value: object) -> _CoreMatcherFactoryBinding:
+    def capture(
+        cls,
+        value: object,
+        source_authority: RootedSourceAuthority,
+    ) -> _CoreMatcherFactoryBinding:
         if type(value) is not FunctionType:
             raise RuntimeError("Core matcher factory must be a Python function")
         function = cast(FunctionType, value)
@@ -1560,9 +1486,9 @@ class _CoreMatcherFactoryBinding:
             raise RuntimeError("Core matcher factory globals must match its module")
         if getattr(module, function.__name__, None) is not function:
             raise RuntimeError("Core matcher factory module binding is foreign")
-        source_path = Path(function.__code__.co_filename).resolve(strict=True)
-        module_path = Path(cast(str, module.__file__)).resolve(strict=True)
-        if source_path != module_path:
+        source_path = _absolute_locator(function.__code__.co_filename)
+        module_path = _absolute_locator(getattr(module, "__file__", None))
+        if source_path is None or module_path is None or source_path != module_path:
             raise RuntimeError("Core matcher factory source identity is foreign")
         kwdefaults = function.__kwdefaults__
         approved_raw = (
@@ -1572,6 +1498,9 @@ class _CoreMatcherFactoryBinding:
         )
         if not isinstance(approved_raw, Path):
             raise RuntimeError("Core matcher factory approved roots are missing")
+        approved_path = _absolute_locator(str(approved_raw))
+        if approved_path is None:
+            raise RuntimeError("Core matcher factory approved roots are invalid")
         closure = cast(tuple[object, ...] | None, function.__closure__)
         global_bindings = tuple(
             sorted(
@@ -1600,23 +1529,23 @@ class _CoreMatcherFactoryBinding:
             kwdefaults_snapshot=_function_kwdefaults_snapshot(kwdefaults),
             closure_identity=closure,
             closure_snapshot=_function_closure_snapshot(closure),
-            source=_PathIdentity.capture(source_path, directory=False),
-            approved_roots=_PathIdentity.capture(
-                approved_raw,
+            source=_PathIdentity.capture(
+                source_path,
                 directory=False,
+                source_authority=source_authority,
+            ),
+            approved_roots=_PathIdentity.capture(
+                approved_path,
+                directory=False,
+                source_authority=source_authority,
             ),
         )
 
     def is_current(self) -> bool:
         function = self.function
-        try:
-            source_path = Path(function.__code__.co_filename).resolve(
-                strict=True
-            )
-            module_path = Path(cast(str, self.module.__file__)).resolve(
-                strict=True
-            )
-        except (OSError, TypeError, ValueError):
+        source_path = _absolute_locator(function.__code__.co_filename)
+        module_path = _absolute_locator(getattr(self.module, "__file__", None))
+        if source_path is None or module_path is None:
             return False
         return (
             globals().get("build_validated_matcher_v1") is function
@@ -1674,19 +1603,9 @@ class _CoreMatcherFactoryBinding:
             return None
         return result
 
-
-_CORE_MATCHER_FACTORY_BINDING = _CoreMatcherFactoryBinding.capture(
-    build_validated_matcher_v1
-)
-_APPLICATION_CHECKOUT_IDENTITY = _ApplicationCheckoutIdentity.capture(
-    _CORE_MATCHER_FACTORY_BINDING.source,
-    _CORE_MATCHER_FACTORY_BINDING.approved_roots,
-)
-
-
 @dataclass(frozen=True, slots=True)
 class _CoreTypeBinding:
-    """Import-time identity of one Core constructor or frozen value type."""
+    """Composition-time identity of one Core constructor or frozen value type."""
 
     host_name: str | None
     value: type[object]
@@ -1701,6 +1620,7 @@ class _CoreTypeBinding:
         value: type[object],
         *,
         host_name: str | None,
+        source_authority: RootedSourceAuthority,
     ) -> _CoreTypeBinding:
         if type(value) is not type:
             raise RuntimeError("Core constructor binding must be a class")
@@ -1709,22 +1629,25 @@ class _CoreTypeBinding:
             raise RuntimeError("Core constructor module must be loaded")
         if getattr(module, value.__name__, None) is not value:
             raise RuntimeError("Core constructor module binding is foreign")
-        module_path = Path(cast(str, module.__file__)).resolve(strict=True)
+        module_path = _absolute_locator(getattr(module, "__file__", None))
+        if module_path is None:
+            raise RuntimeError("Core constructor source locator is unavailable")
         return cls(
             host_name=host_name,
             value=value,
             module=module,
             module_name=module.__name__,
             value_name=value.__name__,
-            source=_PathIdentity.capture(module_path, directory=False),
+            source=_PathIdentity.capture(
+                module_path,
+                directory=False,
+                source_authority=source_authority,
+            ),
         )
 
     def is_current(self) -> bool:
-        try:
-            module_path = Path(cast(str, self.module.__file__)).resolve(
-                strict=True
-            )
-        except (OSError, TypeError, ValueError):
+        module_path = _absolute_locator(getattr(self.module, "__file__", None))
+        if module_path is None:
             return False
         return (
             (
@@ -1737,6 +1660,111 @@ class _CoreTypeBinding:
             and getattr(self.module, self.value_name, None) is self.value
             and module_path == self.source.path
             and self.source.is_current()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceAnchorGraph:
+    """Composition-time source graph retained under one rooted authority."""
+
+    source_authority: RootedSourceAuthority
+    retrieval_approved_roots_anchor: _TrackedFileAnchor
+    retrieval_validation_module_anchor: _ModuleSourceCodeAnchor
+    retrieval_runtime_module_bindings: tuple[_RuntimeModuleCodeBinding, ...]
+    gate_d_contract_anchor: _TrackedFileAnchor
+    gate_d_module_anchors: tuple[_ModuleSourceCodeAnchor, ...]
+    matcher_factory_binding: _CoreMatcherFactoryBinding
+    application_checkout_identity: _ApplicationCheckoutIdentity
+
+    @classmethod
+    def capture(
+        cls,
+        source_authority: RootedSourceAuthority,
+    ) -> _SourceAnchorGraph:
+        if type(source_authority) is not RootedSourceAuthority:
+            raise TypeError("source graph requires RootedSourceAuthority")
+        source_authority.reprove()
+        root = source_authority.root_path
+        retrieval_roots = _TrackedFileAnchor.capture(
+            root / _RETRIEVAL_APPROVED_ROOTS_RELATIVE_PATH,
+            source_authority,
+        )
+        build_module_names = _retrieval_build_modules(retrieval_roots)
+        validation_anchor = _ModuleSourceCodeAnchor.capture(
+            module_name=_RETRIEVAL_VALIDATION_MODULE_NAME,
+            path=root / f"{_RETRIEVAL_VALIDATION_MODULE_NAME}.py",
+            source_authority=source_authority,
+            named_defaults={
+                "_DEFAULT_APPROVED_ROOTS": retrieval_roots.path,
+            },
+        )
+        build_anchors = tuple(
+            validation_anchor
+            if module_name == _RETRIEVAL_VALIDATION_MODULE_NAME
+            else _ModuleSourceCodeAnchor.capture(
+                module_name=module_name,
+                path=root / f"{module_name}.py",
+                source_authority=source_authority,
+                named_defaults=(
+                    {
+                        "_DEFAULT_APPROVED_ROOTS": (
+                            root
+                            / "tests"
+                            / "fixtures"
+                            / "feature5_gate_a_v1.json"
+                        )
+                    }
+                    if module_name == "tm_gate_a"
+                    else None
+                ),
+            )
+            for module_name in build_module_names
+        )
+        runtime_bindings = tuple(
+            _loaded_module_binding(anchor)
+            for anchor in build_anchors
+            if anchor.module_name != _RETRIEVAL_VALIDATION_MODULE_NAME
+        )
+        gate_d_contract = _TrackedFileAnchor.capture(
+            root / _GATE_D_CONTRACT_RELATIVE_PATH,
+            source_authority,
+        )
+        gate_d_anchors = tuple(
+            _ModuleSourceCodeAnchor.capture(
+                module_name=module_name,
+                path=root / f"{module_name}.py",
+                source_authority=source_authority,
+                named_defaults=(
+                    {
+                        "BENCHMARK_PERCENTILE_METHOD": "nearest-rank",
+                        "DEFAULT_TIMING_CLOCK_NAME": "perf_counter_ns",
+                        "time.perf_counter_ns": time.perf_counter_ns,
+                    }
+                    if module_name == "tm_benchmark_latency"
+                    else None
+                ),
+            )
+            for module_name in _GATE_D_MODULE_NAMES
+        )
+        matcher_binding = _CoreMatcherFactoryBinding.capture(
+            build_validated_matcher_v1,
+            source_authority,
+        )
+        application_identity = _ApplicationCheckoutIdentity.capture(
+            matcher_binding.source,
+            matcher_binding.approved_roots,
+            source_authority,
+        )
+        source_authority.reprove()
+        return cls(
+            source_authority=source_authority,
+            retrieval_approved_roots_anchor=retrieval_roots,
+            retrieval_validation_module_anchor=validation_anchor,
+            retrieval_runtime_module_bindings=runtime_bindings,
+            gate_d_contract_anchor=gate_d_contract,
+            gate_d_module_anchors=gate_d_anchors,
+            matcher_factory_binding=matcher_binding,
+            application_checkout_identity=application_identity,
         )
 
 
@@ -1780,6 +1808,7 @@ class _CoreRetrievalValidationBinding:
         validator_anchor: _ModuleSourceCodeAnchor,
         approved_roots_anchor: _TrackedFileAnchor,
         core_graphs: tuple[_RuntimeModuleCodeBinding, ...],
+        source_authority: RootedSourceAuthority,
     ) -> _CoreRetrievalValidationBinding:
         if type(value) is not FunctionType:
             raise RuntimeError("Core Gate C recomputation must be a function")
@@ -1793,9 +1822,9 @@ class _CoreRetrievalValidationBinding:
             raise RuntimeError("Core Gate C globals must match its module")
         if getattr(module, function.__name__, None) is not function:
             raise RuntimeError("Core Gate C module binding is foreign")
-        source_path = Path(function.__code__.co_filename).resolve(strict=True)
-        module_path = Path(cast(str, module.__file__)).resolve(strict=True)
-        if source_path != module_path:
+        source_path = _absolute_locator(function.__code__.co_filename)
+        module_path = _absolute_locator(getattr(module, "__file__", None))
+        if source_path is None or module_path is None or source_path != module_path:
             raise RuntimeError("Core Gate C source identity is foreign")
         kwdefaults = function.__kwdefaults__
         approved_raw = (
@@ -1805,6 +1834,9 @@ class _CoreRetrievalValidationBinding:
         )
         if not isinstance(approved_raw, Path):
             raise RuntimeError("Core Gate C approved roots are missing")
+        approved_path = _absolute_locator(str(approved_raw))
+        if approved_path is None:
+            raise RuntimeError("Core Gate C approved roots are invalid")
         closure = cast(tuple[object, ...] | None, function.__closure__)
         global_bindings = tuple(
             sorted(
@@ -1833,10 +1865,15 @@ class _CoreRetrievalValidationBinding:
             kwdefaults_snapshot=_function_kwdefaults_snapshot(kwdefaults),
             closure_identity=closure,
             closure_snapshot=_function_closure_snapshot(closure),
-            source=_PathIdentity.capture(source_path, directory=False),
-            approved_roots=_PathIdentity.capture(
-                approved_raw,
+            source=_PathIdentity.capture(
+                source_path,
                 directory=False,
+                source_authority=source_authority,
+            ),
+            approved_roots=_PathIdentity.capture(
+                approved_path,
+                directory=False,
+                source_authority=source_authority,
             ),
             approved_roots_anchor=approved_roots_anchor,
             validator_graph=_RuntimeModuleCodeBinding.capture(
@@ -1847,43 +1884,45 @@ class _CoreRetrievalValidationBinding:
             release_type=_CoreTypeBinding.capture(
                 cast(type[object], release_type),
                 host_name=None,
+                source_authority=source_authority,
             ),
             expectation_type=_CoreTypeBinding.capture(
                 RetrievalCapabilityExpectation,
                 host_name="RetrievalCapabilityExpectation",
+                source_authority=source_authority,
             ),
             manifest_type=_CoreTypeBinding.capture(
                 RetrievalCapabilityManifest,
                 host_name="RetrievalCapabilityManifest",
+                source_authority=source_authority,
             ),
             evaluator_type=_CoreTypeBinding.capture(
                 RetrievalCapabilityEvaluator,
                 host_name="RetrievalCapabilityEvaluator",
+                source_authority=source_authority,
             ),
             publisher_type=_CoreTypeBinding.capture(
                 RetrievalCapabilityPublisher,
                 host_name="RetrievalCapabilityPublisher",
+                source_authority=source_authority,
             ),
             snapshot_type=_CoreTypeBinding.capture(
                 RetrievalCapabilitySnapshot,
                 host_name="RetrievalCapabilitySnapshot",
+                source_authority=source_authority,
             ),
             service_type=_CoreTypeBinding.capture(
                 TMRetrievalService,
                 host_name="TMRetrievalService",
+                source_authority=source_authority,
             ),
         )
 
     def is_current(self) -> bool:
         function = self.function
-        try:
-            source_path = Path(function.__code__.co_filename).resolve(
-                strict=True
-            )
-            module_path = Path(cast(str, self.module.__file__)).resolve(
-                strict=True
-            )
-        except (OSError, TypeError, ValueError):
+        source_path = _absolute_locator(function.__code__.co_filename)
+        module_path = _absolute_locator(getattr(self.module, "__file__", None))
+        if source_path is None or module_path is None:
             return False
         return (
             self.module.__name__ == self.module_name
@@ -2019,9 +2058,14 @@ class _RetrievalCheckoutIdentity:
     def capture(
         cls,
         binding: _CoreRetrievalValidationBinding,
+        source_authority: RootedSourceAuthority,
     ) -> _RetrievalCheckoutIdentity:
-        host_path = Path(__file__).resolve(strict=True)
-        root_path = host_path.parent
+        host_path = _absolute_locator(__file__)
+        if host_path is None:
+            raise RuntimeError("capability host source locator is unavailable")
+        root_path = source_authority.root_path
+        if host_path.parent != root_path:
+            raise RuntimeError("capability host must be loaded from the rooted checkout")
         sources = (
             binding.release_type.source,
             binding.expectation_type.source,
@@ -2044,8 +2088,16 @@ class _RetrievalCheckoutIdentity:
                 "Gate C approved roots must belong to the application checkout"
             ) from None
         return cls(
-            root=_PathIdentity.capture(root_path, directory=True),
-            host_module=_PathIdentity.capture(host_path, directory=False),
+            root=_PathIdentity.capture(
+                root_path,
+                directory=True,
+                source_authority=source_authority,
+            ),
+            host_module=_PathIdentity.capture(
+                host_path,
+                directory=False,
+                source_authority=source_authority,
+            ),
             validation_source=binding.source,
             approved_roots=binding.approved_roots,
             core_sources=sources,
@@ -2075,8 +2127,9 @@ class _RetrievalCheckoutIdentity:
 
 
 def _load_retrieval_validation_binding(
+    source_graph: _SourceAnchorGraph,
 ) -> tuple[_CoreRetrievalValidationBinding, _RetrievalCheckoutIdentity]:
-    """Late-bind validator objects under import-time tracked-source anchors."""
+    """Late-bind validator objects under injected tracked-source anchors."""
 
     module = importlib.import_module(_RETRIEVAL_VALIDATION_MODULE_NAME)
     if type(module) is not ModuleType:
@@ -2086,11 +2139,15 @@ def _load_retrieval_validation_binding(
     binding = _CoreRetrievalValidationBinding.capture(
         function,
         release_type,
-        validator_anchor=_RETRIEVAL_VALIDATION_MODULE_ANCHOR,
-        approved_roots_anchor=_RETRIEVAL_APPROVED_ROOTS_ANCHOR,
-        core_graphs=_RETRIEVAL_RUNTIME_MODULE_BINDINGS,
+        validator_anchor=source_graph.retrieval_validation_module_anchor,
+        approved_roots_anchor=source_graph.retrieval_approved_roots_anchor,
+        core_graphs=source_graph.retrieval_runtime_module_bindings,
+        source_authority=source_graph.source_authority,
     )
-    return binding, _RetrievalCheckoutIdentity.capture(binding)
+    return binding, _RetrievalCheckoutIdentity.capture(
+        binding,
+        source_graph.source_authority,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2185,6 +2242,7 @@ class _CoreGateDBinding:
     """Late-bound current-checkout Core Gate D owner graph."""
 
     graphs: tuple[_RuntimeModuleCodeBinding, ...]
+    contract_anchor: _TrackedFileAnchor
     gate_module: ModuleType
     run_function: FunctionType
     publish_function: FunctionType
@@ -2196,10 +2254,25 @@ class _CoreGateDBinding:
     publication_bindings: tuple[object, ...]
 
     @classmethod
-    def capture(cls) -> _CoreGateDBinding:
+    def capture(
+        cls,
+        *,
+        module_anchors: tuple[_ModuleSourceCodeAnchor, ...],
+        contract_anchor: _TrackedFileAnchor,
+    ) -> _CoreGateDBinding:
+        if (
+            type(module_anchors) is not tuple
+            or len(module_anchors) != len(_GATE_D_MODULE_NAMES)
+            or any(
+                type(anchor) is not _ModuleSourceCodeAnchor
+                for anchor in module_anchors
+            )
+            or type(contract_anchor) is not _TrackedFileAnchor
+        ):
+            raise TypeError("Gate D capture requires rooted source anchors")
         modules = tuple(
             importlib.import_module(anchor.module_name)
-            for anchor in _GATE_D_MODULE_ANCHORS
+            for anchor in module_anchors
         )
         if any(type(module) is not ModuleType for module in modules):
             raise RuntimeError("Gate D Core modules must be canonical modules")
@@ -2210,7 +2283,7 @@ class _CoreGateDBinding:
             )
             for module, anchor in zip(
                 modules,
-                _GATE_D_MODULE_ANCHORS,
+                module_anchors,
                 strict=True,
             )
         )
@@ -2254,6 +2327,7 @@ class _CoreGateDBinding:
             raise RuntimeError("Gate D Core owner exports are invalid")
         binding = cls(
             graphs=graphs,
+            contract_anchor=contract_anchor,
             gate_module=gate_module,
             run_function=cast(FunctionType, run_function),
             publish_function=cast(FunctionType, publish_function),
@@ -2280,7 +2354,7 @@ class _CoreGateDBinding:
 
     def is_current(self) -> bool:
         return (
-            _GATE_D_CONTRACT_ANCHOR.is_current()
+            self.contract_anchor.is_current()
             and all(graph.is_current() for graph in self.graphs)
             and self.gate_module.__dict__.get("run_benchmark_gate_d")
             is self.run_function
@@ -2326,7 +2400,7 @@ class _CoreGateDBinding:
     ) -> _CoreGateDPublication:
         if (
             not self.is_current()
-            or contract_path != _GATE_D_CONTRACT_ANCHOR.path
+            or contract_path != self.contract_anchor.path
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
         try:
@@ -2413,7 +2487,7 @@ class _CoreGateDBinding:
         if (
             type(run_result) is not self.run_result_type
             or not self.is_current()
-            or contract_path != _GATE_D_CONTRACT_ANCHOR.path
+            or contract_path != self.contract_anchor.path
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
         try:
@@ -2441,7 +2515,7 @@ class _CoreGateDBinding:
     ) -> _CoreGateDPublication:
         if (
             not self.is_current()
-            or contract_path != _GATE_D_CONTRACT_ANCHOR.path
+            or contract_path != self.contract_anchor.path
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
         try:
@@ -2569,7 +2643,27 @@ class _CoreGateDPublication:
 class _RealGateDExecution:
     """Load and invoke the pinned offline Core owner on the worker thread."""
 
-    __slots__ = ()
+    __slots__ = ("__contract_anchor", "__module_anchors")
+
+    def __init__(
+        self,
+        *,
+        module_anchors: tuple[_ModuleSourceCodeAnchor, ...],
+        contract_anchor: _TrackedFileAnchor,
+    ) -> None:
+        if type(module_anchors) is not tuple or any(
+            type(anchor) is not _ModuleSourceCodeAnchor
+            for anchor in module_anchors
+        ):
+            raise TypeError("Gate D execution requires module source anchors")
+        if type(contract_anchor) is not _TrackedFileAnchor:
+            raise TypeError("Gate D execution requires a contract source anchor")
+        self.__module_anchors = module_anchors
+        self.__contract_anchor = contract_anchor
+
+    @property
+    def contract_path(self) -> Path:
+        return self.__contract_anchor.path
 
     def run(
         self,
@@ -2581,7 +2675,10 @@ class _RealGateDExecution:
         publication_graph_nonce: object,
     ) -> _CoreGateDPublication:
         try:
-            binding = _CoreGateDBinding.capture()
+            binding = _CoreGateDBinding.capture(
+                module_anchors=self.__module_anchors,
+                contract_anchor=self.__contract_anchor,
+            )
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             raise _GateDOperationalError(
                 "GATE_D.IMPLEMENTATION_CHANGED"
@@ -2604,7 +2701,10 @@ class _RealGateDExecution:
         publication_graph_nonce: object,
     ) -> _CoreGateDPublication:
         try:
-            binding = _CoreGateDBinding.capture()
+            binding = _CoreGateDBinding.capture(
+                module_anchors=self.__module_anchors,
+                contract_anchor=self.__contract_anchor,
+            )
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             raise _GateDOperationalError(
                 "GATE_D.IMPLEMENTATION_CHANGED"
@@ -2616,12 +2716,6 @@ class _RealGateDExecution:
             publication_owner_identity=publication_owner_identity,
             publication_graph_nonce=publication_graph_nonce,
         )
-
-
-_REAL_GATE_D_EXECUTION = _RealGateDExecution()
-_REAL_GATE_D_EXECUTE = _REAL_GATE_D_EXECUTION.run
-_REAL_GATE_D_RESTORE = _REAL_GATE_D_EXECUTION.restore
-
 
 class GateDRunState(Enum):
     """Safe lifecycle state; it never carries paths or evidence."""
@@ -3312,6 +3406,9 @@ class CapabilityHost:
     def _composition_matcher_owner(
         self,
         composition_mint_identity: object,
+        *,
+        checkout_identity: _ApplicationCheckoutIdentity,
+        factory_binding: _CoreMatcherFactoryBinding,
     ) -> _MatcherValidationOwner:
         """Mint the owner object only for the application composition root."""
 
@@ -3322,8 +3419,8 @@ class CapabilityHost:
         return _MatcherValidationOwner(
             host=self,
             owner_identity=self.__matcher_owner_identity,
-            checkout_identity=_APPLICATION_CHECKOUT_IDENTITY,
-            factory_binding=_CORE_MATCHER_FACTORY_BINDING,
+            checkout_identity=checkout_identity,
+            factory_binding=factory_binding,
         )
 
     def _composition_gate_c_owner(
@@ -3365,6 +3462,7 @@ class CapabilityHost:
         composition_mint_identity: object,
         *,
         attestation_root: Path | None,
+        execution: _RealGateDExecution,
     ) -> _RetrievalGateDOwner:
         """Mint the Gate D lifecycle only for application composition."""
 
@@ -3376,6 +3474,7 @@ class CapabilityHost:
             host=self,
             owner_identity=self.__retrieval_owner_identity,
             attestation_root=attestation_root,
+            execution=execution,
         )
 
     def _install_core_matcher(
@@ -3720,13 +3819,16 @@ class _MatcherValidationOwner:
     ) -> None:
         if type(host) is not CapabilityHost:
             raise TypeError("matcher owner requires CapabilityHost")
-        if checkout_identity is not _APPLICATION_CHECKOUT_IDENTITY:
+        if (
+            type(checkout_identity) is not _ApplicationCheckoutIdentity
+            or type(factory_binding) is not _CoreMatcherFactoryBinding
+            or checkout_identity.matcher_factory_source
+            is not factory_binding.source
+            or not checkout_identity.is_current()
+            or not factory_binding.is_current()
+        ):
             raise PermissionError(
-                "matcher owner requires the loaded application checkout"
-            )
-        if factory_binding is not _CORE_MATCHER_FACTORY_BINDING:
-            raise PermissionError(
-                "matcher owner requires the loaded Core factory binding"
+                "matcher owner requires current rooted source bindings"
             )
         self.__host = host
         self.__owner_identity = owner_identity
@@ -3910,6 +4012,7 @@ class _RetrievalGateDOwner:
     __slots__ = (
         "__attestation_root",
         "__condition",
+        "__contract_path",
         "__execute",
         "__host",
         "__owner_identity",
@@ -3926,6 +4029,7 @@ class _RetrievalGateDOwner:
         host: CapabilityHost,
         owner_identity: object,
         attestation_root: Path | None,
+        execution: _RealGateDExecution,
     ) -> None:
         if type(host) is not CapabilityHost:
             raise TypeError("Gate D owner requires CapabilityHost")
@@ -3937,8 +4041,11 @@ class _RetrievalGateDOwner:
         ):
             raise ValueError("Gate D attestation root must be absolute")
         self.__attestation_root = attestation_root
-        self.__execute = _REAL_GATE_D_EXECUTE
-        self.__restore = _REAL_GATE_D_RESTORE
+        if type(execution) is not _RealGateDExecution:
+            raise TypeError("Gate D owner requires rooted source execution")
+        self.__contract_path = execution.contract_path
+        self.__execute = execution.run
+        self.__restore = execution.restore
         self.__condition = Condition(Lock())
         self.__status = GateDRunStatus(
             epoch=0,
@@ -4040,7 +4147,7 @@ class _RetrievalGateDOwner:
                     "GATE_D.REVALIDATION_REQUIRED"
                 )
             publication = self.__restore(
-                contract_path=_GATE_D_CONTRACT_ANCHOR.path,
+                contract_path=self.__contract_path,
                 state_root=state_root,
                 base_manifest=graph.base_manifest,
                 publication_owner_identity=self.__owner_identity,
@@ -4175,7 +4282,7 @@ class _RetrievalGateDOwner:
                 )
             self.__retained_roots.append(work_root)
             publication = self.__execute(
-                contract_path=_GATE_D_CONTRACT_ANCHOR.path,
+                contract_path=self.__contract_path,
                 work_root=work_root,
                 evidence_path=evidence_path,
                 publication_owner_identity=self.__owner_identity,
@@ -4185,7 +4292,7 @@ class _RetrievalGateDOwner:
                 raise TypeError("Gate D execution returned an invalid result")
             if self.__attestation_root is not None:
                 publication.persist_attestation(
-                    contract_path=_GATE_D_CONTRACT_ANCHOR.path,
+                    contract_path=self.__contract_path,
                     state_root=self.__attestation_root,
                     base_manifest=graph.base_manifest,
                     issued_at_utc=evaluated_at_utc,
@@ -4323,19 +4430,29 @@ class CapabilityHostComposition:
 
 def compose_capability_host(
     *,
+    source_authority: RootedSourceAuthority,
     evaluated_at_utc: datetime,
     gate_d_attestation_root: Path | None = None,
 ) -> CapabilityHostComposition:
     """Create the application-owned host and its private validation control."""
 
+    if type(source_authority) is not RootedSourceAuthority:
+        raise TypeError("capability host requires RootedSourceAuthority")
+    source_graph = _SourceAnchorGraph.capture(source_authority)
     retrieval_binding, retrieval_checkout = (
-        _load_retrieval_validation_binding()
+        _load_retrieval_validation_binding(source_graph)
+    )
+    gate_d_execution = _RealGateDExecution(
+        module_anchors=source_graph.gate_d_module_anchors,
+        contract_anchor=source_graph.gate_d_contract_anchor,
     )
     host = CapabilityHost(evaluated_at_utc=evaluated_at_utc)
     return CapabilityHostComposition(
         host=host,
         matcher_validation_owner=host._composition_matcher_owner(
             _COMPOSITION_MINT_IDENTITY,
+            checkout_identity=source_graph.application_checkout_identity,
+            factory_binding=source_graph.matcher_factory_binding,
         ),
         retrieval_gate_c_validation_owner=host._composition_gate_c_owner(
             _COMPOSITION_MINT_IDENTITY,
@@ -4345,6 +4462,7 @@ def compose_capability_host(
         retrieval_gate_d_owner=host._composition_gate_d_owner(
             _COMPOSITION_MINT_IDENTITY,
             attestation_root=gate_d_attestation_root,
+            execution=gate_d_execution,
         ),
     )
 
