@@ -400,7 +400,7 @@
   - 完成时，全量测试绿色，新能力仅在单 JSON gate 内可用，所有数据处理保持本地
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7_
 
-- [ ] 5.4a 执行user-managed Windows source产品journey
+- [x] 5.4a 执行user-managed Windows source产品journey
   - 用户安装CPython 3.14 x64、创建专用venv并安装`requirements-ui.txt`；从non-repository CWD经轻量GUI入口启动真实窗口，完成项目保存/重开、TM激活/重启恢复、TMX导入、FTS5、资源与头像验证。入口只调用受验证的绝对`pythonw.exe`/source bootstrap，失效时明确诊断。
   - _Amendment: WA-08_
   - _Depends: 5.2a, 5.3a, WA-03 source phase, WA-04 source phase, WA-05 source phase, WA-07 source phase, windows-platform-enablement 6.6a_
