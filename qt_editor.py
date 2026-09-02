@@ -371,6 +371,40 @@ def _write_bundle_smoke_marker(
         temporary.unlink(missing_ok=True)
 
 
+def _loaded_windows_module_path(module_name: str) -> Path:
+    """Return the live Windows loader path for one already-loaded DLL."""
+
+    if os.name != "nt":
+        raise RuntimeError("Windows module inspection is unavailable")
+    if type(module_name) is not str or not module_name:
+        raise TypeError("Windows module name must be a non-empty exact string")
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+    kernel32.GetModuleFileNameW.argtypes = (
+        wintypes.HMODULE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    )
+    kernel32.GetModuleFileNameW.restype = wintypes.DWORD
+
+    module = kernel32.GetModuleHandleW(module_name)
+    if not module:
+        raise ctypes.WinError(ctypes.get_last_error())
+    capacity = 32_768
+    buffer = ctypes.create_unicode_buffer(capacity)
+    length = int(kernel32.GetModuleFileNameW(module, buffer, capacity))
+    if length == 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if length >= capacity:
+        raise RuntimeError("loaded Windows module path is too long")
+    return Path(buffer.value).resolve()
+
+
 def _write_source_launch_smoke_marker(
     path: Path,
     *,
@@ -381,11 +415,17 @@ def _write_source_launch_smoke_marker(
 
     import json
 
+    from PySide6.QtCore import QLibraryInfo
+
     from windows_source_guardian import DEVELOPER_OVERRIDE_ENVIRONMENT
 
     marker = path.expanduser()
     if not marker.is_absolute() or marker.exists() or not marker.parent.is_dir():
         raise ValueError("source launch smoke marker path is invalid")
+    qt_plugins_path = Path(
+        QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath)
+    ).resolve()
+    qwindows_module_path = _loaded_windows_module_path("qwindows.dll")
     temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
     try:
         temporary.write_text(
@@ -393,6 +433,7 @@ def _write_source_launch_smoke_marker(
                 {
                     "application_name": app.applicationName(),
                     "application_version": app.applicationVersion(),
+                    "application_icon_present": not app.windowIcon().isNull(),
                     "cwd": str(Path.cwd()),
                     "developer_overrides_present": sorted(
                         name
@@ -402,9 +443,11 @@ def _write_source_launch_smoke_marker(
                     "pid": os.getpid(),
                     "platform_name": app.platformName(),
                     "python_executable": str(Path(sys.executable).resolve()),
-                    "version": 1,
+                    "qt_plugins_path": str(qt_plugins_path),
+                    "qwindows_module_path": str(qwindows_module_path),
+                    "version": 2,
                     "window_handle": int(window.winId()),
-                    "window_icon_present": not app.windowIcon().isNull(),
+                    "window_icon_present": not window.windowIcon().isNull(),
                     "window_title": window.windowTitle(),
                     "window_visible": window.isVisible(),
                 },
