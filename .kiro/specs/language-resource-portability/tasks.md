@@ -106,7 +106,7 @@ Cluster 0 治理/characterization
   - _Requirements: 2.1–2.6, 3.1–3.6, 6.1–6.6, 9.1–9.7_
   - _Depends: 2.2, 2.3_
 
-- [ ] 2.4a 将 direct artifact source/destination 接入平台端口
+- [x] 2.4a 将 direct artifact source/destination 接入平台端口
   - JSONL destination family 与 CSV/v1 publication 在 Windows 上使用 retained root/parent binding、`ProcessFileLock` 与 `BoundDirectoryPublisher`；不得绕过 owner snapshot/receipt 闭合。
   - _Amendment: WA-04_
   - _Depends: 2.4, ADR-020, WA-01, WA-06, windows-platform-enablement 2.1_
@@ -118,7 +118,7 @@ Cluster 0 治理/characterization
   - _Requirements: 6.1–6.6, 9.1–9.7, 12.2–12.4_
   - _Depends: 2.4_
 
-- [ ] 2.5a 扩展 Windows identity、锁与 durability fault matrix
+- [x] 2.5a 扩展 Windows identity、锁与 durability fault matrix
   - 覆盖 reparse/hardlink/multi-link、parent/destination replacement、锁竞争/owner exit、replace/readback crash 与 cold recovery；外来目标不删不覆盖。
   - _Amendment: WA-04_
   - _Depends: 2.4a, 2.5, windows-platform-enablement 3.7_
@@ -158,7 +158,7 @@ Cluster 0 治理/characterization
   - _Requirements: 4.1–4.6, 5.1–5.6, 7.1–7.3, 12.5_
   - _Depends: 3.2_
 
-- [ ] 3.4a 以 rooted sealed handle 绑定 ResourcePackage validate/publication
+- [x] 3.4a 以 rooted sealed handle 绑定 ResourcePackage validate/publication
   - Windows validator 从 retained artifact handle 完成 carrier→manifest→payload→owner profile 验证，export publication 复用同一 bound parent；不按路径 hash 后重开。
   - _Amendment: WA-04_
   - _Depends: 3.4, 2.4a, windows-platform-enablement 2.1_
@@ -206,7 +206,7 @@ Cluster 0 治理/characterization
   - _Requirements: 6.3–6.6, 8.6–8.8, 9.1–9.7, 11.1–11.3_
   - _Depends: 4.3_
 
-- [ ] 4.4a 将 package apply/Repository publication 接入 Windows 恢复协议
+- [x] 4.4a 将 package apply/Repository publication 接入 Windows 恢复协议
   - create/replace 在同一 repository binding 与进程锁下协调 owner publication、registry/runtime switch、receipt 与 pending recovery；未知阶段保持 prior resource 和人工恢复事实。
   - _Amendment: WA-04_
   - _Depends: 4.4, 3.4a, WA-06, windows-platform-enablement 3.7_
