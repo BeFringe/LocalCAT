@@ -1,0 +1,242 @@
+{
+  "schema_version": "localcat.qt-editor.windows-user-managed-source-evidence.v1",
+  "generated_at_utc": "2026-09-02T23:42:14Z",
+  "implementation_anchor": "96613f3e93317ae7c23cb26dfcee2ffa9f93cc5e",
+  "implementation_tree": "6e9b9e051c91e0c8d89fcf3425335c02884be23c",
+  "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "architecture": "AMD64",
+    "python": "3.14.7",
+    "python_bits": 64,
+    "runtime": "E:\\Archives\\Project\\CAT\\.validation-ui-mvp\\venv\\Scripts\\python.exe",
+    "pyside6": "6.11.1",
+    "openpyxl": "3.1.5",
+    "sqlite": "3.50.4",
+    "temporary_root_role": "external-disposable"
+  },
+  "scope": {
+    "owner": "qt-editor-json-mvp-increment",
+    "amendment": "WA-08",
+    "task": "5.4a",
+    "delivery_phase": "user-managed-source",
+    "status": "PASS",
+    "excluded": [
+      "bundled Python or PySide6",
+      "TrustedSourceAuthority",
+      "frozen source or fixture closure",
+      "onedir/windowed packaged release",
+      "final Windows VERIFIED status"
+    ]
+  },
+  "prerequisites": {
+    "owner_anchors": {
+      "WA-03": "faed77761b39f273563bd39dc51f5e39cd620cf5",
+      "WA-04_WA-05": "7e28b2b62a0a1c99aff87a3b055463d169a6c9d3",
+      "WA-06": "e7bab7a57283964e9424ea458b222f5b5f65a7fb",
+      "WA-07": "76f9ea47c7962d2d6d3daaf3c18195dc6afc53e4",
+      "launcher_implementation": "039604bd26969918bc414d03cccdabf931283977",
+      "launcher_evidence": "d78a10a4eb57a2a348c49265fd2aa7c86c84e21e"
+    },
+    "evidence_files": [
+      {
+        "path": "multi_document_current_source_evidence.json",
+        "sha256": "9822e6a237bb72631f9f21cb00e84c80bf7e0a2ea5c12a9968ebd6b83ad8d946",
+        "evidence_digest": "0b17be29d45e19d9a5d6fb1ef8186aa413bfeb5cb52aeadbdfd4ba91299db604"
+      },
+      {
+        "path": "collaborative_chunks_current_source_evidence.json",
+        "sha256": "bdd630c0405510c8568b4be5d854183fe1f8d7eeec0b30fcf6291b9bf91659ce",
+        "evidence_digest": "ee71d76878d3bc2033cd3c99ccf46a866e66ba8898839ba753d89127a4b009e7"
+      },
+      {
+        "path": "language_resource_portability_current_source_evidence.json",
+        "sha256": "cdcfde7bce8db2f6baf751a988d7328d45be100d58dc850fe8da8a89d9aaa4d0",
+        "evidence_digest": "a6411fd1b1ac09c81e1ce8c2dbfc38dd91d9fc23e2bb9cbc9db639e21ecae440"
+      },
+      {
+        "path": "tmx_context_interchange_current_source_evidence.json",
+        "sha256": "5213fecbcbfab183e153225f055c7d8bfe14c720d5a4ea863167a994639e562a",
+        "evidence_digest": "8fd132536b33b9e2d455741c11b280300d660c1a4872cf15ed0edc33d6e4fc8f"
+      },
+      {
+        "path": "windows_tm_current_source_evidence.json",
+        "sha256": "c8a6dff7d064062fa8cde58bbac7567cdab768b9033be51b2d96940cd28fa94d"
+      },
+      {
+        "path": "feature5_ui_integration_windows_source_evidence.json",
+        "sha256": "76598e6d9c527abe140ec64e498cbf2a5b6723b7c912269bd68a495f71787d62"
+      },
+      {
+        "path": "windows_user_managed_launcher_evidence.json",
+        "sha256": "0231621f7ce2cc81ec44480fe1c7f91afd0bfbe4abedeb816e47850acaabdcb2"
+      }
+    ],
+    "all_anchors_reachable": true
+  },
+  "matrix": [
+    {
+      "id": "qt_source_project_resources_native_runtime_launcher",
+      "anchor": "96613f3e93317ae7c23cb26dfcee2ffa9f93cc5e",
+      "command": "python -B -m unittest tests.test_qt_windows_source_project_journey tests.test_qt_source_resources tests.test_qt_windows_source_runtime tests.test_windows_source_launcher",
+      "tests": 17,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    {
+      "id": "current_commit_persistence_owner_revalidation",
+      "anchor": "96613f3e93317ae7c23cb26dfcee2ffa9f93cc5e",
+      "command": "python -B -m unittest tests.test_project_windows_source_lane tests.test_resource_windows_source_lane tests.test_tmx_windows_compatibility tests.test_collaborative_chunk_package_windows tests.test_c5_persistence_reboot_worker",
+      "tests": 33,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    {
+      "id": "current_commit_feature5_recovery_composition",
+      "anchor": "96613f3e93317ae7c23cb26dfcee2ffa9f93cc5e",
+      "command": "python -B -m unittest tests.test_platform_fs_windows_lock tests.test_tm_migration.TMMigrationPreflightTests tests.test_editor_controller_tm_activation_completion tests.test_feature5_ui_windows_fresh_process tests.test_qt_bootstrap",
+      "tests": 59,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    {
+      "id": "current_commit_real_fts5_cold_reopen",
+      "anchor": "96613f3e93317ae7c23cb26dfcee2ffa9f93cc5e",
+      "command": "python -B -m unittest tests.test_tm_current_source_retrieval_windows.WindowsCurrentSourceRetrievalTests.test_public_activation_cold_reopen_and_real_gate_d_queries tests.test_tm_portable_recovery_windows.WindowsPortableFreshProcessRecoveryTests.test_real_fts5_publish_and_two_cold_queries_close_identically",
+      "tests": 2,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    {
+      "id": "source_authority_and_current_source",
+      "anchor": "96613f3e93317ae7c23cb26dfcee2ffa9f93cc5e",
+      "command": "python -m unittest tests.test_qt_bootstrap tests.test_platform_source_authority tests.test_tm_snapshot_artifacts_windows tests.test_tm_current_source_retrieval_windows tests.test_validate_windows_tm_current_source_release tests.test_windows_tm_current_source_registry",
+      "tests": 23,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "result": "PASS"
+    },
+    {
+      "id": "requirements_ui_dependency_integrity",
+      "command": "python -m pip check",
+      "result": "PASS",
+      "output": "No broken requirements found."
+    }
+  ],
+  "visible_journey": {
+    "entry": {
+      "name": "LocalCAT Source.lnk",
+      "profile": "user-managed-source",
+      "cwd_role": "non-repository",
+      "qpa": "windows",
+      "qwindows_relative_path": "Lib/site-packages/PySide6/plugins/platforms/qwindows.dll",
+      "qwindows_bytes": 1006904,
+      "qwindows_sha256": "54d736de022f707e9f7f555e4c9f9e993253cd5b0ee2364e6a9458c180828c42",
+      "distinct_cold_start_window": true
+    },
+    "steps": [
+      {
+        "id": "native_start",
+        "status": "PASS",
+        "observable": "Windows shortcut opened a visible native main window with application icon and no console."
+      },
+      {
+        "id": "project_save_reopen",
+        "status": "PASS",
+        "observable": "The title acquired a dirty marker after editing; Save cleared it; a fresh launcher process reopened the project with the saved target 精确译文."
+      },
+      {
+        "id": "tmx_import",
+        "status": "PASS",
+        "observable": "The native file picker and locale dialog reported imported 2, skipped 1, overwritten 1 and errors 1; the stable error was PARSER.TMX.LOCALE_FALLBACK_AMBIGUOUS."
+      },
+      {
+        "id": "tm_activation",
+        "status": "PASS",
+        "observable": "The activation preview reported valid 2, invalid 0 and variants 0; completion changed the managed TM to Canonical active with Exact, Context and Fuzzy available."
+      },
+      {
+        "id": "fuzzy_query",
+        "status": "PASS",
+        "observable": "The Fallbak segment displayed an 82% FUZZY card whose actual matched source was Fallback and whose resource was WA08 Source TM 20260903 User."
+      },
+      {
+        "id": "tm_clean_restart_restore",
+        "status": "PASS",
+        "observable": "After normal exit and a new shortcut launch, the managed TM remained Canonical active and the same 82% FUZZY card returned without pending recovery."
+      },
+      {
+        "id": "fts5_cold_reopen",
+        "status": "PASS",
+        "observable": "The persisted qualification remained byte-identical across cold start and its FTS5_TRIGRAM path report was passed=true with no failed gates."
+      },
+      {
+        "id": "resource_termbase",
+        "status": "PASS",
+        "observable": "The managed TM and local termbase remained active after cold start, and the TM resource name was projected on the visible suggestion card."
+      },
+      {
+        "id": "speaker_avatar",
+        "status": "PASS",
+        "observable": "The raw-speaker inventory rendered the Adela avatar and used an empty avatar cell for the unmatched NoAvatar speaker while retaining both raw labels."
+      },
+      {
+        "id": "native_dialog_and_keyboard",
+        "status": "PASS",
+        "observable": "The journey used real Windows file dialogs, Qt locale and confirmation dialogs, editable fields and keyboard save/quit behavior."
+      }
+    ],
+    "gate_d_qualification": {
+      "path_role": "user-local-app-data/gate-d-qualification/qualification.json",
+      "schema_version": "localcat.gate-d-attestation.v2",
+      "bytes": 1013207,
+      "sha256_before_restart": "28119d8203d906888160e04fcad1c2a3d551d8ca7b36d55fc3fb3bc6317cde19",
+      "sha256_after_restart": "28119d8203d906888160e04fcad1c2a3d551d8ca7b36d55fc3fb3bc6317cde19",
+      "last_write_utc_before_restart": "2026-09-02T22:55:04Z",
+      "last_write_utc_after_restart": "2026-09-02T22:55:04Z",
+      "fts5_trigram": {
+        "passed": true,
+        "failed_gates": []
+      },
+      "gram_fallback": {
+        "passed": false,
+        "failed_gates": [
+          "MIGRATION"
+        ],
+        "scope": "nonblocking alternate route"
+      }
+    }
+  },
+  "assertions": {
+    "project_save_and_fresh_reopen": "PASS",
+    "tm_activation_and_clean_restart_restore": "PASS",
+    "tmx_import": "PASS",
+    "real_fts5_cold_reopen": "PASS",
+    "qwindows_visible_ui": "PASS",
+    "resource_and_avatar_fallback": "PASS",
+    "hidden_business_hooks_used": false,
+    "offscreen_substituted_for_visible_journey": false
+  },
+  "authority_boundary": {
+    "source_profile": "USER_MANAGED_SOURCE",
+    "launcher_role": "PREFLIGHT_AND_CHILD_SUPERVISION_ONLY",
+    "frozen_authority": "NOT_CLAIMED",
+    "packaged_release": "NO_GO",
+    "final_windows_status": "NOT_VERIFIED"
+  },
+  "review": {
+    "cumulative": "APPROVED",
+    "p0": 0,
+    "p1": 0,
+    "p2": 0,
+    "boundary": "WA-08 user-managed source journey only; the platform milestone, frozen authority and packaged release remain downstream."
+  }
+}
