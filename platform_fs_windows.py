@@ -6055,6 +6055,7 @@ class WindowsRootedFileSystem(
         *,
         owner_lease: LockLease,
         mutation_guard: BoundExistingFileMutationGuard,
+        require_private: bool,
     ) -> CandidateFile:
         if (
             type(source_parent)
@@ -6158,10 +6159,13 @@ class WindowsRootedFileSystem(
             handle = source_parent._api.open_handle(
                 selected_path,
                 desired_access=(
-                    GENERIC_READ
-                    | DELETE
-                    | FILE_READ_ATTRIBUTES
-                    | SYNCHRONIZE
+                    (
+                        GENERIC_READ
+                        | DELETE
+                        | FILE_READ_ATTRIBUTES
+                        | SYNCHRONIZE
+                        | (READ_CONTROL if require_private else 0)
+                    )
                     if source_snapshot is None
                     else GENERIC_READ
                     | GENERIC_WRITE
@@ -6199,6 +6203,8 @@ class WindowsRootedFileSystem(
                     expected_kind="regular",
                     stale=True,
                 )
+                if require_private:
+                    _private_security_facts(source_parent._api, raw)
             if (
                 selected != opened.snapshot
                 or opened.snapshot != after_read.snapshot
@@ -6323,7 +6329,7 @@ class WindowsRootedFileSystem(
                 terminal.identity,
                 source_parent._maximum_component_units,
                 self._fault_injector,
-                private=False,
+                private=require_private,
                 recovered_content=expected_content,
             )
             records = None

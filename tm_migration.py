@@ -22,6 +22,7 @@ import uuid
 from tm_activation_journal import (
     ActivationRecoveryReport,
     _ActivationPreparation,
+    _PortableReplacementRecord,
     _activation_journal_path,
     _activation_journal_temp_path,
     _activation_lineage_marker_path,
@@ -30,6 +31,7 @@ from tm_activation_journal import (
     _activation_terminal_temp_path,
     _create_caller_held_portable_journal_borrow,
     _lstat_any_entry,
+    _PORTABLE_SCHEMA_UPGRADE_OPERATION,
     _require_quarantine_directory,
 )
 from tm_activation_recovery import (
@@ -101,6 +103,7 @@ from tm_sqlite_store import (
     _legacy_completed_origin_blocks,
     _legacy_revision_ancestry,
     _open_configured_connection,
+    _require_schema_upgrade_ancestry_provable,
     initialize_stage_schema,
     inspect_stage_schema,
     unique_character_ngrams,
@@ -111,6 +114,7 @@ from tm_stage_sealer import (
     _create_caller_held_seal_borrow,
     StageSealError,
 )
+from tm_content_attestation import PortableContentFileProof
 import tm_schema_upgrade as schema_upgrade_module
 import tm_snapshot_artifacts as snapshot_artifacts_module
 from platform_fs import (
@@ -120,6 +124,7 @@ from platform_fs import (
     narrow_windows_persistent_private_proof,
 )
 from platform_fs_contracts import (
+    BoundContentFacts,
     BoundDirectoryAuthority,
     BoundExistingFileMutationGuard,
     BoundRegularFile,
@@ -128,6 +133,7 @@ from platform_fs_contracts import (
     EntrySnapshot,
     ExistingCandidateRecovery,
     ExistingFileRetirement,
+    ExistingFileDurability,
     ExistingFileMutationGuard,
     FileObjectIdentity,
     LockLease,
@@ -6981,6 +6987,9 @@ class TMMigrationService:
         reported as digest-backed restoration evidence.
         """
 
+        if sys.platform == "win32":
+            return self._portable_upgrade_schema(store_path)
+
         coordinator = self._coordinator
         if coordinator is None:
             raise MigrationPreflightError("SCHEMA.COORDINATOR_UNAVAILABLE")
@@ -7182,6 +7191,568 @@ class TMMigrationService:
                 backup_path=backup_path,
                 backup_identity=backup_identity,
             )
+
+    def _portable_upgrade_schema(
+        self,
+        store_path: Path,
+    ) -> SchemaUpgradeOutcome:
+        """Run the Windows v1->v2 copy-switch under one rooted W1 owner."""
+
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise MigrationPreflightError("SCHEMA.COORDINATOR_UNAVAILABLE")
+        active_store_path = coordinator.active_store_path
+        if (
+            type(store_path) is not _NATIVE_PATH_TYPE
+            or store_path != self._resource_identity.canonical_sidecar_path
+            or (
+                active_store_path is not None
+                and store_path != active_store_path
+            )
+        ):
+            raise MigrationPreflightError("SCHEMA.ACTIVE_STORE_REQUIRED")
+        if coordinator._resource_identity != self._resource_identity:
+            raise MigrationPreflightError("SCHEMA.COORDINATOR_MISMATCH")
+        try:
+            reservation = self._acquire_initial_reservation()
+        except _InitialActivationReservationError as error:
+            raise MigrationPreflightError(
+                "SCHEMA.RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+        try:
+            with reservation:
+                return self._portable_upgrade_schema_reserved(
+                    store_path=store_path,
+                    coordinator=coordinator,
+                    reservation=reservation,
+                )
+        except _InitialActivationReservationError as error:
+            raise MigrationPreflightError(
+                "SCHEMA.RESOURCE_LOCK_UNAVAILABLE"
+            ) from error
+
+    def _portable_upgrade_schema_reserved(
+        self,
+        *,
+        store_path: Path,
+        coordinator: ResourceStoreCoordinator,
+        reservation: _InitialActivationResourceReservation,
+    ) -> SchemaUpgradeOutcome:
+        """Copy, migrate, seal and publish one portable legacy predecessor."""
+
+        stage_label = "PREFLIGHT"
+        prior_generation: int | None = None
+        prior_store_id = coordinator.canonical_store_id
+        store_before: str | None = None
+        ticket: object | None = None
+        stage: MutableStageRef | None = None
+        attempt: _InitialStageAttempt | None = None
+        prior_authority: _PortableRootedRead | None = None
+        stage_mutation_guard: BoundExistingFileMutationGuard | None = None
+        sealed: SealedStage | None = None
+        prepared: object | None = None
+        stage_retirement_entered = False
+        stage_retired = False
+        try:
+            reservation.reprove()
+            recovered: ActivationRecoveryReport | None = None
+            if coordinator._view is None:
+                try:
+                    recovered = coordinator.recover_portable_replacement_activation(
+                        **reservation.portable_replacement_recovery_inputs()
+                    )
+                    reservation.reprove()
+                except _PortableReplacementRecoveryRequired as recovery_error:
+                    return self._portable_schema_upgrade_failure(
+                        recovery_error,
+                        stage_label=stage_label,
+                        coordinator=coordinator,
+                        reservation=reservation,
+                        store_before=(
+                            recovery_error.recovery_locator.expected_digest
+                        ),
+                        prior_generation=recovery_error.prior_generation,
+                    )
+                except Exception as recovery_error:
+                    if not _is_portable_disambiguation_operational_error(
+                        recovery_error
+                    ):
+                        raise
+                    recovered = None
+                if coordinator._view is None:
+                    recovered = (
+                        coordinator.rehydrate_portable_schema_upgrade_predecessor(
+                            **reservation.portable_replacement_recovery_inputs()
+                        )
+                    )
+                    reservation.reprove()
+                if recovered is None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED", retryable=True
+                    )
+            current = coordinator._portable_replacement_current_record
+            if (
+                recovered is not None
+                and recovered.action == "COMPLETED"
+                and type(current) is _PortableReplacementRecord
+                and current.unsigned.operation
+                == _PORTABLE_SCHEMA_UPGRADE_OPERATION
+                and current.unsigned.phase == "READY"
+                and current.unsigned.resource_id
+                == self._resource_identity.resource_id
+                and current.unsigned.target_identity
+                == self._resource_identity.target_identity
+                and current.unsigned.prior_canonical_store_id
+                == self._canonical_store_id
+                and current.unsigned.candidate_canonical_store_id
+                == self._canonical_store_id
+                and current.unsigned.next_generation
+                == current.unsigned.prior_generation + 1
+                and recovered.generation == current.unsigned.next_generation
+                and coordinator.state == "READY"
+                and coordinator.canonical_store_id == self._canonical_store_id
+                and coordinator.current_generation
+                == current.unsigned.next_generation
+                and coordinator.active_store_path == store_path
+            ):
+                reservation.reprove_bound_refresh_owner(
+                    self._canonical_store_id,
+                    current.unsigned.next_generation,
+                )
+                return self._portable_schema_upgrade_report(
+                    coordinator=coordinator,
+                    reservation=reservation,
+                    generation=current.unsigned.next_generation,
+                )
+            if (
+                coordinator.state not in {"READY", "UPGRADE_REQUIRED"}
+                or coordinator.current_generation is None
+                or coordinator.active_store_path != store_path
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED", retryable=True
+                )
+            prior_store_id = coordinator.canonical_store_id
+            prior_generation = coordinator.current_generation
+            if prior_store_id != self._canonical_store_id:
+                raise MigrationPreflightError("SCHEMA.COORDINATOR_MISMATCH")
+
+            # This is the portable-predecessor gate.  It runs before reserving
+            # stage names or publishing a report backup, so an old path-only
+            # fixture or partial owner chain leaves the namespace untouched.
+            reservation.reprove_bound_refresh_owner(
+                prior_store_id,
+                prior_generation,
+            )
+            prior_authority = reservation.open_portable_rooted_read(
+                store_path,
+                unavailable_code="SCHEMA.ACTIVE_STORE_UNREADABLE",
+            )
+            store_before = prior_authority.digest()
+            if _schema_version_of_store(store_path) == TM_SCHEMA_VERSION:
+                raise MigrationPreflightError("SCHEMA.SCHEMA_ALREADY_CURRENT")
+            activation_digest = _read_active_activation_digest(store_path)
+            prior_view = coordinator._view
+            if prior_view is None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED", retryable=True
+                )
+            schema = inspect_stage_schema(
+                prior_view.stage,
+                canonical_store_id=prior_store_id,
+                _allow_legacy_schema=True,
+                _allow_active=True,
+                _expected_active_generation=prior_generation,
+                _expected_activation_digest=activation_digest,
+            )
+            if schema.schema_version != TM_LEGACY_SCHEMA_VERSION:
+                raise MigrationPreflightError("SCHEMA.SCHEMA_UNSUPPORTED")
+            _require_schema_upgrade_ancestry_provable(store_path)
+
+            receipt, manifest_kind = _read_legacy_snapshot_facts(
+                store_path,
+                canonical_store_id=prior_store_id,
+            )
+            path_salt = f"initial-schema-upgrade-{uuid.uuid4().hex}"
+            stage = _deterministic_stage_ref(
+                self._resource_identity,
+                source_digest=receipt.jsonl_digest,
+                stage_prefix="schema-upgrade",
+                path_salt=path_salt,
+            )
+            attempt = _freeze_initial_stage_attempt(
+                stage,
+                path_salt=path_salt,
+                resource_reservation=reservation,
+            )
+            backend = attempt.platform_backend
+            parent = attempt.platform_parent
+            stage_reservation = attempt.stage_reservation
+            if (
+                not isinstance(backend, ExistingFileMutationGuard)
+                or parent is None
+                or stage_reservation is None
+            ):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+                )
+            stage_mutation_guard = backend.guard_existing_for_mutation(
+                parent,
+                PurePath(stage.staged_db_path.name),
+            )
+            if stage_mutation_guard.reprove() != stage_reservation.identity():
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                )
+
+            def snapshot_owner() -> PortableContentFileProof:
+                synchronized = None
+                if prior_authority is None or stage_mutation_guard is None:
+                    raise AssertionError("schema upgrade authority was not retained")
+                try:
+                    prior_facts = prior_authority.authority.content_facts()
+                    if (
+                        prior_facts.snapshot != prior_authority.snapshot
+                        or prior_facts.content_sha256.hex() != store_before
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.UPGRADE_SNAPSHOT_STALE",
+                            retryable=True,
+                        )
+                    destination = sqlite3.connect(
+                        f"{stage.staged_db_path.as_uri()}?mode=rw",
+                        uri=True,
+                        isolation_level=None,
+                    )
+                    try:
+                        destination.enable_load_extension(False)
+                        destination.execute("PRAGMA journal_mode=DELETE")
+                        destination.execute("PRAGMA synchronous=FULL")
+                        source = sqlite3.connect(
+                            f"{store_path.as_uri()}?mode=ro",
+                            uri=True,
+                            isolation_level=None,
+                        )
+                        try:
+                            source.backup(destination)
+                        finally:
+                            source.close()
+                    finally:
+                        destination.close()
+                    _reprove_initial_stage_ownership(attempt)
+                    backend = attempt.platform_backend
+                    parent = attempt.platform_parent
+                    reservation_handle = attempt.stage_reservation
+                    if (
+                        not isinstance(backend, ExistingFileDurability)
+                        or parent is None
+                        or reservation_handle is None
+                    ):
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+                        )
+                    if (
+                        stage_mutation_guard.reprove()
+                        != reservation_handle.identity()
+                    ):
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                        )
+                    synchronized = backend.open_existing_for_synchronization(
+                        parent,
+                        PurePath(stage.staged_db_path.name),
+                    )
+                    stage_facts = synchronized.content_facts()
+                    if (
+                        stage_facts.snapshot.identity
+                        != reservation_handle.identity()
+                        or parent.inspect_entry(stage.staged_db_path.name)
+                        != stage_facts.snapshot
+                    ):
+                        raise MigrationPreflightError(
+                            "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                        )
+                    synchronized.synchronize_content(stage_facts)
+                    prior_authority.reprove_digest(store_before)
+                    return PortableContentFileProof(
+                        size=prior_facts.snapshot.byte_count,
+                        sha256=store_before,
+                    )
+                finally:
+                    if synchronized is not None:
+                        synchronized.close()
+
+            ticket = coordinator.prepare_portable_schema_upgrade_ticket(
+                snapshot_owner
+            )
+            prior_authority.reprove_digest(store_before)
+            prior_authority.close()
+            prior_authority = None
+            activation_digest = _read_active_activation_digest(
+                stage.staged_db_path
+            )
+            inspect_stage_schema(
+                stage,
+                canonical_store_id=prior_store_id,
+                _allow_legacy_schema=True,
+                _allow_active=True,
+                _expected_active_generation=prior_generation,
+                _expected_activation_digest=activation_digest,
+            )
+            stage_label = "COPY"
+            with _open_configured_connection(
+                stage.staged_db_path,
+                require_existing=True,
+            ) as connection:
+                _migrate_schema_copy(
+                    connection,
+                    fts5_available=schema.fts5_available,
+                )
+            if (
+                stage_mutation_guard.reprove()
+                != attempt.stage_reservation.identity()
+            ):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                )
+            inspect_stage_schema(
+                stage,
+                canonical_store_id=prior_store_id,
+            )
+            manifest = SnapshotManifest(
+                manifest_version=SNAPSHOT_MANIFEST_VERSION,
+                snapshot_kind=manifest_kind,
+                receipt=receipt,
+                receipt_digest=snapshot_receipt_digest(receipt),
+            )
+            if (
+                attempt.platform_parent is None
+                or attempt.manifest_reservation is None
+            ):
+                raise MigrationPreflightError(
+                    "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
+                )
+            _write_reserved_initial_manifest(
+                stage.manifest_temp_path,
+                contract_to_json(manifest).encode("utf-8"),
+                attempt.platform_parent,
+                attempt.manifest_reservation,
+            )
+            _reprove_initial_stage_ownership(attempt)
+
+            stage_label = "ACTIVATION"
+            sealed = coordinator._seal_stage(
+                stage,
+                canonical_store_id=prior_store_id,
+                expected_prior_generation=prior_generation,
+                schema_upgrade=True,
+                **reservation.stage_seal_inputs(attempt),
+            )
+            stage_mutation_guard.reprove()
+            stage_mutation_guard.close()
+            stage_mutation_guard = None
+            journal_inputs = reservation.portable_journal_inputs()
+            prepared = coordinator.activate_portable_schema_upgrade(
+                sealed,
+                platform=cast(PlatformFileBackend, journal_inputs["platform"]),
+                persistent_private=cast(
+                    Any, journal_inputs["persistent_private"]
+                ),
+                caller_borrow=cast(Any, journal_inputs["caller_borrow"]),
+                schema_ticket=cast(Any, ticket),
+            )
+            ticket = None
+
+            def retire_upgrade_stage() -> None:
+                nonlocal stage_retirement_entered
+                nonlocal stage_retired
+                stage_retirement_entered = True
+                _cleanup_initial_unpublished_stage(attempt)
+                stage_retired = True
+
+            generation = coordinator.publish_portable_replacement_activation(
+                cast(Any, prepared),
+                platform=cast(PlatformFileBackend, journal_inputs["platform"]),
+                persistent_private=cast(
+                    Any, journal_inputs["persistent_private"]
+                ),
+                caller_borrow=cast(Any, journal_inputs["caller_borrow"]),
+                retire_replacement_stage=retire_upgrade_stage,
+            )
+            reservation.reprove()
+            if (
+                coordinator.state != "READY"
+                or coordinator.canonical_store_id != prior_store_id
+                or coordinator.current_generation != generation
+                or generation != prior_generation + 1
+                or coordinator.active_store_path != store_path
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED", retryable=True
+                )
+            return self._portable_schema_upgrade_report(
+                coordinator=coordinator,
+                reservation=reservation,
+                generation=generation,
+            )
+        except Exception as error:
+            if not _is_portable_disambiguation_operational_error(error):
+                raise
+            if stage_mutation_guard is not None:
+                stage_mutation_guard.close()
+                stage_mutation_guard = None
+            if ticket is not None:
+                coordinator.retire_portable_schema_upgrade_ticket(
+                    cast(Any, ticket)
+                )
+                ticket = None
+            if (
+                attempt is not None
+                and prepared is not None
+                and stage_retirement_entered
+                and not stage_retired
+            ):
+                _cleanup_initial_unpublished_stage(attempt)
+                stage_retired = True
+            if attempt is not None and prepared is None:
+                _cleanup_initial_unpublished_stage(attempt)
+            if prepared is not None or coordinator.state == "ACTIVATING":
+                try:
+                    recovered = coordinator.recover_portable_replacement_activation(
+                        **reservation.portable_replacement_recovery_inputs()
+                    )
+                    reservation.reprove()
+                except Exception as recovery_error:
+                    if not _is_portable_disambiguation_operational_error(
+                        recovery_error
+                    ):
+                        raise
+                    error = recovery_error
+                    recovered = None
+                current = coordinator._portable_replacement_current_record
+                if (
+                    recovered is not None
+                    and coordinator.state == "READY"
+                    and prior_generation is not None
+                    and coordinator.canonical_store_id == prior_store_id
+                    and coordinator.current_generation == prior_generation + 1
+                    and current is not None
+                    and current.unsigned.operation
+                    == _PORTABLE_SCHEMA_UPGRADE_OPERATION
+                ):
+                    return self._portable_schema_upgrade_report(
+                        coordinator=coordinator,
+                        reservation=reservation,
+                        generation=prior_generation + 1,
+                    )
+            if store_before is None or prior_generation is None:
+                raise
+            return self._portable_schema_upgrade_failure(
+                error,
+                stage_label=stage_label,
+                coordinator=coordinator,
+                reservation=reservation,
+                store_before=store_before,
+                prior_generation=prior_generation,
+            )
+        finally:
+            try:
+                try:
+                    if prior_authority is not None:
+                        prior_authority.close()
+                finally:
+                    try:
+                        if stage_mutation_guard is not None:
+                            stage_mutation_guard.close()
+                    finally:
+                        if attempt is not None:
+                            _close_initial_stage_attempt_authorities(attempt)
+            finally:
+                reservation._initial_attempt = None
+
+    def _portable_schema_upgrade_report(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        reservation: _InitialActivationResourceReservation,
+        generation: int,
+    ) -> SchemaUpgradeReport:
+        inputs = reservation.fresh_refresh_owner_inputs()
+        backup = coordinator.portable_schema_upgrade_report_backup(
+            platform=cast(PlatformFileBackend, inputs["platform"]),
+            persistent_private=cast(Any, inputs["persistent_private"]),
+            caller_borrow=cast(Any, inputs["caller_borrow"]),
+        )
+        if backup is None:
+            raise MigrationPreflightError("SCHEMA.BACKUP_UNVERIFIABLE")
+        backup_path, backup_proof = backup
+        success_digest = self._portable_rooted_digest(
+            reservation,
+            self._resource_identity.canonical_sidecar_path,
+            unavailable_code="SCHEMA.SUCCESS_UNVERIFIABLE",
+        )
+        return SchemaUpgradeReport(
+            canonical_store_id=coordinator.canonical_store_id,
+            from_version=TM_LEGACY_SCHEMA_VERSION,
+            to_version=TM_SCHEMA_VERSION,
+            backup_path=backup_path,
+            backup_digest=backup_proof.sha256,
+            success_digest=success_digest,
+            activated_generation=generation,
+        )
+
+    def _portable_schema_upgrade_failure(
+        self,
+        error: Exception,
+        *,
+        stage_label: str,
+        coordinator: ResourceStoreCoordinator,
+        reservation: _InitialActivationResourceReservation,
+        store_before: str,
+        prior_generation: int,
+    ) -> SchemaUpgradeFailure:
+        try:
+            observed = self._portable_rooted_digest(
+                reservation,
+                self._resource_identity.canonical_sidecar_path,
+                unavailable_code="SCHEMA.ACTIVE_STORE_UNREADABLE",
+            )
+        except Exception as observed_error:
+            if not _is_portable_disambiguation_operational_error(observed_error):
+                raise
+            observed = None
+        locators: tuple[RecoveryLocator, ...] = ()
+        if observed == store_before:
+            evidence = _unchanged_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            retryable = _schema_upgrade_retryable(error)
+        elif type(error) is _PortableReplacementRecoveryRequired:
+            locator = error.recovery_locator
+            if locator.expected_digest != store_before:
+                raise AssertionError(
+                    "portable schema recovery locator contradicts the prior"
+                )
+            evidence = _unverified_preservation(
+                AssetKind.ACTIVE_STORE,
+                store_before,
+            )
+            locators = (locator,)
+            retryable = False
+        else:
+            raise MigrationPreflightError("SCHEMA.PRIOR_STATE_UNRECOVERABLE")
+        generation = coordinator.current_generation
+        if generation is None:
+            generation = prior_generation
+        return SchemaUpgradeFailure(
+            stage=stage_label,
+            error_code=_schema_upgrade_error_code(error),
+            retryable=retryable,
+            active_generation=generation,
+            active_store_preservation=evidence,
+            recovery_locators=locators,
+        )
 
     def _explicit_disambiguation(
         self,

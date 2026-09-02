@@ -79,15 +79,20 @@ class PortableReplacementContractTests(unittest.TestCase):
     def _unsigned(
         self,
         *,
+        operation: str = "REPLACEMENT",
         preparation_id: str = "replacement.preparation.1",
         journal_id: str = "replacement.journal.1",
         phase: str = "PREPARED",
         predecessor_digest: str = "0" * 64,
         prior_generation: int = 7,
         prior_store: str = "store.prior",
-        candidate_store: str = "store.candidate",
+        candidate_store: str | None = None,
         active: bool = False,
     ) -> _PortableReplacementUnsigned:
+        if candidate_store is None:
+            candidate_store = (
+                prior_store if operation == "SCHEMA_UPGRADE" else "store.candidate"
+            )
         prior_database = self._file(b"prior database", 31)
         prior_manifest = self._file(b"prior manifest", 17)
         source = self._file(b"source jsonl", 23)
@@ -158,7 +163,7 @@ class PortableReplacementContractTests(unittest.TestCase):
         )
         return _PortableReplacementUnsigned(
             replacement_version=_PORTABLE_REPLACEMENT_VERSION,
-            operation="REPLACEMENT",
+            operation=operation,
             phase=phase,
             predecessor_digest=predecessor_digest,
             journal_id=journal_id,
@@ -320,6 +325,26 @@ class PortableReplacementContractTests(unittest.TestCase):
             with self.subTest(change=change):
                 with self.assertRaises((TypeError, ValueError)):
                     replace(unsigned, **change)
+
+    def test_schema_upgrade_discriminator_preserves_store_id_only(self) -> None:
+        upgrade = self._unsigned(operation="SCHEMA_UPGRADE")
+        self.assertEqual(
+            upgrade.candidate_canonical_store_id,
+            upgrade.prior_canonical_store_id,
+        )
+        self.assertEqual(
+            _parse_portable_replacement_record_bytes(
+                _serialize_portable_replacement_record(self._record(upgrade))
+            ).unsigned.operation,
+            "SCHEMA_UPGRADE",
+        )
+        with self.assertRaises(ValueError):
+            replace(upgrade, candidate_canonical_store_id="store.foreign")
+        with self.assertRaises(ValueError):
+            replace(
+                self._unsigned(),
+                candidate_canonical_store_id="store.prior",
+            )
 
     def test_active_transaction_may_change_database_and_semantic_closure(self) -> None:
         unsigned = self._unsigned(

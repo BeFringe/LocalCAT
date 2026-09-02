@@ -1941,6 +1941,9 @@ class ExistingCandidateRecovery(Protocol):
 
     The lease and mutation guard must bind the same owner parent/root chain as
     ``source_parent``; the capability never authorizes a final replacement.
+    ``require_private`` additionally proves the selected object's private
+    profile through the retained file handle before any rebind can occur and
+    keeps that proof live on the returned publishable candidate.
     """
 
     def recover_existing_candidate(
@@ -1953,6 +1956,7 @@ class ExistingCandidateRecovery(Protocol):
         *,
         owner_lease: LockLease,
         mutation_guard: BoundExistingFileMutationGuard,
+        require_private: bool = False,
     ) -> CandidateFile:
         if not isinstance(source_parent, BoundDirectoryAuthority):
             raise TypeError("source_parent must be BoundDirectoryAuthority")
@@ -1968,6 +1972,8 @@ class ExistingCandidateRecovery(Protocol):
             )
         owner_lease._require_open()
         mutation_guard._require_open()
+        if type(require_private) is not bool:
+            raise TypeError("require_private must be exact bool")
         checked_source = validate_relative_name(source_name)
         checked_target = validate_relative_name(target_name)
         if type(expected_content) is not CandidateContentFacts:
@@ -1980,6 +1986,7 @@ class ExistingCandidateRecovery(Protocol):
             expected_content,
             owner_lease=owner_lease,
             mutation_guard=mutation_guard,
+            require_private=require_private,
         )
         try:
             if not isinstance(authority, CandidateFile):
@@ -2005,6 +2012,7 @@ class ExistingCandidateRecovery(Protocol):
         *,
         owner_lease: LockLease,
         mutation_guard: BoundExistingFileMutationGuard,
+        require_private: bool,
     ) -> CandidateFile: ...
 
 
