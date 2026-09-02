@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import tempfile
 from threading import Event, Thread
 import unittest
@@ -47,6 +50,36 @@ from tests.test_tm_initial_activation_recovery import (
 _EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
 
 
+def _remove_windows_test_quarantine(root: Path) -> None:
+    quarantine = (
+        root
+        / "app-data"
+        / "resources"
+        / ".localcat-activation-quarantine-v1"
+    )
+    if not quarantine.exists():
+        return
+    for attempt_directory in quarantine.iterdir():
+        for path in attempt_directory.iterdir():
+            os.unlink("\\\\?\\" + str(path))
+        os.rmdir("\\\\?\\" + str(attempt_directory))
+    os.rmdir("\\\\?\\" + str(quarantine))
+
+
+@contextmanager
+def _activation_test_root() -> Iterator[Path]:
+    if os.name != "nt":
+        with tempfile.TemporaryDirectory() as temporary:
+            yield Path(temporary)
+        return
+    root = Path(tempfile.mkdtemp())
+    try:
+        yield root
+    finally:
+        _remove_windows_test_quarantine(root)
+        shutil.rmtree(root)
+
+
 def _fixture(
     root: Path,
     *,
@@ -70,10 +103,16 @@ def _fixture(
     if ambiguous_after_activation is None:
         resolver = TMResourceResolver()
     else:
-        def runtime_open(path: Path):  # type: ignore[no-untyped-def]
+        def runtime_open(  # type: ignore[no-untyped-def]
+            path: Path,
+            expected_resource_id: str,
+        ):
             if ambiguous_after_activation[0]:
                 raise ValueError("TM.CANONICAL_ACTIVATION_AMBIGUOUS")
-            return composition_module._open_runtime_binding(path)
+            return composition_module._open_runtime_binding(
+                path,
+                expected_resource_id,
+            )
 
         resolver = TMResourceResolver(runtime_open=runtime_open)
     runtime = TMRuntimeHost(
@@ -102,8 +141,7 @@ def _fixture(
 
 class EditorControllerTMActivationCompletionTests(unittest.TestCase):
     def test_query_waits_until_runtime_and_epoch_publish_together(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, _repository, resource_id = _fixture(root)
             before_epoch = controller.tm_suggestion_report().query_identity.query_epoch
             preflight = controller.prepare_tm_activation(resource_id)
@@ -173,8 +211,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
             self.assertEqual(runtime.snapshot().generation, 1)
 
     def test_real_success_replaces_runtime_then_next_query_is_canonical(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, _repository, resource_id = _fixture(root)
             before_report = controller.tm_suggestion_report()
             before_epoch = before_report.query_identity.query_epoch
@@ -192,6 +229,10 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
 
             snapshot = runtime.capture_operation_snapshot()
             self.assertTrue(completed.succeeded)
+            self.assertNotIn(
+                started.operation_id,
+                controller._tm_activation_workers,
+            )
             self.assertEqual(snapshot.generation, 1)
             self.assertEqual(len(snapshot.legacy_ports), 0)
             self.assertEqual(len(snapshot.canonical_ports), 1)
@@ -225,8 +266,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
     def test_orphan_stage_activation_keeps_peer_legacy_and_cohort_queryable(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             repository = ResourceRepository(root / "app-data")
             orphaned = repository.create_resource(
                 "Orphaned legacy TM",
@@ -331,8 +371,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
             self.assertEqual(residue_journal.read_bytes(), journal_before)
 
     def test_proven_first_failure_rebuilds_and_preserves_legacy(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, _repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             with patch.object(
@@ -366,8 +405,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
             )
 
     def test_ambiguous_failure_replaces_resource_with_unavailable(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             ambiguous = [False]
             controller, runtime, _repository, resource_id = _fixture(
                 root,
@@ -414,8 +452,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
     def test_success_candidate_validation_failure_is_atomic_and_blocks_legacy(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, _repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             before = runtime.snapshot()
@@ -447,8 +484,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                 controller.tm_suggestion_report()
 
     def test_success_outcome_generation_mismatch_is_not_published(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, _repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             started = controller.activate_tm_resource(preflight)
@@ -484,8 +520,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                 controller.tm_suggestion_report()
 
     def test_success_rejects_same_generation_foreign_service_store(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             started = controller.activate_tm_resource(preflight)
@@ -537,8 +572,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
     def test_published_failure_rejects_same_generation_foreign_service_store(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             started = controller.activate_tm_resource(preflight)
@@ -590,8 +624,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
                 controller.tm_suggestion_report()
 
     def test_lkg_failure_rejects_same_generation_foreign_service_store(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             started = controller.activate_tm_resource(preflight)
@@ -657,8 +690,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
     def test_public_canonical_rebuild_failure_keeps_last_known_good_runtime(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             started = controller.activate_tm_resource(preflight)
@@ -706,8 +738,7 @@ class EditorControllerTMActivationCompletionTests(unittest.TestCase):
             )
 
     def test_public_canonical_rebuild_success_refreshes_current_report(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activation_test_root() as root:
             controller, runtime, repository, resource_id = _fixture(root)
             preflight = controller.prepare_tm_activation(resource_id)
             started = controller.activate_tm_resource(preflight)

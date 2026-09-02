@@ -195,7 +195,9 @@ def _adapter(
     bindings: dict[Path, RuntimeOpenBinding],
 ) -> tuple[EditorTMAdapter, TMRuntimeHost]:
     runtime = TMRuntimeHost(
-        resolver=TMResourceResolver(runtime_open=lambda path: bindings[path]),
+        resolver=TMResourceResolver(
+            runtime_open=lambda path, _resource_id: bindings[path]
+        ),
         configs=configs,
     )
     return (
