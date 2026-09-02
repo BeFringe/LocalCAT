@@ -70,7 +70,7 @@ ADR-020～026 promotion、Windows owning scope、WA-01～08 current R/D/T delta�
 | WA-03 | `R2` | `multi-document-project-workspace` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-04 | `R1` | `language-resource-portability` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-05 | `R1` | `tmx-context-interchange` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
-| WA-06 | `R3` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-06 | `R3` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-07 | `R1` | `feature5-ui-integration` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
 | WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
 
@@ -161,5 +161,6 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 | WA-03 | `R2` | `multi-document-project-workspace` | `faed77761b39f273563bd39dc51f5e39cd620cf5` | `SOURCE_MERGED_PASS` | — |
 | WA-04 | `R1` | `language-resource-portability` | `e5c9f13bfff9474e0a086b0f2d93ce316daa768b` | `SOURCE_MERGED_PASS` | — |
 | WA-05 | `R1` | `tmx-context-interchange` | `deca46b58578b6903fa31bb80f6074429b2e3478` | `SOURCE_MERGED_PASS` | — |
+| WA-06 | `R3` | `tm-storage-retrieval-index` | `e7bab7a57283964e9424ea458b222f5b5f65a7fb` | `SOURCE_MERGED_PASS` | — |
 
 `WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
