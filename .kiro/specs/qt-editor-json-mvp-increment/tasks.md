@@ -361,7 +361,7 @@
   - _Boundary: Qt Project Tool Tests_
   - _Depends: 4.7a, 4.7b_
 
-- [ ] 5.2a 从rooted source resource root验证Qt资源与头像退化
+- [x] 5.2a 从rooted source resource root验证Qt资源与头像退化
   - source入口使用有效测试catalog验证speaker avatar唯一命中、大小写匹配、解码失败、无匹配fallback与可访问文本；silver logo与资产只读边界继续验收，不依赖CWD。
   - _Amendment: WA-08_
   - _Depends: 4.2a, 4.8_
