@@ -1912,9 +1912,17 @@ class QtSettingsDialog(QDialog):
             self._tm_operation_timer.stop()
             return
         try:
-            operation = self.controller.tm_activation_operation()
+            # A zero-time wait is non-blocking for Qt.  Once Core has published
+            # completion it also confirms that the worker has fully exited and
+            # releases the retained Thread before the UI exposes the result.
+            operation = self.controller.wait_tm_activation(
+                operation_id,
+                timeout=0.0,
+            )
         except Exception as error:
             self._tm_operation_timer.stop()
+            self._tm_operation_id = None
+            self._tm_operation_action = None
             self._show_tm_action_error(error)
             return
         if operation is None or operation.operation_id != operation_id:

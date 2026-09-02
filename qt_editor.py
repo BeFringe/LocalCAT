@@ -510,20 +510,39 @@ def _start_capability_validation(
     return worker
 
 
-def _compose_editor_controller(repository: object):
+def _compose_editor_controller(
+    repository: object,
+    *,
+    source_authority: object | None = None,
+):
     """Build the one formal TM composition graph owned by this app run."""
+
+    if source_authority is None:
+        # Legacy in-process callers still use the production platform factory;
+        # only main() owns the stricter bootstrap-before-business-import route.
+        from platform_source_authority import compose_rooted_source_authority
+
+        source_authority = compose_rooted_source_authority(
+            Path(__file__).absolute().parent
+        )
 
     from datetime import datetime, timezone
 
     from capability_host import compose_capability_host
     from editor_controller import compose_project_enabled_editor_controller
     from editor_tm_adapter import EditorTMAdapter
+    from platform_source_authority import RootedSourceAuthority
     from resource_repository import ResourceRepository
     from tm_application_composition import TMResourceResolver, TMRuntimeHost
 
     if type(repository) is not ResourceRepository:
         raise TypeError("editor composition requires ResourceRepository")
+    if type(source_authority) is not RootedSourceAuthority:
+        raise TypeError(
+            "editor composition requires one rooted source authority"
+        )
     capability_composition = compose_capability_host(
+        source_authority=source_authority,
         evaluated_at_utc=datetime.now(timezone.utc),
         gate_d_attestation_root=(
             repository.config_dir / "gate-d-qualification"
@@ -646,18 +665,38 @@ def main(argv: list[str] | None = None) -> int:
         raise
 
     try:
+        # The source route establishes one live rooted authority before any
+        # LocalCAT business module is imported.  Paths below remain locators;
+        # CapabilityHost receives only the retained platform proof.
+        from platform_fs import compose_platform_file_backend
+        from platform_source_authority import compose_rooted_source_authority
+
+        root = Path(__file__).absolute().parent
+        platform_backend = compose_platform_file_backend(root)
+        source_authority = compose_rooted_source_authority(
+            root,
+            backend=platform_backend,
+        )
+        data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
+        data_dir.mkdir(parents=True, exist_ok=True)
+        data_root = platform_backend.bind_root(data_dir)
+        try:
+            data_root.reprove()
+        finally:
+            data_root.close()
+
         from qt_editor_window import QtEditorWindow
         from resource_repository import ResourceRepository
 
-        root = Path(__file__).resolve().parent
-        data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
         repository = ResourceRepository(
             data_dir,
             default_tm_path=root / "tm.jsonl",
             default_termbase_path=root / "terms.csv",
+            backend=platform_backend,
         )
         controller, capability_composition = _compose_editor_controller(
-            repository
+            repository,
+            source_authority=source_authority,
         )
         chunk_controller = _compose_chunk_controller(controller, repository)
         tmx_export_service = _compose_tmx_export_service(

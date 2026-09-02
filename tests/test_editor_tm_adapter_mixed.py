@@ -577,7 +577,7 @@ class EditorTMAdapterMixedTests(unittest.TestCase):
             source = _write_legacy(root, "legacy", ())
             backend = FailingLegacyBackend()
             resolver = TMResourceResolver(
-                runtime_open=lambda _path: LegacyOpenBinding(
+                runtime_open=lambda _path, _resource_id: LegacyOpenBinding(
                     backend=cast(LegacyPortBackend, cast(object, backend))
                 )
             )

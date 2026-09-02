@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 from threading import Event
+import time
 import unittest
 from unittest.mock import patch
 
@@ -61,6 +62,9 @@ from tm_application_composition import (
 from tm_contracts import CanonicalResourceIdentity
 from tm_migration import TMMigrationService
 from tm_sqlite_store import _activation_journal_path
+from tests.test_editor_controller_tm_activation_completion import (
+    _activation_test_root,
+)
 from tests.test_tm_canonical_reattestation import _rewrite_persisted_devices
 from tests.test_tm_initial_activation_recovery import _legacy_failure
 
@@ -300,17 +304,21 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
         operation = controller.tm_activation_operation()
         self.assertIsNotNone(operation)
         assert operation is not None
-        completed = controller.wait_tm_activation(
+        deadline = time.monotonic() + timeout
+        while dialog._tm_operation_id is not None:
+            dialog._poll_tm_operation()
+            self._events()
+            if time.monotonic() >= deadline:
+                self.fail("timed out waiting for the Qt TM operation poller")
+            time.sleep(0.01)
+        self.assertNotIn(
             operation.operation_id,
-            timeout=timeout,
+            controller._tm_activation_workers,
         )
-        self.assertTrue(completed.completed)
-        dialog._poll_tm_operation()
-        self._events()
 
-    def test_device_drift_offers_canonical_revalidation_not_fuzzy(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            controller, (resource_id,) = _controller(Path(temporary))
+    def test_platform_requalification_action_is_separate_from_fuzzy(self) -> None:
+        with _activation_test_root() as root:
+            controller, (resource_id,) = _controller(root)
             preflight = controller.prepare_tm_activation(resource_id)
             started = controller.activate_tm_resource(preflight)
             completed = controller.wait_tm_activation(
@@ -323,8 +331,33 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 resource_id,
                 config.path,
             )
+            journal_path = _activation_journal_path(identity)
+            if os.name == "nt":
+                self.assertFalse(journal_path.exists())
+                dialog = QtSettingsDialog(controller)
+                dialog.show()
+                self._events()
+                status = next(
+                    item
+                    for item in controller.tm_resource_statuses()
+                    if item.resource_id == resource_id
+                )
+                self.assertEqual(
+                    status.mode,
+                    TMResourceDisplayMode.CANONICAL_ACTIVE,
+                )
+                self.assertNotIn(
+                    "TM.RUNTIME.CANONICAL_REATTESTATION_REQUIRED",
+                    status.safe_codes,
+                )
+                self.assertEqual(
+                    self._action(dialog, resource_id).text(),
+                    "重建 canonical",
+                )
+                dialog.close()
+                return
             _rewrite_persisted_devices(
-                _activation_journal_path(identity),
+                journal_path,
                 persisted_device=config.path.stat().st_dev + 17,
             )
             dialog = QtSettingsDialog(controller)
@@ -657,8 +690,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             dialog.close()
 
     def test_real_activation_and_explicit_rebuild_refresh_canonical_state(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            controller, (resource_id,) = _controller(Path(temporary))
+        with _activation_test_root() as root:
+            controller, (resource_id,) = _controller(root)
             resource = controller.list_resources()[0]
             dialog = QtSettingsDialog(controller)
             prompts: list[str] = []
@@ -808,8 +841,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
     def test_more_indicator_is_centered_for_canonical_legacy_and_unavailable_rows(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            controller, resource_ids = _controller(Path(temporary), resources=3)
+        with _activation_test_root() as root:
+            controller, resource_ids = _controller(root, resources=3)
             canonical_id, legacy_id, missing_id = resource_ids
             activation_dialog = QtSettingsDialog(controller)
             with patch(

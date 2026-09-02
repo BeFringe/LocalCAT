@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -37,6 +38,7 @@ from tm_contracts import (
 )
 from tm_engine import TMMatch
 from tm_sqlite_store import SourceBindingObservation
+from tests.test_editor_tm_adapter_canonical import _activate
 from tests.test_tm_engine_compat import _activate_resource
 
 
@@ -50,6 +52,18 @@ def _config(root: Path, resource_id: str) -> ResourceConfig:
         lookup=True,
         update=True,
     )
+
+
+def _activated_resource(root: Path) -> Path:
+    if os.name == "nt":
+        return _activate(
+            root,
+            resource_id="tm.primary",
+            rows=(
+                '{"source":"Source","target":"Canonical"}',
+            ),
+        )
+    return _activate_resource(root)
 
 
 class _LegacyBackend:
@@ -300,7 +314,10 @@ class TMResourceLifecycleTests(unittest.TestCase):
                     canonical = _config(root, "canonical.broken")
                     legacy = _config(root, "legacy.good")
 
-                    def open_runtime(path: Path) -> RuntimeOpenBinding:
+                    def open_runtime(
+                        path: Path,
+                        _resource_id: str,
+                    ) -> RuntimeOpenBinding:
                         if path == canonical.path:
                             return CanonicalOpenBinding(
                                 resource_id=canonical.id,
@@ -333,7 +350,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             legacy = _config(root, "legacy.valid")
             second = _config(root, "legacy.second")
             valid = TMResourceResolver(
-                runtime_open=lambda _path: _legacy_binding("valid")
+                runtime_open=lambda _path, _resource_id: _legacy_binding("valid")
             ).resolve((legacy, second))
             unavailable = _unavailable_status(legacy)
 
@@ -381,7 +398,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                 ),
             )
             canonical_snapshot = TMResourceResolver(
-                runtime_open=lambda _path: CanonicalOpenBinding(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                     resource_id=canonical.id,
                     store=cast(
                         TMStore,
@@ -465,7 +482,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                 "programmer contract violation",
             ):
                 TMResourceResolver(
-                    runtime_open=lambda _path: CanonicalOpenBinding(
+                    runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                         resource_id=canonical.id,
                         store=cast(TMStore, _ProgrammerFailureStore()),
                     )
@@ -477,7 +494,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
 
             legacy = _config(root, "legacy.tampered")
             legacy_snapshot = TMResourceResolver(
-                runtime_open=lambda _path: _legacy_binding("legacy")
+                runtime_open=lambda _path, _resource_id: _legacy_binding("legacy")
             ).resolve((legacy,))
             object.__setattr__(
                 legacy_snapshot.statuses[0],
@@ -511,7 +528,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             diverged = _config(root, "canonical.diverged-tampered")
             digest = "d" * 64
             diverged_snapshot = TMResourceResolver(
-                runtime_open=lambda _path: CanonicalOpenBinding(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                     resource_id=diverged.id,
                     store=cast(
                         TMStore,
@@ -562,7 +579,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
 
             port_config = _config(root, "legacy.port-tampered")
             port_snapshot = TMResourceResolver(
-                runtime_open=lambda _path: _legacy_binding("legacy")
+                runtime_open=lambda _path, _resource_id: _legacy_binding("legacy")
             ).resolve((port_config,))
             object.__setattr__(port_snapshot.legacy_ports[0], "backend", object())
             with self.subTest(case="legacy-port"):
@@ -586,7 +603,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                 ),
             )
             canonical_snapshot = TMResourceResolver(
-                runtime_open=lambda _path: CanonicalOpenBinding(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                     resource_id=canonical.id,
                     store=cast(
                         TMStore,
@@ -703,7 +720,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                     )
 
                     snapshot = TMResourceResolver(
-                        runtime_open=lambda path: (
+                        runtime_open=lambda path, _resource_id: (
                             CanonicalOpenBinding(
                                 resource_id=canonical.id,
                                 store=cast(TMStore, store),
@@ -765,7 +782,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                         ),
                     )
                     snapshot = TMResourceResolver(
-                        runtime_open=lambda _path: CanonicalOpenBinding(
+                        runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                             resource_id=canonical.id,
                             store=cast(
                                 TMStore,
@@ -807,7 +824,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                 ),
             )
             snapshot = TMResourceResolver(
-                runtime_open=lambda _path: CanonicalOpenBinding(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                     resource_id=canonical.id,
                     store=cast(
                         TMStore,
@@ -891,7 +908,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
     def test_corrupt_activated_sidecar_is_unavailable_never_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            path = _activate_resource(root)
+            path = _activated_resource(root)
             config = ResourceConfig(
                 id="tm.primary",
                 name="Primary TM",
@@ -923,7 +940,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            path = _activate_resource(root)
+            path = _activated_resource(root)
             config = ResourceConfig(
                 id="tm.primary",
                 name="Primary TM",
@@ -959,7 +976,10 @@ class TMResourceLifecycleTests(unittest.TestCase):
             canonical = _config(root, "canonical.broken")
             legacy = _config(root, "legacy.good")
 
-            def open_runtime(path: Path) -> RuntimeOpenBinding:
+            def open_runtime(
+                path: Path,
+                _resource_id: str,
+            ) -> RuntimeOpenBinding:
                 if path == canonical.path:
                     return CanonicalOpenBinding(
                         resource_id=canonical.id,
@@ -993,7 +1013,10 @@ class TMResourceLifecycleTests(unittest.TestCase):
             release = threading.Event()
             entered = threading.Event()
 
-            def open_runtime(path: Path) -> RuntimeOpenBinding:
+            def open_runtime(
+                path: Path,
+                _resource_id: str,
+            ) -> RuntimeOpenBinding:
                 if path == new_second.path:
                     entered.set()
                     self.assertTrue(release.wait(timeout=5.0))
@@ -1066,7 +1089,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                 resource_id=canonical.id,
             )
             resolved = TMResourceResolver(
-                runtime_open=lambda _path: CanonicalOpenBinding(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                     resource_id=canonical.id,
                     store=cast(TMStore, store),
                 )
@@ -1130,7 +1153,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
                 second_config.path: store_for(second_config.id, "store-second"),
             }
             resolved = TMResourceResolver(
-                runtime_open=lambda path: CanonicalOpenBinding(
+                runtime_open=lambda path, _resource_id: CanonicalOpenBinding(
                     resource_id=(
                         first_config.id
                         if path == first_config.path
@@ -1161,7 +1184,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             config = _config(root, "legacy.programmer-error")
             host = TMRuntimeHost(
                 resolver=TMResourceResolver(
-                    runtime_open=lambda _path: _legacy_binding("stable")
+                    runtime_open=lambda _path, _resource_id: _legacy_binding("stable")
                 ),
                 configs=(config,),
             )
@@ -1182,7 +1205,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             config = _config(root, "legacy.programmer-type-error")
             host = TMRuntimeHost(
                 resolver=TMResourceResolver(
-                    runtime_open=lambda _path: _legacy_binding("stable")
+                    runtime_open=lambda _path, _resource_id: _legacy_binding("stable")
                 ),
                 configs=(config,),
             )
@@ -1205,7 +1228,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             config = _config(root, "legacy.clone-lineage")
             host = TMRuntimeHost(
                 resolver=TMResourceResolver(
-                    runtime_open=lambda _path: _legacy_binding("stable")
+                    runtime_open=lambda _path, _resource_id: _legacy_binding("stable")
                 ),
                 configs=(config,),
             )
@@ -1245,7 +1268,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             config = _config(root, "legacy.clone-pair")
             host = TMRuntimeHost(
                 resolver=TMResourceResolver(
-                    runtime_open=lambda _path: _legacy_binding("stable")
+                    runtime_open=lambda _path, _resource_id: _legacy_binding("stable")
                 ),
                 configs=(config,),
             )
@@ -1289,7 +1312,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             config = _config(root, "legacy.stable")
             host = TMRuntimeHost(
                 resolver=TMResourceResolver(
-                    runtime_open=lambda _path: _legacy_binding("stable")
+                    runtime_open=lambda _path, _resource_id: _legacy_binding("stable")
                 ),
                 configs=(config,),
             )

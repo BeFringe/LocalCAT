@@ -15,6 +15,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from capability_host import compose_capability_host
+from tests.source_authority_support import current_source_authority
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationFailure,
@@ -133,7 +134,10 @@ def _query_payload(report: QueryReport) -> dict[str, object]:
 def _query(root: Path) -> dict[str, object]:
     identity = _identity(root, create_source=False)
     evaluated_at = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
-    composition = compose_capability_host(evaluated_at_utc=evaluated_at)
+    composition = compose_capability_host(
+        source_authority=current_source_authority(),
+        evaluated_at_utc=evaluated_at,
+    )
     gate_c_owner = composition.retrieval_gate_c_validation_owner
     if gate_c_owner is None:
         raise AssertionError("production composition did not expose Gate C")

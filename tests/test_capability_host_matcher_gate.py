@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import os
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from matcher_validation import (
     build_validated_matcher_v1,
     recompute_matcher_validation,
 )
+from tests.source_authority_support import current_source_authority
 from tm_contracts import (
     SearchOptions,
     TextMatchProfile,
@@ -46,6 +48,7 @@ _EXPIRED_AT = _VALID_UNTIL
 
 def _composition() -> CapabilityHostComposition:
     return compose_capability_host(
+        source_authority=current_source_authority(),
         evaluated_at_utc=_EVALUATED_AT,
     )
 
@@ -85,7 +88,7 @@ class CapabilityHostMatcherGateOwnershipTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(
             prefix="localcat-matcher-foreign-",
-            dir="/private/tmp",
+            dir=tempfile.gettempdir(),
         ) as raw_root:
             foreign_root = Path(raw_root)
             for relative_path in required_paths:
@@ -115,7 +118,7 @@ class CapabilityHostMatcherGateOwnershipTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(
             prefix="localcat-matcher-foreign-factory-",
-            dir="/private/tmp",
+            dir=tempfile.gettempdir(),
         ) as raw_root:
             foreign_root = Path(raw_root)
             for relative_path in required_paths:
@@ -248,7 +251,7 @@ class CapabilityHostMatcherGateOwnershipTests(unittest.TestCase):
         original_path = source_identity.path
         with tempfile.TemporaryDirectory(
             prefix="localcat-matcher-factory-source-",
-            dir="/private/tmp",
+            dir=tempfile.gettempdir(),
         ) as raw_root:
             foreign_source = Path(raw_root) / "matcher_validation.py"
             shutil.copy2(original_path, foreign_source)
@@ -281,7 +284,11 @@ class CapabilityHostMatcherGateOwnershipTests(unittest.TestCase):
         self.assertFalse(hasattr(composition, "__dict__"))
         self.assertEqual(
             tuple(inspect.signature(compose_capability_host).parameters),
-            ("evaluated_at_utc", "gate_d_attestation_root"),
+            (
+                "source_authority",
+                "evaluated_at_utc",
+                "gate_d_attestation_root",
+            ),
         )
         self.assertEqual(
             tuple(
@@ -379,6 +386,8 @@ class CapabilityHostMatcherGateOwnershipTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             cast(Any, host)._composition_matcher_owner(
                 object(),
+                checkout_identity=cast(Any, object()),
+                factory_binding=cast(Any, object()),
             )
         with self.assertRaises(ValueError):
             CapabilityHostComposition(
@@ -416,13 +425,23 @@ class CapabilityHostMatcherGateOwnershipTests(unittest.TestCase):
         original_path = root_identity.path
         with tempfile.TemporaryDirectory(
             prefix="localcat-matcher-identity-",
-            dir="/private/tmp",
+            dir=tempfile.gettempdir(),
         ) as raw_root:
             temp_root = Path(raw_root)
             symlink_root = temp_root / "checkout-link"
-            symlink_root.symlink_to(_REPOSITORY_ROOT, target_is_directory=True)
             renamed_old_path = temp_root / "renamed-checkout-old-path"
-            for invalid_path in (symlink_root, renamed_old_path):
+            invalid_paths = [renamed_old_path]
+            try:
+                symlink_root.symlink_to(
+                    _REPOSITORY_ROOT,
+                    target_is_directory=True,
+                )
+            except OSError as error:
+                if os.name != "nt" or error.winerror != 1314:
+                    raise
+            else:
+                invalid_paths.insert(0, symlink_root)
+            for invalid_path in invalid_paths:
                 with self.subTest(path=invalid_path):
                     object.__setattr__(root_identity, "path", invalid_path)
                     try:
