@@ -166,6 +166,7 @@ class WindowsSourceLauncherTests(unittest.TestCase):
             payload = json.loads(marker.read_text(encoding="utf-8"))
             self.assertEqual(payload["application_name"], "LocalCAT")
             self.assertEqual(payload["application_version"], launcher.APPLICATION_VERSION)
+            self.assertEqual(payload["version"], 2)
             self.assertEqual(payload["platform_name"], "windows")
             self.assertEqual(payload["developer_overrides_present"], [])
             self.assertEqual(
@@ -177,11 +178,34 @@ class WindowsSourceLauncherTests(unittest.TestCase):
                 report.target_path,
             )
             self.assertTrue(payload["window_visible"])
+            self.assertTrue(payload["application_icon_present"])
             self.assertTrue(payload["window_icon_present"])
             self.assertIs(type(payload["window_handle"]), int)
             self.assertGreater(payload["window_handle"], 0)
             self.assertNotEqual(payload["pid"], guardian_pid)
             self.assertIn("LocalCAT", payload["window_title"])
+
+            import PySide6
+
+            environment_root = Path(sys.prefix).resolve()
+            expected_plugins = (
+                Path(PySide6.__file__).resolve().parent / "plugins"
+            ).resolve()
+            expected_qwindows = (
+                expected_plugins / "platforms" / "qwindows.dll"
+            ).resolve()
+            marker_plugins = Path(payload["qt_plugins_path"]).resolve()
+            loaded_qwindows = Path(payload["qwindows_module_path"]).resolve()
+            self.assertEqual(
+                os.path.normcase(str(marker_plugins)),
+                os.path.normcase(str(expected_plugins)),
+            )
+            self.assertEqual(
+                os.path.normcase(str(loaded_qwindows)),
+                os.path.normcase(str(expected_qwindows)),
+            )
+            self.assertTrue(loaded_qwindows.is_file())
+            self.assertTrue(loaded_qwindows.is_relative_to(environment_root))
 
     def test_real_shortcut_maps_missing_checkout_to_body_free_code(self) -> None:
         with tempfile.TemporaryDirectory(prefix="LocalCAT missing source ") as temporary:
