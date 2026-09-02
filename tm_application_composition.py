@@ -112,7 +112,12 @@ type RuntimeOpenBinding = CanonicalOpenBinding | LegacyOpenBinding
 
 
 class RuntimeOpenPort(Protocol):
-    def __call__(self, path: Path, /) -> RuntimeOpenBinding: ...
+    def __call__(
+        self,
+        path: Path,
+        expected_resource_id: str,
+        /,
+    ) -> RuntimeOpenBinding: ...
 
 
 class _CanonicalQueryViewPort(Protocol):
@@ -731,7 +736,7 @@ class TMResourceResolver:
             if config.kind is not ResourceKind.TRANSLATION_MEMORY:
                 continue
             try:
-                binding = self._runtime_open(config.path)
+                binding = self._runtime_open(config.path, config.id)
             except (
                 FileNotFoundError,
                 PermissionError,
@@ -888,8 +893,14 @@ class _TMEngineLegacyBackend:
             raise LegacyAppendOperationError()
 
 
-def _open_runtime_binding(path: Path) -> RuntimeOpenBinding:
-    engine = TMEngine(str(path))
+def _open_runtime_binding(
+    path: Path,
+    expected_resource_id: str,
+) -> RuntimeOpenBinding:
+    engine = TMEngine(
+        str(path),
+        expected_resource_id=expected_resource_id,
+    )
     store = engine.canonical_store
     if store is None:
         if not path.is_file():

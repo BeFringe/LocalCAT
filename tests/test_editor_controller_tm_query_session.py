@@ -25,6 +25,7 @@ from editor_controller import EditorController, EditorControllerError
 from editor_tm_adapter import EditorTMAdapter
 from resource_repository import ResourceRepository
 from tm_application_composition import TMResourceResolver, TMRuntimeHost
+from tests.source_authority_support import current_source_authority
 
 
 _EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
@@ -598,7 +599,10 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            composition = compose_capability_host(evaluated_at_utc=_EVALUATED_AT)
+            composition = compose_capability_host(
+                source_authority=current_source_authority(),
+                evaluated_at_utc=_EVALUATED_AT,
+            )
             controller, adapter, _runtime, _repository = self._controller(
                 Path(temporary),
                 composition=composition,
@@ -666,7 +670,10 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
 
     def test_capability_and_threshold_generation_changes_auto_requery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            composition = compose_capability_host(evaluated_at_utc=_EVALUATED_AT)
+            composition = compose_capability_host(
+                source_authority=current_source_authority(),
+                evaluated_at_utc=_EVALUATED_AT,
+            )
             controller, _adapter, _runtime, _repository = self._controller(
                 Path(temporary),
                 composition=composition,

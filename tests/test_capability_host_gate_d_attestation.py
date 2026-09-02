@@ -8,9 +8,14 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import capability_host
+from tests.source_authority_support import current_source_authority
 import tm_benchmark_gate
 from capability_host import GateDRunState
-from tests.test_capability_host_gate_d import _EVALUATED_AT, _gate_c
+from tests.test_capability_host_gate_d import (
+    _EVALUATED_AT,
+    _gate_c,
+    _gate_d_binding,
+)
 from tests.test_tm_benchmark_gate import _combined_bundle
 
 
@@ -36,6 +41,7 @@ class CapabilityHostGateDAttestationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             state_root = (Path(temporary) / "gate-d").resolve()
             first = capability_host.compose_capability_host(
+                source_authority=current_source_authority(),
                 evaluated_at_utc=_EVALUATED_AT,
                 gate_d_attestation_root=state_root,
             )
@@ -58,6 +64,7 @@ class CapabilityHostGateDAttestationTests(unittest.TestCase):
             )
 
             second = capability_host.compose_capability_host(
+                source_authority=current_source_authority(),
                 evaluated_at_utc=_EVALUATED_AT,
                 gate_d_attestation_root=state_root,
             )
@@ -82,13 +89,14 @@ class CapabilityHostGateDAttestationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             state_root = (Path(temporary) / "gate-d").resolve()
             first = capability_host.compose_capability_host(
+                source_authority=current_source_authority(),
                 evaluated_at_utc=_EVALUATED_AT,
                 gate_d_attestation_root=state_root,
             )
             _gate_c(first)
             host = cast(Any, first.host)
             owner_identity = host._CapabilityHost__retrieval_owner_identity
-            binding = cast(Any, capability_host)._CoreGateDBinding.capture()
+            binding = _gate_d_binding(first)
 
             def execute(**kwargs: object):
                 return cast(Any, capability_host)._CoreGateDPublication(
@@ -116,6 +124,7 @@ class CapabilityHostGateDAttestationTests(unittest.TestCase):
             self.assertTrue((state_root / "qualification.json").is_file())
 
             second = capability_host.compose_capability_host(
+                source_authority=current_source_authority(),
                 evaluated_at_utc=_EVALUATED_AT,
                 gate_d_attestation_root=state_root,
             )

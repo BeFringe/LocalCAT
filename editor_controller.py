@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+from time import monotonic
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -352,7 +353,10 @@ def _tm_rebuild_service(config: ResourceConfig) -> TMMigrationService:
     if type(config) is not ResourceConfig:
         raise TypeError("TM rebuild config must be ResourceConfig")
     config.__post_init__()
-    engine = TMEngine(str(config.path))
+    engine = TMEngine(
+        str(config.path),
+        expected_resource_id=config.id,
+    )
     store = engine.canonical_store
     if store is None:
         raise EditorControllerError(
@@ -1291,6 +1295,7 @@ class EditorController:
             None
         )
         self._tm_activation_worker_error: BaseException | None = None
+        self._tm_activation_workers: dict[str, Thread] = {}
         self._tm_runtime_blocked_safe_code: str | None = None
         self._project: EditorProject | None = None
         self._workspace_service: ProjectWorkspaceService | None = None
@@ -4040,9 +4045,11 @@ class EditorController:
                 name=f"localcat-tm-rebuild-{operation.operation_id[:8]}",
                 daemon=True,
             )
+            self._tm_activation_workers[operation.operation_id] = worker
             try:
                 worker.start()
             except BaseException:
+                self._tm_activation_workers.pop(operation.operation_id, None)
                 self._tm_activation_operation = None
                 raise
             return replace(operation)
@@ -4109,9 +4116,11 @@ class EditorController:
                 name=f"localcat-tm-reattest-{operation.operation_id[:8]}",
                 daemon=True,
             )
+            self._tm_activation_workers[operation.operation_id] = worker
             try:
                 worker.start()
             except BaseException:
+                self._tm_activation_workers.pop(operation.operation_id, None)
                 self._tm_activation_operation = None
                 raise
             return replace(operation)
@@ -4201,9 +4210,11 @@ class EditorController:
                 name=f"localcat-tm-activation-{operation.operation_id[:8]}",
                 daemon=True,
             )
+            self._tm_activation_workers[operation.operation_id] = worker
             try:
                 worker.start()
             except BaseException:
+                self._tm_activation_workers.pop(operation.operation_id, None)
                 self._tm_activation_operation = None
                 self._prepared_tm_activation = prepared
                 raise
@@ -4446,6 +4457,10 @@ class EditorController:
     def tm_resource_statuses(self) -> tuple[TMResourceStatus, ...]:
         """Return fresh lifecycle facts with same-generation query authority."""
 
+        operation = self.tm_activation_operation()
+        activation_in_progress = (
+            operation is not None and not operation.completed
+        )
         with self._tm_query_lock:
             self._synchronize_tm_query_state(refresh_current=False)
             configs = self.repository.list_resources()
@@ -4462,9 +4477,15 @@ class EditorController:
                     safe_codes=("TM.RETRIEVAL.UNAVAILABLE",),
                 )
             else:
-                statuses = adapter._inspect_resource_statuses_for_controller(
-                    configs
-                )
+                if activation_in_progress:
+                    runtime = adapter._capture_runtime_for_controller(configs)
+                    statuses = tuple(
+                        replace(status) for status in runtime.statuses
+                    )
+                else:
+                    statuses = adapter._inspect_resource_statuses_for_controller(
+                        configs
+                    )
                 retrieval_status = self._inspect_tm_retrieval_status_no_query(
                     adapter
                 )
@@ -4542,6 +4563,7 @@ class EditorController:
             or timeout < 0.0
         ):
             raise TypeError("TM activation timeout must be finite non-negative float")
+        deadline = None if timeout is None else monotonic() + timeout
         with self._tm_activation_condition:
             current = self._tm_activation_operation
             if current is None or current.operation_id != operation_id:
@@ -4558,6 +4580,32 @@ class EditorController:
             if current is None or current.operation_id != operation_id:
                 raise EditorControllerError("TM activation operation is unknown")
             result = replace(current)
+            worker = self._tm_activation_workers.get(operation_id)
+        if result.completed and worker is not None:
+            remaining = (
+                None
+                if deadline is None
+                else max(0.0, deadline - monotonic())
+            )
+            worker.join(remaining)
+            if worker.is_alive():
+                return replace(
+                    result,
+                    phase="ACTIVATING",
+                    completed=False,
+                    succeeded=False,
+                    safe_code=None,
+                    retryable=False,
+                )
+        with self._tm_activation_condition:
+            current = self._tm_activation_operation
+            if current is None or current.operation_id != operation_id:
+                raise EditorControllerError("TM activation operation is unknown")
+            result = replace(current)
+            if worker is not None and not worker.is_alive():
+                retained = self._tm_activation_workers.get(operation_id)
+                if retained is worker:
+                    self._tm_activation_workers.pop(operation_id, None)
             worker_error = (
                 self._tm_activation_worker_error if result.completed else None
             )
