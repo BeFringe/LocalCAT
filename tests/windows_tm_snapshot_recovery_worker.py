@@ -34,12 +34,11 @@ import tm_migration
 import tm_snapshot_artifacts
 import tm_snapshot_recovery
 from platform_fs_contracts import (
-    BoundRegularFile,
     CandidateContentFacts,
     CandidateFile,
     PendingPublication,
 )
-from platform_fs_windows import WindowsPlatformAdapter
+from platform_fs_windows import WindowsPlatformAdapter, _WindowsBoundRegularFile
 from tm_contracts import (
     CanonicalResourceIdentity,
     ExportFailure,
@@ -543,6 +542,7 @@ def _install_publication_fault(
         "terminal": 0,
         "close": 0,
     }
+    retained_authorities: list[_WindowsBoundRegularFile] = []
     adapter_counts = {event: 0 for event in ADAPTER_PUBLISH_EVENTS}
     state = {"issued": False, "owner_committed": False, "business_seen": False}
 
@@ -604,10 +604,29 @@ def _install_publication_fault(
         mock.patch.object(SQLiteTMStore, "register_issued_refresh_receipt", new=register)
     )
 
-    real_read_all = BoundRegularFile.read_all
+    real_retained_destination = PendingPublication.retained_destination
 
-    def read_all(authority: BoundRegularFile) -> bytes:
-        if not state["issued"]:
+    def retained_destination(
+        pending: PendingPublication,
+    ) -> _WindowsBoundRegularFile:
+        authority = real_retained_destination(pending)
+        if not isinstance(authority, _WindowsBoundRegularFile):
+            raise AssertionError("Windows publication returned a foreign authority")
+        retained_authorities.append(authority)
+        return authority
+
+    stack.enter_context(
+        mock.patch.object(
+            PendingPublication,
+            "retained_destination",
+            new=retained_destination,
+        )
+    )
+
+    real_read_all = _WindowsBoundRegularFile.read_all
+
+    def read_all(authority: _WindowsBoundRegularFile) -> bytes:
+        if not any(authority is retained for retained in retained_authorities):
             return real_read_all(authority)
         counts["readback"] += 1
         ordinal = counts["readback"]
@@ -620,7 +639,9 @@ def _install_publication_fault(
             _write_marker(marker, after, {"ordinal": ordinal})
         return payload
 
-    stack.enter_context(mock.patch.object(BoundRegularFile, "read_all", new=read_all))
+    stack.enter_context(
+        mock.patch.object(_WindowsBoundRegularFile, "read_all", new=read_all)
+    )
 
     real_complete = SQLiteTMStore.complete_bound_issued_refresh_receipt
 
