@@ -26,6 +26,7 @@ from editor_contracts import (
     TextMatcherDisplayState,
 )
 from editor_controller import EditorController, EditorControllerError
+from platform_source_authority import compose_rooted_source_authority
 from qt_editor import _compose_editor_controller
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
@@ -92,8 +93,10 @@ class QtProjectSearchAcceptanceTests(unittest.TestCase):
             prefix="localcat-q1-acceptance-"
         )
         root = Path(self.temporary.name)
+        source_authority = compose_rooted_source_authority(_REPOSITORY_ROOT)
+        self.addCleanup(source_authority.close)
         self.controller, self.composition = _compose_editor_controller(
-            ResourceRepository(root / "app-data")
+            ResourceRepository(root / "app-data"), source_authority=source_authority,
         )
         self.project_path = root / "acceptance.json"
         _write_project(self.project_path)

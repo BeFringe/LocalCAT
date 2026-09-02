@@ -92,7 +92,10 @@ def _adapter(
 ) -> tuple[EditorTMAdapter, TMRuntimeHost]:
     resolver = TMResourceResolver()
     if backends is not None:
-        def open_runtime(path: Path) -> RuntimeOpenBinding:
+        def open_runtime(
+            path: Path,
+            _resource_id: str,
+        ) -> RuntimeOpenBinding:
             return LegacyOpenBinding(
                 backend=cast(LegacyPortBackend, backends[path])
             )

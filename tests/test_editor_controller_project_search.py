@@ -22,6 +22,7 @@ from editor_contracts import (
 )
 from editor_controller import EditorController, EditorControllerError
 from project_search import ProjectSearchError, ProjectSearchService
+from platform_source_authority import compose_rooted_source_authority
 from qt_editor import _compose_editor_controller
 from resource_repository import ResourceRepository
 from tm_contracts import (
@@ -110,7 +111,11 @@ class EditorControllerProjectSearchTests(unittest.TestCase):
         )
         root = Path(self.temporary.name)
         repository = ResourceRepository(root / "app-data")
-        self.controller, self.composition = _compose_editor_controller(repository)
+        source_authority = compose_rooted_source_authority(Path(__file__).resolve().parents[1])
+        self.addCleanup(source_authority.close)
+        self.controller, self.composition = _compose_editor_controller(
+            repository, source_authority=source_authority,
+        )
         self.project_path = root / "project.JsOn"
         _write_project(self.project_path)
 

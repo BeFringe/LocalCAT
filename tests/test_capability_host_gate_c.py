@@ -18,6 +18,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from capability_host import CapabilityHostComposition, compose_capability_host
+from tests.source_authority_support import current_source_authority
 from tm_contracts import QueryReport, TMQuery, TextMatcherState
 from tm_retrieval import TMRetrievalService
 from tm_retrieval_capability import (
@@ -50,7 +51,10 @@ _EMPTY_QUERY = TMQuery(
 
 
 def _composition() -> CapabilityHostComposition:
-    return compose_capability_host(evaluated_at_utc=_EVALUATED_AT)
+    return compose_capability_host(
+        source_authority=current_source_authority(),
+        evaluated_at_utc=_EVALUATED_AT,
+    )
 
 
 def _gate_c_owner(composition: CapabilityHostComposition) -> Any:
@@ -96,7 +100,11 @@ class CapabilityHostGateCPublicBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(
             tuple(inspect.signature(compose_capability_host).parameters),
-            ("evaluated_at_utc", "gate_d_attestation_root"),
+            (
+                "source_authority",
+                "evaluated_at_utc",
+                "gate_d_attestation_root",
+            ),
         )
         with self.assertRaises(TypeError):
             cast(Any, compose_capability_host)(
@@ -649,7 +657,7 @@ def recompute_retrieval_validation(
         original_path = root_identity.path
         with tempfile.TemporaryDirectory(
             prefix="localcat-gate-c-checkout-",
-            dir="/private/tmp",
+            dir=tempfile.gettempdir(),
         ) as raw_root:
             object.__setattr__(root_identity, "path", Path(raw_root))
             try:
@@ -934,7 +942,7 @@ def recompute_retrieval_validation(
         )
         with tempfile.TemporaryDirectory(
             prefix="localcat-gate-c-foreign-",
-            dir="/private/tmp",
+            dir=tempfile.gettempdir(),
         ) as raw_root:
             foreign_root = Path(raw_root)
             for relative_path in required_paths:

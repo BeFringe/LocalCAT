@@ -32,6 +32,7 @@ from project_package import (
     ProjectPackageImportMode,
     ProjectPackageService,
 )
+from platform_source_authority import compose_rooted_source_authority
 from project_save import (
     DocumentSaveStatus,
     ProjectSaveService,
@@ -167,7 +168,11 @@ class Cluster3ApplicationTests(unittest.TestCase):
         self.assertIsNotNone(exported.receipt)
         self.assertIsNotNone(exported.persistence_binding)
         repository = ResourceRepository(self.root / "app-data")
-        self.controller, self.composition = _compose_editor_controller(repository)
+        self.source_authority = compose_rooted_source_authority(Path(__file__).resolve().parents[1])
+        self.addCleanup(self.source_authority.close)
+        self.controller, self.composition = _compose_editor_controller(
+            repository, source_authority=self.source_authority,
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -493,7 +498,9 @@ class Cluster3ApplicationTests(unittest.TestCase):
         self.assertEqual(remembered.local_segment_id, expected.local_segment_id)
 
         repository = ResourceRepository(self.root / "app-data")
-        reopened, _composition = _compose_editor_controller(repository)
+        reopened, _composition = _compose_editor_controller(
+            repository, source_authority=self.source_authority,
+        )
         reopened.open_project_package(self.package_path)
         self.assertEqual(
             reopened.current_workspace_identity.segment_identity,
@@ -508,7 +515,9 @@ class Cluster3ApplicationTests(unittest.TestCase):
             "shared",
             2,
         )
-        legacy_reopened, _composition = _compose_editor_controller(repository)
+        legacy_reopened, _composition = _compose_editor_controller(
+            repository, source_authority=self.source_authority,
+        )
         legacy_reopened.open_project_package(self.package_path)
         self.assertEqual(legacy_reopened.workspace_global_index, 2)
         self.assertEqual(

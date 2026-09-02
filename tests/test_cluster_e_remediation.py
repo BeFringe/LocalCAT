@@ -41,6 +41,7 @@ from tests.test_capability_host_gate_d import (
     _FakeGateDExecution,
     _composition as _gate_d_composition,
     _gate_c,
+    _gate_d_binding,
     _gate_d_owner,
 )
 from tests.test_editor_controller_tm_activation_completion import (
@@ -51,6 +52,7 @@ from tests.test_editor_controller_tm_apply import (
     _canonical_controller,
 )
 from tests.test_editor_tm_adapter_canonical import _activate
+from tests.source_authority_support import current_source_authority
 from tm_application_composition import TMResourceResolver, TMRuntimeHost
 from tm_retrieval_capability import (
     RetrievalCapabilityManifest,
@@ -65,15 +67,22 @@ def _live_gate_d_composition(
     """Attach the fake Gate D runner to a composition evaluated at now."""
 
     composition = capability_host_module.compose_capability_host(
+        source_authority=current_source_authority(),
         evaluated_at_utc=datetime.now(timezone.utc),
     )
     owner = composition.retrieval_gate_d_owner
     self_owner = owner
     assert self_owner is not None
+
+    rooted_binding = _gate_d_binding(composition)
+
+    def execute_from_composition(**kwargs: object) -> object:
+        return execution.run(rooted_binding=rooted_binding, **kwargs)
+
     object.__setattr__(
         self_owner,
         "_RetrievalGateDOwner__execute",
-        execution.run,
+        execute_from_composition,
     )
 
     def publish_from_authentic_binding(
@@ -410,6 +419,7 @@ class ClusterERemediationTests(unittest.TestCase):
         ):
             with self.subTest(stage=failing_stage):
                 composition = capability_host_module.compose_capability_host(
+                    source_authority=current_source_authority(),
                     evaluated_at_utc=datetime.now(timezone.utc)
                 )
                 entered = Event()
@@ -502,6 +512,7 @@ class ClusterERemediationTests(unittest.TestCase):
 
     def test_capability_validation_preserves_owner_order(self) -> None:
         composition = capability_host_module.compose_capability_host(
+            source_authority=current_source_authority(),
             evaluated_at_utc=datetime.now(timezone.utc)
         )
         order: list[str] = []

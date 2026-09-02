@@ -45,6 +45,7 @@ from parser_contracts import (
     LINE_TEXT_V1,
     LOCALCAT_JSON_V1,
 )
+from platform_source_authority import compose_rooted_source_authority
 from project_package import ProjectPackageService
 import project_package as project_package_module
 from project_save import (
@@ -236,8 +237,10 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             name="Foreign safe project name",
         )
 
+        source_authority = compose_rooted_source_authority(_ROOT)
+        self.addCleanup(source_authority.close)
         self.controller, self.composition = _compose_editor_controller(
-            ResourceRepository(self.root / "app-data")
+            ResourceRepository(self.root / "app-data"), source_authority=source_authority,
         )
         self.window = QtEditorWindow(self.controller)
         self.errors: list[tuple[str, str]] = []

@@ -30,8 +30,16 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import stat
+import sys
+
+from platform_fs import compose_platform_file_backend
+from platform_fs_contracts import (
+    FileObjectIdentity,
+    PlatformFileError,
+    PlatformFileErrorCode,
+)
 
 from tm_activation_journal import (
     ActivationPreparationError,
@@ -3125,7 +3133,11 @@ def _fsync_artifact_parent(
 
 def _strict_pair_file_state(
     path: Path,
-) -> tuple[str, str | None, tuple[int, int] | None]:
+) -> tuple[
+    str,
+    str | None,
+    tuple[int, int] | FileObjectIdentity | None,
+]:
     """One descriptor-based no-follow proof of a configured pair entry.
 
     Returns ``("absent", None, None)`` when the path does not exist,
@@ -3137,6 +3149,41 @@ def _strict_pair_file_state(
     Pathname hashing is never used, so a foreign same-byte inode cannot
     masquerade as a stable owned entry.
     """
+
+    if sys.platform == "win32":
+        backend = compose_platform_file_backend(path.parent)
+        root = None
+        bound = None
+        try:
+            root = backend.bind_root(path.parent)
+            bound = backend.open_regular(root, PureWindowsPath(path.name))
+            root.reprove()
+            before = bound.snapshot()
+            facts = bound.content_facts()
+            after = bound.snapshot()
+            root.reprove()
+            if before != facts.snapshot or facts.snapshot != after:
+                return ("unsafe", None, None)
+            return (
+                "present",
+                facts.content_sha256.hex(),
+                facts.snapshot.identity,
+            )
+        except PlatformFileError as error:
+            if error.code == PlatformFileErrorCode.ENTRY_UNAVAILABLE.value:
+                return ("absent", None, None)
+            return ("unsafe", None, None)
+        finally:
+            if bound is not None:
+                try:
+                    bound.close()
+                except PlatformFileError:
+                    pass
+            if root is not None:
+                try:
+                    root.close()
+                except PlatformFileError:
+                    pass
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     descriptor = -1

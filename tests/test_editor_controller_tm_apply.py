@@ -39,6 +39,7 @@ from tests.test_capability_host_gate_d import (
     _gate_d_owner,
 )
 from tests.test_editor_tm_adapter_canonical import _activate
+from tests.source_authority_support import current_source_authority
 
 
 _EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
@@ -374,7 +375,10 @@ class EditorControllerTMSuggestionApplyTests(unittest.TestCase):
     def test_capability_generation_stale_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            composition = compose_capability_host(evaluated_at_utc=_EVALUATED_AT)
+            composition = compose_capability_host(
+                source_authority=current_source_authority(),
+                evaluated_at_utc=_EVALUATED_AT,
+            )
             controller, _adapter, _runtime, _repository = _legacy_fixture(
                 root,
                 capability_host=composition.host,
@@ -464,6 +468,7 @@ class EditorControllerTMSuggestionApplyTests(unittest.TestCase):
             with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 composition = compose_capability_host(
+                    source_authority=current_source_authority(),
                     evaluated_at_utc=_EVALUATED_AT
                 )
                 controller, _adapter, runtime, repository = _legacy_fixture(

@@ -67,19 +67,27 @@ class QtBootstrapTest(unittest.TestCase):
         self.assertIn("python -m pip install -r requirements-ui.txt", output)
         self.assertNotIn("Traceback", output)
 
-    def test_offscreen_smoke_subprocess_reaches_usable_window(self) -> None:
+    def test_offscreen_smoke_from_non_repository_cwd_reaches_usable_window(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            temporary_root = Path(temp_dir)
+            launch_cwd = temporary_root / "launch-cwd"
+            data_dir = temporary_root / "app-data"
+            launch_cwd.mkdir()
             environment = os.environ.copy()
             environment["QT_QPA_PLATFORM"] = "offscreen"
+            environment.pop("PYTHONHOME", None)
+            environment.pop("PYTHONPATH", None)
             completed = subprocess.run(
                 [
                     sys.executable,
-                    "qt_editor.py",
+                    str(ROOT / "qt_editor.py"),
                     "--smoke-test",
                     "--data-dir",
-                    temp_dir,
+                    str(data_dir),
                 ],
-                cwd=ROOT,
+                cwd=launch_cwd,
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -89,6 +97,44 @@ class QtBootstrapTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Qt editor smoke test passed", completed.stdout)
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_source_authority_failure_precedes_business_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            launch_cwd = root / "launch-cwd"
+            data_dir = root / "app-data"
+            launch_cwd.mkdir()
+            probe = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                "import platform_source_authority as source_authority\n"
+                "def fail(*args, **kwargs):\n"
+                "    raise RuntimeError('SOURCE.AUTHORITY.UNAVAILABLE')\n"
+                "source_authority.compose_rooted_source_authority = fail\n"
+                "import qt_editor\n"
+                f"code = qt_editor.main(['--smoke-test', '--data-dir', {str(data_dir)!r}])\n"
+                "for name in ('capability_host', 'editor_controller', "
+                "'resource_repository', 'qt_editor_window'):\n"
+                "    assert name not in sys.modules, name\n"
+                "raise SystemExit(code)\n"
+            )
+            environment = os.environ.copy()
+            environment["QT_QPA_PLATFORM"] = "offscreen"
+            environment.pop("PYTHONHOME", None)
+            environment.pop("PYTHONPATH", None)
+            completed = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=launch_cwd,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("SOURCE.AUTHORITY.UNAVAILABLE", completed.stderr)
         self.assertNotIn("Traceback", completed.stderr)
 
     def test_missing_openpyxl_only_returns_actionable_xlsx_error(self) -> None:
@@ -143,13 +189,22 @@ class QtBootstrapTest(unittest.TestCase):
             self.assertEqual(launcher.name, "localcat.desktop")
             self.assertIn("[Desktop Entry]", rendered)
             self.assertIn("Name=LocalCAT", rendered)
-            self.assertIn(str(Path(qt_editor.__file__).resolve()), rendered)
-            self.assertIn(str(Path(sys.executable).resolve()), rendered)
+            self.assertIn(
+                qt_editor._desktop_exec_argument(
+                    Path(qt_editor.__file__).resolve()
+                ),
+                rendered,
+            )
+            self.assertIn(
+                qt_editor._desktop_exec_argument(Path(sys.executable).resolve()),
+                rendered,
+            )
             self.assertIn("Icon=localcat", rendered)
             self.assertIn(f"Path={ROOT.resolve()}", rendered)
             self.assertIn("StartupWMClass=LocalCAT", rendered)
             self.assertFalse(rendered.startswith("Traceback"))
-            self.assertTrue(launcher.stat().st_mode & 0o111)
+            if os.name != "nt":
+                self.assertTrue(launcher.stat().st_mode & 0o111)
             install_icon.assert_called_once_with(icon.resolve())
             refresh.assert_called_once_with(Path(temp_dir).resolve())
 

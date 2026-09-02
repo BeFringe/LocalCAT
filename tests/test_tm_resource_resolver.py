@@ -258,6 +258,7 @@ class TMResourceResolverTests(unittest.TestCase):
                 "active",
                 "lookup",
                 "update",
+                "expected_resource_id",
                 "drain_timeout_seconds",
             ),
         )
@@ -295,7 +296,7 @@ class TMResourceResolverTests(unittest.TestCase):
             del store.coordinator
 
             snapshot = TMResourceResolver(
-                runtime_open=lambda _path: CanonicalOpenBinding(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                     resource_id="canonical.formal",
                     store=cast(TMStore, store),
                 ),
@@ -319,7 +320,10 @@ class TMResourceResolverTests(unittest.TestCase):
             legacy_backend = _RecordingLegacyBackend(legacy_result)
             canonical_store = _RecordingStore("canonical.delegate")
 
-            def open_runtime(path: Path) -> RuntimeOpenBinding:
+            def open_runtime(
+                path: Path,
+                _resource_id: str,
+            ) -> RuntimeOpenBinding:
                 if path == canonical_config.path:
                     return CanonicalOpenBinding(
                         resource_id="canonical.delegate",
@@ -375,10 +379,13 @@ class TMResourceResolverTests(unittest.TestCase):
                 configs[0].path: _RecordingLegacyBackend(),
                 configs[4].path: _RecordingLegacyBackend(),
             }
-            opened: list[Path] = []
+            opened: list[tuple[Path, str]] = []
 
-            def open_runtime(path: Path) -> RuntimeOpenBinding:
-                opened.append(path)
+            def open_runtime(
+                path: Path,
+                resource_id: str,
+            ) -> RuntimeOpenBinding:
+                opened.append((path, resource_id))
                 store = stores.get(path)
                 if store is None:
                     return _legacy_binding(legacy_backends[path])
@@ -402,7 +409,12 @@ class TMResourceResolverTests(unittest.TestCase):
             )
             self.assertEqual(
                 opened,
-                [configs[0].path, configs[2].path, configs[3].path, configs[4].path],
+                [
+                    (configs[0].path, configs[0].id),
+                    (configs[2].path, configs[2].id),
+                    (configs[3].path, configs[3].id),
+                    (configs[4].path, configs[4].id),
+                ],
             )
 
             self.assertTrue(
@@ -483,7 +495,10 @@ class TMResourceResolverTests(unittest.TestCase):
                 configs[2].path: _RecordingLegacyBackend(),
             }
 
-            def open_runtime(path: Path) -> RuntimeOpenBinding:
+            def open_runtime(
+                path: Path,
+                _resource_id: str,
+            ) -> RuntimeOpenBinding:
                 if path != configs[1].path:
                     return _legacy_binding(legacy_backends[path])
                 return _canonical_binding(store)
@@ -518,7 +533,10 @@ class TMResourceResolverTests(unittest.TestCase):
             )
             opened_stores: list[_NoOperationStore] = []
 
-            def open_runtime(path: Path) -> RuntimeOpenBinding:
+            def open_runtime(
+                path: Path,
+                _resource_id: str,
+            ) -> RuntimeOpenBinding:
                 if path != configs[1].path:
                     return _legacy_binding(_RecordingLegacyBackend())
                 store = _NoOperationStore("canonical.middle")
@@ -541,7 +559,7 @@ class TMResourceResolverTests(unittest.TestCase):
             canonical_config = _config(root, "canonical.valid")
             store = _NoOperationStore("canonical.valid")
             snapshot = TMResourceResolver(
-                runtime_open=lambda path: (
+                runtime_open=lambda path, _resource_id: (
                     _canonical_binding(store)
                     if path == canonical_config.path
                     else _legacy_binding(_RecordingLegacyBackend())
@@ -623,7 +641,10 @@ class TMResourceResolverTests(unittest.TestCase):
             duplicate = _config(root, "duplicate")
             opened: list[Path] = []
 
-            def record_open(path: Path) -> RuntimeOpenBinding:
+            def record_open(
+                path: Path,
+                _resource_id: str,
+            ) -> RuntimeOpenBinding:
                 opened.append(path)
                 return _legacy_binding(_RecordingLegacyBackend())
 
@@ -637,7 +658,7 @@ class TMResourceResolverTests(unittest.TestCase):
             canonical = _config(root, "canonical.expected")
             foreign_store = _NoOperationStore("canonical.foreign")
             foreign = TMResourceResolver(
-                runtime_open=lambda _path: CanonicalOpenBinding(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
                     resource_id="canonical.foreign",
                     store=cast(TMStore, foreign_store),
                 ),
