@@ -103,6 +103,10 @@ BENCHMARK_IMPLEMENTATION_SOURCE_PATHS = (
     "benchmark_tm_contract.json",
     "capability_gated_text_matcher.py",
     "matcher_capability.py",
+    "platform_fs.py",
+    "platform_fs_contracts.py",
+    "platform_fs_posix.py",
+    "platform_fs_windows.py",
     "text_matcher.py",
     "tm_activation_journal.py",
     "tm_activation_recovery.py",
@@ -129,6 +133,7 @@ BENCHMARK_IMPLEMENTATION_SOURCE_PATHS = (
     "tm_sqlite_store.py",
     "tm_stage_sealer.py",
     "unicode_word_break_data.py",
+    "windows_file_api.py",
 )
 if BENCHMARK_IMPLEMENTATION_SOURCE_PATHS != tuple(
     sorted(set(BENCHMARK_IMPLEMENTATION_SOURCE_PATHS))

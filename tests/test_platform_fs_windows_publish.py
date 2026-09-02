@@ -96,6 +96,135 @@ class WindowsPublishRuntimeTests(unittest.TestCase):
             pending.close()
         self.assertEqual((self.root_path / "destination.bin").read_bytes(), payload)
 
+    def test_retained_publish_facts_hash_once_then_terminal_reproves_cache(self) -> None:
+        payload = b"publish-facts" * (2 * 1024 * 1024 // len(b"publish-facts") + 1)
+        candidate = self._candidate("candidate.tmp", payload)
+        retained_type = platform_fs_windows._WindowsBoundRegularFile
+        real_capture = retained_type._capture_whole_file_locked
+        real_reprove = retained_type._reprove
+        capture_calls = 0
+        reprove_calls = 0
+
+        def counted_capture(bound: object, *, materialize: bool) -> object:
+            nonlocal capture_calls
+            capture_calls += 1
+            return real_capture(bound, materialize=materialize)
+
+        def counted_reprove(bound: object) -> object:
+            nonlocal reprove_calls
+            reprove_calls += 1
+            return real_reprove(bound)
+
+        with mock.patch.object(
+            retained_type,
+            "_capture_whole_file_locked",
+            new=counted_capture,
+        ), mock.patch.object(
+            retained_type,
+            "_reprove",
+            new=counted_reprove,
+        ):
+            pending = self.parent.begin_publish(
+                candidate,
+                "destination.bin",
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+        try:
+            preliminary = pending.preliminary_facts()
+            self.assertEqual(capture_calls, 1)
+            self.assertEqual(reprove_calls, 3)
+            self.assertEqual(preliminary.byte_count, len(payload))
+            self.assertEqual(
+                preliminary.content_sha256,
+                hashlib.sha256(payload).digest(),
+            )
+
+            retained = pending.retained_destination()
+            capture_calls = 0
+            reprove_calls = 0
+            with mock.patch.object(
+                retained_type,
+                "_capture_whole_file_locked",
+                new=counted_capture,
+            ), mock.patch.object(
+                retained_type,
+                "_reprove",
+                new=counted_reprove,
+            ), mock.patch.object(
+                retained._api,
+                "ReadFile",
+                wraps=retained._api.ReadFile,
+            ) as read_file:
+                self.assertEqual(pending.terminal_reproof(), preliminary)
+            self.assertEqual(capture_calls, 0)
+            self.assertEqual(reprove_calls, 1)
+            read_file.assert_not_called()
+        finally:
+            pending.close()
+
+    def test_terminal_retained_drift_and_consumer_fault_require_recovery(self) -> None:
+        retained_type = platform_fs_windows._WindowsBoundRegularFile
+        for case in ("drift", "consumer"):
+            with self.subTest(case=case):
+                candidate = self._candidate(f"{case}.tmp", case.encode("ascii") * 257)
+                pending = self.parent.begin_publish(
+                    candidate,
+                    f"{case}.bin",
+                    mode=PublishMode.CREATE_IF_ABSENT,
+                    lease=None,
+                )
+                retained = pending.retained_destination()
+                try:
+                    if case == "drift":
+                        real_reprove = retained_type._reprove
+
+                        def drifting_reprove(bound: object) -> object:
+                            proof = real_reprove(bound)
+                            if bound is not retained:
+                                return proof
+                            snapshot = platform_fs_windows.EntrySnapshot(
+                                identity=proof.snapshot.identity,
+                                byte_count=proof.snapshot.byte_count,
+                                modified_token=hashlib.sha256(
+                                    proof.snapshot.modified_token + b"drift"
+                                ).digest(),
+                                reparse_free=proof.snapshot.reparse_free,
+                            )
+                            return platform_fs_windows._WindowsHandleProof(
+                                proof.identity,
+                                snapshot,
+                                proof.final_path,
+                            )
+
+                        patcher = mock.patch.object(
+                            retained_type,
+                            "_reprove",
+                            new=drifting_reprove,
+                        )
+                    else:
+                        real_content_facts = retained_type._content_facts
+
+                        def consumer_fault(bound: object) -> object:
+                            if bound is retained:
+                                raise RuntimeError("consumer fault")
+                            return real_content_facts(bound)
+
+                        patcher = mock.patch.object(
+                            retained_type,
+                            "_content_facts",
+                            new=consumer_fault,
+                        )
+                    with patcher, self.assertRaises(PlatformFileError) as caught:
+                        pending.terminal_reproof()
+                    _assert_platform_error(
+                        self,
+                        caught,
+                        PlatformFileErrorCode.RECOVERY_REQUIRED,
+                    )
+                finally:
+                    pending.close()
+
     def test_same_parent_native_name_is_independent_of_current_directory(self) -> None:
         payload = b"root-owned payload"
         candidate = self._candidate("candidate.tmp", payload)

@@ -2698,6 +2698,7 @@ class TMMigrationService:
             source,
             preflight=preflight,
             canonical_store_id=self._canonical_store_id,
+            immediate_seal=False,
             batch_kind="migration",
             batch_prefix="migration",
             snapshot_prefix="snapshot.migration",
@@ -3015,6 +3016,7 @@ class TMMigrationService:
                     source,
                     preflight=preflight,
                     canonical_store_id=self._canonical_store_id,
+                    immediate_seal=True,
                     batch_kind="migration",
                     batch_prefix="migration",
                     snapshot_prefix="snapshot.migration",
@@ -7238,6 +7240,7 @@ class TMMigrationService:
                 source,
                 preflight=preflight,
                 canonical_store_id=new_store_id,
+                immediate_seal=True,
                 batch_kind="import",
                 batch_prefix="import",
                 snapshot_prefix="snapshot.import",
@@ -7452,6 +7455,7 @@ class TMMigrationService:
                 source,
                 preflight=preflight,
                 canonical_store_id=new_store_id,
+                immediate_seal=True,
                 batch_kind="import",
                 batch_prefix="import",
                 snapshot_prefix="snapshot.import",
@@ -8634,6 +8638,7 @@ class TMMigrationService:
         *,
         preflight: MigrationPreflight,
         canonical_store_id: str,
+        immediate_seal: bool,
         batch_kind: str,
         batch_prefix: str,
         snapshot_prefix: str,
@@ -8662,6 +8667,8 @@ class TMMigrationService:
         those paths without ever touching a foreign inode.
         """
 
+        if type(immediate_seal) is not bool:
+            raise TypeError("immediate_seal must be a built-in bool")
         if batch_id is None:
             batch_id = f"{batch_prefix}.{preflight.source_digest}"
         if type(batch_id) is not str or not batch_id.strip():
@@ -8726,21 +8733,34 @@ class TMMigrationService:
                 canonical_store_id=canonical_store_id,
             )
             observation = _StreamingBuildObservation()
-            store.append_streamed_batch(
-                batch_id=batch_id,
-                kind=batch_kind,
-                drafts=(
-                    _iter_portable_draft_pairs(portable_source, observation)
-                    if portable_source is not None
-                    else _iter_draft_pairs(source, observation)
-                ),
-                source_digest=preflight.source_digest,
-                source_path=source,
-                invalid_count=preflight.invalid_count,
-                duplicate_source_count=preflight.duplicate_source_count,
-                chunk_size=MIGRATION_STREAM_CHUNK_SIZE,
-                _defer_secondary_indexes=True,
+            drafts = (
+                _iter_portable_draft_pairs(portable_source, observation)
+                if portable_source is not None
+                else _iter_draft_pairs(source, observation)
             )
+            if immediate_seal:
+                store._append_streamed_batch_for_immediate_seal(
+                    batch_id=batch_id,
+                    kind=batch_kind,
+                    drafts=drafts,
+                    source_digest=preflight.source_digest,
+                    source_path=source,
+                    invalid_count=preflight.invalid_count,
+                    duplicate_source_count=preflight.duplicate_source_count,
+                    chunk_size=MIGRATION_STREAM_CHUNK_SIZE,
+                )
+            else:
+                store.append_streamed_batch(
+                    batch_id=batch_id,
+                    kind=batch_kind,
+                    drafts=drafts,
+                    source_digest=preflight.source_digest,
+                    source_path=source,
+                    invalid_count=preflight.invalid_count,
+                    duplicate_source_count=preflight.duplicate_source_count,
+                    chunk_size=MIGRATION_STREAM_CHUNK_SIZE,
+                    _defer_secondary_indexes=True,
+                )
             if not _observation_matches(observation, preflight):
                 raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
             revision = store.canonical_revision()

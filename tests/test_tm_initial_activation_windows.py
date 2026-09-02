@@ -2323,6 +2323,7 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
                     identity.configured_jsonl_path,
                     preflight=preflight,
                     canonical_store_id="store.primary",
+                    immediate_seal=True,
                     batch_kind="migration",
                     batch_prefix="migration",
                     snapshot_prefix="snapshot.migration",

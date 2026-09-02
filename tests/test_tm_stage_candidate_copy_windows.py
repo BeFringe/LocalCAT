@@ -6,11 +6,12 @@ import hashlib
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 import tm_stage_sealer
-from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+from platform_fs_contracts import BoundRegularFile
 from tm_contracts import CanonicalResourceIdentity
 from tm_migration import TMMigrationService
 from tm_sqlite_store import ResourceStoreCoordinator
@@ -132,7 +133,83 @@ class WindowsPortableStageCandidateCopyTests(unittest.TestCase):
                     if not candidate.closed:
                         self._close_and_unlink(candidate, name)
 
-    def test_mid_copy_source_mutation_fails_closed(self) -> None:
+    def test_database_bulk_copy_uses_one_proof_window_and_short_reads(self) -> None:
+        candidate_name = "publication-bulk.candidate"
+        entry = self.registry._entries[self.sealed.artifact.artifact_id]
+        live_authority = entry.live_authority
+        if live_authority is None:
+            raise AssertionError("expected portable live authority")
+        source = live_authority._PortableStageLiveAuthority__database
+        source_type = type(source)
+        real_reprove = source_type._reprove
+        real_read = source._api.ReadFile
+        source_reproves = 0
+        source_reads = 0
+
+        def count_source_reproof(bound: object) -> object:
+            nonlocal source_reproves
+            if bound is source:
+                source_reproves += 1
+            return real_reprove(bound)
+
+        def short_read(
+            handle: int,
+            buffer: object,
+            requested: int,
+            read: object,
+            overlapped: object,
+        ) -> int:
+            nonlocal source_reads
+            limited = min(int(requested), 97)
+            result = real_read(handle, buffer, limited, read, overlapped)
+            source_reads += 1
+            return result
+
+        borrow = self._borrow()
+        expected = self.stage.staged_db_path.read_bytes()
+        try:
+            with mock.patch.object(
+                source_type,
+                "_reprove",
+                new=count_source_reproof,
+            ), mock.patch.object(
+                source_type,
+                "read_at",
+                wraps=source_type.read_at,
+            ) as read_at, mock.patch.object(
+                source._api,
+                "ReadFile",
+                side_effect=short_read,
+            ):
+                candidate, facts = borrow.copy_asset_to_new_candidate(
+                    platform=self.reservation._backend,
+                    parent=self.reservation._root,
+                    asset="database",
+                    candidate_name=candidate_name,
+                )
+            try:
+                self.assertEqual(source_reproves, 4)
+                self.assertGreater(source_reads, 2)
+                read_at.assert_not_called()
+                self.assertEqual(facts.byte_count, len(expected))
+                self.assertEqual(
+                    facts.content_sha256,
+                    hashlib.sha256(expected).digest(),
+                )
+                candidate.flush_content()
+                identity = candidate.identity()
+                candidate.close()
+                self.assertEqual((self.root / candidate_name).read_bytes(), expected)
+                self.reservation._root.unlink_owned(candidate_name, identity)
+            finally:
+                if not candidate.closed:
+                    self._close_and_unlink(candidate, candidate_name)
+        finally:
+            candidate_path = self.root / candidate_name
+            if candidate_path.exists():
+                candidate_path.unlink()
+
+    def test_mid_copy_source_snapshot_drift_fails_closed(self) -> None:
         candidate_name = "publication-mutated.candidate"
         entry = self.registry._entries[self.sealed.artifact.artifact_id]
         live_authority = entry.live_authority
@@ -140,58 +217,39 @@ class WindowsPortableStageCandidateCopyTests(unittest.TestCase):
             raise AssertionError("expected portable live authority")
         source = live_authority._PortableStageLiveAuthority__database
         source_type = type(source)
-        real_read_at = source_type.read_at
-        real_write_chunks = tm_stage_sealer.CandidateFile.write_chunks
-        copying = False
-        copy_reads = 0
+        real_reprove = source_type._reprove
+        after_body = False
 
-        def track_copy(
-            candidate: object,
-            chunks: object,
-            *,
-            maximum_bytes: int,
-        ) -> object:
-            nonlocal copying
-            copying = True
-            try:
-                return real_write_chunks(
-                    candidate,
-                    chunks,
-                    maximum_bytes=maximum_bytes,
-                )
-            finally:
-                copying = False
+        def mark_after_body(phase: str) -> None:
+            nonlocal after_body
+            if phase == "windows_after_body_read":
+                after_body = True
 
-        def become_stale_after_first_chunk(
-            bound: object,
-            offset: int,
-            maximum_bytes: int,
-            expected: object,
-        ) -> bytes:
-            nonlocal copy_reads
-            if copying and bound is source:
-                copy_reads += 1
-                if copy_reads == 2:
-                    raise PlatformFileError(
-                        PlatformFileErrorCode.IDENTITY_STALE,
-                        retryable=True,
-                    )
-            return real_read_at(bound, offset, maximum_bytes, expected)
+        def drift_after_copy(bound: object) -> object:
+            proof = real_reprove(bound)
+            if bound is not source or not after_body:
+                return proof
+            snapshot = tm_stage_sealer.EntrySnapshot(
+                identity=proof.snapshot.identity,
+                byte_count=proof.snapshot.byte_count,
+                modified_token=hashlib.sha256(
+                    proof.snapshot.modified_token + b"drift"
+                ).digest(),
+                reparse_free=proof.snapshot.reparse_free,
+            )
+            return type(proof)(proof.identity, snapshot, proof.final_path)
 
-        with (
-            mock.patch.object(
-                tm_stage_sealer.CandidateFile,
-                "write_chunks",
-                new=track_copy,
-            ),
-            mock.patch.object(
+        source._fault_injector = mark_after_body
+        try:
+            with mock.patch.object(
                 source_type,
-                "read_at",
-                new=become_stale_after_first_chunk,
-            ),
-        ):
-            with self.assertRaises(tm_stage_sealer.StageSealError) as caught:
-                self._copy("database", candidate_name)
+                "_reprove",
+                new=drift_after_copy,
+            ):
+                with self.assertRaises(tm_stage_sealer.StageSealError) as caught:
+                    self._copy("database", candidate_name)
+        finally:
+            source._fault_injector = None
         self.assertIn(
             caught.exception.error_code,
             {
@@ -199,7 +257,110 @@ class WindowsPortableStageCandidateCopyTests(unittest.TestCase):
                 "SEALER.ATTESTATION_UNAVAILABLE",
             },
         )
-        self.assertEqual(copy_reads, 2)
+        self.assertTrue(after_body)
+        self.assertEqual(self.registry._portable_borrows, {})
+        candidate_path = self.root / candidate_name
+        if candidate_path.exists():
+            candidate_path.unlink()
+
+    def test_consumer_fault_closes_stream_and_next_thread_rehashes(self) -> None:
+        candidate_name = "publication-interrupted.candidate"
+        entry = self.registry._entries[self.sealed.artifact.artifact_id]
+        live_authority = entry.live_authority
+        if live_authority is None:
+            raise AssertionError("expected portable live authority")
+        source = live_authority._PortableStageLiveAuthority__database
+        expected_snapshot = source.snapshot()
+        expected_facts = source.content_facts()
+        borrow = self._borrow()
+
+        def fail_after_first_chunk(
+            candidate: object,
+            chunks: object,
+            *,
+            maximum_bytes: int,
+        ) -> object:
+            del candidate, maximum_bytes
+            first = next(iter(chunks))  # type: ignore[arg-type]
+            self.assertTrue(first)
+            raise RuntimeError("consumer interrupted exact stream")
+
+        with mock.patch.object(
+            tm_stage_sealer.CandidateFile,
+            "write_chunks",
+            new=fail_after_first_chunk,
+        ), self.assertRaisesRegex(RuntimeError, "consumer interrupted"):
+            borrow.copy_asset_to_new_candidate(
+                platform=self.reservation._backend,
+                parent=self.reservation._root,
+                asset="database",
+                candidate_name=candidate_name,
+            )
+
+        self.assertIsNone(source._content_facts_cache)
+        acquired = source._read_lock.acquire(blocking=False)
+        self.assertTrue(acquired)
+        if acquired:
+            source._read_lock.release()
+
+        results: dict[str, object] = {}
+        failures: list[BaseException] = []
+
+        def fresh_read() -> None:
+            try:
+                with mock.patch.object(
+                    source._api,
+                    "ReadFile",
+                    wraps=source._api.ReadFile,
+                ) as read_file:
+                    results["facts"] = source.content_facts()
+                    results["body_reads"] = read_file.call_count
+                    results["prefix"] = source.read_at(0, 31, expected_snapshot)
+            except BaseException as error:
+                failures.append(error)
+
+        reader = threading.Thread(target=fresh_read)
+        reader.start()
+        reader.join(5.0)
+        self.assertFalse(reader.is_alive(), "interrupted stream retained its read lock")
+        self.assertEqual(failures, [])
+        self.assertEqual(results["facts"], expected_facts)
+        self.assertGreater(results["body_reads"], 0)
+        self.assertEqual(
+            results["prefix"],
+            self.stage.staged_db_path.read_bytes()[:31],
+        )
+        candidate_path = self.root / candidate_name
+        if candidate_path.exists():
+            candidate_path.unlink()
+
+    def test_bulk_copy_tamper_is_not_accepted_or_published(self) -> None:
+        candidate_name = "publication-tampered.candidate"
+        entry = self.registry._entries[self.sealed.artifact.artifact_id]
+        live_authority = entry.live_authority
+        if live_authority is None:
+            raise AssertionError("expected portable live authority")
+        source = live_authority._PortableStageLiveAuthority__database
+        real_stream = BoundRegularFile.iter_exact_chunks
+
+        def tampered_stream(bound: object, expected: object) -> object:
+            for ordinal, chunk in enumerate(real_stream(bound, expected)):
+                if ordinal == 0:
+                    yield bytes((chunk[0] ^ 1,)) + chunk[1:]
+                else:
+                    yield chunk
+
+        with mock.patch.object(
+            BoundRegularFile,
+            "iter_exact_chunks",
+            new=tampered_stream,
+        ):
+            with self.assertRaises(tm_stage_sealer.StageSealError) as caught:
+                self._copy("database", candidate_name)
+        self.assertEqual(
+            caught.exception.error_code,
+            "SEALER.ARTIFACT_MUTATED",
+        )
         self.assertEqual(self.registry._portable_borrows, {})
         candidate_path = self.root / candidate_name
         if candidate_path.exists():

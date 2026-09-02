@@ -89,6 +89,7 @@ from tm_content_attestation import (
     PortableContentFileProof,
     PortableSealedContentAttestation,
     _capture_content_file,
+    _capture_platform_content_file,
     _create_portable_active_content_attestation,
 )
 from platform_fs_contracts import (
@@ -343,6 +344,7 @@ _SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
 FOLD_VERSION_V1 = "fold-v1-unicode-16.0.0"
 BUSY_TIMEOUT_MS = 5000
 _NATIVE_PATH_TYPE = type(Path())
+_IMMEDIATE_SEAL_CACHE_KIB = 128 * 1024
 
 _RECORD_COLUMNS = (
     "record_id, source_raw, target_raw, speaker_raw, context_prev_raw, "
@@ -1549,6 +1551,7 @@ class _CoordinatorStorePort:
         activation_digest: str,
         expected_logical_closure_digest: str,
         database_guard: BoundExistingFileMutationGuard,
+        expected_candidate_projection_digest: str | None = None,
     ) -> tuple[
         _CanonicalStoreRef,
         SQLiteSchemaSnapshot,
@@ -1565,6 +1568,9 @@ class _CoordinatorStorePort:
             activation_digest=activation_digest,
             expected_logical_closure_digest=expected_logical_closure_digest,
             database_guard=database_guard,
+            expected_candidate_projection_digest=(
+                expected_candidate_projection_digest
+            ),
         )
 
     def ensure_portable_activation_lineage_marker(
@@ -2323,6 +2329,59 @@ def _rehydrate_completed_portable_authority(
                 )
             observed[name] = (port.portable_content_proof(facts), facts)
 
+        reuse_semantic_facts = (
+            observed[identity.canonical_sidecar_path.name][0]
+            == active.database
+        )
+
+        def pair_matches_attestation(
+            name: str,
+            expected: PortableContentFileProof,
+        ) -> bool:
+            opened: BoundRegularFile | None = None
+            matched = False
+            close_failed = False
+            try:
+                entry = root.inspect_entry(name)
+                if (
+                    entry is not None
+                    and entry.identity.kind == "regular"
+                    and entry.identity.link_count == 1
+                    and entry.reparse_free
+                ):
+                    opened = platform.open_regular(root, PurePath(name))
+                    facts = opened.content_facts()
+                    if (
+                        facts.snapshot == entry
+                        and root.inspect_entry(name) == facts.snapshot
+                    ):
+                        observed_proof = port.portable_content_proof(facts)
+                        final_facts = opened.content_facts()
+                        matched = (
+                            final_facts == facts
+                            and root.inspect_entry(name)
+                            == final_facts.snapshot
+                            and observed_proof == expected
+                        )
+            except (PlatformFileError, OSError):
+                matched = False
+            finally:
+                active_exception = sys.exception()
+                if opened is not None:
+                    try:
+                        opened.close()
+                    except (PlatformFileError, OSError):
+                        if active_exception is None:
+                            close_failed = True
+            return matched and not close_failed
+
+        for name, expected in (
+            (identity.snapshot_manifest_path.name, active.manifest),
+            (identity.configured_jsonl_path.name, active.source),
+        ):
+            if not pair_matches_attestation(name, expected):
+                reuse_semantic_facts = False
+
         if (
             active.manifest != sealed.manifest
             or active.source != sealed.source
@@ -2400,9 +2459,13 @@ def _rehydrate_completed_portable_authority(
                     canonical_store_id=port.canonical_store_id,
                     target_identity=identity.target_identity,
                 )
-                if connection.execute("PRAGMA integrity_check").fetchall() != [
-                    ("ok",)
-                ] or connection.execute("PRAGMA foreign_key_check").fetchall():
+                if not reuse_semantic_facts and (
+                    connection.execute("PRAGMA integrity_check").fetchall()
+                    != [("ok",)]
+                    or connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                ):
                     raise port.store_schema_error("STORE.INTEGRITY_CHECK_FAILED")
                 facts = port.read_source_binding_facts_in_transaction(
                     connection,
@@ -2443,13 +2506,14 @@ def _rehydrate_completed_portable_authority(
                     != binding.receipt.record_count
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
-                port.validate_candidate_proof_index(
-                    connection,
-                    required_sizes=(
-                        (1, 2) if schema.fts5_available else (1, 2, 3)
-                    ),
-                    fts5_available=schema.fts5_available,
-                )
+                if not reuse_semantic_facts:
+                    port.validate_candidate_proof_index(
+                        connection,
+                        required_sizes=(
+                            (1, 2) if schema.fts5_available else (1, 2, 3)
+                        ),
+                        fts5_available=schema.fts5_available,
+                    )
             finally:
                 connection.rollback()
 
@@ -2509,6 +2573,13 @@ def _rehydrate_completed_portable_authority(
         if active_error is None and close_error is not None:
             active_error = close_error
     if active_error is not None:
+        if isinstance(active_error, (PlatformFileError, OSError)):
+            normalized = ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+            normalized.__cause__ = active_error
+            active_error = normalized
         port.view = None
         port.state = "ACTIVATING"
         port.notify_all()
@@ -6249,6 +6320,7 @@ class ResourceStoreCoordinator:
         activation_digest: str,
         expected_logical_closure_digest: str,
         database_guard: BoundExistingFileMutationGuard,
+        expected_candidate_projection_digest: str | None = None,
     ) -> tuple[
         _CanonicalStoreRef,
         SQLiteSchemaSnapshot,
@@ -6416,12 +6488,37 @@ class ResourceStoreCoordinator:
                         raise SQLiteStoreSchemaError(
                             "STORE.ACTIVE_COUNT_MISMATCH"
                         )
-                    gram_counts, fts_count = _validate_activation_indexes(
-                        port,
-                        connection,
-                        semantic_facts=sealed_semantic,
-                        fts5_available=snapshot.fts5_available,
-                    )
+                    if expected_candidate_projection_digest is None:
+                        gram_counts, fts_count = _validate_activation_indexes(
+                            port,
+                            connection,
+                            semantic_facts=sealed_semantic,
+                            fts5_available=snapshot.fts5_available,
+                        )
+                    else:
+                        try:
+                            candidate_projection_digest = (
+                                _candidate_proof_projection_digest(
+                                    connection,
+                                    fts5_available=snapshot.fts5_available,
+                                )
+                            )
+                        except (
+                            CandidateProofIndexError,
+                            sqlite3.DatabaseError,
+                        ) as error:
+                            raise SQLiteStoreSchemaError(
+                                "STORE.CANDIDATE_INDEX_INVALID"
+                            ) from error
+                        if (
+                            candidate_projection_digest
+                            != expected_candidate_projection_digest
+                        ):
+                            raise SQLiteStoreSchemaError(
+                                "STORE.CANDIDATE_INDEX_INVALID"
+                            )
+                        gram_counts = sealed_semantic.gram_counts
+                        fts_count = sealed_semantic.fts_count
                     if (
                         sealed_semantic.receipt_boundary_record_count
                         == record_count
@@ -7111,6 +7208,9 @@ class ResourceStoreCoordinator:
                         activation_digest=digest,
                         expected_logical_closure_digest=logical_closure,
                         database_guard=database_guard,
+                        expected_candidate_projection_digest=(
+                            physical.candidate_projection_digest
+                        ),
                     )
                 )
                 database_guard = None
@@ -7652,6 +7752,9 @@ class ResourceStoreCoordinator:
                         activation_digest=digest,
                         expected_logical_closure_digest=logical_closure,
                         database_guard=database_guard,
+                        expected_candidate_projection_digest=(
+                            physical.candidate_projection_digest
+                        ),
                     )
                 )
                 database_guard = None
@@ -13452,6 +13555,66 @@ class SQLiteTMStore:
         discard the stage (the migration build deletes both stage files).
         """
 
+        if type(_defer_secondary_indexes) is not bool:
+            raise TypeError(
+                "_defer_secondary_indexes must be a built-in bool"
+            )
+        self._append_streamed_batch_body(
+            batch_id=batch_id,
+            kind=kind,
+            drafts=drafts,
+            source_digest=source_digest,
+            source_path=source_path,
+            invalid_count=invalid_count,
+            duplicate_source_count=duplicate_source_count,
+            chunk_size=chunk_size,
+            defer_secondary_indexes=_defer_secondary_indexes,
+            immediate_seal=False,
+        )
+
+    def _append_streamed_batch_for_immediate_seal(
+        self,
+        *,
+        batch_id: str,
+        kind: str,
+        drafts: Iterator[tuple[TMRecordDraft, int | None]],
+        source_digest: str,
+        source_path: Path,
+        invalid_count: int,
+        duplicate_source_count: int,
+        chunk_size: int,
+    ) -> None:
+        """Build deferred indexes for an owner-held immediate seal handoff."""
+
+        self._append_streamed_batch_body(
+            batch_id=batch_id,
+            kind=kind,
+            drafts=drafts,
+            source_digest=source_digest,
+            source_path=source_path,
+            invalid_count=invalid_count,
+            duplicate_source_count=duplicate_source_count,
+            chunk_size=chunk_size,
+            defer_secondary_indexes=True,
+            immediate_seal=True,
+        )
+
+    def _append_streamed_batch_body(
+        self,
+        *,
+        batch_id: str,
+        kind: str,
+        drafts: Iterator[tuple[TMRecordDraft, int | None]],
+        source_digest: str,
+        source_path: Path,
+        invalid_count: int,
+        duplicate_source_count: int,
+        chunk_size: int,
+        defer_secondary_indexes: bool,
+        immediate_seal: bool,
+    ) -> None:
+        """Implement public validation and owner-private immediate sealing."""
+
         _validate_batch_scalars(
             batch_id=batch_id,
             kind=kind,
@@ -13470,15 +13633,21 @@ class SQLiteTMStore:
             raise TypeError("chunk_size must be a built-in integer")
         if chunk_size < 1:
             raise ValueError("chunk_size must be a positive integer")
-        if type(_defer_secondary_indexes) is not bool:
+        if type(defer_secondary_indexes) is not bool:
             raise TypeError(
-                "_defer_secondary_indexes must be a built-in bool"
+                "defer_secondary_indexes must be a built-in bool"
             )
+        if type(immediate_seal) is not bool:
+            raise TypeError("immediate_seal must be a built-in bool")
+        if immediate_seal and not defer_secondary_indexes:
+            raise ValueError("immediate seal requires deferred secondary indexes")
         timestamp = datetime.now(UTC).isoformat()
 
         with self._coordinator._operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
-                if _defer_secondary_indexes:
+                if immediate_seal:
+                    _configure_immediate_seal_bulk_cache(connection)
+                if defer_secondary_indexes:
                     _suspend_streamed_stage_secondary_indexes(
                         connection,
                         lease,
@@ -13534,16 +13703,17 @@ class SQLiteTMStore:
                                 ),
                             )
                         if is_last:
-                            if _defer_secondary_indexes:
+                            if defer_secondary_indexes:
                                 _restore_streamed_stage_secondary_indexes(
                                     connection,
                                     lease,
                                     before_publication=True,
                                 )
-                            _validate_candidate_index_before_publication(
-                                connection,
-                                fts5_available=lease.fts5_available,
-                            )
+                            if not immediate_seal:
+                                _validate_candidate_index_before_publication(
+                                    connection,
+                                    fts5_available=lease.fts5_available,
+                                )
                             _complete_streamed_batch(
                                 connection,
                                 batch_id=batch_id,
@@ -15394,34 +15564,14 @@ def _insert_streamed_candidate_index(
         (draft[10], draft[2]) for draft in prepared_drafts
     )
     copied_record_ids = tuple(record_ids_by_ordinal.items())
-    gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
-    expected_gram_row_count = 0
-    for gram_size in gram_sizes:
-        candidate_gram_facts = tuple(
-            (draft[10], gram_size, gram, term_frequency)
-            for draft in prepared_drafts
-            for gram, term_frequency in character_ngram_frequencies(
-                draft[2],
-                gram_size,
-            )
-        )
-        gram_result = candidate_projection.insert_streamed_candidate_gram_rows(
-            connection,
-            candidate_records,
-            copied_record_ids,
-            candidate_gram_facts,
-            gram_size=gram_size,
-        )
-        if gram_result is not None:
-            raise TypeError("streamed candidate projection returned authority")
-        expected_gram_row_count += len(candidate_gram_facts)
-        del candidate_gram_facts
     try:
-        fts_result = candidate_projection.insert_streamed_candidate_fts_rows(
-            connection,
-            candidate_records,
-            copied_record_ids,
-            fts5_available=fts5_available,
+        projection_result = (
+            candidate_projection._insert_streamed_candidate_projection(
+                connection,
+                candidate_records,
+                copied_record_ids,
+                fts5_available=fts5_available,
+            )
         )
     except sqlite3.OperationalError as error:
         if (
@@ -15431,15 +15581,7 @@ def _insert_streamed_candidate_index(
         ):
             raise SQLiteStoreSchemaError("STORE.FTS5_UNAVAILABLE") from error
         raise
-    if fts_result is not None:
-        raise TypeError("streamed candidate projection returned authority")
-    proof_result = candidate_projection.insert_streamed_candidate_proof_rows(
-        connection,
-        candidate_records,
-        copied_record_ids,
-        expected_gram_row_count=expected_gram_row_count,
-    )
-    if proof_result is not None:
+    if projection_result is not None:
         raise TypeError("streamed candidate projection returned authority")
 
 
@@ -15638,7 +15780,7 @@ def _source_binding_health_state(
 
 def _active_attestation_for_health(
     lease: _SQLiteGenerationView,
-) -> ActiveContentAttestation | None:
+) -> ActiveContentAttestation | PortableActiveContentAttestation | None:
     """Re-prove one immutable active byte set for semantic-health reuse.
 
     A legitimate post-activation write changes the database bytes and falls
@@ -15660,10 +15802,7 @@ def _active_attestation_for_health(
             or active.generation != lease.generation
         ):
             raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
-        # Portable attestations intentionally persist bytes, not a reusable
-        # FileId authority.  The Windows runtime therefore takes the full
-        # SQLite health path instead of treating historical identity as live.
-        return None
+        return active
     if type(active) is not ActiveContentAttestation or (
         active.resource_id != identity.resource_id
         or active.target_identity != identity.target_identity
@@ -15689,11 +15828,102 @@ def _active_attestation_for_health(
     return active
 
 
+def _rebind_portable_attestation_for_health(
+    lease: _SQLiteGenerationView,
+    active: PortableActiveContentAttestation,
+) -> PortableActiveContentAttestation | None:
+    """Bind portable semantic facts to the current rooted three-file set.
+
+    Portable attestations deliberately persist only byte count and SHA-256.
+    A health call may therefore reuse their semantic facts only after fresh
+    platform-rooted handles prove the current database, manifest, and source
+    bytes.  File identities are live facts for this capture window only; they
+    are never compared with or written into the durable attestation.
+
+    A stable byte difference is an ordinary cache miss (for example, a legal
+    canonical append) and falls back to the full SQLite validator.  A rooted
+    authority failure or retained-handle race on the canonical database
+    invalidates the attestation.  The configured manifest and source remain
+    observable inputs, so any failure to prove that optional pair is only a
+    cache miss; ``SourceBindingMonitor`` owns its divergence classification.
+    """
+
+    identity = lease.stage.resource_identity
+    root_path = identity.configured_jsonl_path.parent
+    expected = (
+        (identity.canonical_sidecar_path, active.database),
+        (identity.snapshot_manifest_path, active.manifest),
+        (identity.configured_jsonl_path, active.source),
+    )
+    if any(path.parent != root_path for path, _proof in expected):
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+    try:
+        backend = importlib.import_module(
+            "platform_fs"
+        ).compose_platform_file_backend(root_path)
+    except (PlatformFileError, OSError) as error:
+        raise SQLiteStoreSchemaError(
+            "STORE.ACTIVE_ATTESTATION_INVALID"
+        ) from error
+
+    captures: list[tuple[str, OpaqueAuthority]] = []
+    reuse_semantic_facts = True
+    try:
+        database_path, database_proof = expected[0]
+        try:
+            database_capture = _capture_platform_content_file(
+                backend,
+                root_path,
+                PurePath(database_path.name),
+            )
+            captures.append(("database", database_capture))
+            database_capture.reprove()
+        except (ContentAttestationError, PlatformFileError, OSError) as error:
+            raise SQLiteStoreSchemaError(
+                "STORE.ACTIVE_ATTESTATION_INVALID"
+            ) from error
+        if database_capture.persisted_proof() != database_proof:
+            reuse_semantic_facts = False
+
+        for path, proof in expected[1:]:
+            if not reuse_semantic_facts:
+                break
+            try:
+                capture = _capture_platform_content_file(
+                    backend,
+                    root_path,
+                    PurePath(path.name),
+                )
+                captures.append(("pair", capture))
+                capture.reprove()
+            except (ContentAttestationError, PlatformFileError, OSError):
+                reuse_semantic_facts = False
+                break
+            if capture.persisted_proof() != proof:
+                reuse_semantic_facts = False
+    finally:
+        active_error = sys.exception()
+        database_close_error: BaseException | None = None
+        for role, capture in reversed(captures):
+            try:
+                capture.close()
+            except (ContentAttestationError, PlatformFileError, OSError) as error:
+                if role == "database" and database_close_error is None:
+                    database_close_error = error
+                else:
+                    reuse_semantic_facts = False
+        if active_error is None and database_close_error is not None:
+            raise SQLiteStoreSchemaError(
+                "STORE.ACTIVE_ATTESTATION_INVALID"
+            ) from database_close_error
+    return active if reuse_semantic_facts else None
+
+
 def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
     """Build one health snapshot from one already-held canonical lease."""
 
     active_attestation = _active_attestation_for_health(lease)
-    with _open_leased_connection(lease) as connection:
+    with _open_health_connection(lease) as connection:
         connection.execute("BEGIN")
         try:
             identity = lease.stage.resource_identity
@@ -15714,6 +15944,11 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
             index_kind = meta["candidate_index_kind"]
             if type(index_kind) is not str or not index_kind.strip():
                 raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
+            if type(active_attestation) is PortableActiveContentAttestation:
+                active_attestation = _rebind_portable_attestation_for_health(
+                    lease,
+                    active_attestation,
+                )
             if (
                 schema_version == TM_SCHEMA_VERSION
                 and active_attestation is None
@@ -16241,6 +16476,28 @@ def _probe_fts5() -> bool:
         connection.close()
 
 
+def _configure_immediate_seal_bulk_cache(
+    connection: sqlite3.Connection,
+) -> None:
+    """Apply one connection-local cache hint before private bulk build."""
+
+    if type(connection) is not sqlite3.Connection:
+        raise TypeError("connection must be an exact sqlite3 connection")
+    if connection.in_transaction:
+        raise AssertionError("bulk cache must be configured before transaction")
+    try:
+        connection.execute(
+            f"PRAGMA cache_size={-_IMMEDIATE_SEAL_CACHE_KIB}"
+        )
+        observed = connection.execute("PRAGMA cache_size").fetchone()
+    except sqlite3.Error as error:
+        raise SQLiteStoreSchemaError(
+            "STORE.BULK_CACHE_UNAVAILABLE"
+        ) from error
+    if observed != (-_IMMEDIATE_SEAL_CACHE_KIB,):
+        raise SQLiteStoreSchemaError("STORE.BULK_CACHE_UNAVAILABLE")
+
+
 @contextmanager
 def _open_configured_connection(
     database_path: Path,
@@ -16322,6 +16579,72 @@ def _open_leased_connection(
                 retryable=True,
             ) from error
         raise
+
+
+@contextmanager
+def _open_health_connection(
+    lease: _SQLiteGenerationView,
+) -> Iterator[sqlite3.Connection]:
+    """Open portable health read-only so rooted byte proof can share the file.
+
+    The ordinary store connection requests write access even for read methods.
+    On Windows that conflicts with the intentionally strict rooted content
+    handle, whose ``FILE_SHARE_READ`` freezes the exact bytes while hashing.
+    A portable health call instead opens SQLite in locking, read-only mode.
+    Its established read transaction prevents a writer from changing database
+    pages while the retained rooted handle captures the same file.  This is not
+    ``immutable=1``: SQLite still participates in the rollback-journal locks.
+    """
+
+    if not (
+        sys.platform == "win32"
+        and type(lease.active_content_attestation)
+        is PortableActiveContentAttestation
+    ):
+        with _open_leased_connection(lease) as connection:
+            yield connection
+        return
+
+    database_path = lease.stage.staged_db_path
+    _require_absolute_path(database_path, "database_path")
+    connection = sqlite3.connect(
+        f"{database_path.as_uri()}?mode=ro",
+        timeout=BUSY_TIMEOUT_MS / 1000,
+        isolation_level=None,
+        uri=True,
+    )
+    try:
+        connection.enable_load_extension(False)
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        if _pragma_int(connection, "query_only") != 1:
+            raise SQLiteStoreSchemaError("STORE.QUERY_ONLY_DISABLED")
+        if _pragma_text(connection, "journal_mode").lower() == "wal":
+            raise SQLiteStoreSchemaError("STORE.WAL_FORBIDDEN")
+        yield connection
+    except sqlite3.OperationalError as error:
+        sqlite_code = getattr(error, "sqlite_errorcode", None)
+        primary_code = (
+            sqlite_code & 0xFF
+            if type(sqlite_code) is int
+            else None
+        )
+        message = str(error).lower()
+        if (
+            primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            or "database is locked" in message
+            or "database table is locked" in message
+        ):
+            raise SQLiteStoreLifecycleError(
+                "STORE.BUSY_TIMEOUT",
+                resource_id=lease.stage.resource_identity.resource_id,
+                generation=lease.generation,
+                retryable=True,
+            ) from error
+        raise
+    finally:
+        connection.close()
 
 
 @contextmanager

@@ -1779,6 +1779,50 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
         self.assertEqual(facts.byte_count, len(payload))
         self.assertEqual((self.nested / "stream.tmp").read_bytes(), payload)
 
+    def test_candidate_stream_coalesces_only_native_write_batches(self) -> None:
+        chunks = tuple(bytes((index,)) * 65536 for index in range(18)) + (
+            b"tail",
+        )
+        payload = b"".join(chunks)
+        adapter = WindowsPlatformAdapter()
+        with adapter.bind_root(self.root_path) as root:
+            with adapter.bind_parent(
+                root,
+                PureWindowsPath("NestedCase", "placeholder.bin"),
+            ) as parent:
+                candidate = parent.create_candidate("batched-stream.tmp", private=False)
+                real_write = candidate._api.WriteFile
+                requested_counts: list[int] = []
+
+                def recording_write(
+                    handle: int,
+                    buffer: object,
+                    requested: int,
+                    written: object,
+                    overlapped: object,
+                ) -> int:
+                    requested_counts.append(int(requested))
+                    return real_write(handle, buffer, requested, written, overlapped)
+
+                with mock.patch.object(
+                    candidate._api,
+                    "WriteFile",
+                    side_effect=recording_write,
+                ):
+                    facts = candidate.write_chunks(
+                        iter(chunks),
+                        maximum_bytes=len(payload),
+                )
+                self.assertEqual(requested_counts, [1024 * 1024, 2 * 65536 + 4])
+                self.assertEqual(facts.byte_count, len(payload))
+                self.assertEqual(
+                    facts.content_sha256,
+                    hashlib.sha256(payload).digest(),
+                )
+                candidate.flush_content()
+                candidate.close()
+        self.assertEqual((self.nested / "batched-stream.tmp").read_bytes(), payload)
+
     def test_candidate_stream_completes_short_native_writes_and_publishes(self) -> None:
         payload = b"short-native-write" * 37
         adapter = WindowsPlatformAdapter()
@@ -1834,6 +1878,7 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
 
     def test_candidate_stream_fault_is_fail_closed_and_cannot_be_retried(self) -> None:
         file_system = WindowsRootedFileSystem()
+        chunks = tuple(bytes((index,)) * 65536 for index in range(17))
         with file_system.bind_root(self.root_path) as root:
             with file_system.bind_parent(
                 root,
@@ -1856,8 +1901,8 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                     side_effect=fail_second,
                 ), self.assertRaises(PlatformFileError) as caught:
                     candidate.write_chunks(
-                        (b"a" * 65536, b"b"),
-                        maximum_bytes=65537,
+                        iter(chunks),
+                        maximum_bytes=sum(map(len, chunks)),
                     )
                 _assert_platform_error(
                     self,
@@ -2315,6 +2360,104 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
             second.join(5.0)
             source.close()
 
+    def test_bulk_capture_and_bounded_read_serialize_one_file_pointer(
+        self,
+    ) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source = file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+        expected = source.snapshot()
+        first_seek = threading.Event()
+        release_first = threading.Event()
+        second_acquire = threading.Event()
+        guard = threading.Lock()
+        acquire_calls = 0
+        seek_calls = 0
+        results: dict[str, bytes] = {}
+        failures: list[BaseException] = []
+        real_seek = source._api.SetFilePointerEx
+
+        class ObservingLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+
+            def __enter__(self) -> ObservingLock:
+                nonlocal acquire_calls
+                with guard:
+                    acquire_calls += 1
+                    current = acquire_calls
+                if current == 2:
+                    second_acquire.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _exc_type: object,
+                _exc: object,
+                _traceback: object,
+            ) -> None:
+                self._lock.release()
+
+        source._read_lock = ObservingLock()
+
+        def blocking_seek(*args: object) -> int:
+            nonlocal seek_calls
+            with guard:
+                seek_calls += 1
+                current = seek_calls
+            result = real_seek(*args)
+            if current == 1:
+                first_seek.set()
+                if not release_first.wait(5.0):
+                    raise AssertionError(
+                        "bounded read did not contend on the file pointer"
+                    )
+            return result
+
+        def read_all() -> None:
+            try:
+                results["all"] = source.read_all()
+            except BaseException as error:
+                failures.append(error)
+
+        def read_at() -> None:
+            try:
+                results["at"] = source.read_at(101, 257, expected)
+            except BaseException as error:
+                failures.append(error)
+
+        whole = threading.Thread(target=read_all)
+        bounded = threading.Thread(target=read_at)
+        try:
+            with mock.patch.object(
+                source._api,
+                "SetFilePointerEx",
+                side_effect=blocking_seek,
+            ):
+                whole.start()
+                self.assertTrue(first_seek.wait(5.0))
+                bounded.start()
+                self.assertTrue(second_acquire.wait(5.0))
+                with guard:
+                    self.assertEqual(seek_calls, 1)
+                release_first.set()
+                whole.join(5.0)
+                bounded.join(5.0)
+            self.assertFalse(whole.is_alive())
+            self.assertFalse(bounded.is_alive())
+            self.assertEqual(failures, [])
+            self.assertEqual(results["all"], self.payload)
+            self.assertEqual(results["at"], self.payload[101:358])
+        finally:
+            release_first.set()
+            whole.join(5.0)
+            bounded.join(5.0)
+            source.close()
+
     def test_source_and_ancestor_handles_block_replacement(self) -> None:
         replacement = self.nested / "replacement.txt"
         replacement.write_bytes(b"replacement")
@@ -2328,6 +2471,15 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
             os.replace(replacement, self.source)
         with self.assertRaises(PermissionError):
             os.rename(self.nested, self.root_path / "MovedCase")
+        for mode, payload in (
+            ("ab", b"append"),
+            ("wb", b"truncate"),
+            ("r+b", b"same-size"),
+        ):
+            with self.subTest(mode=mode), self.assertRaises(PermissionError):
+                with self.source.open(mode) as writer:
+                    writer.write(payload)
+        self.assertEqual(source.read_all(), self.payload)
         source.close()
         root.close()
 
@@ -2659,9 +2811,223 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                 first_counts = tuple(counts)
                 counts.clear()
                 self.assertEqual(source.read_all(), self.payload)
+                counts.clear()
+                facts = source.content_facts()
             self.assertGreater(len(first_counts), 2)
             self.assertEqual(first_counts[-1], 0)
             self.assertEqual(counts[-1], 0)
+            self.assertEqual(facts.snapshot.byte_count, len(self.payload))
+            self.assertEqual(
+                facts.content_sha256,
+                hashlib.sha256(self.payload).digest(),
+            )
+        finally:
+            source.close()
+
+    def test_bulk_capture_and_exact_stream_reuse_one_fixed_read_buffer(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source = file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+        expected = source.snapshot()
+        real_allocate = platform_fs_windows.ctypes.create_string_buffer
+
+        def run(operation: str) -> tuple[bytes, ...]:
+            allocations: list[int] = []
+
+            def allocate(size: int) -> object:
+                allocations.append(size)
+                return real_allocate(size)
+
+            with mock.patch.object(
+                platform_fs_windows.ctypes,
+                "create_string_buffer",
+                side_effect=allocate,
+            ):
+                if operation == "read_all":
+                    result = (source.read_all(),)
+                else:
+                    result = tuple(source.iter_exact_chunks(expected))
+            self.assertEqual(
+                allocations.count(platform_fs_windows._READ_CHUNK_BYTES),
+                1,
+            )
+            self.assertIn(1, allocations)
+            return result
+
+        try:
+            self.assertEqual(run("read_all"), (self.payload,))
+            chunks = run("iter_exact_chunks")
+            self.assertEqual(
+                chunks,
+                (
+                    self.payload[: platform_fs_windows._READ_CHUNK_BYTES],
+                    self.payload[platform_fs_windows._READ_CHUNK_BYTES :],
+                ),
+            )
+            self.assertTrue(all(type(chunk) is bytes for chunk in chunks))
+        finally:
+            source.close()
+
+    def test_bulk_capture_bytes_hash_and_proof_cost_are_size_invariant(self) -> None:
+        proof_counts: list[tuple[int, int]] = []
+        for size in (
+            0,
+            1,
+            64 * 1024 - 1,
+            64 * 1024,
+            64 * 1024 + 1,
+            2 * 1024 * 1024 + 19,
+        ):
+            payload = bytes((index * 17 + 11) % 251 for index in range(size))
+            self.source.write_bytes(payload)
+            file_system = WindowsRootedFileSystem()
+            with file_system.bind_root(self.root_path) as root:
+                source = file_system.open_regular(
+                    root,
+                    PureWindowsPath("NestedCase", "sample.txt"),
+                )
+            reprove_calls = 0
+            real_reprove = platform_fs_windows._WindowsBoundRegularFile._reprove
+
+            def counted_reprove(
+                bound: platform_fs_windows._WindowsBoundRegularFile,
+            ) -> platform_fs_windows._WindowsHandleProof:
+                nonlocal reprove_calls
+                reprove_calls += 1
+                return real_reprove(bound)
+
+            try:
+                with mock.patch.object(
+                    platform_fs_windows._WindowsBoundRegularFile,
+                    "_reprove",
+                    new=counted_reprove,
+                ), mock.patch.object(
+                    source._api,
+                    "GetFileInformationByHandleEx",
+                    wraps=source._api.GetFileInformationByHandleEx,
+                ) as native_proof:
+                    self.assertEqual(source.read_all(), payload)
+                    read_all_native_proofs = native_proof.call_count
+                    native_proof.reset_mock()
+                    facts = source.content_facts()
+                    content_native_proofs = native_proof.call_count
+                self.assertEqual(reprove_calls, 4)
+                self.assertEqual(facts.snapshot.byte_count, size)
+                self.assertEqual(
+                    facts.content_sha256,
+                    hashlib.sha256(payload).digest(),
+                )
+                proof_counts.append((read_all_native_proofs, content_native_proofs))
+            finally:
+                source.close()
+        self.assertEqual(len(set(proof_counts)), 1)
+
+    def test_content_facts_cache_is_live_handle_local_and_reproved(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            first = file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+            second = file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+        real_reprove = platform_fs_windows._WindowsBoundRegularFile._reprove
+        first_reproves = 0
+
+        def count_first(
+            bound: platform_fs_windows._WindowsBoundRegularFile,
+        ) -> platform_fs_windows._WindowsHandleProof:
+            nonlocal first_reproves
+            if bound is first:
+                first_reproves += 1
+            return real_reprove(bound)
+
+        try:
+            with mock.patch.object(
+                platform_fs_windows._WindowsBoundRegularFile,
+                "_reprove",
+                new=count_first,
+            ), mock.patch.object(
+                first._api,
+                "ReadFile",
+                wraps=first._api.ReadFile,
+            ) as read_file:
+                expected = first.content_facts()
+                self.assertGreater(read_file.call_count, 0)
+                read_file.reset_mock()
+                reproves_before_cached_read = first_reproves
+                self.assertEqual(first.content_facts(), expected)
+                self.assertEqual(first_reproves, reproves_before_cached_read + 1)
+                read_file.assert_not_called()
+
+            with mock.patch.object(
+                second._api,
+                "ReadFile",
+                wraps=second._api.ReadFile,
+            ) as fresh_read_file:
+                self.assertEqual(second.content_facts(), expected)
+                self.assertGreater(fresh_read_file.call_count, 0)
+        finally:
+            first.close()
+            second.close()
+        self.assertIsNone(first._content_facts_cache)
+        with self.assertRaises(PlatformFileError):
+            first.content_facts()
+
+    def test_content_facts_cache_drift_clears_without_body_read(self) -> None:
+        file_system = WindowsRootedFileSystem()
+        with file_system.bind_root(self.root_path) as root:
+            source = file_system.open_regular(
+                root,
+                PureWindowsPath("NestedCase", "sample.txt"),
+            )
+        expected = source.content_facts()
+        real_reprove = platform_fs_windows._WindowsBoundRegularFile._reprove
+
+        def drifting_reprove(
+            bound: platform_fs_windows._WindowsBoundRegularFile,
+        ) -> platform_fs_windows._WindowsHandleProof:
+            proof = real_reprove(bound)
+            if bound is not source:
+                return proof
+            snapshot = platform_fs_windows.EntrySnapshot(
+                identity=proof.snapshot.identity,
+                byte_count=proof.snapshot.byte_count,
+                modified_token=hashlib.sha256(
+                    proof.snapshot.modified_token + b"drift"
+                ).digest(),
+                reparse_free=proof.snapshot.reparse_free,
+            )
+            return platform_fs_windows._WindowsHandleProof(
+                proof.identity,
+                snapshot,
+                proof.final_path,
+            )
+
+        try:
+            self.assertEqual(source._content_facts_cache, expected)
+            with mock.patch.object(
+                platform_fs_windows._WindowsBoundRegularFile,
+                "_reprove",
+                new=drifting_reprove,
+            ), mock.patch.object(
+                source._api,
+                "ReadFile",
+                wraps=source._api.ReadFile,
+            ) as read_file, self.assertRaises(PlatformFileError) as caught:
+                source.content_facts()
+            _assert_platform_error(
+                self,
+                caught,
+                PlatformFileErrorCode.IDENTITY_STALE,
+            )
+            read_file.assert_not_called()
+            self.assertIsNone(source._content_facts_cache)
         finally:
             source.close()
 
@@ -2768,6 +3134,66 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
         finally:
             source.close()
 
+    def test_bulk_capture_rejects_append_truncate_and_same_size_rewrite(
+        self,
+    ) -> None:
+        for drift in ("append", "truncate", "same-size-rewrite"):
+            file_system = WindowsRootedFileSystem()
+            with file_system.bind_root(self.root_path) as root:
+                source = file_system.open_regular(
+                    root,
+                    PureWindowsPath("NestedCase", "sample.txt"),
+                )
+            real_reprove = platform_fs_windows._WindowsBoundRegularFile._reprove
+            reprove_calls = 0
+
+            def drifting_reprove(
+                bound: platform_fs_windows._WindowsBoundRegularFile,
+            ) -> platform_fs_windows._WindowsHandleProof:
+                nonlocal reprove_calls
+                proof = real_reprove(bound)
+                if bound is not source:
+                    return proof
+                reprove_calls += 1
+                if reprove_calls != 2:
+                    return proof
+                byte_count = proof.snapshot.byte_count
+                modified_token = proof.snapshot.modified_token
+                if drift == "append":
+                    byte_count += 1
+                elif drift == "truncate":
+                    byte_count -= 1
+                else:
+                    modified_token = hashlib.sha256(
+                        modified_token + b"rewrite"
+                    ).digest()
+                snapshot = platform_fs_windows.EntrySnapshot(
+                    identity=proof.identity,
+                    byte_count=byte_count,
+                    modified_token=modified_token,
+                    reparse_free=proof.snapshot.reparse_free,
+                )
+                return platform_fs_windows._WindowsHandleProof(
+                    proof.identity,
+                    snapshot,
+                    proof.final_path,
+                )
+
+            try:
+                with self.subTest(drift=drift), mock.patch.object(
+                    platform_fs_windows._WindowsBoundRegularFile,
+                    "_reprove",
+                    new=drifting_reprove,
+                ), self.assertRaises(PlatformFileError) as caught:
+                    source.content_facts()
+                _assert_platform_error(
+                    self,
+                    caught,
+                    PlatformFileErrorCode.IDENTITY_STALE,
+                )
+            finally:
+                source.close()
+
     def test_readfile_failure_is_body_free_identity_stale(self) -> None:
         file_system = WindowsRootedFileSystem()
         with file_system.bind_root(self.root_path) as root:
@@ -2791,7 +3217,7 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
             source.close()
 
     def test_read_loop_rejects_early_eof_oversized_count_and_extra_byte(self) -> None:
-        def run_case(mode: str) -> PlatformFileError:
+        def run_case(mode: str, operation: str) -> PlatformFileError:
             file_system = WindowsRootedFileSystem()
             with file_system.bind_root(self.root_path) as root:
                 source = file_system.open_regular(
@@ -2824,14 +3250,21 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                     "ReadFile",
                     side_effect=adversarial_read,
                 ), self.assertRaises(PlatformFileError) as caught:
-                    source.read_all()
+                    getattr(source, operation)()
                 return caught.exception
             finally:
                 source.close()
 
-        for mode in ("early_eof", "oversized", "extra_byte"):
-            with self.subTest(mode=mode):
-                error = run_case(mode)
-                self.assertEqual(error.code, PlatformFileErrorCode.IDENTITY_STALE.value)
-                self.assertEqual(error.args, (PlatformFileErrorCode.IDENTITY_STALE.value,))
-                self.assertIsNone(error.__cause__)
+        for operation in ("read_all", "content_facts"):
+            for mode in ("early_eof", "oversized", "extra_byte"):
+                with self.subTest(operation=operation, mode=mode):
+                    error = run_case(mode, operation)
+                    self.assertEqual(
+                        error.code,
+                        PlatformFileErrorCode.IDENTITY_STALE.value,
+                    )
+                    self.assertEqual(
+                        error.args,
+                        (PlatformFileErrorCode.IDENTITY_STALE.value,),
+                    )
+                    self.assertIsNone(error.__cause__)

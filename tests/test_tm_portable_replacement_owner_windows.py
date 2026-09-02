@@ -13,6 +13,8 @@ from unittest import mock
 import tm_activation_journal
 import tm_activation_recovery
 import tm_migration
+import tm_sqlite_store
+import tm_stage_sealer
 from platform_fs_windows import WindowsPlatformAdapter
 from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
 from tm_contracts import (
@@ -114,6 +116,61 @@ def _replacement_bytes(private_root: Path) -> dict[str, bytes]:
 
 @unittest.skipUnless(sys.platform == "win32", "requires real Windows")
 class WindowsPortableReplacementOwnerTests(unittest.TestCase):
+    def test_replacement_reuses_sealed_projection_after_full_predecessor_check(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            try:
+                identity, coordinator, service = _fixture(root)
+                real_sealer_validation = (
+                    tm_stage_sealer._validate_candidate_proof_index_with_digest
+                )
+                real_predecessor_validation = (
+                    tm_sqlite_store.validate_candidate_proof_index
+                )
+                real_projection_digest = (
+                    tm_sqlite_store._candidate_proof_projection_digest
+                )
+                with (
+                    mock.patch.object(
+                        tm_stage_sealer,
+                        "_validate_candidate_proof_index_with_digest",
+                        wraps=real_sealer_validation,
+                    ) as sealer_validation,
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "validate_candidate_proof_index",
+                        wraps=real_predecessor_validation,
+                    ) as predecessor_validation,
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "_validate_activation_indexes",
+                        side_effect=AssertionError(
+                            "replacement candidate must reuse the sealed projection"
+                        ),
+                    ) as active_full_validation,
+                    mock.patch.object(
+                        tm_sqlite_store,
+                        "_candidate_proof_projection_digest",
+                        wraps=real_projection_digest,
+                    ) as active_projection_digest,
+                ):
+                    outcome = service._explicit_disambiguation(
+                        identity.configured_jsonl_path,
+                        identity.resource_id,
+                    )
+                self.assertIs(type(outcome), MigrationReport)
+                self.assertEqual(outcome.activated_generation, 1)
+                sealer_validation.assert_called_once()
+                predecessor_validation.assert_called_once()
+                active_full_validation.assert_not_called()
+                active_projection_digest.assert_called_once()
+                self.assertEqual(coordinator.current_generation, 1)
+            finally:
+                _remove_long_quarantine(root)
+                _remove_long_private(root)
+
     def test_prior_backups_close_before_prepared_and_ready_adopts_n_plus_one(
         self,
     ) -> None:
