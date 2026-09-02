@@ -278,16 +278,26 @@ class WindowsTMSnapshotRecoveryProcessTests(unittest.TestCase):
     def _expected_first_recovery(cls, phase: str) -> str:
         if not cls._phase_has_issued_receipt(phase):
             return "BLOCKED"
-        if phase in {
-            "owner_completion.after",
-            "business_reproof.before",
-            "business_reproof.after",
-        } or phase.startswith("terminal_reproof.") or phase.startswith("close."):
+        if cls._phase_has_completed_receipt(phase):
             return "NOOP"
         return (
             "CANCELLED"
             if cls._expected_pair_kind(phase) == "old"
             else "COMPLETED"
+        )
+
+    @staticmethod
+    def _phase_has_completed_receipt(phase: str) -> bool:
+        return (
+            phase in {
+                "retained_readback.before.3",
+                "retained_readback.after.3",
+                "owner_completion.after",
+                "business_reproof.before",
+                "business_reproof.after",
+            }
+            or phase.startswith("terminal_reproof.")
+            or phase.startswith("close.")
         )
 
     def _assert_raw_publication_state(
@@ -343,11 +353,7 @@ class WindowsTMSnapshotRecoveryProcessTests(unittest.TestCase):
         elif pair_kind == "new":
             manifest_contract = observed["manifest_contract"]
             self.assertEqual(manifest_contract["receipt"]["snapshot_id"], row[0])
-        completed_phase = phase in {
-            "owner_completion.after",
-            "business_reproof.before",
-            "business_reproof.after",
-        } or phase.startswith("terminal_reproof.") or phase.startswith("close.")
+        completed_phase = self._phase_has_completed_receipt(phase)
         self.assertEqual(row[4], "completed" if completed_phase else "issued")
         if completed_phase:
             self.assertEqual(observed["database"]["binding"][3], row[0])

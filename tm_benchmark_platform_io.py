@@ -30,6 +30,19 @@ from platform_fs_contracts import (
 )
 
 
+def _windows_extended_path(path: Path) -> Path:
+    if sys.platform != "win32":
+        return path
+    raw = str(path)
+    if raw.startswith("\\\\?\\"):
+        return path
+    if raw.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{raw[2:]}")
+    if len(raw) >= 3 and raw[0].isalpha() and raw[1:3] == ":\\":
+        return Path(f"\\\\?\\{raw}")
+    return path
+
+
 @dataclass(frozen=True, slots=True)
 class PortableFileFacts:
     byte_count: int
@@ -291,7 +304,7 @@ def create_windows_private_work_root(prefix: str) -> Path:
         evidence = backend.prove_private(private)
         private.reprove()
         work_root = base / name
-        if work_root.parent != base or any(work_root.iterdir()):
+        if work_root.parent != base or any(_windows_extended_path(work_root).iterdir()):
             raise ValueError("private work root is not a fresh direct child")
         evidence.close()
         evidence = None
@@ -339,7 +352,9 @@ def windows_rooted_directory_names(root_path: Path) -> tuple[str, ...]:
     try:
         root = backend.bind_root(root_path)
         root.reprove()
-        names = tuple(sorted(entry.name for entry in root_path.iterdir()))
+        names = tuple(
+            sorted(entry.name for entry in _windows_extended_path(root_path).iterdir())
+        )
         root.reprove()
         return names
     finally:
@@ -377,7 +392,7 @@ def windows_benchmark_artifact_family(
     try:
         root_authority = backend.bind_root(run_root)
         root_authority.reprove()
-        entries = tuple(run_root.iterdir())
+        entries = tuple(_windows_extended_path(run_root).iterdir())
         root_authority.reprove()
         entry_names = {entry.name for entry in entries}
         private_names = tuple(
@@ -406,7 +421,7 @@ def windows_benchmark_artifact_family(
         private_evidence = backend.prove_private(private_authority)
         private_authority.reprove()
         private_path = run_root / private_names[0]
-        private_entries = tuple(private_path.iterdir())
+        private_entries = tuple(_windows_extended_path(private_path).iterdir())
         private_authority.reprove()
 
         quarantine_authority = backend.bind_parent(
@@ -415,7 +430,7 @@ def windows_benchmark_artifact_family(
         )
         quarantine_authority.reprove()
         quarantine_path = run_root / quarantine_name
-        attempts = tuple(quarantine_path.iterdir())
+        attempts = tuple(_windows_extended_path(quarantine_path).iterdir())
         quarantine_authority.reprove()
         if len(attempts) != 1 or not attempts[0].name.startswith("initial-"):
             raise ValueError("Windows activation quarantine is not closed")
@@ -426,7 +441,7 @@ def windows_benchmark_artifact_family(
         )
         attempt_authority.reprove()
         attempt_path = quarantine_path / attempt_name
-        attempt_files = tuple(attempt_path.iterdir())
+        attempt_files = tuple(_windows_extended_path(attempt_path).iterdir())
         attempt_authority.reprove()
 
         expected_private_files = {
@@ -543,7 +558,9 @@ def cleanup_windows_benchmark_artifact_family(
     fresh_root: RootedDirectoryAuthority | None = None
     try:
         run_root_authority.reprove()
-        root_names = {entry.name for entry in run_root.iterdir()}
+        root_names = {
+            entry.name for entry in _windows_extended_path(run_root).iterdir()
+        }
         run_root_authority.reprove()
         if not root_names:
             return
@@ -568,12 +585,19 @@ def cleanup_windows_benchmark_artifact_family(
         private_path = run_root / private_name
         quarantine_path = run_root / quarantine_name
         authorities[private_relative].reprove()
-        private_names_observed = {entry.name for entry in private_path.iterdir()}
+        private_names_observed = {
+            entry.name for entry in _windows_extended_path(private_path).iterdir()
+        }
         authorities[private_relative].reprove()
         if private_names_observed != expected_private_files:
             raise ValueError("Windows private activation family is not closed")
         authorities[quarantine_relative].reprove()
-        attempt_names = tuple(sorted(entry.name for entry in quarantine_path.iterdir()))
+        attempt_names = tuple(
+            sorted(
+                entry.name
+                for entry in _windows_extended_path(quarantine_path).iterdir()
+            )
+        )
         authorities[quarantine_relative].reprove()
         if len(attempt_names) != 1 or not attempt_names[0].startswith("initial-"):
             raise ValueError("Windows quarantine family is not closed")
@@ -585,7 +609,10 @@ def cleanup_windows_benchmark_artifact_family(
         attempt_path = quarantine_path / attempt_names[0]
         authorities[attempt_relative].reprove()
         attempt_names_observed = tuple(
-            sorted(entry.name for entry in attempt_path.iterdir())
+            sorted(
+                entry.name
+                for entry in _windows_extended_path(attempt_path).iterdir()
+            )
         )
         authorities[attempt_relative].reprove()
         suffixes = sorted(

@@ -82,6 +82,7 @@ class WindowsC3BEvidenceAggregationTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.source_snapshot = "a" * 64
         self.commit = "b" * 40
+        self.environment = gate.current_environment()
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -96,8 +97,13 @@ class WindowsC3BEvidenceAggregationTests(unittest.TestCase):
             log_path.write_text(f"{test_name} ... ok\n", encoding="utf-8")
             rows.append(
                 {
-                    "coverage": ["private"],
+                    "coverage": (
+                        ["private", "elevated positive"]
+                        if index == 0
+                        else ["private", "elevated owner tamper"]
+                    ),
                     "errors": 0,
+                    "expected_failures": 0,
                     "failures": 0,
                     "id": row_id,
                     "log": log_key,
@@ -105,11 +111,12 @@ class WindowsC3BEvidenceAggregationTests(unittest.TestCase):
                     "skipped": 0,
                     "test": test_name,
                     "tests_run": 1,
+                    "unexpected_successes": 0,
                     "verdict": "PASS",
                 }
             )
         report = {
-            "environment": {},
+            "environment": self.environment,
             "repository_commit": self.commit,
             "rows": rows,
             "schema": gate.ELEVATED_SCHEMA,
@@ -169,6 +176,7 @@ class WindowsC3BEvidenceAggregationTests(unittest.TestCase):
             self.commit,
             digest,
             self.source_snapshot,
+            self.environment,
         )
         self.assertEqual([row["verdict"] for row in rows], ["PASS", "PASS"])
 
@@ -180,6 +188,133 @@ class WindowsC3BEvidenceAggregationTests(unittest.TestCase):
                 self.commit,
                 digest,
                 self.source_snapshot,
+                self.environment,
+            )
+
+    def _write_aggregate(
+        self,
+        *,
+        status: str = "NOT_RUN",
+    ) -> tuple[Path, str]:
+        rows: list[dict[str, object]] = []
+        for row_id, selectors, coverage in gate.GROUPS:
+            log_key = f"logs/{row_id}.log"
+            log_path = self.root.joinpath(*log_key.split("/"))
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(f"{row_id} ... ok\n", encoding="utf-8")
+            rows.append(
+                {
+                    "coverage": list(coverage),
+                    "errors": 0,
+                    "expected_failures": 0,
+                    "failures": 0,
+                    "id": row_id,
+                    "log": log_key,
+                    "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
+                    "selected_tests": list(selectors),
+                    "skipped": 0,
+                    "tests_run": gate._load_group(selectors).countTestCases(),
+                    "unexpected_successes": 0,
+                    "verdict": "PASS",
+                }
+            )
+        if status == "FAIL":
+            rows[0]["failures"] = 1
+            rows[0]["verdict"] = "FAIL"
+            rows.extend(gate._pending_rows())
+        elif status == "PASS":
+            for index, test_name in enumerate(gate.ELEVATED_TESTS):
+                row_id = (
+                    "elevated-private-positive",
+                    "elevated-owner-tamper",
+                )[index]
+                coverage = (
+                    ["private", "elevated positive"]
+                    if index == 0
+                    else ["private", "elevated owner tamper"]
+                )
+                log_key = f"logs/{row_id}.log"
+                log_path = self.root.joinpath(*log_key.split("/"))
+                log_path.write_text(f"{row_id} ... ok\n", encoding="utf-8")
+                rows.append(
+                    {
+                        "coverage": coverage,
+                        "errors": 0,
+                        "expected_failures": 0,
+                        "failures": 0,
+                        "id": row_id,
+                        "log": log_key,
+                        "log_sha256": hashlib.sha256(
+                            log_path.read_bytes()
+                        ).hexdigest(),
+                        "skipped": 0,
+                        "test": test_name,
+                        "tests_run": 1,
+                        "unexpected_successes": 0,
+                        "verdict": "PASS",
+                    }
+                )
+            rows.append(
+                {
+                    "coverage": ["documented publish", "normal OS reboot"],
+                    "id": "normal-os-reboot",
+                    "manifest_sha256": "c" * 64,
+                    "scenario_contract_sha256": "d" * 64,
+                    "source_snapshot_sha256": self.source_snapshot,
+                    "test": (
+                        "tools.run_windows_documented_publish_evidence "
+                        "--resume-reboot"
+                    ),
+                    "verdict": "PASS",
+                }
+            )
+        else:
+            rows.extend(gate._pending_rows())
+        report = {
+            "environment": self.environment,
+            "repository_commit": self.commit,
+            "rows": rows,
+            "source_snapshot_sha256": self.source_snapshot,
+            "status": status,
+        }
+        path = self.root / "c3b-matrix.json"
+        path.write_text(json.dumps(report), encoding="utf-8")
+        return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_aggregate_validator_accepts_structurally_valid_not_run(self) -> None:
+        path, digest = self._write_aggregate()
+        result = gate.validate_aggregate_matrix(
+            path,
+            expected_sha256=digest,
+            repository_commit=self.commit,
+            expected_source_snapshot=self.source_snapshot,
+        )
+        self.assertEqual(result["status"], "NOT_RUN")
+
+    def test_aggregate_validator_accepts_strict_pass_and_fail(self) -> None:
+        for status in ("PASS", "FAIL"):
+            with self.subTest(status=status):
+                path, digest = self._write_aggregate(status=status)
+                result = gate.validate_aggregate_matrix(
+                    path,
+                    expected_sha256=digest,
+                    repository_commit=self.commit,
+                    expected_source_snapshot=self.source_snapshot,
+                )
+                self.assertEqual(result["status"], status)
+
+    def test_aggregate_validator_rejects_log_tamper(self) -> None:
+        path, digest = self._write_aggregate()
+        (self.root / "logs" / "shared-contracts.log").write_text(
+            "tampered\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "log digest mismatch"):
+            gate.validate_aggregate_matrix(
+                path,
+                expected_sha256=digest,
+                repository_commit=self.commit,
+                expected_source_snapshot=self.source_snapshot,
             )
 
     def test_reboot_aggregation_accepts_matching_manifest_and_log_snapshot(self) -> None:
@@ -205,6 +340,23 @@ class WindowsC3BEvidenceAggregationTests(unittest.TestCase):
                 "d" * 64,
                 self.source_snapshot,
             )
+
+    def test_reboot_aggregation_preserves_valid_fail_as_no_go_input(self) -> None:
+        manifest = self._write_reboot(self.source_snapshot)
+        matrix_path = self.root / "matrix.json"
+        matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+        matrix["scenarios"][0]["verdict"] = "FAIL"
+        matrix_path.write_text(json.dumps(matrix), encoding="utf-8")
+        manifest["run"]["status"] = "FAIL"
+        manifest["commands"][0]["status"] = "FAIL"
+        with mock.patch.object(gate, "validate_evidence_bundle", return_value=manifest):
+            row = gate._load_reboot_evidence(
+                self.root,
+                self.commit,
+                "d" * 64,
+                self.source_snapshot,
+            )
+        self.assertEqual(row["verdict"], "FAIL")
 
     def test_reboot_aggregation_rejects_manifest_output_snapshot_tamper(self) -> None:
         manifest = self._write_reboot(self.source_snapshot)
