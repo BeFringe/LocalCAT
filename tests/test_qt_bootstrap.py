@@ -99,18 +99,70 @@ class QtBootstrapTest(unittest.TestCase):
         self.assertIn("Qt editor smoke test passed", completed.stdout)
         self.assertNotIn("Traceback", completed.stderr)
 
-    def test_source_authority_failure_precedes_business_imports(self) -> None:
+    def test_source_qt_does_not_require_xlwings(self) -> None:
+        requirements = tuple(
+            line.strip().lower()
+            for line in (ROOT / "requirements-ui.txt").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        self.assertTrue(any(line.startswith("pyside6") for line in requirements))
+        self.assertTrue(any(line.startswith("openpyxl") for line in requirements))
+        self.assertFalse(any(line.startswith("xlwings") for line in requirements))
+
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             launch_cwd = root / "launch-cwd"
             data_dir = root / "app-data"
             launch_cwd.mkdir()
             probe = (
+                "import builtins, sys\n"
+                f"sys.path.insert(0, {str(ROOT)!r})\n"
+                "original_import = builtins.__import__\n"
+                "def guarded_import(name, *args, **kwargs):\n"
+                "    if name == 'xlwings' or name.startswith('xlwings.'):\n"
+                "        raise AssertionError('Qt source imported xlwings')\n"
+                "    return original_import(name, *args, **kwargs)\n"
+                "builtins.__import__ = guarded_import\n"
+                "import qt_editor\n"
+                f"raise SystemExit(qt_editor.main(['--smoke-test', '--data-dir', {str(data_dir)!r}]))\n"
+            )
+            environment = os.environ.copy()
+            environment["QT_QPA_PLATFORM"] = "offscreen"
+            environment.pop("PYTHONHOME", None)
+            environment.pop("PYTHONPATH", None)
+            completed = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=launch_cwd,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Qt editor smoke test passed", completed.stdout)
+        self.assertNotIn("xlwings", completed.stderr.lower())
+        self.assertNotIn("Traceback", completed.stderr)
+
+    def test_source_authority_failure_is_body_safe_before_business_imports(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            launch_cwd = root / "launch-cwd"
+            data_dir = root / "app-data"
+            secret_path = root / "private" / "source-proof.json"
+            secret_body = "proof=private-source-authority-body"
+            launch_cwd.mkdir()
+            probe = (
                 "import sys\n"
                 f"sys.path.insert(0, {str(ROOT)!r})\n"
                 "import platform_source_authority as source_authority\n"
                 "def fail(*args, **kwargs):\n"
-                "    raise RuntimeError('SOURCE.AUTHORITY.UNAVAILABLE')\n"
+                f"    raise RuntimeError({f'{secret_path}: {secret_body}'!r})\n"
                 "source_authority.compose_rooted_source_authority = fail\n"
                 "import qt_editor\n"
                 f"code = qt_editor.main(['--smoke-test', '--data-dir', {str(data_dir)!r}])\n"
@@ -134,7 +186,13 @@ class QtBootstrapTest(unittest.TestCase):
             )
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("SOURCE.AUTHORITY.UNAVAILABLE", completed.stderr)
+        self.assertEqual(
+            completed.stderr.strip(),
+            "LocalCAT Qt editor could not start [LOCALCAT.STARTUP.FAILED].",
+        )
+        self.assertNotIn(str(secret_path), completed.stderr)
+        self.assertNotIn(secret_body, completed.stderr)
+        self.assertNotIn("proof", completed.stderr.lower())
         self.assertNotIn("Traceback", completed.stderr)
 
     def test_missing_openpyxl_only_returns_actionable_xlsx_error(self) -> None:

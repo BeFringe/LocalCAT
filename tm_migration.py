@@ -23,6 +23,7 @@ from tm_activation_journal import (
     ActivationRecoveryReport,
     _ActivationPreparation,
     _PortableReplacementRecord,
+    _WindowsPortableFreshRecoveryOwner,
     _activation_journal_path,
     _activation_journal_temp_path,
     _activation_lineage_marker_path,
@@ -132,6 +133,7 @@ from platform_fs_contracts import (
     CandidateFile,
     EntrySnapshot,
     ExistingCandidateRecovery,
+    ExistingProcessFileLock,
     ExistingFileRetirement,
     ExistingFileDurability,
     ExistingFileMutationGuard,
@@ -2688,6 +2690,21 @@ class TMMigrationService:
             backend,
         )
 
+    def _acquire_existing_initial_reservation(
+        self,
+    ) -> _InitialActivationResourceReservation:
+        """Acquire W1 only when its exact persistent control file exists."""
+
+        backend = self._platform_backend
+        if backend is None:
+            backend = compose_platform_file_backend(
+                self._resource_identity.canonical_sidecar_path.parent
+            )
+        return _InitialActivationResourceReservation.acquire_existing_with_backend(
+            self._resource_identity,
+            backend,
+        )
+
     def preflight(self, source: Path) -> MigrationPreflight:
         """Stream exact source bytes and return safe, deterministic facts."""
 
@@ -2695,6 +2712,70 @@ class TMMigrationService:
         preflight = _scan_jsonl(source)
         self._reject_sidecar_reuse(preflight.source_digest)
         return preflight
+
+    def preflight_pending_recovery(self, source: Path) -> MigrationPreflight:
+        """Classify one exact Windows publication tail without mutating it.
+
+        Ordinary sidecar reuse is never recovery authority.  The portable
+        recovery owner classifies the authenticated post-generation tail for
+        this exact resource/store/source while this seam only consumes its
+        body-free result.  ``activate_initial()`` remains the sole operation
+        that may recover it.
+        """
+
+        self._validate_source_preconditions(source)
+        preflight = _scan_jsonl(source)
+        coordinator = self._coordinator
+        if (
+            sys.platform != "win32"
+            or coordinator is None
+            or coordinator._resource_identity != self._resource_identity
+            or coordinator.resource_id != self._resource_identity.resource_id
+            or coordinator.canonical_store_id != self._canonical_store_id
+            or coordinator.current_generation is not None
+            or coordinator.active_store_path is not None
+            or coordinator.state != "READY"
+        ):
+            raise MigrationPreflightError("MIGRATION.RECOVERY_NOT_APPLICABLE")
+
+        try:
+            reservation = self._acquire_existing_initial_reservation()
+            with reservation:
+                inputs = reservation.portable_recovery_preflight_inputs()
+                eligibility = (
+                    _WindowsPortableFreshRecoveryOwner.classify_initial_publication_tail(
+                        identity=self._resource_identity,
+                        canonical_store_id=self._canonical_store_id,
+                        expected_source_sha256=preflight.source_digest,
+                        backend=cast(PlatformFileBackend, inputs["platform"]),
+                        persistent_private=cast(
+                            Any,
+                            inputs["persistent_private"],
+                        ),
+                        descendant_inspection=cast(
+                            LockedDescendantNamespaceInspection,
+                            inputs["descendant_inspection"],
+                        ),
+                        caller_borrow=cast(Any, inputs["caller_borrow"]),
+                    )
+                )
+                if eligibility.state != "RECOVERABLE":
+                    raise MigrationPreflightError(
+                        "MIGRATION.RECOVERY_NOT_APPLICABLE"
+                    )
+                reservation.reprove()
+                return preflight
+        except MigrationPreflightError:
+            raise
+        except (
+            _InitialActivationReservationError,
+            ActivationPreparationError,
+            PlatformFileError,
+            OSError,
+        ) as error:
+            raise MigrationPreflightError(
+                "MIGRATION.RECOVERY_NOT_APPLICABLE"
+            ) from error
 
     def build_mutable_stage(self, source: Path) -> MigrationStageBuild:
         """Build or reuse one complete unpublished migration stage."""
@@ -9816,8 +9897,43 @@ class _InitialActivationResourceReservation:
     ) -> _InitialActivationResourceReservation:
         """Acquire one reservation through the shared rooted/lock ports."""
 
+        return cls._acquire_with_backend(
+            identity,
+            backend,
+            existing_only=False,
+        )
+
+    @classmethod
+    def acquire_existing_with_backend(
+        cls,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+    ) -> _InitialActivationResourceReservation:
+        """Acquire one exact existing W1 without creating or upgrading it."""
+
+        return cls._acquire_with_backend(
+            identity,
+            backend,
+            existing_only=True,
+        )
+
+    @classmethod
+    def _acquire_with_backend(
+        cls,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        *,
+        existing_only: bool,
+    ) -> _InitialActivationResourceReservation:
+        if type(existing_only) is not bool:
+            raise TypeError("existing_only must be exact bool")
+
         if not isinstance(backend, PlatformFileBackend):
             raise TypeError("backend must satisfy PlatformFileBackend")
+        if existing_only and not isinstance(backend, ExistingProcessFileLock):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
         root: RootedDirectoryAuthority | None = None
         lease: LockLease | None = None
         try:
@@ -9829,12 +9945,21 @@ class _InitialActivationResourceReservation:
                 f".{identity.canonical_sidecar_path.name}."
                 "localcat-initial-activation.lock"
             )
-            lease = backend.acquire(
-                root,
-                lock_name,
-                cls._payload(identity),
-                LockPolicy(LockWait.FAIL_FAST),
-            )
+            if existing_only:
+                assert isinstance(backend, ExistingProcessFileLock)
+                lease = backend.acquire_existing(
+                    root,
+                    lock_name,
+                    cls._payload(identity),
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
+            else:
+                lease = backend.acquire(
+                    root,
+                    lock_name,
+                    cls._payload(identity),
+                    LockPolicy(LockWait.FAIL_FAST),
+                )
             reservation = cls(
                 identity=identity,
                 parent=None,
@@ -10366,6 +10491,20 @@ class _InitialActivationResourceReservation:
         result = self._mint_portable_recovery_inputs()
         self._recovery_borrow_minted = True
         return result
+
+    def portable_recovery_preflight_inputs(self) -> dict[str, object]:
+        """Mint one read-only Windows recovery-classification borrow."""
+
+        if (
+            self._backend is None
+            or self._root is None
+            or self._lease is None
+            or self._released
+        ):
+            raise _InitialActivationReservationError(
+                "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+            )
+        return self._mint_portable_recovery_inputs()
 
     def portable_replacement_recovery_inputs(self) -> dict[str, object]:
         """Mint a fresh single-claim replacement recovery borrow under W1.

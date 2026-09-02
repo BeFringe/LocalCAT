@@ -30,6 +30,7 @@ from platform_fs_contracts import (
     DeviceSecretAuthority,
     EntrySnapshot,
     ExactEmptyChildDirectoryRetirement,
+    ExistingProcessFileLock,
     ExistingFileDurability,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
@@ -2826,7 +2827,7 @@ class _WindowsLockLease(LockLease):
             raise _lock_unavailable() from None
 
 
-class WindowsProcessFileLock(ProcessFileLock):
+class WindowsProcessFileLock(ProcessFileLock, ExistingProcessFileLock):
     """Task 3.3 persistent W1 protocol-control LockFileEx capability."""
 
     def __init__(
@@ -2845,6 +2846,40 @@ class WindowsProcessFileLock(ProcessFileLock):
         payload: bytes,
         policy: LockPolicy,
     ) -> LockLease:
+        return self._acquire_lock(
+            parent,
+            name,
+            payload,
+            policy,
+            existing_only=False,
+        )
+
+    def _acquire_existing(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+        policy: LockPolicy,
+    ) -> LockLease:
+        return self._acquire_lock(
+            parent,
+            name,
+            payload,
+            policy,
+            existing_only=True,
+        )
+
+    def _acquire_lock(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+        policy: LockPolicy,
+        *,
+        existing_only: bool,
+    ) -> LockLease:
+        if type(existing_only) is not bool:
+            raise TypeError("existing_only must be exact bool")
         if type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}:
             raise _lock_unavailable()
         _validate_windows_component(
@@ -2873,20 +2908,21 @@ class WindowsProcessFileLock(ProcessFileLock):
             )
             user_sid = _current_primary_user_sid(api)
             created = False
-            try:
-                with _protocol_control_creation_security(api, user_sid) as security:
-                    handle = _open_protocol_handle(
-                        api,
-                        entry_path,
-                        creation_disposition=CREATE_NEW,
-                        share_mode=0,
-                        security_attributes=security,
-                        init_profile=True,
-                    )
-                created = True
-            except Win32CallError as error:
-                if error.winerror != ERROR_FILE_EXISTS:
-                    raise _lock_unavailable() from None
+            if not existing_only:
+                try:
+                    with _protocol_control_creation_security(api, user_sid) as security:
+                        handle = _open_protocol_handle(
+                            api,
+                            entry_path,
+                            creation_disposition=CREATE_NEW,
+                            share_mode=0,
+                            security_attributes=security,
+                            init_profile=True,
+                        )
+                    created = True
+                except Win32CallError as error:
+                    if error.winerror != ERROR_FILE_EXISTS:
+                        raise _lock_unavailable() from None
 
             if created:
                 _hit_fault(self._fault_injector, "lock_init_after_create")
@@ -2941,6 +2977,8 @@ class WindowsProcessFileLock(ProcessFileLock):
                         payload,
                     )
                     break
+                if existing_only:
+                    raise _lock_unavailable()
                 if not payload.startswith(actual):
                     raise _lock_unavailable()
                 handle.close()

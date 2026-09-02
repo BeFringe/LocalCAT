@@ -212,6 +212,7 @@ _TM_MODE_LABELS = {
 _TM_SAFE_REASON_LABELS = {
     "TM.RUNTIME.PATH_UNAVAILABLE": "本地资源路径不可用",
     "TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE": "Canonical 权威无法验证",
+    "TM.RUNTIME.CANONICAL_RECOVERY_REQUIRED": "Canonical 发布需要完成恢复",
     "TM.RUNTIME.OPEN_UNAVAILABLE": "资源无法安全打开",
     "TM.RUNTIME.SOURCE_BINDING_UNAVAILABLE": "来源绑定无法验证",
     "TM.RUNTIME.QUERY_LEASE_UNAVAILABLE": "Canonical 查询不可用",
@@ -235,6 +236,7 @@ _TM_SAFE_REASON_LABELS = {
     "MIGRATION.ACTIVATION_NOT_READY": "Canonical 激活前置未就绪",
     "MIGRATION.SOURCE_UNREADABLE": "本地来源不可读",
     "MIGRATION.SOURCE_CHANGED": "本地来源已变更",
+    "MIGRATION.RECOVERY_NOT_APPLICABLE": "未发现可安全恢复的 Canonical 发布",
     "RETRIEVAL.CONTEXT_EVIDENCE_MISSING": "Context 尚未开放",
     "RETRIEVAL.CONTEXT_IDENTITY_INVALID": "Context 证据身份无法验证",
     "RETRIEVAL.CONTEXT_EVIDENCE_FAILED": "Context 正确性证据未通过",
@@ -1694,6 +1696,17 @@ class QtSettingsDialog(QDialog):
                 "重新证明同一 canonical 文件身份，不重建 TM 或运行 Fuzzy 验证",
                 True,
             )
+        if (
+            status is not None
+            and status.mode is TMResourceDisplayMode.UNAVAILABLE
+            and status.safe_codes
+            == ("TM.RUNTIME.CANONICAL_RECOVERY_REQUIRED",)
+        ):
+            return (
+                "恢复 canonical",
+                "检查并恢复已完成发布、尚未收尾的 canonical TM",
+                True,
+            )
         if status is not None and status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
             return (
                 "激活 canonical",
@@ -1833,6 +1846,39 @@ class QtSettingsDialog(QDialog):
                     return
                 started = self.controller.reattest_tm_resource(resource_id)
                 action_name = "Canonical 重新验证"
+            elif (
+                status.mode is TMResourceDisplayMode.UNAVAILABLE
+                and status.safe_codes
+                == ("TM.RUNTIME.CANONICAL_RECOVERY_REQUIRED",)
+            ):
+                preflight = self.controller.prepare_tm_activation(resource_id)
+                prompt = (
+                    f"资源：{preflight.resource_name}\n"
+                    f"有效 {preflight.valid_count} · 无效 {preflight.invalid_count} "
+                    f"· 变体 {preflight.variant_count}\n\n"
+                    "将恢复已经发布、尚未完成收尾的 canonical TM；"
+                    "不会从 JSONL 重新构建。"
+                )
+                answer = _ask_localized_question(
+                    self,
+                    "恢复 canonical TM",
+                    prompt,
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                    {
+                        QMessageBox.StandardButton.Yes: "恢复",
+                        QMessageBox.StandardButton.Cancel: "取消",
+                    },
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.controller.cancel_tm_activation(preflight)
+                    self.status_label.setText(
+                        f"已取消 {preflight.resource_name} 的 canonical 恢复。"
+                    )
+                    return
+                started = self.controller.activate_tm_resource(preflight)
+                action_name = "Canonical 恢复"
             elif status.mode is TMResourceDisplayMode.LEGACY_EXACT_ONLY:
                 preflight = self.controller.prepare_tm_activation(resource_id)
                 prompt = (
