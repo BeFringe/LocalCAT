@@ -524,7 +524,7 @@
   - 完成时，完整测试套件退出码为零、四道门证据为最新状态且不存在未解决阻断项
   - _Requirements: 2.9, 4.2, 6.10, 7.5, 8.7, 9.12_
 
-- [ ] 9.6a 执行Windows canonical TM source完整发布验证
+- [x] 9.6a 执行Windows canonical TM source完整发布验证
   - 在源码运行时以固定Windows产品清单完成canonical激活、重启恢复、exact/context/fuzzy、FTS5、snapshot export/refresh与schema/故障恢复；同一发布入口严格消费当前Windows/CPython 3.14 Gate D bundle和C3B source-snapshot handoff。合法benchmark/C3B NO_GO形成可审计阻断，skip、陈旧或畸形输入不得生成GO。通用acceptance/fault/release矩阵不在Windows v3上重解释，其同提交跨平台重签归windows-platform-enablement Task 9.2；TMX产品汇合仍归WA-05/08。
   - _Amendment: WA-06_
   - _Depends: 5.11a, 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
