@@ -1501,6 +1501,54 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
             all(snapshot == expected for _offset, _maximum, snapshot in regular.read_at_calls)
         )
 
+    def test_regular_exact_chunk_stream_defaults_to_bounded_live_reads(self) -> None:
+        payload = b"x" * (64 * 1024 + 17)
+        regular = _Regular(payload)
+        expected = regular.snapshot()
+
+        self.assertEqual(
+            tuple(regular.iter_exact_chunks(expected)),
+            (b"x" * (64 * 1024), b"x" * 17),
+        )
+        self.assertEqual(
+            [(offset, maximum) for offset, maximum, _snapshot in regular.read_at_calls],
+            [(0, 64 * 1024), (64 * 1024, 17), (len(payload), 1)],
+        )
+        self.assertTrue(
+            all(snapshot == expected for _offset, _maximum, snapshot in regular.read_at_calls)
+        )
+        with self.assertRaises(TypeError):
+            regular.iter_exact_chunks(object())  # type: ignore[arg-type]
+        regular.close()
+        with self.assertRaises(PlatformFileError) as caught:
+            regular.iter_exact_chunks(expected)
+        self.assertEqual(
+            caught.exception.code,
+            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
+        )
+
+    def test_exact_chunk_stream_close_releases_backend_iterator(self) -> None:
+        closed = False
+
+        class ClosingRegular(_Regular):
+            def _iter_exact_chunks(
+                self,
+                expected: EntrySnapshot,
+            ) -> object:
+                nonlocal closed
+                del expected
+                try:
+                    yield b"first"
+                    yield b"second"
+                finally:
+                    closed = True
+
+        regular = ClosingRegular(b"firstsecond")
+        stream = regular.iter_exact_chunks(regular.snapshot())
+        self.assertEqual(next(stream), b"first")
+        stream.close()  # type: ignore[attr-defined]
+        self.assertTrue(closed)
+
     def test_regular_content_facts_stream_exact_bytes_and_are_live_only(self) -> None:
         payload = b"x" * (64 * 1024 + 17)
         regular = _Regular(payload)

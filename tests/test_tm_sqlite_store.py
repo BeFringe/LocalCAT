@@ -2255,9 +2255,7 @@ class SQLiteTMStoreTests(unittest.TestCase):
                         for index, source in enumerate(sources)
                     )
                     stream = ((draft, index + 1) for index, draft in enumerate(drafts))
-                    original_frequencies = (
-                        tm_sqlite_store.character_ngram_frequencies
-                    )
+                    original_frequencies = character_ngram_frequencies
                     frequency_calls: dict[tuple[str, int], int] = {}
 
                     def recording_frequencies(
@@ -2269,7 +2267,7 @@ class SQLiteTMStoreTests(unittest.TestCase):
                         return original_frequencies(folded_text, gram_size)
 
                     with patch(
-                        "tm_sqlite_store.character_ngram_frequencies",
+                        "tm_sqlite_candidate_projection.character_ngram_frequencies",
                         side_effect=recording_frequencies,
                     ):
                         store.append_streamed_batch(

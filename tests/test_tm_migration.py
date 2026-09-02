@@ -333,10 +333,17 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                     with patch(
                         "tm_sqlite_store._probe_fts5",
                         return_value=fts5_available,
-                    ):
+                    ), patch.object(
+                        tm_sqlite_store,
+                        "_validate_candidate_index_before_publication",
+                        wraps=(
+                            tm_sqlite_store._validate_candidate_index_before_publication
+                        ),
+                    ) as validator:
                         result = service.build_mutable_stage(
                             identity.configured_jsonl_path
                         )
+                    validator.assert_called_once()
 
                     self.assertIsInstance(result, MigrationStageBuild)
                     self.assertIsNone(result.reused_completed_revision)
@@ -530,17 +537,25 @@ class TMMigrationStageBuildTests(unittest.TestCase):
             with patch(
                 "tm_migration._validate_reusable_stage",
                 wraps=real_validate,
-            ) as validate:
+            ) as validate, patch.object(
+                tm_sqlite_store,
+                "_validate_candidate_index_before_publication",
+                wraps=(
+                    tm_sqlite_store._validate_candidate_index_before_publication
+                ),
+            ) as prepublication:
                 first = service.build_mutable_stage(
                     identity.configured_jsonl_path
                 )
                 self.assertEqual(validate.call_count, 0)
+                prepublication.assert_called_once()
                 second = service.build_mutable_stage(
                     identity.configured_jsonl_path
                 )
 
             self.assertEqual(second, first)
             self.assertEqual(validate.call_count, 1)
+            prepublication.assert_called_once()
 
     def test_naked_sidecar_is_not_authority_and_never_reports_reuse(
         self,
@@ -670,6 +685,68 @@ class TMMigrationStageBuildTests(unittest.TestCase):
                         ),
                         (),
                     )
+
+    def test_validation_or_restore_failure_removes_only_created_stage_files(
+        self,
+    ) -> None:
+        source_bytes = b'{"source":"a","target":"b"}\n'
+        for failure_kind in ("public-validation", "immediate-restore"):
+            with self.subTest(
+                failure=failure_kind
+            ), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                identity = _identity(root)
+                identity.configured_jsonl_path.write_bytes(source_bytes)
+                foreign = root / "foreign.bin"
+                foreign.write_bytes(b"foreign")
+                service = _service(identity)
+                fault = SQLiteStoreSchemaError("STORE.CANDIDATE_INDEX_INVALID")
+                if failure_kind == "public-validation":
+                    context = patch.object(
+                        tm_sqlite_store,
+                        "_validate_candidate_index_before_publication",
+                        side_effect=fault,
+                    )
+
+                    def build() -> object:
+                        return service.build_mutable_stage(
+                            identity.configured_jsonl_path
+                        )
+                else:
+                    preflight = service.preflight(identity.configured_jsonl_path)
+                    context = patch.object(
+                        tm_sqlite_store,
+                        "_restore_streamed_stage_secondary_indexes",
+                        side_effect=fault,
+                    )
+
+                    def build() -> object:
+                        return service._build_stage(
+                            identity.configured_jsonl_path,
+                            preflight=preflight,
+                            canonical_store_id="store.primary",
+                            immediate_seal=True,
+                            batch_kind="migration",
+                            batch_prefix="migration",
+                            snapshot_prefix="snapshot.migration",
+                            stage_prefix="migration",
+                        )
+
+                with context, self.assertRaises(SQLiteStoreSchemaError) as raised:
+                    build()
+                self.assertIs(raised.exception, fault)
+                self.assertEqual(foreign.read_bytes(), b"foreign")
+                self.assertEqual(
+                    tuple(sorted(path.name for path in root.iterdir())),
+                    tuple(
+                        sorted(
+                            (
+                                foreign.name,
+                                identity.configured_jsonl_path.name,
+                            )
+                        )
+                    ),
+                )
 
     def test_issued_receipt_failure_rolls_back_all_stage_files(self) -> None:
         source_bytes = b'{"source":"a","target":"b"}\n'

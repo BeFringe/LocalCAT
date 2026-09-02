@@ -118,6 +118,17 @@ _BANNED_RUNTIME_MODULES = {
 
 
 class BenchmarkImplementationFingerprintTests(unittest.TestCase):
+    def test_platform_backend_implementation_is_in_source_closure(self) -> None:
+        self.assertTrue(
+            {
+                "platform_fs.py",
+                "platform_fs_contracts.py",
+                "platform_fs_posix.py",
+                "platform_fs_windows.py",
+                "windows_file_api.py",
+            }.issubset(tm_benchmark.BENCHMARK_IMPLEMENTATION_SOURCE_PATHS)
+        )
+
     def test_two_pass_snapshot_rejects_earlier_source_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

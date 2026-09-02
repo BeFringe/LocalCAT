@@ -1188,6 +1188,23 @@ def insert_streamed_candidate_gram_rows(
         candidate_records,
         record_ids_by_ordinal,
     )
+    _insert_prepared_streamed_candidate_gram_rows(
+        connection,
+        prepared,
+        candidate_gram_facts,
+        gram_size=gram_size,
+    )
+
+
+def _insert_prepared_streamed_candidate_gram_rows(
+    connection: sqlite3.Connection,
+    prepared: tuple[tuple[int, str, int], ...],
+    candidate_gram_facts: tuple[tuple[int, int, str, int], ...],
+    *,
+    gram_size: int,
+) -> None:
+    """Insert one already-proven gram slice without rebuilding its record map."""
+
     if type(candidate_gram_facts) is not tuple:
         raise TypeError("candidate_gram_facts must be a built-in tuple")
     if type(gram_size) is not int or gram_size not in {1, 2, 3}:
@@ -1231,6 +1248,39 @@ def insert_streamed_candidate_gram_rows(
     )
 
 
+def _insert_generated_streamed_candidate_gram_rows(
+    connection: sqlite3.Connection,
+    prepared: tuple[tuple[int, str, int], ...],
+    *,
+    gram_size: int,
+) -> int:
+    """Generate one owner-prepared gram slice directly in legacy row order."""
+
+    if type(gram_size) is not int or gram_size not in {1, 2, 3}:
+        raise TypeError("gram_size must be an exact supported integer")
+    postings: dict[str, list[tuple[int, int]]] = {}
+    for _origin_ordinal, folded_source, record_id in prepared:
+        for gram, term_frequency in character_ngram_frequencies(
+            folded_source,
+            gram_size,
+        ):
+            postings.setdefault(gram, []).append(
+                (record_id, term_frequency)
+            )
+    gram_row_count = sum(len(rows) for rows in postings.values())
+    connection.executemany(
+        "INSERT INTO tm_gram("
+        "gram_size, gram, record_id, term_frequency) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            (gram_size, gram, record_id, term_frequency)
+            for gram in sorted(postings)
+            for record_id, term_frequency in postings[gram]
+        ),
+    )
+    return gram_row_count
+
+
 def insert_streamed_candidate_fts_rows(
     connection: sqlite3.Connection,
     candidate_records: tuple[tuple[int, str], ...],
@@ -1244,6 +1294,21 @@ def insert_streamed_candidate_fts_rows(
         candidate_records,
         record_ids_by_ordinal,
     )
+    _insert_prepared_streamed_candidate_fts_rows(
+        connection,
+        prepared,
+        fts5_available=fts5_available,
+    )
+
+
+def _insert_prepared_streamed_candidate_fts_rows(
+    connection: sqlite3.Connection,
+    prepared: tuple[tuple[int, str, int], ...],
+    *,
+    fts5_available: bool,
+) -> None:
+    """Insert optional FTS rows from one owner-prepared streamed chunk."""
+
     if type(fts5_available) is not bool:
         raise TypeError("fts5_available must be a built-in bool")
     if fts5_available:
@@ -1274,6 +1339,21 @@ def insert_streamed_candidate_proof_rows(
         candidate_records,
         record_ids_by_ordinal,
     )
+    _insert_prepared_streamed_candidate_proof_rows(
+        connection,
+        prepared,
+        expected_gram_row_count=expected_gram_row_count,
+    )
+
+
+def _insert_prepared_streamed_candidate_proof_rows(
+    connection: sqlite3.Connection,
+    prepared: tuple[tuple[int, str, int], ...],
+    *,
+    expected_gram_row_count: int,
+) -> None:
+    """Maintain proof rows from one owner-prepared streamed chunk."""
+
     record_ids = tuple(item[2] for item in prepared)
     if record_ids and record_ids != tuple(
         range(record_ids[0], record_ids[0] + len(record_ids))
@@ -1356,6 +1436,46 @@ def insert_streamed_candidate_proof_rows(
     )
 
 
+def _insert_streamed_candidate_projection(
+    connection: sqlite3.Connection,
+    candidate_records: tuple[tuple[int, str], ...],
+    record_ids_by_ordinal: tuple[tuple[int, int], ...],
+    *,
+    fts5_available: bool,
+) -> None:
+    """Build one bounded streamed projection from one prepared record copy."""
+
+    prepared = _prepare_streamed_candidate_records(
+        candidate_records,
+        record_ids_by_ordinal,
+    )
+    gram_sizes = (1, 2) if fts5_available else (1, 2, 3)
+    expected_gram_row_count = 0
+    for gram_size in gram_sizes:
+        gram_result = _insert_generated_streamed_candidate_gram_rows(
+            connection,
+            prepared,
+            gram_size=gram_size,
+        )
+        if type(gram_result) is not int or gram_result < 0:
+            raise TypeError("streamed candidate projection returned authority")
+        expected_gram_row_count += gram_result
+    fts_result = _insert_prepared_streamed_candidate_fts_rows(
+        connection,
+        prepared,
+        fts5_available=fts5_available,
+    )
+    if fts_result is not None:
+        raise TypeError("streamed candidate projection returned authority")
+    proof_result = _insert_prepared_streamed_candidate_proof_rows(
+        connection,
+        prepared,
+        expected_gram_row_count=expected_gram_row_count,
+    )
+    if proof_result is not None:
+        raise TypeError("streamed candidate projection returned authority")
+
+
 def streamed_stage_secondary_index_inventory(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -1420,6 +1540,9 @@ def restore_streamed_stage_secondary_indexes(
 
 _CANDIDATE_PROJECTION_DIGEST_VERSION = "candidate-projection-digest-v2"
 _CANDIDATE_PROJECTION_DIGEST_GRAM_CHUNK_ROWS = 50_000
+_CANDIDATE_PROJECTION_DIGEST_FETCH_ROWS = 2_048
+_CANDIDATE_PROJECTION_DIGEST_BUFFER_BYTES = 1024 * 1024
+_CANDIDATE_VALIDATION_FETCH_ROWS = 2_048
 
 
 def _candidate_projection_table_digest(table: str) -> Any:
@@ -1452,7 +1575,10 @@ def _update_candidate_projection_digest(
         framed.extend(encoded)
         framed.extend(b";")
     framed.extend(b"\n")
-    digest.update(framed)
+    if type(digest) is bytearray:
+        digest.extend(framed)
+    else:
+        digest.update(framed)
 
 
 def _finish_candidate_projection_digest(
@@ -1507,11 +1633,11 @@ def _update_candidate_gram_projection_digest(
     last_rowid: int | None = None
     row_payload = (
         "json_array("
-        "typeof(rowid), hex(CAST(rowid AS BLOB)), "
-        "typeof(record_id), hex(CAST(record_id AS BLOB)), "
-        "typeof(gram_size), hex(CAST(gram_size AS BLOB)), "
-        "typeof(gram), hex(CAST(gram AS BLOB)), "
-        "typeof(term_frequency), hex(CAST(term_frequency AS BLOB)), "
+        "typeof(rowid), hex(rowid), "
+        "typeof(record_id), hex(record_id), "
+        "typeof(gram_size), hex(gram_size), "
+        "typeof(gram), hex(gram), "
+        "typeof(term_frequency), hex(term_frequency), "
         "rowid)"
     )
     while True:
@@ -1526,15 +1652,16 @@ def _update_candidate_gram_projection_digest(
                 gram_chunk_rows,
             )
         row = connection.execute(
-            "SELECT group_concat(row_payload, char(10)), COUNT(*) FROM ("
-            f"SELECT {row_payload} AS row_payload "
+            "SELECT CAST(group_concat(row_payload, char(10)) AS BLOB), "
+            "COUNT(*), MAX(cursor_rowid) FROM ("
+            f"SELECT {row_payload} AS row_payload, rowid AS cursor_rowid "
             f"FROM tm_gram NOT INDEXED {where} "
             "ORDER BY rowid LIMIT ?)",
             parameters,
         ).fetchone()
         if (
             type(row) is not tuple
-            or len(row) != 2
+            or len(row) != 3
             or type(row[1]) is not int
             or row[1] < 0
         ):
@@ -1543,20 +1670,21 @@ def _update_candidate_gram_projection_digest(
             )
         chunk_count = row[1]
         if chunk_count == 0:
-            if row[0] is not None:
+            if row[0] is not None or row[2] is not None:
                 raise CandidateProofIndexError(
                     "candidate projection digest chunk is invalid"
                 )
             break
         if (
             chunk_count > gram_chunk_rows
-            or type(row[0]) is not str
+            or type(row[0]) is not bytes
+            or type(row[2]) is not int
+            or isinstance(row[2], bool)
         ):
             raise CandidateProofIndexError(
                 "candidate projection digest chunk is invalid"
             )
-        payload = row[0]
-        encoded = payload.encode("utf-8")
+        encoded = row[0]
         digest.update(b"chunk:")
         digest.update(str(chunk_count).encode("ascii"))
         digest.update(b":")
@@ -1564,22 +1692,7 @@ def _update_candidate_gram_projection_digest(
         digest.update(b":")
         digest.update(encoded)
         digest.update(b";")
-        try:
-            tail = json.loads(payload.rsplit("\n", 1)[-1])
-        except (TypeError, ValueError) as error:
-            raise CandidateProofIndexError(
-                "candidate projection digest tail is invalid"
-            ) from error
-        if (
-            type(tail) is not list
-            or len(tail) != 11
-            or type(tail[10]) is not int
-            or isinstance(tail[10], bool)
-        ):
-            raise CandidateProofIndexError(
-                "candidate projection digest tail is invalid"
-            )
-        next_rowid = tail[10]
+        next_rowid = row[2]
         if last_rowid is not None and next_rowid <= last_rowid:
             raise CandidateProofIndexError(
                 "candidate projection digest order is invalid"
@@ -1617,27 +1730,45 @@ def candidate_proof_projection_digest(
         gram_chunk_rows=gram_chunk_rows,
     )
     block_digest = _candidate_projection_table_digest("tm_candidate_block")
-    for row in connection.execute(
+    block_cursor = connection.execute(
         "SELECT block_id, first_record_id, last_record_id, record_count, "
         "min_source_fold_length, max_source_fold_length "
         "FROM tm_candidate_block ORDER BY block_id"
+    )
+    while rows := block_cursor.fetchmany(
+        _CANDIDATE_PROJECTION_DIGEST_FETCH_ROWS
     ):
-        _update_candidate_projection_digest(block_digest, row)
+        framed = bytearray()
+        for row in rows:
+            _update_candidate_projection_digest(framed, row)
+        block_digest.update(framed)
     table_digests["tm_candidate_block"] = block_digest
     maximum_digest = _candidate_projection_table_digest("tm_gram_block_max")
-    for row in connection.execute(
+    maximum_cursor = connection.execute(
         "SELECT block_id, gram_size, gram, max_term_frequency "
         "FROM tm_gram_block_max ORDER BY block_id, gram_size, gram"
+    )
+    while rows := maximum_cursor.fetchmany(
+        _CANDIDATE_PROJECTION_DIGEST_FETCH_ROWS
     ):
-        _update_candidate_projection_digest(maximum_digest, row)
+        framed = bytearray()
+        for row in rows:
+            _update_candidate_projection_digest(framed, row)
+        maximum_digest.update(framed)
     table_digests["tm_gram_block_max"] = maximum_digest
     if fts5_available:
         fts_digest = _candidate_projection_table_digest("tm_fts")
-        for row in connection.execute(
+        fts_cursor = connection.execute(
             "SELECT record_id, source_fold_v1 FROM tm_fts "
             "ORDER BY record_id"
+        )
+        while rows := fts_cursor.fetchmany(
+            _CANDIDATE_PROJECTION_DIGEST_FETCH_ROWS
         ):
-            _update_candidate_projection_digest(fts_digest, row)
+            framed = bytearray()
+            for row in rows:
+                _update_candidate_projection_digest(framed, row)
+            fts_digest.update(framed)
         table_digests["tm_fts"] = fts_digest
     return _finish_candidate_projection_digest(
         table_digests,
@@ -1694,6 +1825,10 @@ def _validate_candidate_proof_index_core(
             raise CandidateProofIndexError("candidate text fact is invalid")
         return value
 
+    def batched_rows(cursor: sqlite3.Cursor) -> Any:
+        while rows := cursor.fetchmany(_CANDIDATE_VALIDATION_FETCH_ROWS):
+            yield from rows
+
     record_cursor = connection.execute(
         "SELECT record_id, source_raw, source_fold_v1, source_fold_length "
         "FROM tm_record ORDER BY record_id"
@@ -1718,15 +1853,43 @@ def _validate_candidate_proof_index_core(
         if fts5_available
         else None
     )
-    current_gram = gram_cursor.fetchone()
-    current_block = block_cursor.fetchone()
-    current_maximum = maximum_cursor.fetchone()
-    current_fts = fts_cursor.fetchone() if fts_cursor is not None else None
+    gram_rows = iter(batched_rows(gram_cursor))
+    block_rows = iter(batched_rows(block_cursor))
+    maximum_rows = iter(batched_rows(maximum_cursor))
+    fts_rows = (
+        iter(batched_rows(fts_cursor)) if fts_cursor is not None else None
+    )
+    current_gram = next(gram_rows, None)
+    current_block = next(block_rows, None)
+    current_maximum = next(maximum_rows, None)
+    current_fts = next(fts_rows, None) if fts_rows is not None else None
     gram_counts = {size: 0 for size in required_sizes}
     fts_count = 0
     block_id: int | None = None
     block_lengths: list[int] = []
     block_maxima: dict[tuple[int, str], int] = {}
+    table_digests: dict[str, Any] | None = None
+    block_digest_buffer: bytearray | None = None
+    maximum_digest_buffer: bytearray | None = None
+    fts_digest_buffer: bytearray | None = None
+    if include_projection_digest:
+        table_digests = {
+            "tm_gram": _candidate_projection_table_digest("tm_gram"),
+            "tm_candidate_block": _candidate_projection_table_digest(
+                "tm_candidate_block"
+            ),
+            "tm_gram_block_max": _candidate_projection_table_digest(
+                "tm_gram_block_max"
+            ),
+        }
+        block_digest_buffer = bytearray()
+        maximum_digest_buffer = bytearray()
+        if fts5_available:
+            table_digests["tm_fts"] = _candidate_projection_table_digest(
+                "tm_fts"
+            )
+            fts_digest_buffer = bytearray()
+    missing_expected_gram = object()
 
     def flush_block() -> None:
         nonlocal current_block, current_maximum
@@ -1745,7 +1908,21 @@ def _validate_candidate_proof_index_core(
             proof_int(value) for value in current_block
         ) != expected_block:
             raise CandidateProofIndexError("candidate block fact is invalid")
-        current_block = block_cursor.fetchone()
+        if block_digest_buffer is not None:
+            _update_candidate_projection_digest(
+                block_digest_buffer,
+                current_block,
+            )
+            if (
+                len(block_digest_buffer)
+                >= _CANDIDATE_PROJECTION_DIGEST_BUFFER_BYTES
+            ):
+                assert table_digests is not None
+                table_digests["tm_candidate_block"].update(
+                    block_digest_buffer
+                )
+                block_digest_buffer.clear()
+        current_block = next(block_rows, None)
         actual_maxima: dict[tuple[int, str], int] = {}
         while current_maximum is not None:
             maximum_block_id = proof_int(current_maximum[0])
@@ -1760,18 +1937,40 @@ def _validate_candidate_proof_index_core(
                     "candidate block maximum is invalid"
                 )
             actual_maxima[key] = frequency
-            current_maximum = maximum_cursor.fetchone()
+            if maximum_digest_buffer is not None:
+                _update_candidate_projection_digest(
+                    maximum_digest_buffer,
+                    current_maximum,
+                )
+                if (
+                    len(maximum_digest_buffer)
+                    >= _CANDIDATE_PROJECTION_DIGEST_BUFFER_BYTES
+                ):
+                    assert table_digests is not None
+                    table_digests["tm_gram_block_max"].update(
+                        maximum_digest_buffer
+                    )
+                    maximum_digest_buffer.clear()
+            current_maximum = next(maximum_rows, None)
         if actual_maxima != block_maxima:
             raise CandidateProofIndexError(
                 "candidate block maximum is invalid"
             )
 
     expected_record_id = 1
-    for record_row in record_cursor:
-        record_id = proof_int(record_row[0])
-        source_raw = proof_text(record_row[1])
-        stored_folded_source = proof_text(record_row[2])
-        source_fold_length = proof_int(record_row[3])
+    for record_row in batched_rows(record_cursor):
+        record_id = record_row[0]
+        if type(record_id) is not int:
+            raise CandidateProofIndexError("candidate integer fact is invalid")
+        source_raw = record_row[1]
+        if type(source_raw) is not str or not source_raw:
+            raise CandidateProofIndexError("candidate text fact is invalid")
+        stored_folded_source = record_row[2]
+        if type(stored_folded_source) is not str or not stored_folded_source:
+            raise CandidateProofIndexError("candidate text fact is invalid")
+        source_fold_length = record_row[3]
+        if type(source_fold_length) is not int:
+            raise CandidateProofIndexError("candidate integer fact is invalid")
         folded_source = fold_text_value_v1(source_raw)
         if (
             not folded_source
@@ -1789,41 +1988,61 @@ def _validate_candidate_proof_index_core(
         block_id = next_block_id
         block_lengths.append(source_fold_length)
 
-        actual_grams: dict[tuple[int, str], int] = {}
+        expected_grams: dict[tuple[int, str], int] = {}
+        for size in required_sizes:
+            for offset in range(max(0, len(folded_source) - size + 1)):
+                key = (size, folded_source[offset : offset + size])
+                expected_grams[key] = expected_grams.get(key, 0) + 1
+        previous_gram_key: tuple[int, str] | None = None
+        gram_mismatch = False
         while current_gram is not None:
-            gram_record_id = proof_int(current_gram[0])
+            gram_record_id = current_gram[0]
+            if type(gram_record_id) is not int:
+                raise CandidateProofIndexError(
+                    "candidate integer fact is invalid"
+                )
             if gram_record_id != record_id:
                 break
-            size = proof_int(current_gram[1])
-            gram = proof_text(current_gram[2])
-            frequency = proof_int(current_gram[3])
+            size = current_gram[1]
+            if type(size) is not int:
+                raise CandidateProofIndexError(
+                    "candidate integer fact is invalid"
+                )
+            gram = current_gram[2]
+            if type(gram) is not str or not gram:
+                raise CandidateProofIndexError("candidate text fact is invalid")
+            frequency = current_gram[3]
+            if type(frequency) is not int:
+                raise CandidateProofIndexError(
+                    "candidate integer fact is invalid"
+                )
             key = (size, gram)
             if (
                 size not in required_sizes
                 or frequency < 1
-                or key in actual_grams
+                or key == previous_gram_key
             ):
                 raise CandidateProofIndexError(
                     "candidate gram fact is invalid"
                 )
-            actual_grams[key] = frequency
-            current_gram = gram_cursor.fetchone()
-        expected_grams = {
-            (size, gram): frequency
-            for size in required_sizes
-            for gram, frequency in character_ngram_frequencies(
-                folded_source, size
+            previous_gram_key = key
+            expected_frequency = expected_grams.pop(
+                key,
+                missing_expected_gram,
             )
-        }
-        if actual_grams != expected_grams:
-            raise CandidateProofIndexError("candidate gram fact is invalid")
-        for (size, gram), frequency in actual_grams.items():
+            if (
+                expected_frequency is missing_expected_gram
+                or frequency != expected_frequency
+            ):
+                gram_mismatch = True
             gram_counts[size] += 1
             if size in {1, 2}:
-                key = (size, gram)
                 block_maxima[key] = max(
                     block_maxima.get(key, 0), frequency
                 )
+            current_gram = next(gram_rows, None)
+        if gram_mismatch or expected_grams:
+            raise CandidateProofIndexError("candidate gram fact is invalid")
 
         if fts5_available:
             if current_fts is None:
@@ -1837,8 +2056,20 @@ def _validate_candidate_proof_index_core(
                     "candidate FTS fact is invalid"
                 )
             fts_count += 1
+            if fts_digest_buffer is not None:
+                _update_candidate_projection_digest(
+                    fts_digest_buffer,
+                    current_fts,
+                )
+                if (
+                    len(fts_digest_buffer)
+                    >= _CANDIDATE_PROJECTION_DIGEST_BUFFER_BYTES
+                ):
+                    assert table_digests is not None
+                    table_digests["tm_fts"].update(fts_digest_buffer)
+                    fts_digest_buffer.clear()
             current_fts = (
-                fts_cursor.fetchone() if fts_cursor is not None else None
+                next(fts_rows, None) if fts_rows is not None else None
             )
 
     flush_block()
@@ -1851,18 +2082,28 @@ def _validate_candidate_proof_index_core(
         )
     if current_fts is not None:
         raise CandidateProofIndexError("candidate FTS fact is invalid")
+    projection_digest: str | None = None
+    if table_digests is not None:
+        assert block_digest_buffer is not None
+        assert maximum_digest_buffer is not None
+        table_digests["tm_candidate_block"].update(block_digest_buffer)
+        table_digests["tm_gram_block_max"].update(maximum_digest_buffer)
+        if fts5_available:
+            assert fts_digest_buffer is not None
+            table_digests["tm_fts"].update(fts_digest_buffer)
+        _update_candidate_gram_projection_digest(
+            connection,
+            table_digests["tm_gram"],
+            gram_chunk_rows=gram_chunk_rows,
+        )
+        projection_digest = _finish_candidate_projection_digest(
+            table_digests,
+            fts5_available=fts5_available,
+        )
     return (
         tuple(sorted(gram_counts.items())),
         fts_count,
-        (
-            candidate_proof_projection_digest(
-                connection,
-                fts5_available=fts5_available,
-                gram_chunk_rows=gram_chunk_rows,
-            )
-            if include_projection_digest
-            else None
-        ),
+        projection_digest,
     )
 
 

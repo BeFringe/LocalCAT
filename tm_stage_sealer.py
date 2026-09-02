@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -80,7 +81,7 @@ from text_matcher import fold_text_value_v1
 
 _NATIVE_PATH_TYPE = type(Path())
 _READ_CHUNK_BYTES = 1024 * 1024
-_PORTABLE_CANDIDATE_COPY_CHUNK_BYTES = 64 * 1024
+_STAGE_CLOSURE_FETCH_ROWS = 2_048
 _PORTABLE_PUBLICATION_ASSETS = frozenset({"database", "manifest"})
 _EXPECTED_PROVENANCE_JSON = (
     '[["source","legacy-jsonl"]]'
@@ -491,28 +492,11 @@ class _PortableStageLiveAuthority(OpaqueAuthority):
         )
         try:
             expected_snapshot = expected_facts.snapshot
-
-            def exact_chunks() -> Iterator[bytes]:
-                offset = 0
-                while offset < expected_snapshot.byte_count:
-                    maximum_bytes = min(
-                        _PORTABLE_CANDIDATE_COPY_CHUNK_BYTES,
-                        expected_snapshot.byte_count - offset,
-                    )
-                    chunk = source.read_at(
-                        offset,
-                        maximum_bytes,
-                        expected_snapshot,
-                    )
-                    offset += len(chunk)
-                    yield chunk
-                if source.read_at(offset, 1, expected_snapshot):
-                    raise StageSealError("SEALER.ARTIFACT_MUTATED")
-
-            copied = candidate.write_chunks(
-                exact_chunks(),
-                maximum_bytes=expected_snapshot.byte_count,
-            )
+            with closing(source.iter_exact_chunks(expected_snapshot)) as exact_chunks:
+                copied = candidate.write_chunks(
+                    exact_chunks,
+                    maximum_bytes=expected_snapshot.byte_count,
+                )
             if (
                 copied.byte_count != expected_proof.size
                 or copied.content_sha256.hex() != expected_proof.sha256
@@ -940,6 +924,7 @@ class _PortableVerifiedSealCommitCapability:
     evidence: StageValidationEvidence
     generation: GenerationExpectation
     attestation: PortableSealedContentAttestation
+    candidate_projection_digest: str
     authority_transfer: _PortableAuthorityTransfer
     nonce: str
     _factory_key: object
@@ -961,6 +946,15 @@ class _PortableVerifiedSealCommitCapability:
             raise TypeError("generation must be exact")
         if type(self.attestation) is not PortableSealedContentAttestation:
             raise TypeError("portable attestation must be exact")
+        if (
+            type(self.candidate_projection_digest) is not str
+            or len(self.candidate_projection_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.candidate_projection_digest
+            )
+        ):
+            raise ValueError("portable candidate projection digest is invalid")
         if type(self.authority_transfer) is not _PortableAuthorityTransfer:
             raise TypeError("portable authority transfer must be exact")
         self.authority_transfer._require_open()
@@ -976,6 +970,7 @@ def _create_portable_verified_seal_commit_capability(
     evidence: StageValidationEvidence,
     generation: GenerationExpectation,
     attestation: PortableSealedContentAttestation,
+    candidate_projection_digest: str,
     authority_transfer: _PortableAuthorityTransfer,
 ) -> _PortableVerifiedSealCommitCapability:
     if type(registry) is not _SealedArtifactRegistry:
@@ -998,6 +993,11 @@ def _create_portable_verified_seal_commit_capability(
     object.__setattr__(capability, "evidence", claim)
     object.__setattr__(capability, "generation", expected_generation)
     object.__setattr__(capability, "attestation", attestation)
+    object.__setattr__(
+        capability,
+        "candidate_projection_digest",
+        candidate_projection_digest,
+    )
     object.__setattr__(capability, "authority_transfer", authority_transfer)
     object.__setattr__(
         capability,
@@ -1030,6 +1030,7 @@ class _PortableRegistryEntry:
     stage: SealedStage
     state: ActivationCapabilityState
     sealed_content_attestation: PortableSealedContentAttestation
+    candidate_projection_digest: str
     live_authority: _PortableStageLiveAuthority | None
     token: contract_module._ActivationToken | None = None
 
@@ -1075,6 +1076,7 @@ class _PortablePhysicalReadinessSnapshot:
     evidence: StageValidationEvidence
     generation: GenerationExpectation
     sealed_content_attestation: PortableSealedContentAttestation
+    candidate_projection_digest: str
     live_reproof: _PortableAuthorityBorrow
 
 
@@ -1543,6 +1545,51 @@ def _winners_parity_digest(winners: dict[str, str]) -> str:
     return digest.hexdigest()
 
 
+def _stage_closure_cell_frame(value: object) -> bytes:
+    if value is None:
+        return b"n;"
+    if type(value) is str:
+        encoded = value.encode("utf-8")
+        tag = b"s"
+    elif type(value) is int and not isinstance(value, bool):
+        encoded = str(value).encode("ascii")
+        tag = b"i"
+    else:
+        raise StageSealError("SEALER.STAGE_INVALID")
+    return (
+        tag
+        + str(len(encoded)).encode("ascii")
+        + b":"
+        + encoded
+        + b";"
+    )
+
+
+def _stage_closure_row_frame(row: tuple[object, ...]) -> bytes:
+    """Frame one closure row without a Python helper call per cell."""
+
+    framed = bytearray()
+    for value in row:
+        if value is None:
+            framed.extend(b"n;")
+            continue
+        if type(value) is str:
+            encoded = value.encode("utf-8")
+            tag = b"s"
+        elif type(value) is int and not isinstance(value, bool):
+            encoded = str(value).encode("ascii")
+            tag = b"i"
+        else:
+            raise StageSealError("SEALER.STAGE_INVALID")
+        framed.extend(tag)
+        framed.extend(str(len(encoded)).encode("ascii"))
+        framed.extend(b":")
+        framed.extend(encoded)
+        framed.extend(b";")
+    framed.extend(b"\n")
+    return bytes(framed)
+
+
 def _stage_closure_digests(
     connection: sqlite3.Connection,
     *,
@@ -1566,23 +1613,13 @@ def _stage_closure_digests(
         hashlib.sha256() if reconstruct_pre_activation else None
     )
 
-    def frame(digest: Any, value: object) -> None:
-        if value is None:
-            digest.update(b"n;")
-            return
-        if type(value) is str:
-            encoded = value.encode("utf-8")
-            tag = b"s"
-        elif type(value) is int and not isinstance(value, bool):
-            encoded = str(value).encode("ascii")
-            tag = b"i"
+    def frame(digest: Any, value: object) -> bytes:
+        encoded_frame = _stage_closure_cell_frame(value)
+        if type(digest) is bytearray:
+            digest.extend(encoded_frame)
         else:
-            raise StageSealError("SEALER.STAGE_INVALID")
-        digest.update(tag)
-        digest.update(str(len(encoded)).encode("ascii"))
-        digest.update(b":")
-        digest.update(encoded)
-        digest.update(b";")
+            digest.update(encoded_frame)
+        return encoded_frame
 
     def pre_activation_row(
         table: str,
@@ -1619,18 +1656,40 @@ def _stage_closure_digests(
         frame_table_header(table)
         cursor = connection.execute(query)
         while True:
-            row = cursor.fetchone()
-            if row is None:
+            rows = cursor.fetchmany(_STAGE_CLOSURE_FETCH_ROWS)
+            if not rows:
                 break
-            for cell in row:
-                frame(active_digest, cell)
-            active_digest.update(b"\n")
-            if pre_activation_digest is not None:
-                reconstructed = pre_activation_row(table, row)
-                if reconstructed is not None:
-                    for cell in reconstructed:
-                        frame(pre_activation_digest, cell)
-                    pre_activation_digest.update(b"\n")
+            active_framed = bytearray()
+            pre_activation_framed = (
+                bytearray() if pre_activation_digest is not None else None
+            )
+            for row in rows:
+                if pre_activation_framed is not None:
+                    reconstructed = pre_activation_row(table, row)
+                else:
+                    reconstructed = None
+                if (
+                    pre_activation_framed is not None
+                    and reconstructed == row
+                ):
+                    encoded_row = _stage_closure_row_frame(row)
+                    active_framed.extend(encoded_row)
+                    pre_activation_framed.extend(encoded_row)
+                else:
+                    active_framed.extend(_stage_closure_row_frame(row))
+                    if (
+                        pre_activation_framed is not None
+                        and reconstructed is not None
+                    ):
+                        pre_activation_framed.extend(
+                            _stage_closure_row_frame(reconstructed)
+                        )
+            active_digest.update(active_framed)
+            if (
+                pre_activation_digest is not None
+                and pre_activation_framed is not None
+            ):
+                pre_activation_digest.update(pre_activation_framed)
 
     def has_table(table: str) -> bool:
         row = connection.execute(
@@ -3563,6 +3622,9 @@ class _SealedArtifactRegistry:
                 stage=sealed_stage,
                 state=ActivationCapabilityState.SEALED,
                 sealed_content_attestation=attestation,
+                candidate_projection_digest=(
+                    capability.candidate_projection_digest
+                ),
                 live_authority=live_authority,
             )
             self._sealed_paths[reservation.key] = artifact_id
@@ -3880,6 +3942,9 @@ class _SealedArtifactRegistry:
                     generation=entry.stage.generation,
                     sealed_content_attestation=(
                         entry.sealed_content_attestation
+                    ),
+                    candidate_projection_digest=(
+                        entry.candidate_projection_digest
                     ),
                     live_reproof=_PortableAuthorityBorrow(
                         self,
@@ -4269,6 +4334,7 @@ class StageSealer:
                 evidence,
                 generation,
                 attestation,
+                facts.candidate_projection_digest,
                 authority_transfer,
             )
             sealed_stage = lifecycle._commit_verified(capability)

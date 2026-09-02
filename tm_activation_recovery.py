@@ -1259,6 +1259,7 @@ class _PortableRecoveryStorePort(Protocol):
         activation_digest: str,
         expected_logical_closure_digest: str,
         database_guard: BoundExistingFileMutationGuard,
+        expected_candidate_projection_digest: str | None = None,
     ) -> tuple[
         _CanonicalStoreRef,
         Any,
