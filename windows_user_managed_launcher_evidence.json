@@ -1,0 +1,79 @@
+{
+  "schema_version": "localcat-windows-user-managed-launcher-evidence-v1",
+  "generated_at_utc": "2026-09-02T19:31:13Z",
+  "implementation_anchor": "039604bd26969918bc414d03cccdabf931283977",
+  "implementation_tree": "a1f006eb05d9bda2d1d1dedc3c67d1141f2348b1",
+  "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "architecture": "AMD64",
+    "python": "3.14.7",
+    "runtime": "E:\\Archives\\Project\\CAT\\.validation-ui-mvp\\venv\\Scripts\\python.exe",
+    "pyside6": "6.11.1",
+    "openpyxl": "3.1.5",
+    "qwindows_bytes": 1006904,
+    "temporary_root": "E:\\SDK\\tmp"
+  },
+  "scope": {
+    "owner": "windows-platform-enablement",
+    "task": "6.6a",
+    "delivery_phase": "user-managed-source",
+    "status": "PASS",
+    "entry": "LocalCAT Source.lnk -> absolute venv pythonw.exe -I -> installed stdlib guardian -> same-runtime child -> qt_editor.py",
+    "installed_files": [
+      "windows_source_guardian.py",
+      "LocalCAT-logo-silver.ico"
+    ],
+    "excluded": [
+      "Python or dependency redistribution",
+      "LocalCAT business-source copying",
+      "TrustedSourceAuthority or frozen bootstrap handoff",
+      "WA-08 full visible product journey",
+      "packaged or frozen release"
+    ]
+  },
+  "matrix": [
+    {
+      "id": "windows_source_launcher_and_qt_bootstrap",
+      "command": "python -B -m unittest tests.test_windows_source_launcher tests.test_qt_bootstrap",
+      "tests": 21,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "seconds": 35.762,
+      "result": "PASS"
+    },
+    {
+      "id": "requirements_ui_dependency_integrity",
+      "command": "python -m pip check",
+      "result": "PASS",
+      "output": "No broken requirements found."
+    }
+  ],
+  "assertions": {
+    "absolute_current_venv_pythonw": "PASS",
+    "cpython_3_14_x64_dedicated_venv": "PASS",
+    "pyside6_openpyxl_qwindows_preflight": "PASS",
+    "non_repository_working_directory": "PASS",
+    "developer_override_environment_removed": "PASS",
+    "visible_native_window": "PASS",
+    "qt_platform_windows": "PASS",
+    "guardian_and_qt_child_are_distinct_processes": "PASS",
+    "application_icon_and_version": "PASS",
+    "windows_shell_extractable_ico": "PASS",
+    "normal_exit": "PASS",
+    "missing_checkout_body_free_diagnostic": "PASS",
+    "child_nonzero_body_free_diagnostic": "PASS",
+    "child_native_abort_body_free_diagnostic": "PASS"
+  },
+  "authority_boundary": {
+    "guardian_role": "Environment/path preflight, same-runtime child supervision and stable diagnostic projection only.",
+    "source_authority": "The child qt_editor composition remains the sole owner of rooted LocalCAT source authority.",
+    "frozen_authority": "NOT_CLAIMED"
+  },
+  "review": {
+    "cumulative": "APPROVED",
+    "p0": 0,
+    "p1": 0,
+    "p2": 0
+  }
+}

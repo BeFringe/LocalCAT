@@ -377,7 +377,7 @@
   - _Boundary: Feature5 UI Windows Source Integration_
   - _Depends: 0.3a, 0.3c, 6.3, 6.4_
 
-- [ ] 6.6a 实现并验证user-managed Windows轻量GUI入口
+- [x] 6.6a 实现并验证user-managed Windows轻量GUI入口
   - 用户安装CPython 3.14 x64、创建专用venv并按`requirements-ui.txt`安装依赖；入口只使用受验证的绝对`pythonw.exe`和source bootstrap，不复制Python/PySide6/Qt/source或冒充packaged release
   - 从non-repository CWD启动真实可见窗口并验证qwindows、图标/版本、环境清理、正常退出与环境/source路径失效诊断；本任务只交付可被WA-08使用的入口，不提前声称完整产品journey
   - 完成时WA-08 5.4a可经该入口运行，且入口没有取得ADR-022 bootstrap/packaging authority
