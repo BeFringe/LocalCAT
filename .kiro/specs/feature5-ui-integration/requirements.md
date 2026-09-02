@@ -24,7 +24,7 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 1. Windows source启动必须先由platform factory建立ADR-020/021 rooted source、lock与private-proof ports，再import/construct CapabilityHost、Controller或业务graph；Windows frozen启动必须先由ADR-022 native entry/Boot TCB闭合并移交`TrustedSourceAuthority`，随后才建立platform factory并进入业务import。不支持的平台状态只产生安全startup/capability failure，不绕过为path-only proof。
 2. source CapabilityHost只能消费rooted source authority对实际loader/source/fixture digest的既有证明；frozen CapabilityHost只能消费`TrustedSourceLoader`对retained-handle exact executed source的attestation/digest/origin/`co_filename` closure。两种路径均不得用`Path.resolve()`、`lstat()`、`O_NOFOLLOW=0`、loader metadata或PYZ/bytecode duplicate铸造source authority。
-3. Windows canonical activation/restart与ADR-021 re-attestation必须保持Core owner envelope、nested `WindowsPrivateProof`、same store/generation与Gate C/D正交；UI只投影safe state，不显示raw proof/path或自行判定资格。
+3. Windows canonical activation/restart以ADR-021 cold-open reproof保持Core owner envelope、nested `WindowsPrivateProof`、same store/generation与Gate C/D正交；v3 durable qualification保存portable content/phase、owner facts与nested private proof，live FileId只参与当前会话比较，成功重开不改写durable qualification；UI只投影safe state，不显示raw proof/path或自行判定资格。
 4. packaged resource lifecycle、TM activation/restart与集成回归必须在 non-repository CWD 验证；本 amendment不把PyInstaller build、Qt project/resource journey、TM Core或Resource owner迁入本 Spec。
 5. source与frozen验收分阶段完成：source阶段可先交付用户管理Python/venv的Windows运行时，但不构成packaged release；只有frozen阶段消费ADR-022 authority并完成packaged integration后，本amendment才达到terminal completion。
 

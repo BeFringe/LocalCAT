@@ -6938,6 +6938,17 @@ class _PortableFreshRecoverySnapshot:
         raise TypeError("portable recovery snapshot is code-only")
 
 
+@dataclass(frozen=True, slots=True)
+class _PortableRecoveryEligibility:
+    """Body-free read-only classification of one Windows initial tail."""
+
+    state: str
+
+    def __post_init__(self) -> None:
+        if self.state not in {"NOT_APPLICABLE", "RECOVERABLE", "READY"}:
+            raise ValueError("portable recovery eligibility is invalid")
+
+
 class _WindowsPortablePublicationPhaseOwner:
     """Write-once owner for one exact portable canonical-publication phase."""
 
@@ -7631,6 +7642,226 @@ class _WindowsPortableFreshRecoveryOwner:
         if result is None:
             raise AssertionError("portable recovery owner produced no snapshot")
         return result
+
+    @staticmethod
+    def classify_initial_publication_tail(
+        *,
+        identity: CanonicalResourceIdentity,
+        canonical_store_id: str,
+        expected_source_sha256: str,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> _PortableRecoveryEligibility:
+        """Classify every legal post-GENERATION tail without mutating it."""
+
+        if (
+            type(expected_source_sha256) is not str
+            or len(expected_source_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_source_sha256
+            )
+        ):
+            raise TypeError("portable recovery source digest is invalid")
+        snapshot = _WindowsPortableFreshRecoveryOwner.inspect(
+            identity=identity,
+            canonical_store_id=canonical_store_id,
+            backend=backend,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+        )
+        if (
+            snapshot.state != "PENDING"
+            or snapshot.namespace_state != "JOURNAL"
+            or snapshot.highest_phase != "GENERATION_PUBLISHED"
+            or type(snapshot.pending_record) is not _PortableActivationJournalRecord
+            or len(snapshot.phase_records) != len(_PORTABLE_PUBLICATION_PHASES)
+        ):
+            return _PortableRecoveryEligibility("NOT_APPLICABLE")
+        pending = snapshot.pending_record.unsigned
+        active = snapshot.phase_records[-1].unsigned.active_content_attestation
+        if (
+            type(active) is not PortableActiveContentAttestation
+            or pending.resource_id != identity.resource_id
+            or pending.target_identity != identity.target_identity
+            or pending.canonical_store_id != canonical_store_id
+            or pending.source_jsonl_digest != expected_source_sha256
+            or pending.sealed_content_attestation.source.sha256
+            != expected_source_sha256
+            or active.source.sha256 != expected_source_sha256
+        ):
+            return _PortableRecoveryEligibility("NOT_APPLICABLE")
+
+        root, lease = caller_borrow._fresh_recovery_authorities(
+            backend,
+            persistent_private,
+            identity,
+        )
+
+        def exact_file(
+            relative: PurePath,
+            expected: PortableContentFileProof,
+            parent: BoundDirectoryAuthority,
+        ) -> bool:
+            authority = None
+            try:
+                entry = parent.inspect_entry(relative.name)
+                if entry is None:
+                    return False
+                authority = backend.open_regular(root, relative)
+                facts = authority.content_facts()
+                return (
+                    facts.snapshot == entry
+                    and facts.snapshot.identity.kind == "regular"
+                    and facts.snapshot.identity.link_count == 1
+                    and facts.snapshot.reparse_free
+                    and facts.snapshot.byte_count == expected.size
+                    and facts.content_sha256.hex() == expected.sha256
+                    and parent.inspect_entry(relative.name) == facts.snapshot
+                )
+            finally:
+                if authority is not None:
+                    authority.close()
+
+        sealed = pending.sealed_content_attestation
+        for name, expected in (
+            (identity.canonical_sidecar_path.name, active.database),
+            (identity.snapshot_manifest_path.name, active.manifest),
+            (identity.configured_jsonl_path.name, active.source),
+        ):
+            if not exact_file(PurePath(name), expected, root):
+                return _PortableRecoveryEligibility("NOT_APPLICABLE")
+
+        stage_expected = {
+            pending.candidate_stage_db_name: sealed.database,
+            pending.candidate_manifest_temp_name: sealed.manifest,
+        }
+        stage_presence = {
+            name: root.inspect_entry(name) is not None for name in stage_expected
+        }
+        if len(set(stage_presence.values())) != 1:
+            return _PortableRecoveryEligibility("NOT_APPLICABLE")
+        stage_present = next(iter(stage_presence.values()))
+        if stage_present and any(
+            not exact_file(PurePath(name), expected, root)
+            for name, expected in stage_expected.items()
+        ):
+            return _PortableRecoveryEligibility("NOT_APPLICABLE")
+
+        quarantine_name = _portable_initial_stage_quarantine_name(
+            identity,
+            pending,
+        )
+        quarantine_target: BoundDirectoryAuthority | None = None
+        quarantine_names: set[str] | None = None
+        quarantine_root_entry = root.inspect_entry(
+            _PORTABLE_ACTIVATION_QUARANTINE_ROOT
+        )
+        try:
+            if quarantine_root_entry is not None:
+                if (
+                    quarantine_root_entry.identity.kind != "directory"
+                    or not quarantine_root_entry.reparse_free
+                ):
+                    return _PortableRecoveryEligibility("NOT_APPLICABLE")
+                quarantine_root = backend.bind_parent(
+                    root,
+                    PurePath(
+                        _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                        "eligibility-placeholder",
+                    ),
+                )
+                try:
+                    target_entry = quarantine_root.inspect_entry(quarantine_name)
+                finally:
+                    quarantine_root.close()
+                if target_entry is not None:
+                    if (
+                        target_entry.identity.kind != "directory"
+                        or not target_entry.reparse_free
+                    ):
+                        return _PortableRecoveryEligibility("NOT_APPLICABLE")
+                    quarantine_target = backend.bind_parent(
+                        root,
+                        PurePath(
+                            _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                            quarantine_name,
+                            "eligibility-placeholder",
+                        ),
+                    )
+                    quarantine_names = {
+                        item.name
+                        for item in descendant_inspection.observe_descendant_entries(
+                            root,
+                            lease,
+                            quarantine_target,
+                            LedgerEnumerationLimits(
+                                maximum_entries=2,
+                                maximum_name_bytes=4096,
+                                maximum_total_bytes=sum(
+                                    proof.size
+                                    for proof in stage_expected.values()
+                                ),
+                            ),
+                        )
+                    }
+                    if quarantine_names and (
+                        quarantine_names != set(stage_expected)
+                        or any(
+                            not exact_file(
+                                PurePath(
+                                    _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                                    quarantine_name,
+                                    name,
+                                ),
+                                expected,
+                                quarantine_target,
+                            )
+                            for name, expected in stage_expected.items()
+                        )
+                    ):
+                        return _PortableRecoveryEligibility("NOT_APPLICABLE")
+        finally:
+            if quarantine_target is not None:
+                quarantine_target.close()
+
+        if stage_present:
+            if quarantine_names is not None and quarantine_names != set():
+                return _PortableRecoveryEligibility("NOT_APPLICABLE")
+        elif quarantine_names != set(stage_expected):
+            return _PortableRecoveryEligibility("NOT_APPLICABLE")
+
+        marker_name = _activation_lineage_marker_path(identity).name
+        marker_temp_name = _activation_lineage_marker_temp_path(
+            _activation_lineage_marker_path(identity)
+        ).name
+        if root.inspect_entry(marker_temp_name) is not None:
+            return _PortableRecoveryEligibility("NOT_APPLICABLE")
+        marker_entry = root.inspect_entry(marker_name)
+        if marker_entry is None:
+            caller_borrow.reprove(backend, identity)
+            return _PortableRecoveryEligibility("RECOVERABLE")
+        marker = backend.open_regular(root, PurePath(marker_name))
+        try:
+            marker_facts = marker.content_facts()
+            marker_valid = (
+                not stage_present
+                and marker_facts.snapshot == marker_entry
+                and marker_facts.snapshot.identity.kind == "regular"
+                and marker_facts.snapshot.identity.link_count == 1
+                and marker_facts.snapshot.reparse_free
+                and marker.read_all() == _activation_lineage_marker_payload(identity)
+                and root.inspect_entry(marker_name) == marker_facts.snapshot
+            )
+        finally:
+            marker.close()
+        caller_borrow.reprove(backend, identity)
+        return _PortableRecoveryEligibility(
+            "READY" if marker_valid else "NOT_APPLICABLE"
+        )
 
 
 def _portable_initial_stage_quarantine_name(
