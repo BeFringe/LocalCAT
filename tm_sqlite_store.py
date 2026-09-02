@@ -2777,11 +2777,12 @@ def _open_completed_authority_read_connection(
     _require_absolute_path(database_path, "database_path")
     if _completed_authority_sqlite_sidecar_present(database_path):
         raise SQLiteStoreSchemaError("STORE.SQLITE_SIDECAR_PRESENT")
+    database, uri = _sqlite_readonly_connection_target(database_path)
     connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro&immutable=1",
+        database,
         timeout=BUSY_TIMEOUT_MS / 1000,
         isolation_level=None,
-        uri=True,
+        uri=uri,
     )
     try:
         connection.enable_load_extension(False)
@@ -2822,7 +2823,7 @@ def _inspect_completed_active_schema_read_only(
         raise TypeError("legacy upgrade-only mode must be exact bool")
     validated_stage = _require_inspectable_store_ref(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
-    if not validated_stage.staged_db_path.is_file():
+    if not _sqlite_path_is_regular_file(validated_stage.staged_db_path):
         raise SQLiteStoreSchemaError("STORE.DATABASE_MISSING")
     with _open_completed_authority_read_connection(
         validated_stage.staged_db_path
@@ -7894,9 +7895,13 @@ class ResourceStoreCoordinator:
                             "ACTIVATION.DB_REOPEN_INVALID",
                             retryable=False,
                         )
+                    database, uri = _sqlite_uri_connection_target(
+                        identity.canonical_sidecar_path,
+                        mode="ro",
+                    )
                     readonly = sqlite3.connect(
-                        f"{identity.canonical_sidecar_path.as_uri()}?mode=ro",
-                        uri=True,
+                        database,
+                        uri=uri,
                         timeout=BUSY_TIMEOUT_MS / 1000,
                         isolation_level=None,
                     )
@@ -17482,11 +17487,10 @@ def _open_configured_connection(
     """Open one short, thread-local connection under the fixed policy."""
 
     _require_absolute_path(database_path, "database_path")
-    database: str | Path = database_path
-    uri = False
-    if expected_file is not None or require_existing:
-        database = f"{database_path.as_uri()}?mode=rw"
-        uri = True
+    database, uri = _sqlite_connection_target(
+        database_path,
+        require_existing=(expected_file is not None or require_existing),
+    )
     connection = sqlite3.connect(
         database,
         timeout=BUSY_TIMEOUT_MS / 1000,
@@ -17520,6 +17524,109 @@ def _open_configured_connection(
         yield connection
     finally:
         connection.close()
+
+
+def _sqlite_connection_target(
+    database_path: Path,
+    *,
+    require_existing: bool,
+) -> tuple[str | Path, bool]:
+    """Return the platform SQLite locator without weakening open semantics.
+
+    CPython's bundled SQLite uses the ordinary ``win32`` VFS by default.  That
+    VFS cannot open a database whose native path crosses the legacy Windows
+    path boundary, even though the rooted Win32 adapter has already created
+    and retained the exact file.  The built-in ``win32-longpath`` VFS accepts
+    the extended-length URI spelling.  ``mode=rw`` remains mandatory for an
+    existing reservation so a name swap cannot make SQLite create a new file.
+    """
+
+    if type(require_existing) is not bool:
+        raise TypeError("require_existing must be a built-in bool")
+    if sys.platform == "win32":
+        return _sqlite_uri_connection_target(
+            database_path,
+            mode="rw" if require_existing else "rwc",
+        )
+    if require_existing:
+        return f"{database_path.as_uri()}?mode=rw", True
+    return database_path, False
+
+
+def _sqlite_readonly_connection_target(
+    database_path: Path,
+) -> tuple[str, bool]:
+    return _sqlite_uri_connection_target(
+        database_path,
+        mode="ro",
+        immutable=True,
+    )
+
+
+def _sqlite_uri_connection_target(
+    database_path: Path,
+    *,
+    mode: str,
+    immutable: bool = False,
+) -> tuple[str, bool]:
+    if mode not in {"ro", "rw", "rwc"}:
+        raise ValueError("SQLite URI mode is invalid")
+    if type(immutable) is not bool:
+        raise TypeError("immutable must be a built-in bool")
+    windows_uri = _windows_extended_sqlite_uri(database_path)
+    base = windows_uri if windows_uri is not None else database_path.as_uri()
+    query = f"mode={mode}"
+    if immutable:
+        query += "&immutable=1"
+    if windows_uri is not None:
+        query += "&vfs=win32-longpath"
+    return f"{base}?{query}", True
+
+
+def _windows_extended_sqlite_uri(database_path: Path) -> str | None:
+    if sys.platform != "win32":
+        return None
+    ordinary_uri = database_path.as_uri()
+    drive_prefix = "file:///"
+    if not ordinary_uri.startswith(drive_prefix):
+        return None
+    drive_path = ordinary_uri[len(drive_prefix) :]
+    if not (
+        len(drive_path) >= 3
+        and drive_path[0].isalpha()
+        and drive_path[1:3] == ":/"
+    ):
+        return None
+    return f"file:////%3f/{drive_path}"
+
+
+def _sqlite_native_probe_path(database_path: Path) -> str | Path:
+    if sys.platform != "win32":
+        return database_path
+    raw = str(database_path)
+    if raw.startswith("\\\\?\\"):
+        return raw
+    if raw.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{raw[2:]}"
+    if len(raw) >= 3 and raw[0].isalpha() and raw[1:3] == ":\\":
+        return f"\\\\?\\{raw}"
+    return database_path
+
+
+def _sqlite_path_is_regular_file(database_path: Path) -> bool:
+    try:
+        observed = os.stat(_sqlite_native_probe_path(database_path))
+    except OSError:
+        return False
+    return stat.S_ISREG(observed.st_mode)
+
+
+def _sqlite_path_is_symlink(database_path: Path) -> bool:
+    try:
+        observed = os.lstat(_sqlite_native_probe_path(database_path))
+    except OSError:
+        return False
+    return stat.S_ISLNK(observed.st_mode)
 
 
 @contextmanager
@@ -17581,11 +17688,15 @@ def _open_health_connection(
 
     database_path = lease.stage.staged_db_path
     _require_absolute_path(database_path, "database_path")
+    database, uri = _sqlite_uri_connection_target(
+        database_path,
+        mode="ro",
+    )
     connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro",
+        database,
         timeout=BUSY_TIMEOUT_MS / 1000,
         isolation_level=None,
-        uri=True,
+        uri=uri,
     )
     try:
         connection.enable_load_extension(False)
@@ -17802,7 +17913,7 @@ def inspect_stage_schema(
         raise TypeError("_allow_legacy_schema must be a built-in bool")
     validated_stage = _require_inspectable_store_ref(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
-    if not validated_stage.staged_db_path.is_file():
+    if not _sqlite_path_is_regular_file(validated_stage.staged_db_path):
         raise SQLiteStoreSchemaError("STORE.DATABASE_MISSING")
     with _open_configured_connection(
         validated_stage.staged_db_path,
@@ -18265,7 +18376,7 @@ def _require_stage(value: object) -> MutableStageRef:
     identity = value.resource_identity
     if not isinstance(identity, CanonicalResourceIdentity):
         raise TypeError("stage resource identity is invalid")
-    if value.staged_db_path.is_symlink():
+    if _sqlite_path_is_symlink(value.staged_db_path):
         raise SQLiteStoreSchemaError("STORE.STAGE_PATH_UNSAFE")
     if value.staged_db_path == identity.canonical_sidecar_path:
         raise SQLiteStoreSchemaError("STORE.CANONICAL_WRITE_FORBIDDEN")
@@ -18300,7 +18411,7 @@ def _require_inspectable_store_ref(value: object) -> _StoreRuntimeRef:
         or value.manifest_temp_path != identity.snapshot_manifest_path
     ):
         raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
-    if value.staged_db_path.is_symlink():
+    if _sqlite_path_is_symlink(value.staged_db_path):
         raise SQLiteStoreSchemaError("STORE.STAGE_PATH_UNSAFE")
     return value
 
@@ -18701,9 +18812,13 @@ def _schema_upgrade_db_capture(
 def _schema_upgrade_head_revision(database_path: Path) -> int:
     """Read the active store's head revision strictly read-only."""
 
+    database, uri = _sqlite_uri_connection_target(
+        database_path,
+        mode="ro",
+    )
     connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro",
-        uri=True,
+        database,
+        uri=uri,
         isolation_level=None,
     )
     try:
@@ -18740,9 +18855,13 @@ def _schema_upgrade_head_revision(database_path: Path) -> int:
 def _read_schema_upgrade_marker(database_path: Path) -> str | None:
     """Read the durable schema-upgrade origin marker, or None when absent."""
 
+    database, uri = _sqlite_uri_connection_target(
+        database_path,
+        mode="ro",
+    )
     connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro",
-        uri=True,
+        database,
+        uri=uri,
         isolation_level=None,
     )
     try:
@@ -18780,9 +18899,13 @@ def _require_schema_upgrade_ancestry_provable(database_path: Path) -> None:
     sorting.  The store is opened strictly read-only and never mutated.
     """
 
+    database, uri = _sqlite_uri_connection_target(
+        database_path,
+        mode="ro",
+    )
     connection = sqlite3.connect(
-        f"{database_path.as_uri()}?mode=ro",
-        uri=True,
+        database,
+        uri=uri,
         isolation_level=None,
     )
     try:
