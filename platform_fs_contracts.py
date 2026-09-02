@@ -847,6 +847,59 @@ class BoundRegularFile(OpaqueAuthority, ABC):
         expected: EntrySnapshot,
     ) -> bytes: ...
 
+    def iter_exact_chunks(self, expected: EntrySnapshot) -> Iterator[bytes]:
+        """Stream one exact file generation through this live authority."""
+
+        self._require_open()
+        if type(expected) is not EntrySnapshot:
+            raise TypeError("expected must be exact EntrySnapshot")
+        chunks = self._iter_exact_chunks(expected)
+
+        def checked_chunks() -> Iterator[bytes]:
+            try:
+                byte_count = 0
+                for chunk in chunks:
+                    if type(chunk) is not bytes:
+                        raise TypeError("backend exact stream chunks must be exact bytes")
+                    if not chunk or len(chunk) > self._MAXIMUM_BOUNDED_READ_BYTES:
+                        raise ValueError(
+                            "backend exact stream chunks must contain from 1 through 65536 bytes"
+                        )
+                    byte_count += len(chunk)
+                    if byte_count > expected.byte_count:
+                        raise PlatformFileError(
+                            PlatformFileErrorCode.IDENTITY_STALE,
+                            retryable=True,
+                        )
+                    yield chunk
+                if byte_count != expected.byte_count:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.IDENTITY_STALE,
+                        retryable=True,
+                    )
+            finally:
+                close = getattr(chunks, "close", None)
+                if callable(close):
+                    close()
+
+        return checked_chunks()
+
+    def _iter_exact_chunks(self, expected: EntrySnapshot) -> Iterator[bytes]:
+        offset = 0
+        while offset < expected.byte_count:
+            maximum_bytes = min(
+                self._MAXIMUM_BOUNDED_READ_BYTES,
+                expected.byte_count - offset,
+            )
+            chunk = self.read_at(offset, maximum_bytes, expected)
+            offset += len(chunk)
+            yield chunk
+        if self.read_at(offset, 1, expected) or self.snapshot() != expected:
+            raise PlatformFileError(
+                PlatformFileErrorCode.IDENTITY_STALE,
+                retryable=True,
+            )
+
     def read_all(self) -> bytes:
         self._require_open()
         expected = self.snapshot()

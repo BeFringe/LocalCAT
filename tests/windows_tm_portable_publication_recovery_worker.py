@@ -1302,10 +1302,26 @@ def _activate(
     coordinator, service = _owner(identity)
     registry = coordinator._sealed_registry
     boundary_calls = 0
+    full_validation_calls = 0
     expected_primary: BaseException | None = None
     caught_error: BaseException | None = None
     fault_guard: _FreshReproveFaultGuard | None = None
     with ExitStack() as stack:
+        if mode.startswith("recover"):
+            real_full_validation = tm_sqlite_store._validate_activation_indexes
+
+            def count_full_validation(*args: object, **kwargs: object) -> object:
+                nonlocal full_validation_calls
+                full_validation_calls += 1
+                return real_full_validation(*args, **kwargs)
+
+            stack.enter_context(
+                mock.patch.object(
+                    tm_sqlite_store,
+                    "_validate_activation_indexes",
+                    new=count_full_validation,
+                )
+            )
         if reject_database_materialization:
             private_root = (
                 root
@@ -1497,6 +1513,7 @@ def _activate(
     )
     return {
         "mode": mode,
+        "full_validation_calls": full_validation_calls,
         "pid": os.getpid(),
         "guarded": guarded,
         "boundary_calls": boundary_calls,

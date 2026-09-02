@@ -6,12 +6,16 @@ import ast
 from pathlib import Path
 import sqlite3
 import unittest
+from unittest import mock
 
 import tm_sqlite_candidate_projection as projection
 from tm_candidate_store_contracts import (
+    CandidateProofIndexError,
     SQLiteCandidateProofBlock,
     SQLiteStoreSchemaError,
+    character_ngram_frequencies,
 )
+from text_matcher import fold_text_value_v1
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +24,31 @@ _EXPECTED_PROJECTION_FUNCTION_SURFACE = (
     ("_chunks", ("values",)),
     ("_finish_candidate_projection_digest", ("table_digests", "fts5_available")),
     ("_fts5_match_expression", ("trigrams",)),
+    (
+        "_insert_generated_streamed_candidate_gram_rows",
+        ("connection", "prepared", "gram_size"),
+    ),
+    (
+        "_insert_prepared_streamed_candidate_fts_rows",
+        ("connection", "prepared", "fts5_available"),
+    ),
+    (
+        "_insert_prepared_streamed_candidate_gram_rows",
+        ("connection", "prepared", "candidate_gram_facts", "gram_size"),
+    ),
+    (
+        "_insert_prepared_streamed_candidate_proof_rows",
+        ("connection", "prepared", "expected_gram_row_count"),
+    ),
+    (
+        "_insert_streamed_candidate_projection",
+        (
+            "connection",
+            "candidate_records",
+            "record_ids_by_ordinal",
+            "fts5_available",
+        ),
+    ),
     (
         "_prepare_streamed_candidate_records",
         ("candidate_records", "record_ids_by_ordinal"),
@@ -42,6 +71,7 @@ _EXPECTED_PROJECTION_FUNCTION_SURFACE = (
             "gram_chunk_rows",
         ),
     ),
+    ("_validate_candidate_proof_index_core.batched_rows", ("cursor",)),
     ("_validate_candidate_proof_index_core.flush_block", ()),
     ("_validate_candidate_proof_index_core.proof_int", ("value",)),
     ("_validate_candidate_proof_index_core.proof_text", ("value",)),
@@ -298,7 +328,47 @@ def _connection() -> sqlite3.Connection:
     return connection
 
 
+def _proof_validation_connection() -> sqlite3.Connection:
+    connection = _connection()
+    connection.execute("ALTER TABLE tm_record ADD COLUMN source_raw TEXT")
+    connection.execute(
+        "UPDATE tm_record SET source_raw = source_fold_v1"
+    )
+    connection.execute(
+        "DELETE FROM tm_gram_block_max WHERE gram_size = 3"
+    )
+    connection.commit()
+    return connection
+
+
 class CandidateProjectionArchitectureTests(unittest.TestCase):
+    def test_streamed_exported_wrappers_keep_raw_input_validation(self) -> None:
+        connection = _connection()
+        self.addCleanup(connection.close)
+        invalid_records: object = []
+        with self.assertRaisesRegex(TypeError, "candidate_records"):
+            projection.insert_streamed_candidate_gram_rows(
+                connection,
+                invalid_records,  # type: ignore[arg-type]
+                (),
+                (),
+                gram_size=1,
+            )
+        with self.assertRaisesRegex(TypeError, "candidate_records"):
+            projection.insert_streamed_candidate_fts_rows(
+                connection,
+                invalid_records,  # type: ignore[arg-type]
+                (),
+                fts5_available=False,
+            )
+        with self.assertRaisesRegex(TypeError, "candidate_records"):
+            projection.insert_streamed_candidate_proof_rows(
+                connection,
+                invalid_records,  # type: ignore[arg-type]
+                (),
+                expected_gram_row_count=0,
+            )
+
     def test_imports_and_executable_calls_stay_inside_the_data_plane(self) -> None:
         source = (_ROOT / "tm_sqlite_candidate_projection.py").read_text(
             encoding="utf-8"
@@ -419,7 +489,7 @@ def future_candidate_callback(connection, callback):
             node
             for node in tree.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "insert_streamed_candidate_proof_rows"
+            and node.name == "_insert_prepared_streamed_candidate_proof_rows"
         )
         sql_literals = tuple(
             node.value
@@ -460,6 +530,295 @@ def future_candidate_callback(connection, callback):
 
 
 class CandidateProjectionReadTests(unittest.TestCase):
+    def test_validator_direct_grams_match_canonical_helper(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.executescript(
+            "CREATE TABLE tm_record ("
+            "record_id INTEGER PRIMARY KEY, source_raw TEXT NOT NULL, "
+            "source_fold_v1 TEXT NOT NULL, source_fold_length INTEGER NOT NULL);"
+            "CREATE TABLE tm_gram ("
+            "record_id INTEGER NOT NULL, gram_size INTEGER NOT NULL, "
+            "gram TEXT NOT NULL, term_frequency INTEGER NOT NULL);"
+            "CREATE TABLE tm_gram_block_max ("
+            "block_id INTEGER NOT NULL, gram_size INTEGER NOT NULL, "
+            "gram TEXT NOT NULL, max_term_frequency INTEGER NOT NULL);"
+            "CREATE TABLE tm_candidate_block ("
+            "block_id INTEGER PRIMARY KEY, first_record_id INTEGER NOT NULL, "
+            "last_record_id INTEGER NOT NULL, record_count INTEGER NOT NULL, "
+            "min_source_fold_length INTEGER NOT NULL, "
+            "max_source_fold_length INTEGER NOT NULL);"
+        )
+        raw_sources = ("x", "xy", "abab", "ÉéÉ")
+        gram_rows: list[tuple[int, int, str, int]] = []
+        maxima: dict[tuple[int, str], int] = {}
+        lengths: list[int] = []
+        for record_id, raw_source in enumerate(raw_sources, start=1):
+            folded_source = fold_text_value_v1(raw_source)
+            lengths.append(len(folded_source))
+            connection.execute(
+                "INSERT INTO tm_record VALUES (?, ?, ?, ?)",
+                (record_id, raw_source, folded_source, len(folded_source)),
+            )
+            for size in (1, 2, 3):
+                for gram, frequency in character_ngram_frequencies(
+                    folded_source,
+                    size,
+                ):
+                    gram_rows.append((record_id, size, gram, frequency))
+                    if size in {1, 2}:
+                        key = (size, gram)
+                        maxima[key] = max(maxima.get(key, 0), frequency)
+        connection.executemany(
+            "INSERT INTO tm_gram VALUES (?, ?, ?, ?)",
+            gram_rows,
+        )
+        connection.executemany(
+            "INSERT INTO tm_gram_block_max VALUES (0, ?, ?, ?)",
+            tuple(
+                (size, gram, frequency)
+                for (size, gram), frequency in maxima.items()
+            ),
+        )
+        connection.execute(
+            "INSERT INTO tm_candidate_block VALUES (0, 1, 256, ?, ?, ?)",
+            (len(raw_sources), min(lengths), max(lengths)),
+        )
+        connection.commit()
+        expected_counts = tuple(
+            (size, sum(1 for row in gram_rows if row[1] == size))
+            for size in (1, 2, 3)
+        )
+
+        with mock.patch.object(
+            projection,
+            "character_ngram_frequencies",
+            side_effect=AssertionError("validator must use direct gram counting"),
+        ):
+            self.assertEqual(
+                projection.validate_candidate_proof_index(
+                    connection,
+                    required_sizes=(1, 2, 3),
+                    fts5_available=False,
+                ),
+                (expected_counts, 0),
+            )
+
+    def test_gram_duplicate_and_mismatch_preserve_error_precedence(
+        self,
+    ) -> None:
+        duplicate = _proof_validation_connection()
+        self.addCleanup(duplicate.close)
+        duplicate.execute(
+            "INSERT INTO tm_gram(record_id, gram_size, gram, term_frequency) "
+            "VALUES (1, 1, 'a', 2)"
+        )
+        duplicate.execute(
+            "INSERT INTO tm_gram(record_id, gram_size, gram, term_frequency) "
+            "VALUES (1, 'bad-size', 'later', 1)"
+        )
+        with self.assertRaisesRegex(
+            CandidateProofIndexError,
+            "^candidate gram fact is invalid$",
+        ):
+            projection.validate_candidate_proof_index(
+                duplicate,
+                required_sizes=(1, 2, 3),
+                fts5_available=False,
+            )
+
+        mismatch = _proof_validation_connection()
+        self.addCleanup(mismatch.close)
+        mismatch.execute(
+            "UPDATE tm_gram SET term_frequency = term_frequency + 1 "
+            "WHERE record_id = 1 AND gram_size = 1 AND gram = 'a'"
+        )
+        mismatch.execute(
+            "INSERT INTO tm_gram(record_id, gram_size, gram, term_frequency) "
+            "VALUES (1, 'bad-size', 'later', 1)"
+        )
+        with self.assertRaisesRegex(
+            CandidateProofIndexError,
+            "^candidate integer fact is invalid$",
+        ):
+            projection.validate_candidate_proof_index(
+                mismatch,
+                required_sizes=(1, 2, 3),
+                fts5_available=False,
+            )
+
+    def test_projection_digest_preserves_v2_bytes_across_chunk_boundaries(
+        self,
+    ) -> None:
+        connection = _connection()
+        self.addCleanup(connection.close)
+        expected_without_fts = {
+            1: (
+                "61ca0ced6519efa8b3c4d2ecac7965f7"
+                "4dd513f35c07dcce5621654d24ea03e4"
+            ),
+            2: (
+                "bb72a73938dd3a88fa4038da67f64636"
+                "8d358044309b095f6c20423c8ea037d6"
+            ),
+            50_000: (
+                "be50776b7f9c703d8bc4c0b672b24816"
+                "099b0eea5b920baf0a84f3a9d66184eb"
+            ),
+        }
+        for chunk_rows, expected in expected_without_fts.items():
+            with self.subTest(fts5_available=False, chunk_rows=chunk_rows):
+                self.assertEqual(
+                    projection.candidate_proof_projection_digest(
+                        connection,
+                        fts5_available=False,
+                        gram_chunk_rows=chunk_rows,
+                    ),
+                    expected,
+                )
+
+        connection.execute(
+            "CREATE TABLE tm_fts(record_id INTEGER, source_fold_v1 TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO tm_fts VALUES (?, ?)",
+            ((1, "aba"), (2, "abb")),
+        )
+        expected_with_fts = {
+            1: (
+                "0b32660d8bf4389d32a92be30c9c7eab"
+                "d74c6c609c1074e248574ec42ce715b5"
+            ),
+            2: (
+                "5e459d274d196d5d0cdfc4d19565eace"
+                "315233ecd67ab759a02fe2846486be06"
+            ),
+            50_000: (
+                "97215c21b096d7f10b5ae1ddbdd7827e"
+                "ecca0c32bcdf620b389d336079e6b1fc"
+            ),
+        }
+        for chunk_rows, expected in expected_with_fts.items():
+            with self.subTest(fts5_available=True, chunk_rows=chunk_rows):
+                self.assertEqual(
+                    projection.candidate_proof_projection_digest(
+                        connection,
+                        fts5_available=True,
+                        gram_chunk_rows=chunk_rows,
+                    ),
+                    expected,
+                )
+
+    def test_gram_digest_hex_elides_cast_without_payload_drift(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE payload_values("
+            "record_id, gram_size, gram, term_frequency)"
+        )
+        connection.executemany(
+            "INSERT INTO payload_values VALUES (?, ?, ?, ?)",
+            (
+                (1, 2, 3, 4),
+                ("1", "2", "gram", "4"),
+                (None, None, None, None),
+                (
+                    sqlite3.Binary(b"\x00\xff"),
+                    sqlite3.Binary(b"\x01\xfe"),
+                    sqlite3.Binary(b"\x02\xfd"),
+                    sqlite3.Binary(b"\x03\xfc"),
+                ),
+                (1.5, 2.5, 3.5, 4.5),
+            ),
+        )
+        columns = (
+            "rowid",
+            "record_id",
+            "gram_size",
+            "gram",
+            "term_frequency",
+        )
+        old_payload = "json_array(" + ", ".join(
+            item
+            for column in columns
+            for item in (
+                f"typeof({column})",
+                f"hex(CAST({column} AS BLOB))",
+            )
+        ) + ")"
+        new_payload = "json_array(" + ", ".join(
+            item
+            for column in columns
+            for item in (f"typeof({column})", f"hex({column})")
+        ) + ")"
+        rows = connection.execute(
+            f"SELECT CAST({old_payload} AS BLOB), "
+            f"CAST({new_payload} AS BLOB), typeof(record_id) "
+            "FROM payload_values ORDER BY rowid"
+        ).fetchall()
+        self.assertEqual(
+            tuple(row[2] for row in rows),
+            ("integer", "text", "null", "blob", "real"),
+        )
+        self.assertEqual(
+            tuple(row[0] for row in rows),
+            tuple(row[1] for row in rows),
+        )
+
+    def test_projection_digest_empty_gram_path_and_tamper_remain_exact(
+        self,
+    ) -> None:
+        empty = sqlite3.connect(":memory:")
+        self.addCleanup(empty.close)
+        empty.executescript(
+            "CREATE TABLE tm_gram(record_id INTEGER, gram_size INTEGER, "
+            "gram TEXT, term_frequency INTEGER);"
+            "CREATE TABLE tm_candidate_block("
+            "block_id INTEGER, first_record_id INTEGER, last_record_id INTEGER, "
+            "record_count INTEGER, min_source_fold_length INTEGER, "
+            "max_source_fold_length INTEGER);"
+            "CREATE TABLE tm_gram_block_max("
+            "block_id INTEGER, gram_size INTEGER, gram TEXT, "
+            "max_term_frequency INTEGER);"
+        )
+        empty_digest = projection.candidate_proof_projection_digest(
+            empty,
+            fts5_available=False,
+            gram_chunk_rows=1,
+        )
+        self.assertEqual(
+            empty_digest,
+            "fa799b02f752b48ca3d3e3275b16a288"
+            "8e2e58f126a5b5e4976f4429da253447",
+        )
+
+        connection = _connection()
+        self.addCleanup(connection.close)
+        baseline = projection.candidate_proof_projection_digest(
+            connection,
+            fts5_available=False,
+            gram_chunk_rows=2,
+        )
+        connection.execute(
+            "UPDATE tm_gram SET term_frequency = term_frequency + 1 "
+            "WHERE rowid = (SELECT MIN(rowid) FROM tm_gram)"
+        )
+        tampered = projection.candidate_proof_projection_digest(
+            connection,
+            fts5_available=False,
+            gram_chunk_rows=2,
+        )
+        self.assertNotEqual(tampered, baseline)
+        connection.rollback()
+        self.assertEqual(
+            projection.candidate_proof_projection_digest(
+                connection,
+                fts5_available=False,
+                gram_chunk_rows=2,
+            ),
+            baseline,
+        )
+
     def test_fts5_single_and_chunked_union_queries_return_sorted_ids(self) -> None:
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

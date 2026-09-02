@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 import tm_migration
+import tm_sqlite_store
+import tm_stage_sealer
 from tm_contracts import (
     CanonicalResourceIdentity,
     MigrationOutcome,
@@ -139,11 +141,26 @@ class InitialActivationPublicContractTests(unittest.TestCase):
             coordinator = _coordinator(identity)
             service = _service(identity, coordinator)
 
-            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+            with patch(
+                "tm_sqlite_store._probe_fts5",
+                return_value=False,
+            ), patch.object(
+                tm_sqlite_store,
+                "_validate_candidate_index_before_publication",
+                wraps=(
+                    tm_sqlite_store._validate_candidate_index_before_publication
+                ),
+            ) as prepublication, patch.object(
+                tm_stage_sealer,
+                "_validate_stage_facts",
+                wraps=tm_stage_sealer._validate_stage_facts,
+            ) as full_seal:
                 outcome: MigrationOutcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
+            prepublication.assert_not_called()
+            full_seal.assert_called_once()
 
             self.assertIs(type(outcome), MigrationReport)
             report = outcome

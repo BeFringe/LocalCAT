@@ -493,6 +493,12 @@ class WindowsPortableFreshProcessRecoveryTests(unittest.TestCase):
                     else:
                         self.assertEqual(state, "COMPLETE_GEN0")
                         completed = recovered
+                    if phase in {"DB_REPLACED", "MANIFEST_PUBLISHED"}:
+                        self.assertEqual(
+                            recovered["full_validation_calls"],
+                            1,
+                            recovered,
+                        )
                     replay = _run_worker(root, "replay")
                     _assert_complete(self, replay)
                     self.assertEqual(
