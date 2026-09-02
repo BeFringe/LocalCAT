@@ -381,7 +381,7 @@
   - _Boundary: Qt Bootstrap, Settings and Boundary Tests_
   - _Depends: 4.8, 4.9_
 
-- [ ] 5.3a 在user-managed source runtime验证`qwindows.dll`与真实可见窗口
+- [x] 5.3a 在user-managed source runtime验证`qwindows.dll`与真实可见窗口
   - 在干净CPython 3.14 x64专用venv确认PySide6 platform plugin路径、`qwindows.dll`加载、非offscreen主窗口可见与dialog/icon/keyboard journey；不安装Excel/xlwings。
   - _Amendment: WA-08_
   - _Depends: 4.8a, 5.3_
