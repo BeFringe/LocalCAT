@@ -239,6 +239,7 @@
 
 - [ ] 5.5a 在 Windows 重启后恢复 activation/runtime projection
   - 成功、published-tail、proven rollback、ambiguous 与 source-diverged 经 fresh process 重新 resolve 并一次换代；不允许旧 JSONL、旧 runtime 或旧 suggestion membership 复活。
+  - published-tail恢复提示只消费TM owner在existing-only W1内给出的body-free eligibility；分类与取消零持久修改，确认后仍由既有`activate_initial()` worker恢复，其他unavailable状态不创建operation。
   - _Amendment: WA-07_
   - _Depends: 5.4a, 5.5, WA-06_
 
@@ -322,10 +323,10 @@
   - _Boundary: ADR-016 Canonical Device Re-attestation_
   - _Depends: 3.8, 5.5, 6.2_
 
-- [ ] 6.7a 以 ADR-021 重新证明 Windows canonical private storage
-  - 显式维护在`ProcessFileLock`下复验exact store/generation、bytes、retained live-handle opaque identity comparison、ACL/owner、non-reparse root与journal phase；历史FileId不参与恢复授权，成功只更新同一canonical qualification，不铸造新store权威。
+- [ ] 6.7a 冷重开并重新证明 Windows canonical private storage
+  - 在`ProcessFileLock`下重新绑定rooted live handles并复验exact store/generation、bytes、phase、ACL/owner/MIC、non-reparse root、nested private proof与device-secret MAC；成功只恢复同一runtime authority且不改写v3 durable qualification，失败保持resource-local unavailable并禁止JSONL fallback。
   - _Amendment: WA-07_
-  - _Depends: 3.8a, 5.5a, 6.7, ADR-021_
+  - _Depends: 3.8a, 5.5a, ADR-021_
 
 - [x] 7. 完成 TextMatcher handoff 与 canonical integration 验收
 

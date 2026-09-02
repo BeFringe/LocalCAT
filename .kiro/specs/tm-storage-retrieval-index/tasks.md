@@ -211,6 +211,7 @@
 - [x] 5.8a 闭合 Windows restart/owner-exit 幂等恢复
   - 每个 journal phase 在 fresh process 中重验 lock、private proof、DB/manifest bytes 与 token，只有 exact prior/new facts 可继续或取消并且只发布一个 generation。
   - PREPARED取消闭合后将exact CANCELLED terminal无覆盖归档到确定性quarantine，fresh复证private闭集仅保留已验证device key；下一次attempt只在该key-only形态与canonical absence同时成立时复用private root/key，并创建全新的PENDING。
+  - 向Feature5提供body-free read-only eligibility：只在existing-only W1内认证可继续的post-generation tail，覆盖stage在位、exact quarantine与lineage-marker边界；分类零持久修改，实际恢复仍由`activate_initial()`独占。
   - _Amendment: WA-06_
   - _Depends: 5.7a, 5.8_
 
