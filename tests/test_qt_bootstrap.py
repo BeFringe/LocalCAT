@@ -312,6 +312,7 @@ class QtBootstrapTest(unittest.TestCase):
     ) -> None:
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication, QDialog, QWidget
+        from qt_speaker_avatar import SpeakerAvatarCatalog
 
         existing_app = QApplication.instance()
         app = (
@@ -392,8 +393,6 @@ class QtBootstrapTest(unittest.TestCase):
             },
         )
         self.assertEqual(set(captured), {"application", "window", "dialog"})
-        from qt_speaker_avatar import SpeakerAvatarCatalog
-
         self.assertEqual(len(captured_catalog), 1)
         self.assertIs(type(captured_catalog[0]), SpeakerAvatarCatalog)
         for name, icon in captured.items():
