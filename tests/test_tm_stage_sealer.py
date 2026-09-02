@@ -425,6 +425,36 @@ class StageSealerHappyPathTests(unittest.TestCase):
                 tm_stage_sealer._PortableRegistryEntry,
                 entry,
             )
+            connection = sqlite3.connect(
+                f"{stage.staged_db_path.as_uri()}?mode=ro",
+                isolation_level=None,
+                uri=True,
+            )
+            try:
+                expected_projection_digest = (
+                    tm_sqlite_store._candidate_proof_projection_digest(
+                        connection,
+                        fts5_available=True,
+                    )
+                )
+            finally:
+                connection.close()
+            self.assertEqual(
+                portable.candidate_projection_digest,
+                expected_projection_digest,
+            )
+            readiness = registry.resolve_physical_readiness(sealed)
+            try:
+                self.assertIs(
+                    type(readiness),
+                    tm_stage_sealer._PortablePhysicalReadinessSnapshot,
+                )
+                self.assertEqual(
+                    readiness.candidate_projection_digest,
+                    expected_projection_digest,
+                )
+            finally:
+                readiness.live_reproof._release()
             self.assertIs(
                 type(portable.sealed_content_attestation),
                 PortableSealedContentAttestation,
@@ -534,6 +564,166 @@ class StageSealerHappyPathTests(unittest.TestCase):
                             fts5_available=fts5_available,
                         )
                     self.assertEqual(sealed.evidence.record_count, 3)
+
+    def test_logical_closure_v2_bytes_survive_fetch_batching(self) -> None:
+        expected_by_fts = {
+            False: (
+                "5b9795742b1313efc6382d1975c78180"
+                "493d1a827f81d7f07352ae25bdb94d8c"
+            ),
+            True: (
+                "806bcf945fd5551c1e1a145434a430ac"
+                "312b9cb49d8b12465045904f8eeb7f1f"
+            ),
+        }
+        for fts5_available, expected in expected_by_fts.items():
+            with self.subTest(fts5_available=fts5_available):
+                with tempfile.TemporaryDirectory() as temporary:
+                    _, stage = _build_stage(
+                        Path(temporary),
+                        fts5_available=fts5_available,
+                    )
+                    connection = sqlite3.connect(stage.staged_db_path)
+                    try:
+                        connection.execute(
+                            "UPDATE tm_meta SET value = ? "
+                            "WHERE key = 'target_identity'",
+                            ("0" * 64,),
+                        )
+                        connection.execute(
+                            "UPDATE tm_origin_batch SET source_path = ?, "
+                            "created_at = ?",
+                            (
+                                "C:/fixed/source.jsonl",
+                                "2000-01-01T00:00:00Z",
+                            ),
+                        )
+                        connection.execute(
+                            "UPDATE tm_snapshot_receipt SET "
+                            "destination_jsonl_path = ?, "
+                            "destination_manifest_path = ?, created_at = ?",
+                            (
+                                "C:/fixed/source.jsonl",
+                                "C:/fixed/manifest.json",
+                                "2000-01-01T00:00:00Z",
+                            ),
+                        )
+                        with patch.object(
+                            tm_stage_sealer,
+                            "_STAGE_CLOSURE_FETCH_ROWS",
+                            1,
+                        ):
+                            one_row_batches = (
+                                tm_stage_sealer._stage_closure_digests(
+                                    connection,
+                                    reconstruct_pre_activation=True,
+                                )
+                            )
+                        default_batches = tm_stage_sealer._stage_closure_digests(
+                            connection,
+                            reconstruct_pre_activation=True,
+                        )
+                    finally:
+                        connection.close()
+                    self.assertEqual(
+                        one_row_batches,
+                        (expected, expected),
+                    )
+                    self.assertEqual(default_batches, one_row_batches)
+
+    def test_unchanged_tm_record_cells_are_framed_once_for_both_closures(
+        self,
+    ) -> None:
+        record = (
+            910001,
+            "closure-source-only",
+            "closure-target-only",
+            "closure-fold-only",
+            910004,
+            "closure-speaker-only",
+            "closure-context-prev-only",
+            "closure-context-next-only",
+            "closure-file-source-only",
+            "closure-provenance-only",
+            910010,
+            910011,
+            "closure-last-used-only",
+            "closure-origin-batch-only",
+            910014,
+        )
+
+        class Cursor:
+            def __init__(self, rows: list[tuple[object, ...]]) -> None:
+                self._rows = rows
+
+            def fetchmany(self, _size: int) -> list[tuple[object, ...]]:
+                rows, self._rows = self._rows, []
+                return rows
+
+            def fetchone(self) -> tuple[object, ...] | None:
+                return self._rows.pop(0) if self._rows else None
+
+        class Connection:
+            def execute(
+                self,
+                query: str,
+                _parameters: object = (),
+            ) -> Cursor:
+                if "FROM tm_record ORDER BY record_id" in query:
+                    return Cursor([record])
+                return Cursor([])
+
+        real_frame = tm_stage_sealer._stage_closure_row_frame
+        record_frame_count = 0
+
+        def count_frame(row: tuple[object, ...]) -> bytes:
+            nonlocal record_frame_count
+            if row == record:
+                record_frame_count += 1
+            return real_frame(row)
+
+        with patch.object(
+            tm_stage_sealer,
+            "_stage_closure_row_frame",
+            side_effect=count_frame,
+        ):
+            active, pre_activation = tm_stage_sealer._stage_closure_digests(
+                cast(Any, Connection()),
+                reconstruct_pre_activation=True,
+            )
+
+        self.assertEqual(active, pre_activation)
+        self.assertEqual(record_frame_count, 1)
+
+    def test_stage_closure_row_frame_is_exact_and_rejects_non_cells(self) -> None:
+        row = (None, "", "é", -12, 0)
+        self.assertEqual(
+            tm_stage_sealer._stage_closure_row_frame(row),
+            b"n;s0:;s2:\xc3\xa9;i3:-12;i1:0;\n",
+        )
+        self.assertEqual(
+            tm_stage_sealer._stage_closure_row_frame(row),
+            b"".join(
+                tm_stage_sealer._stage_closure_cell_frame(cell)
+                for cell in row
+            )
+            + b"\n",
+        )
+
+        class Text(str):
+            pass
+
+        class Integer(int):
+            pass
+
+        for invalid in (False, 1.0, Text("text"), Integer(1)):
+            with self.subTest(value=invalid), self.assertRaisesRegex(
+                StageSealError,
+                "^SEALER.STAGE_INVALID$",
+            ):
+                tm_stage_sealer._stage_closure_row_frame((invalid,))
+        with self.assertRaises(UnicodeEncodeError):
+            tm_stage_sealer._stage_closure_row_frame(("\ud800",))
 
     def test_logical_closure_v2_composes_authority_and_validated_projection(
         self,

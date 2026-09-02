@@ -3110,6 +3110,7 @@ class _WindowsBoundRegularFile(BoundRegularFile):
         "_maximum_component_units",
         "_fault_injector",
         "_read_lock",
+        "_content_facts_cache",
     )
 
     def __init__(
@@ -3131,6 +3132,7 @@ class _WindowsBoundRegularFile(BoundRegularFile):
         self._maximum_component_units = maximum_component_units
         self._fault_injector = fault_injector
         self._read_lock = threading.Lock()
+        self._content_facts_cache: BoundContentFacts | None = None
         try:
             self._reprove()
         except BaseException:
@@ -3257,6 +3259,146 @@ class _WindowsBoundRegularFile(BoundRegularFile):
         except Exception:
             raise _identity_stale() from None
 
+    def _capture_whole_file(
+        self,
+        *,
+        materialize: bool,
+    ) -> tuple[EntrySnapshot, bytes | None, bytes]:
+        """Capture one exact whole-file generation through the retained handle."""
+
+        with self._read_lock:
+            return self._capture_whole_file_locked(materialize=materialize)
+
+    def _capture_whole_file_locked(
+        self,
+        *,
+        materialize: bool,
+    ) -> tuple[EntrySnapshot, bytes | None, bytes]:
+        try:
+            before = self._reprove()
+            _hit_fault(self._fault_injector, "windows_before_body_read")
+            with self._handle.borrow() as raw:
+                _seek_start(self._api, raw)
+                chunks: list[bytes] | None = [] if materialize else None
+                digest = hashlib.sha256()
+                remaining = before.snapshot.byte_count
+                buffer = ctypes.create_string_buffer(_READ_CHUNK_BYTES)
+                while remaining:
+                    requested = min(_READ_CHUNK_BYTES, remaining)
+                    read = DWORD()
+                    self._api.checked_bool(
+                        "ReadFile",
+                        self._api.ReadFile,
+                        raw,
+                        buffer,
+                        requested,
+                        ctypes.byref(read),
+                        None,
+                    )
+                    count = int(read.value)
+                    if count < 1 or count > requested:
+                        raise _identity_stale()
+                    chunk = buffer.raw[:count]
+                    digest.update(chunk)
+                    if chunks is not None:
+                        chunks.append(chunk)
+                    remaining -= count
+                eof_buffer = ctypes.create_string_buffer(1)
+                eof_read = DWORD()
+                self._api.checked_bool(
+                    "ReadFile",
+                    self._api.ReadFile,
+                    raw,
+                    eof_buffer,
+                    1,
+                    ctypes.byref(eof_read),
+                    None,
+                )
+                if int(eof_read.value) != 0:
+                    raise _identity_stale()
+            _hit_fault(self._fault_injector, "windows_after_body_read")
+            after = self._reprove()
+            if before.snapshot != after.snapshot:
+                raise _identity_stale()
+            payload = b"".join(chunks) if chunks is not None else None
+            return after.snapshot, payload, digest.digest()
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            raise _identity_stale() from None
+
+    def _iter_exact_chunks(
+        self,
+        expected_snapshot: EntrySnapshot,
+    ) -> Iterator[bytes]:
+        """Stream one exact generation under a single retained-handle proof window."""
+
+        self._require_open()
+        if type(expected_snapshot) is not EntrySnapshot:
+            raise TypeError("expected snapshot must be exact EntrySnapshot")
+        completed = False
+        with self._read_lock:
+            try:
+                before = self._reprove()
+                if before.snapshot != expected_snapshot:
+                    raise _identity_stale()
+                _hit_fault(self._fault_injector, "windows_before_body_read")
+                with self._handle.borrow() as raw:
+                    _seek_start(self._api, raw)
+                    remaining = expected_snapshot.byte_count
+                    buffer = ctypes.create_string_buffer(_READ_CHUNK_BYTES)
+                    while remaining:
+                        requested = min(_READ_CHUNK_BYTES, remaining)
+                        read = DWORD()
+                        self._api.checked_bool(
+                            "ReadFile",
+                            self._api.ReadFile,
+                            raw,
+                            buffer,
+                            requested,
+                            ctypes.byref(read),
+                            None,
+                        )
+                        count = int(read.value)
+                        if count < 1 or count > requested:
+                            raise _identity_stale()
+                        remaining -= count
+                        yield buffer.raw[:count]
+                    eof_buffer = ctypes.create_string_buffer(1)
+                    eof_read = DWORD()
+                    self._api.checked_bool(
+                        "ReadFile",
+                        self._api.ReadFile,
+                        raw,
+                        eof_buffer,
+                        1,
+                        ctypes.byref(eof_read),
+                        None,
+                    )
+                    if int(eof_read.value) != 0:
+                        raise _identity_stale()
+                _hit_fault(self._fault_injector, "windows_after_body_read")
+                after = self._reprove()
+                if after.snapshot != expected_snapshot:
+                    raise _identity_stale()
+                completed = True
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                raise _identity_stale() from None
+            finally:
+                if not completed:
+                    self._content_facts_cache = None
+
+    def read_all(self) -> bytes:
+        self._require_open()
+        _snapshot, payload, _content_sha256 = self._capture_whole_file(
+            materialize=True,
+        )
+        if payload is None:
+            raise AssertionError("materialized whole-file capture omitted payload")
+        return payload
+
     def _identity(self) -> FileObjectIdentity:
         return self._reprove().identity
 
@@ -3265,23 +3407,28 @@ class _WindowsBoundRegularFile(BoundRegularFile):
 
     def _content_facts(self) -> BoundContentFacts:
         with self._read_lock:
-            try:
-                before = self._reprove()
-                actual = _read_publish_facts(
-                    self._api,
-                    self._handle,
-                    before.snapshot.byte_count,
-                )
-                after = self._reprove()
-            except BaseException as error:
-                if not isinstance(error, Exception):
-                    raise
-                raise _identity_stale() from None
-            if before.snapshot != after.snapshot:
-                raise _identity_stale()
-            return BoundContentFacts(after.snapshot, actual.content_sha256)
+            cached = self._content_facts_cache
+            if cached is not None:
+                try:
+                    if self._reprove().snapshot != cached.snapshot:
+                        raise _identity_stale()
+                except BaseException as error:
+                    self._content_facts_cache = None
+                    if not isinstance(error, Exception):
+                        raise
+                    raise _identity_stale() from None
+                return cached
+            snapshot, payload, content_sha256 = self._capture_whole_file_locked(
+                materialize=False,
+            )
+            if payload is not None:
+                raise AssertionError("streamed whole-file capture materialized payload")
+            facts = BoundContentFacts(snapshot, content_sha256)
+            self._content_facts_cache = facts
+            return facts
 
     def _close_authority(self) -> None:
+        self._content_facts_cache = None
         first_error: BaseException | None = None
         try:
             self._handle.close()
@@ -4001,6 +4148,8 @@ def _rename_candidate_handle(
 
 
 class _WindowsCandidateFile(CandidateFile):
+    _MAXIMUM_NATIVE_WRITE_BATCH_BYTES = 1024 * 1024
+
     __slots__ = (
         "_api",
         "_records",
@@ -4121,10 +4270,30 @@ class _WindowsCandidateFile(CandidateFile):
             with self._handle.borrow() as raw:
                 _seek_start(self._api, raw)
                 self._api.checked_bool("SetEndOfFile", self._api.SetEndOfFile, raw)
+                pending: list[bytes] = []
+                pending_count = 0
+
+                def write_pending() -> None:
+                    nonlocal pending_count
+                    if not pending:
+                        return
+                    _write_stream_chunk(self._api, raw, b"".join(pending))
+                    pending.clear()
+                    pending_count = 0
+
                 for chunk in chunks:
-                    _write_stream_chunk(self._api, raw, chunk)
+                    if (
+                        pending_count + len(chunk)
+                        > self._MAXIMUM_NATIVE_WRITE_BATCH_BYTES
+                    ):
+                        write_pending()
+                    pending.append(chunk)
+                    pending_count += len(chunk)
                     digest.update(chunk)
                     byte_count += len(chunk)
+                    if pending_count == self._MAXIMUM_NATIVE_WRITE_BATCH_BYTES:
+                        write_pending()
+                write_pending()
                 self._api.checked_bool("SetEndOfFile", self._api.SetEndOfFile, raw)
             proof = self._reprove_handle()
             if proof.snapshot.byte_count != byte_count:
@@ -4236,25 +4405,12 @@ def _publish_facts_from_retained(
     mode: PublishMode,
 ) -> PublishFacts:
     try:
-        expected = retained.snapshot()
-        digest = hashlib.sha256()
-        offset = 0
-        while offset < expected.byte_count:
-            chunk = retained.read_at(
-                offset,
-                min(_READ_CHUNK_BYTES, expected.byte_count - offset),
-                expected,
-            )
-            digest.update(chunk)
-            offset += len(chunk)
-        if retained.read_at(offset, 1, expected) or retained.snapshot() != expected:
-            raise _recovery_required()
-        identity = retained._identity()
+        facts = retained.content_facts()
         return PublishFacts(
             mode=mode,
-            destination_identity=identity,
-            content_sha256=digest.digest(),
-            byte_count=offset,
+            destination_identity=facts.snapshot.identity,
+            content_sha256=facts.content_sha256,
+            byte_count=facts.snapshot.byte_count,
             reparse_free=True,
         )
     except BaseException as error:
