@@ -251,6 +251,13 @@
   - 完成时，成功升级产生等价新 generation，每个失败阶段都能重开旧 schema
   - _Requirements: 2.4, 2.9, 2.11, 7.5, 7.14_
 
+- [x] 5.11a 将 Windows schema upgrade 接入 caller-held replacement owner
+  - 在同一 resource backend/root/W1 owner 内恢复未闭合 transition，排空当前 lease并以 live rooted facts冻结已有portable authority的legacy-schema canonical、generation 与 head；通过已预留 stage 执行 SQLite copy 和 v1→v2 数据面，manifest 经 reservation 写入，schema-upgrade seal 只消费同一 non-closing borrow。无portable predecessor的内部旧夹具或跨OS复制sidecar保持零mutation fail closed，不在本任务发明authority bootstrap。
+  - 为 portable transition owner 增加严格 `SCHEMA_UPGRADE` operation：保持 canonical store id 不变并仅推进 generation N→N+1；既有 `REPLACEMENT` 继续只接受 fresh store id。prior backup、phase journal、DB/manifest `PendingPublication`、terminal reproof 与 fresh recovery复用5.10a，不得进入POSIX ticket/dirfd/fsync fallback。
+  - upgrade backup/report artifact 在 drain 后由已证明 prior canonical 生成，并在 caller-held rooted authority 下以唯一名称、无覆盖 publication 和 retained readback 闭合。故障或进程终止只允许完整 prior、完整 upgraded 或 recovery-required；不新增 provider、hardware、frozen 资格，也不持久化 FileId。
+  - _Amendment: WA-06_
+  - _Depends: 5.10a, 5.11, 5.R2, windows-platform-enablement 3.7a, 3.7b_
+
 - [x] 5.R2 收束 schema upgrade 模块边界
   - 在 Cluster E 行为与故障矩阵闭合后，将 v1→v2 copy 数据面、backup/locator pending→reported 持久化协议、strict locator file proof 与纯候选事实校验提取到设计指定模块
   - coordinator 继续独占 ticket/locator snapshot、lease/drain/state transition、activation guard 与 cold-recovery root 选择；`TMMigrationService` 继续编排公开 schema-upgrade 成败流程
@@ -520,7 +527,7 @@
 - [ ] 9.6a 执行Windows canonical TM source完整发布验证
   - 在源码运行时完成canonical激活、重启恢复、exact/context/fuzzy、FTS5、snapshot export/refresh、故障矩阵与current-source Core release；以正常platform ports重放`WindowsDocumentedPublishV1`及provider-agnostic private-proof矩阵，pre-arm capability缺失必须零命名mutation，post-arm不确定进入recovery-required。任一能力缺失保持对应gate关闭，TMX产品汇合仍归WA-05/08。
   - _Amendment: WA-06_
-  - _Depends: 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
+  - _Depends: 5.11a, 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
 
 - [ ] 9.6b 在ADR-022 frozen harness重放Windows canonical TM发布验证
   - 在W3 custom spike全PASS后重放9.6a；frozen manifest不再包含硬件durability registry输入，CapabilityHost/SQLite/snapshot仍必须服从正常platform publish、trusted source closure且不访问checkout，其他ADR-022 strict frozen要求保持不变。
