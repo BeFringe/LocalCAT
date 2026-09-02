@@ -127,6 +127,7 @@ from qt_browse_group_dialog import (
 )
 from qt_preprocess_dialog import QtPreprocessDialog
 from qt_settings_dialog import QtSettingsDialog
+from qt_speaker_avatar import SpeakerAvatarCatalog
 from qt_speaker_inventory_dialog import QtSpeakerInventoryDialog
 from qt_termbase_dialog import QtTermbaseDialog
 from qt_control_styles import configure_combo_popup, configure_menu
@@ -851,6 +852,7 @@ class QtEditorWindow(QMainWindow):
         *,
         chunk_controller: object | None = None,
         tmx_export_coordinator: object | None = None,
+        speaker_avatar_catalog: SpeakerAvatarCatalog | None = None,
     ) -> None:
         super().__init__()
         # The UI is assembled by small builder methods.  Keep the resulting
@@ -956,6 +958,16 @@ class QtEditorWindow(QMainWindow):
         self.controller = controller
         self.chunk_controller = chunk_controller
         self.tmx_export_coordinator = tmx_export_coordinator
+        if (
+            speaker_avatar_catalog is not None
+            and type(speaker_avatar_catalog) is not SpeakerAvatarCatalog
+        ):
+            raise TypeError("Qt editor window requires SpeakerAvatarCatalog")
+        self.speaker_avatar_catalog = (
+            SpeakerAvatarCatalog()
+            if speaker_avatar_catalog is None
+            else speaker_avatar_catalog
+        )
         self._chunk_view: ChunkApplicationProjectView | None = None
         self._chunk_view_error_code: str | None = None
         self._chunk_scope_cache_key: tuple[str, int, str] | None = None
@@ -5446,7 +5458,11 @@ class QtEditorWindow(QMainWindow):
             )
             return
         try:
-            dialog = QtSpeakerInventoryDialog(self.controller, self)
+            dialog = QtSpeakerInventoryDialog(
+                self.controller,
+                self,
+                avatar_catalog=self.speaker_avatar_catalog,
+            )
         except (EditorControllerError, TypeError, ValueError) as error:
             self._show_error("无法盘点 raw speaker", str(error))
             self.statusBar().showMessage(

@@ -32,7 +32,14 @@ class QtSpeakerInventoryDialog(QDialog):
         self.setWindowTitle("Raw speaker 盘点")
         self.setMinimumSize(560, 420)
         self.setAccessibleName("Raw speaker 盘点")
-        self._avatar_catalog = avatar_catalog or SpeakerAvatarCatalog()
+        if (
+            avatar_catalog is not None
+            and type(avatar_catalog) is not SpeakerAvatarCatalog
+        ):
+            raise TypeError("speaker inventory requires SpeakerAvatarCatalog")
+        self._avatar_catalog = (
+            SpeakerAvatarCatalog() if avatar_catalog is None else avatar_catalog
+        )
 
         inventory = controller.speaker_inventory()
         layout = QVBoxLayout(self)
