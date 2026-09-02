@@ -86,6 +86,8 @@ from tm_activation_journal import (
     _portable_replacement_namespace_limits,
     _serialize_portable_replacement_record,
     _portable_record_pair_matches,
+    _PORTABLE_REPLACEMENT_OPERATION,
+    _PORTABLE_SCHEMA_UPGRADE_OPERATION,
     _RecoveryBackupAsset,
     _SQLiteGenerationView,
     _StoreRuntimeRef,
@@ -155,6 +157,7 @@ from platform_fs_contracts import (
 
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
 _SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
+_PORTABLE_UPGRADE_REQUIRED_STATE = "UPGRADE_REQUIRED"
 
 
 class _PortableReplacementRecoveryRequired(ActivationPreparationError):
@@ -297,6 +300,7 @@ class _StoreValidationPort(Protocol):
         *,
         canonical_store_id: str,
         _allow_diverged_runtime: bool = False,
+        _allow_legacy_schema: bool = False,
         _allow_sealed: bool = False,
         _allow_active: bool = False,
         _expected_active_generation: int | None = None,
@@ -1226,6 +1230,14 @@ class _PortableRecoveryStorePort(Protocol):
         facts: BoundContentFacts | CandidateContentFacts,
     ) -> PortableContentFileProof: ...
 
+    def reprove_portable_schema_upgrade_report_backup(
+        self,
+        record: _PortableReplacementRecord,
+        *,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+    ) -> tuple[Path, PortableContentFileProof] | None: ...
+
     def apply_portable_receipt_activation(
         self,
         *,
@@ -1275,6 +1287,15 @@ class _PortableRecoveryStorePort(Protocol):
     ) -> None: ...
 
     def rehydrate_completed_portable_base(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> ActivationRecoveryReport | None: ...
+
+    def rehydrate_portable_schema_upgrade_predecessor_base(
         self,
         *,
         platform: PlatformFileBackend,
@@ -1575,11 +1596,42 @@ def recover_portable_replacement_activation(
         finally:
             opened.close()
 
+    def reprove_schema_upgrade_backup(
+        record: _PortableReplacementRecord,
+    ) -> tuple[Path, PortableContentFileProof] | None:
+        if type(record) is not _PortableReplacementRecord:
+            raise TypeError("portable transition record is invalid")
+        operation = record.unsigned.operation
+        if operation == _PORTABLE_REPLACEMENT_OPERATION:
+            return None
+        if operation != _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        backup = port.reprove_portable_schema_upgrade_report_backup(
+            record,
+            platform=platform,
+            root=root,
+        )
+        if backup is None:
+            raise AssertionError("schema upgrade report backup is missing")
+        path, proof = backup
+        if (
+            type(path) is not type(identity.canonical_sidecar_path)
+            or not path.is_absolute()
+            or type(proof) is not PortableContentFileProof
+            or proof != record.unsigned.prior_active_content_attestation.database
+        ):
+            raise AssertionError("schema upgrade report backup port is invalid")
+        return backup
+
     def adopt(
         active: PortableActiveContentAttestation,
         *,
         view_active: PortableActiveContentAttestation | None = None,
         current: _PortableReplacementRecord | None,
+        transition_record: _PortableReplacementRecord,
         require_source: PortableContentFileProof,
         terminal_new: bool,
         cleanup_snapshot: _PortableReplacementNamespaceSnapshot | None = None,
@@ -1593,6 +1645,7 @@ def recover_portable_replacement_activation(
             view_active = active
         if type(view_active) is not PortableActiveContentAttestation:
             raise TypeError("portable replacement recovery view is invalid")
+        schema_upgrade_backup = reprove_schema_upgrade_backup(transition_record)
         prove(identity.canonical_sidecar_path.name, active.database)
         prove(identity.snapshot_manifest_path.name, active.manifest)
         prove(identity.configured_jsonl_path.name, require_source)
@@ -1600,15 +1653,32 @@ def recover_portable_replacement_activation(
             identity,
             journal_id=active.journal_id,
         )
+        legacy_upgrade_only = (
+            transition_record.unsigned.operation
+            == _PORTABLE_SCHEMA_UPGRADE_OPERATION
+            and not terminal_new
+        )
         schema = port.inspect_stage_schema(
             active_ref,
             canonical_store_id=active.canonical_store_id,
             _allow_diverged_runtime=True,
+            _allow_legacy_schema=legacy_upgrade_only,
             _allow_active=True,
             _expected_active_generation=active.generation,
             _expected_activation_digest=active.activation_digest,
         )
         if schema.activation_status != "ACTIVE":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if legacy_upgrade_only:
+            if schema.schema_version != 1:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        elif schema.schema_version != 2:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
                 retryable=True,
@@ -1645,6 +1715,15 @@ def recover_portable_replacement_activation(
                     "ACTIVATION.RECOVERY_REQUIRED",
                     retryable=True,
                 )
+        if (
+            schema_upgrade_backup is not None
+            and reprove_schema_upgrade_backup(transition_record)
+            != schema_upgrade_backup
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
         port._activate_candidate_store_id(active.canonical_store_id)
         port.adopt_portable_replacement_current(current)
         port.view = _SQLiteGenerationView(
@@ -1654,7 +1733,11 @@ def recover_portable_replacement_activation(
             fts5_available=schema.fts5_available,
             active_content_attestation=view_active,
         )
-        port.state = "READY"
+        port.state = (
+            _PORTABLE_UPGRADE_REQUIRED_STATE
+            if legacy_upgrade_only
+            else "READY"
+        )
         port.notify_all()
         return ActivationRecoveryReport(
             phase="GENERATION_PUBLISHED" if terminal_new else "PREPARED",
@@ -1685,6 +1768,7 @@ def recover_portable_replacement_activation(
         return adopt(
             current.unsigned.active_content_attestation,
             current=current,
+            transition_record=current,
             require_source=current.unsigned.sealed_content_attestation.source,
             terminal_new=True,
             cleanup_snapshot=snapshot,
@@ -1724,6 +1808,7 @@ def recover_portable_replacement_activation(
             prior,
             view_active=predecessor_active,
             current=snapshot.current_record,
+            transition_record=prepared,
             require_source=prepared.unsigned.sealed_content_attestation.source,
             terminal_new=False,
             cleanup_snapshot=snapshot,
@@ -1739,21 +1824,27 @@ def recover_portable_replacement_activation(
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
                 retryable=True,
-            )
-        database_backup = database_backups[0]
-        locator_path = (
-            identity.canonical_sidecar_path.parent
-            / prepared.unsigned.private_directory_name
-            / database_backup.backup_name
         )
-        if sys.platform == "win32":
-            locator_path = Path("\\\\?\\" + str(locator_path))
+        database_backup = database_backups[0]
+        schema_upgrade_backup = reprove_schema_upgrade_backup(prepared)
+        if schema_upgrade_backup is None:
+            locator_path = (
+                identity.canonical_sidecar_path.parent
+                / prepared.unsigned.private_directory_name
+                / database_backup.backup_name
+            )
+            locator_digest = database_backup.content.sha256
+            if sys.platform == "win32":
+                locator_path = Path("\\\\?\\" + str(locator_path))
+        else:
+            locator_path, stable_proof = schema_upgrade_backup
+            locator_digest = stable_proof.sha256
         raise _PortableReplacementRecoveryRequired(
             prior_generation=prepared.unsigned.prior_generation,
             recovery_locator=RecoveryLocator(
                 path=locator_path,
                 asset_kind=AssetKind.ACTIVE_STORE,
-                expected_digest=database_backup.content.sha256,
+                expected_digest=locator_digest,
             ),
         )
     raise ActivationPreparationError(
@@ -1770,7 +1861,51 @@ def rehydrate_completed_portable_replacement_activation(
     descendant_inspection: LockedDescendantNamespaceInspection,
     caller_borrow: _CallerHeldPortableJournalBorrow,
 ) -> ActivationRecoveryReport | None:
-    """Read-only hydrate base gen0 or one exact terminal replacement current."""
+    """Read-only hydrate only a current-schema portable authority."""
+
+    return _rehydrate_completed_portable_replacement_activation(
+        port,
+        platform=platform,
+        persistent_private=persistent_private,
+        descendant_inspection=descendant_inspection,
+        caller_borrow=caller_borrow,
+        schema_upgrade_predecessor=False,
+    )
+
+
+def rehydrate_portable_schema_upgrade_predecessor(
+    port: _PortableRecoveryStorePort,
+    *,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> ActivationRecoveryReport | None:
+    """Hydrate one exact portable v1 owner as upgrade-only authority."""
+
+    return _rehydrate_completed_portable_replacement_activation(
+        port,
+        platform=platform,
+        persistent_private=persistent_private,
+        descendant_inspection=descendant_inspection,
+        caller_borrow=caller_borrow,
+        schema_upgrade_predecessor=True,
+    )
+
+
+def _rehydrate_completed_portable_replacement_activation(
+    port: _PortableRecoveryStorePort,
+    *,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+    schema_upgrade_predecessor: bool,
+) -> ActivationRecoveryReport | None:
+    """Shared strict hydration; legacy mode is upgrade-only and explicit."""
+
+    if type(schema_upgrade_predecessor) is not bool:
+        raise TypeError("schema upgrade predecessor mode must be exact bool")
 
     if not (
         isinstance(platform, PlatformFileBackend)
@@ -1794,7 +1929,12 @@ def rehydrate_completed_portable_replacement_activation(
         f"{port.resource_identity.target_identity}"
     )
     if root.inspect_entry(private_name) is None:
-        return port.rehydrate_completed_portable_base(
+        hydrate_base = (
+            port.rehydrate_portable_schema_upgrade_predecessor_base
+            if schema_upgrade_predecessor
+            else port.rehydrate_completed_portable_base
+        )
+        return hydrate_base(
             platform=platform,
             persistent_private=persistent_private,
             descendant_inspection=descendant_inspection,
@@ -1810,7 +1950,12 @@ def rehydrate_completed_portable_replacement_activation(
         )
     )
     if snapshot is None:
-        return port.rehydrate_completed_portable_base(
+        hydrate_base = (
+            port.rehydrate_portable_schema_upgrade_predecessor_base
+            if schema_upgrade_predecessor
+            else port.rehydrate_completed_portable_base
+        )
+        return hydrate_base(
             platform=platform,
             persistent_private=persistent_private,
             descendant_inspection=descendant_inspection,
@@ -1838,7 +1983,33 @@ def rehydrate_completed_portable_replacement_activation(
     observed: dict[str, BoundContentFacts] = {}
     active_error: BaseException | None = None
     staged_view: _SQLiteGenerationView | None = None
+    schema_upgrade_backup: tuple[Path, PortableContentFileProof] | None = None
     try:
+        operation = current.unsigned.operation
+        if operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+            schema_upgrade_backup = (
+                port.reprove_portable_schema_upgrade_report_backup(
+                    current,
+                    platform=platform,
+                    root=root,
+                )
+            )
+            if schema_upgrade_backup is None:
+                raise AssertionError("schema upgrade report backup is missing")
+            backup_path, backup_proof = schema_upgrade_backup
+            if (
+                type(backup_path) is not type(identity.canonical_sidecar_path)
+                or not backup_path.is_absolute()
+                or type(backup_proof) is not PortableContentFileProof
+                or backup_proof
+                != current.unsigned.prior_active_content_attestation.database
+            ):
+                raise AssertionError("schema upgrade report backup port is invalid")
+        elif operation != _PORTABLE_REPLACEMENT_OPERATION:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
         for name in (identity.canonical_sidecar_path.name,):
             opened = platform.open_regular(root, PurePath(name))
             authorities.append(opened)
@@ -1857,15 +2028,32 @@ def rehydrate_completed_portable_replacement_activation(
             identity,
             journal_id=active.journal_id,
         )
+        allow_legacy_upgrade_only = (
+            schema_upgrade_predecessor
+            and current.unsigned.operation == _PORTABLE_REPLACEMENT_OPERATION
+        )
         schema = port.inspect_stage_schema(
             active_ref,
             canonical_store_id=active.canonical_store_id,
             _allow_diverged_runtime=True,
+            _allow_legacy_schema=allow_legacy_upgrade_only,
             _allow_active=True,
             _expected_active_generation=active.generation,
             _expected_activation_digest=active.activation_digest,
         )
         if schema.activation_status != "ACTIVE":
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        legacy_upgrade_only = schema.schema_version == 1
+        if legacy_upgrade_only:
+            if not allow_legacy_upgrade_only:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        elif schema.schema_version != 2:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
                 retryable=True,
@@ -1903,6 +2091,17 @@ def rehydrate_completed_portable_replacement_activation(
                     "ACTIVATION.RECOVERY_REQUIRED",
                     retryable=True,
                 )
+        if schema_upgrade_backup is not None:
+            repeated_backup = port.reprove_portable_schema_upgrade_report_backup(
+                current,
+                platform=platform,
+                root=root,
+            )
+            if repeated_backup != schema_upgrade_backup:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
         caller_borrow.reprove(platform, identity)
     except BaseException as error:
         active_error = error
@@ -1925,7 +2124,11 @@ def rehydrate_completed_portable_replacement_activation(
     port._activate_candidate_store_id(active.canonical_store_id)
     port.adopt_portable_replacement_current(current)
     port.view = staged_view
-    port.state = "READY"
+    port.state = (
+        _PORTABLE_UPGRADE_REQUIRED_STATE
+        if legacy_upgrade_only
+        else "READY"
+    )
     port.notify_all()
     return ActivationRecoveryReport(
         phase="GENERATION_PUBLISHED",

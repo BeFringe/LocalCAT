@@ -100,6 +100,7 @@ from platform_fs_contracts import (
     BoundSynchronizedRegularFile,
     CandidateContentFacts,
     CandidateFile,
+    ExistingCandidateRecovery,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
     FileObjectIdentity,
@@ -191,6 +192,7 @@ from tm_activation_journal import (
     _serialize_portable_replacement_record,
     _PORTABLE_REPLACEMENT_CURRENT_NAME,
     _PORTABLE_REPLACEMENT_OPERATION,
+    _PORTABLE_SCHEMA_UPGRADE_OPERATION,
     _PORTABLE_REPLACEMENT_VERSION,
     _WindowsPortablePreparedJournalOwner,
     _WindowsPortableCancelledJournalOwner,
@@ -328,6 +330,8 @@ from tm_activation_recovery import (
     recover_portable_activation,
     recover_portable_replacement_activation,
     rehydrate_completed_portable_replacement_activation,
+    rehydrate_portable_schema_upgrade_predecessor as _rehydrate_portable_schema_upgrade_predecessor,
+    _PORTABLE_UPGRADE_REQUIRED_STATE,
     rollback_durable_activation,
 )
 
@@ -950,6 +954,7 @@ class _PortableReplacementPreparation:
     """
 
     preparation_id: str
+    operation: str
     resource_id: str
     target_identity: str
     candidate_store_id: str
@@ -976,6 +981,7 @@ class _PortableReplacementPreparation:
         self,
         *,
         preparation_id: str,
+        operation: str,
         resource_id: str,
         target_identity: str,
         candidate_store_id: str,
@@ -1007,6 +1013,11 @@ class _PortableReplacementPreparation:
         ):
             if type(value) is not str or not value:
                 raise TypeError(f"replacement {label} is invalid")
+        if operation not in {
+            _PORTABLE_REPLACEMENT_OPERATION,
+            _PORTABLE_SCHEMA_UPGRADE_OPERATION,
+        }:
+            raise ValueError("portable transition operation is invalid")
         if type(expected_prior_generation) is not int:
             raise TypeError("replacement prior generation is invalid")
         if expected_prior_generation < 0:
@@ -1015,8 +1026,11 @@ class _PortableReplacementPreparation:
             raise TypeError("replacement next generation is invalid")
         if next_generation != expected_prior_generation + 1:
             raise ValueError("replacement generation transition is invalid")
-        if candidate_store_id == prior_store_id:
-            raise ValueError("replacement candidate store must be fresh")
+        if operation == _PORTABLE_REPLACEMENT_OPERATION:
+            if candidate_store_id == prior_store_id:
+                raise ValueError("replacement candidate store must be fresh")
+        elif candidate_store_id != prior_store_id:
+            raise ValueError("schema upgrade must preserve the store id")
         if (
             type(backup_plans) is not tuple
             or len(backup_plans) != 2
@@ -1036,6 +1050,7 @@ class _PortableReplacementPreparation:
             raise TypeError("replacement prior authority is invalid")
         for name, value in (
             ("preparation_id", preparation_id),
+            ("operation", operation),
             ("resource_id", resource_id),
             ("target_identity", target_identity),
             ("candidate_store_id", candidate_store_id),
@@ -1060,6 +1075,58 @@ class _PortableReplacementPreparation:
     def __reduce_ex__(self, protocol: int) -> object:
         del protocol
         raise TypeError("portable replacement preparation is code-only")
+
+
+_PORTABLE_SCHEMA_UPGRADE_TICKET_FACTORY_KEY = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class _PortableSchemaUpgradeSnapshotTicket:
+    resource_id: str
+    canonical_store_id: str
+    generation: int
+    prior_database: PortableContentFileProof
+    _owner_nonce: str = field(repr=False, compare=False)
+    _prior_view: _SQLiteGenerationView = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        resource_id: str,
+        canonical_store_id: str,
+        generation: int,
+        prior_database: PortableContentFileProof,
+        _owner_nonce: str,
+        _prior_view: _SQLiteGenerationView,
+        _factory_key: object | None = None,
+    ) -> None:
+        if _factory_key is not _PORTABLE_SCHEMA_UPGRADE_TICKET_FACTORY_KEY:
+            raise TypeError("portable schema ticket requires owner factory")
+        if type(resource_id) is not str or not resource_id:
+            raise TypeError("portable schema ticket resource is invalid")
+        if type(canonical_store_id) is not str or not canonical_store_id:
+            raise TypeError("portable schema ticket store id is invalid")
+        if type(generation) is not int or generation < 0:
+            raise ValueError("portable schema ticket generation is invalid")
+        if type(prior_database) is not PortableContentFileProof:
+            raise TypeError("portable schema ticket database proof is invalid")
+        if type(_owner_nonce) is not str or not _owner_nonce:
+            raise TypeError("portable schema ticket owner is invalid")
+        if type(_prior_view) is not _SQLiteGenerationView:
+            raise TypeError("portable schema ticket view is invalid")
+        object.__setattr__(self, "resource_id", resource_id)
+        object.__setattr__(self, "canonical_store_id", canonical_store_id)
+        object.__setattr__(self, "generation", generation)
+        object.__setattr__(self, "prior_database", prior_database)
+        object.__setattr__(self, "_owner_nonce", _owner_nonce)
+        object.__setattr__(self, "_prior_view", _prior_view)
+
+    def __reduce__(self) -> object:
+        raise TypeError("portable schema ticket is code-only")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("portable schema ticket is code-only")
 
 
 class _PortableReplacementPriorAuthority(OpaqueAuthority):
@@ -1255,6 +1322,58 @@ class _PortableReplacementPriorAuthority(OpaqueAuthority):
             raise first_error
 
 
+def _portable_schema_upgrade_report_backup_name(
+    *,
+    canonical_database_name: str,
+    target_identity: str,
+    canonical_store_id: str,
+    prior_generation: int,
+    prior_database: PortableContentFileProof,
+) -> str:
+    """Derive one stable adjacent backup name from persisted transition facts."""
+
+    for value, label in (
+        (canonical_database_name, "canonical database name"),
+        (target_identity, "target identity"),
+        (canonical_store_id, "canonical store id"),
+    ):
+        if type(value) is not str or not value:
+            raise TypeError(f"schema upgrade backup {label} is invalid")
+    if (
+        PurePath(canonical_database_name).name != canonical_database_name
+        or canonical_database_name in {".", ".."}
+    ):
+        raise ValueError("schema upgrade backup canonical name is invalid")
+    if (
+        type(prior_generation) is not int
+        or isinstance(prior_generation, bool)
+        or prior_generation < 0
+    ):
+        raise ValueError("schema upgrade backup generation is invalid")
+    if type(prior_database) is not PortableContentFileProof:
+        raise TypeError("schema upgrade backup proof is invalid")
+    token = hashlib.sha256(
+        json.dumps(
+            {
+                "canonical_store_id": canonical_store_id,
+                "database_sha256": prior_database.sha256,
+                "database_size": prior_database.size,
+                "generation": prior_generation,
+                "protocol": "portable-schema-upgrade-backup-v1",
+                "target_identity": target_identity,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    return (
+        f".{canonical_database_name}.localcat-schema-upgrade."
+        f"{token}.bak"
+    )
+
+
 class _PortableReplacementBackupSet(OpaqueAuthority):
     """Two retained backup publications spanning the PREPARED owner commit."""
 
@@ -1448,6 +1567,24 @@ class _CoordinatorStorePort:
             persistent_private=persistent_private,
             descendant_inspection=descendant_inspection,
             caller_borrow=caller_borrow,
+            schema_upgrade_predecessor=False,
+        )
+
+    def rehydrate_portable_schema_upgrade_predecessor_base(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> ActivationRecoveryReport | None:
+        return _rehydrate_completed_portable_authority(
+            self,
+            platform=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+            schema_upgrade_predecessor=True,
         )
 
     def adopt_portable_replacement_current(
@@ -1496,6 +1633,20 @@ class _CoordinatorStorePort:
         facts: BoundContentFacts | CandidateContentFacts,
     ) -> PortableContentFileProof:
         return self._coordinator._portable_content_proof(facts)
+
+    def reprove_portable_schema_upgrade_report_backup(
+        self,
+        record: _PortableReplacementRecord,
+        *,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+    ) -> tuple[Path, PortableContentFileProof] | None:
+        return self._coordinator._reprove_portable_schema_upgrade_report_backup(
+            record,
+            platform=platform,
+            root=root,
+            recovery=True,
+        )
 
     def apply_portable_receipt_activation(
         self,
@@ -1757,6 +1908,7 @@ class _CoordinatorStorePort:
         *,
         canonical_store_id: str,
         _allow_diverged_runtime: bool = False,
+        _allow_legacy_schema: bool = False,
         _allow_sealed: bool = False,
         _allow_active: bool = False,
         _expected_active_generation: int | None = None,
@@ -1766,6 +1918,7 @@ class _CoordinatorStorePort:
             stage_ref,
             canonical_store_id=canonical_store_id,
             _allow_diverged_runtime=_allow_diverged_runtime,
+            _allow_legacy_schema=_allow_legacy_schema,
             _allow_sealed=_allow_sealed,
             _allow_active=_allow_active,
             _expected_active_generation=_expected_active_generation,
@@ -2142,6 +2295,7 @@ def _rehydrate_completed_portable_authority(
     persistent_private: PersistentPrivateProof,
     descendant_inspection: LockedDescendantNamespaceInspection,
     caller_borrow: _CallerHeldPortableJournalBorrow,
+    schema_upgrade_predecessor: bool,
 ) -> ActivationRecoveryReport | None:
     """Read-only cold hydration for one complete Windows portable chain.
 
@@ -2155,6 +2309,8 @@ def _rehydrate_completed_portable_authority(
     canonical authority has been hydrated, rather than revoking that authority.
     """
 
+    if type(schema_upgrade_predecessor) is not bool:
+        raise TypeError("schema upgrade predecessor mode must be exact bool")
     identity = port.resource_identity
     snapshot = _WindowsPortableFreshRecoveryOwner.inspect(
         identity=identity,
@@ -2419,6 +2575,7 @@ def _rehydrate_completed_portable_authority(
             canonical_store_id=port.canonical_store_id,
             expected_generation=0,
             expected_activation_digest=activation_digest,
+            allow_legacy_upgrade_only=schema_upgrade_predecessor,
         )
         semantic = active.semantic_facts
         if (
@@ -2587,7 +2744,14 @@ def _rehydrate_completed_portable_authority(
     if staged_view is None:
         raise AssertionError("portable completed hydration produced no view")
     port.view = staged_view
-    port.state = "READY"
+    legacy_upgrade_only = schema.schema_version == TM_LEGACY_SCHEMA_VERSION
+    if legacy_upgrade_only and not schema_upgrade_predecessor:
+        raise AssertionError("legacy schema escaped explicit predecessor mode")
+    port.state = (
+        _PORTABLE_UPGRADE_REQUIRED_STATE
+        if legacy_upgrade_only
+        else "READY"
+    )
     port.notify_all()
     return ActivationRecoveryReport(
         phase="GENERATION_PUBLISHED",
@@ -2650,9 +2814,12 @@ def _inspect_completed_active_schema_read_only(
     canonical_store_id: str,
     expected_generation: int,
     expected_activation_digest: str,
+    allow_legacy_upgrade_only: bool = False,
 ) -> SQLiteSchemaSnapshot:
     """Validate the active schema without opening the target writable."""
 
+    if type(allow_legacy_upgrade_only) is not bool:
+        raise TypeError("legacy upgrade-only mode must be exact bool")
     validated_stage = _require_inspectable_store_ref(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
     if not validated_stage.staged_db_path.is_file():
@@ -2666,7 +2833,10 @@ def _inspect_completed_active_schema_read_only(
             schema_version = _meta_int(meta, "schema_version")
             if schema_version > TM_SCHEMA_VERSION:
                 raise SQLiteStoreSchemaError("STORE.SCHEMA_TOO_NEW")
-            if schema_version != TM_SCHEMA_VERSION:
+            if schema_version != TM_SCHEMA_VERSION and not (
+                allow_legacy_upgrade_only
+                and schema_version == TM_LEGACY_SCHEMA_VERSION
+            ):
                 raise SQLiteStoreSchemaError("STORE.SCHEMA_UNSUPPORTED")
             identity = validated_stage.resource_identity
             if (
@@ -2686,7 +2856,10 @@ def _inspect_completed_active_schema_read_only(
             )
             table_names = _schema_object_names(connection, "table")
             index_names = _schema_object_names(connection, "index")
-            expected_tables = set(_BASE_TABLES)
+            legacy_schema = schema_version == TM_LEGACY_SCHEMA_VERSION
+            base_tables = _LEGACY_BASE_TABLES if legacy_schema else _BASE_TABLES
+            base_indexes = _LEGACY_BASE_INDEXES if legacy_schema else _BASE_INDEXES
+            expected_tables = set(base_tables)
             fts5_available = _meta_bool(meta, "fts5_available")
             if fts5_available:
                 expected_tables.add("tm_fts")
@@ -2697,28 +2870,30 @@ def _inspect_completed_active_schema_read_only(
                 raise SQLiteStoreSchemaError("STORE.SCHEMA_INCOMPLETE")
             if table_names != expected_physical_tables:
                 raise SQLiteStoreSchemaError("STORE.SCHEMA_UNEXPECTED")
-            if not _BASE_INDEXES.issubset(index_names):
+            if not base_indexes.issubset(index_names):
                 raise SQLiteStoreSchemaError("STORE.SCHEMA_INCOMPLETE")
-            if index_names != _BASE_INDEXES:
+            if index_names != base_indexes:
                 raise SQLiteStoreSchemaError("STORE.SCHEMA_UNEXPECTED")
             _validate_schema_object_types(connection)
-            approved_schema_digest = _APPROVED_SCHEMA_DIGESTS[
-                fts5_available
-            ]
+            approved_schema_digest = (
+                _APPROVED_LEGACY_SCHEMA_DIGESTS
+                if legacy_schema
+                else _APPROVED_SCHEMA_DIGESTS
+            )[fts5_available]
             if (
                 meta["schema_digest"] != approved_schema_digest
                 or _schema_digest(
                     connection,
                     fts5_available=fts5_available,
-                    legacy_schema=False,
+                    legacy_schema=legacy_schema,
                 )
                 != approved_schema_digest
             ):
                 raise SQLiteStoreSchemaError(
                     "STORE.TABLE_SCHEMA_MISMATCH"
                 )
-            _validate_index_schema(connection, legacy_schema=False)
-            _validate_foreign_key_schema(connection, legacy_schema=False)
+            _validate_index_schema(connection, legacy_schema=legacy_schema)
+            _validate_foreign_key_schema(connection, legacy_schema=legacy_schema)
             if fts5_available != runtime.fts5_available:
                 raise SQLiteStoreSchemaError(
                     "STORE.RUNTIME_CAPABILITY_CHANGED"
@@ -2765,7 +2940,7 @@ def _inspect_completed_active_schema_read_only(
                 activation_digest=meta.get("activation_digest"),
                 fuzzy_available=False,
                 table_names=tuple(sorted(expected_tables)),
-                index_names=tuple(sorted(_BASE_INDEXES)),
+                index_names=tuple(sorted(base_indexes)),
             )
         finally:
             connection.rollback()
@@ -3345,6 +3520,9 @@ class ResourceStoreCoordinator:
         self._portable_replacement_current_record: (
             _PortableReplacementRecord | None
         ) = None
+        self._portable_schema_upgrade_ticket: (
+            _PortableSchemaUpgradeSnapshotTicket | None
+        ) = None
         self._cleanup_reservation: _ActivationCleanupReservation | None = None
         self._cleanup_in_progress = False
         # Process-local fail-stop for an initial activation whose unpublished
@@ -3834,6 +4012,91 @@ class ResourceStoreCoordinator:
                 self._state = "READY"
                 self._condition.notify_all()
 
+    def prepare_portable_schema_upgrade_ticket(
+        self,
+        snapshot_owner: Callable[[], PortableContentFileProof],
+    ) -> _PortableSchemaUpgradeSnapshotTicket:
+        if not callable(snapshot_owner):
+            raise TypeError("portable schema snapshot owner must be callable")
+        with self._condition:
+            view = self._view
+            if (
+                self._state != _PORTABLE_UPGRADE_REQUIRED_STATE
+                or self._preparation is not None
+                or self._portable_replacement_preparation is not None
+                or self._portable_schema_upgrade_ticket is not None
+                or self._schema_upgrade_ticket is not None
+                or self._cleanup_reservation is not None
+                or self._cleanup_in_progress
+                or type(view) is not _SQLiteGenerationView
+                or type(view.active_content_attestation)
+                is not PortableActiveContentAttestation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_BUSY", retryable=True
+                )
+            if (
+                view.canonical_store_id != self._canonical_store_id
+                or view.active_content_attestation.canonical_store_id
+                != self._canonical_store_id
+                or view.active_content_attestation.generation != view.generation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_TICKET_INVALID", retryable=False
+                )
+            self._state = "DRAINING"
+            self._condition.notify_all()
+            deadline = time.monotonic() + self._drain_timeout_seconds
+            try:
+                while self._active_lease_count:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.DRAIN_TIMEOUT", retryable=True
+                        )
+                    self._condition.wait(remaining)
+                if self._view is not view or (
+                    self._canonical_store_id != view.canonical_store_id
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.GENERATION_STALE", retryable=False
+                    )
+                prior_database = snapshot_owner()
+                if type(prior_database) is not PortableContentFileProof:
+                    raise TypeError(
+                        "portable schema snapshot owner must return exact proof"
+                    )
+                ticket = _PortableSchemaUpgradeSnapshotTicket(
+                    resource_id=self._resource_id,
+                    canonical_store_id=self._canonical_store_id,
+                    generation=view.generation,
+                    prior_database=prior_database,
+                    _owner_nonce=self._owner_nonce,
+                    _prior_view=view,
+                    _factory_key=_PORTABLE_SCHEMA_UPGRADE_TICKET_FACTORY_KEY,
+                )
+                self._portable_schema_upgrade_ticket = ticket
+                return ticket
+            finally:
+                self._state = _PORTABLE_UPGRADE_REQUIRED_STATE
+                self._condition.notify_all()
+
+    def retire_portable_schema_upgrade_ticket(
+        self,
+        ticket: _PortableSchemaUpgradeSnapshotTicket,
+    ) -> None:
+        if type(ticket) is not _PortableSchemaUpgradeSnapshotTicket:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_INVALID", retryable=False
+            )
+        with self._condition:
+            if self._portable_schema_upgrade_ticket is ticket:
+                self._portable_schema_upgrade_ticket = None
+            elif self._portable_schema_upgrade_ticket is not None:
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_TICKET_INVALID", retryable=False
+                )
+
     def retire_schema_upgrade_ticket(
         self,
         ticket: _SchemaUpgradeSnapshotTicket,
@@ -3986,6 +4249,43 @@ class ResourceStoreCoordinator:
         persistent_private: PersistentPrivateProof,
         caller_borrow: _CallerHeldPortableJournalBorrow,
     ) -> _PortableReplacementPreparation:
+        return self._activate_portable_transition(
+            sealed_stage,
+            platform=platform,
+            persistent_private=persistent_private,
+            caller_borrow=caller_borrow,
+            operation=_PORTABLE_REPLACEMENT_OPERATION,
+            schema_ticket=None,
+        )
+
+    def activate_portable_schema_upgrade(
+        self,
+        sealed_stage: SealedStage,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        schema_ticket: _PortableSchemaUpgradeSnapshotTicket,
+    ) -> _PortableReplacementPreparation:
+        return self._activate_portable_transition(
+            sealed_stage,
+            platform=platform,
+            persistent_private=persistent_private,
+            caller_borrow=caller_borrow,
+            operation=_PORTABLE_SCHEMA_UPGRADE_OPERATION,
+            schema_ticket=schema_ticket,
+        )
+
+    def _activate_portable_transition(
+        self,
+        sealed_stage: SealedStage,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        operation: str,
+        schema_ticket: _PortableSchemaUpgradeSnapshotTicket | None,
+    ) -> _PortableReplacementPreparation:
         """Prepare one strict Windows N -> N+1 replacement under W1.
 
         This path never enters the native/path-bearing backup machinery used
@@ -4009,6 +4309,25 @@ class ResourceStoreCoordinator:
             )
         if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
             raise TypeError("caller_borrow must be the exact portable borrow")
+        if operation not in {
+            _PORTABLE_REPLACEMENT_OPERATION,
+            _PORTABLE_SCHEMA_UPGRADE_OPERATION,
+        }:
+            raise ValueError("portable transition operation is invalid")
+        if operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+            if type(schema_ticket) is not _PortableSchemaUpgradeSnapshotTicket:
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_TICKET_INVALID", retryable=False
+                )
+        elif schema_ticket is not None:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_TICKET_INVALID", retryable=False
+            )
+        expected_prior_state = (
+            _PORTABLE_UPGRADE_REQUIRED_STATE
+            if operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION
+            else "READY"
+        )
 
         gate_b_evaluator = getattr(
             importlib.import_module("tm_gate_b"),
@@ -4025,7 +4344,7 @@ class ResourceStoreCoordinator:
         with self._condition:
             prior_view = self._view
             if (
-                self._state != "READY"
+                self._state != expected_prior_state
                 or self._preparation is not None
                 or self._portable_replacement_preparation is not None
                 or self._cleanup_reservation is not None
@@ -4033,6 +4352,18 @@ class ResourceStoreCoordinator:
                 or type(prior_view) is not _SQLiteGenerationView
                 or type(prior_view.active_content_attestation)
                 is not PortableActiveContentAttestation
+                or (
+                    operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION
+                    and (
+                        self._portable_schema_upgrade_ticket is not schema_ticket
+                        or schema_ticket._owner_nonce != self._owner_nonce
+                        or schema_ticket._prior_view is not prior_view
+                        or schema_ticket.resource_id != self._resource_id
+                        or schema_ticket.canonical_store_id
+                        != self._canonical_store_id
+                        or schema_ticket.generation != prior_view.generation
+                    )
+                )
             ):
                 raise ActivationPreparationError(
                     "ACTIVATION.CONCURRENT_PREPARATION",
@@ -4051,13 +4382,22 @@ class ResourceStoreCoordinator:
                 reason_code=first_report.error_code,
             )
         first_grant = first_report.grant
-        _require_activation_grant_identity_replacement(
-            first_grant,
-            identity=identity,
-            canonical_store_id=prior_store_id,
-            prior_view=prior_view,
-            current_generation=prior_generation,
-        )
+        if operation == _PORTABLE_REPLACEMENT_OPERATION:
+            _require_activation_grant_identity_replacement(
+                first_grant,
+                identity=identity,
+                canonical_store_id=prior_store_id,
+                prior_view=prior_view,
+                current_generation=prior_generation,
+            )
+        else:
+            _require_activation_grant_identity(
+                first_grant,
+                identity=identity,
+                canonical_store_id=prior_store_id,
+                prior_view=prior_view,
+                current_generation=prior_generation,
+            )
 
         borrow_already_claimed = False
         current_record = self._portable_replacement_current_record
@@ -4111,10 +4451,14 @@ class ResourceStoreCoordinator:
         try:
             with self._condition:
                 if (
-                    self._state != "READY"
+                    self._state != expected_prior_state
                     or self._view is not prior_view
                     or self._canonical_store_id != prior_store_id
                     or self._portable_replacement_preparation is not None
+                    or (
+                        operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION
+                        and self._portable_schema_upgrade_ticket is not schema_ticket
+                    )
                 ):
                     raise ActivationPreparationError(
                         "ACTIVATION.CONCURRENT_PREPARATION",
@@ -4136,7 +4480,7 @@ class ResourceStoreCoordinator:
                         current_generation=prior_generation,
                     )
                 except stage_seal_error as error:
-                    self._state = "READY"
+                    self._state = expected_prior_state
                     self._condition.notify_all()
                     raise ActivationPreparationError(
                         "ACTIVATION.TOKEN_REJECTED",
@@ -4176,25 +4520,42 @@ class ResourceStoreCoordinator:
                     reason_code=second_report.error_code,
                 )
             second_grant = second_report.grant
-            _require_activation_grant_identity_replacement(
-                second_grant,
-                identity=identity,
-                canonical_store_id=prior_store_id,
-                prior_view=prior_view,
-                current_generation=prior_generation,
-            )
+            if operation == _PORTABLE_REPLACEMENT_OPERATION:
+                _require_activation_grant_identity_replacement(
+                    second_grant,
+                    identity=identity,
+                    canonical_store_id=prior_store_id,
+                    prior_view=prior_view,
+                    current_generation=prior_generation,
+                )
+            else:
+                _require_activation_grant_identity(
+                    second_grant,
+                    identity=identity,
+                    canonical_store_id=prior_store_id,
+                    prior_view=prior_view,
+                    current_generation=prior_generation,
+                )
             assert token is not None
             contract_module._validate_activation_token_for_stage(
                 token,
                 sealed_stage,
             )
-            _require_activation_token_identity_replacement(
-                token,
-                identity=identity,
-                canonical_store_id=prior_store_id,
-                candidate_store_id=second_grant.canonical_store_id,
-                current_generation=prior_generation,
-            )
+            if operation == _PORTABLE_REPLACEMENT_OPERATION:
+                _require_activation_token_identity_replacement(
+                    token,
+                    identity=identity,
+                    canonical_store_id=prior_store_id,
+                    candidate_store_id=second_grant.canonical_store_id,
+                    current_generation=prior_generation,
+                )
+            else:
+                _require_activation_token_identity(
+                    token,
+                    identity=identity,
+                    canonical_store_id=prior_store_id,
+                    current_generation=prior_generation,
+                )
             physical = registry.resolve_physical_readiness(sealed_stage)
             if (
                 type(physical) is not portable_snapshot_type
@@ -4218,9 +4579,22 @@ class ResourceStoreCoordinator:
                 persistent_private=persistent_private,
                 caller_borrow=caller_borrow,
                 borrow_already_claimed=borrow_already_claimed,
+                operation=operation,
             )
             prior_authority.reprove()
-            preparation_id = f"replacement.{uuid.uuid4().hex}"
+            if schema_ticket is not None and (
+                prior_authority.database_proof != schema_ticket.prior_database
+                or prior_view is not schema_ticket._prior_view
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=True
+                )
+            prefix = (
+                "replacement"
+                if operation == _PORTABLE_REPLACEMENT_OPERATION
+                else "schema-upgrade"
+            )
+            preparation_id = f"{prefix}.{uuid.uuid4().hex}"
             backup_plans = (
                 _PortableReplacementBackupPlan(
                     asset_kind="DATABASE",
@@ -4241,6 +4615,7 @@ class ResourceStoreCoordinator:
             )
             preparation = _PortableReplacementPreparation(
                 preparation_id=preparation_id,
+                operation=operation,
                 resource_id=identity.resource_id,
                 target_identity=identity.target_identity,
                 candidate_store_id=second_grant.canonical_store_id,
@@ -4268,6 +4643,8 @@ class ResourceStoreCoordinator:
                         retryable=False,
                     )
                 self._portable_replacement_preparation = preparation
+                if operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+                    self._portable_schema_upgrade_ticket = None
             prior_authority = None
             return preparation
         except BaseException:
@@ -4297,7 +4674,7 @@ class ResourceStoreCoordinator:
             with self._condition:
                 self._portable_replacement_preparation = None
                 self._view = prior_view
-                self._state = "READY"
+                self._state = expected_prior_state
                 self._condition.notify_all()
             raise
 
@@ -5243,6 +5620,7 @@ class ResourceStoreCoordinator:
         persistent_private: PersistentPrivateProof,
         caller_borrow: _CallerHeldPortableJournalBorrow,
         borrow_already_claimed: bool,
+        operation: str,
     ) -> _PortableReplacementPriorAuthority:
         """Bind the prior pair and selected source without pathname adoption."""
 
@@ -5261,6 +5639,11 @@ class ResourceStoreCoordinator:
             raise TypeError("caller_borrow must be the exact portable borrow")
         if type(borrow_already_claimed) is not bool:
             raise TypeError("portable replacement borrow state is invalid")
+        if operation not in {
+            _PORTABLE_REPLACEMENT_OPERATION,
+            _PORTABLE_SCHEMA_UPGRADE_OPERATION,
+        }:
+            raise ValueError("portable transition operation is invalid")
         lineage_attestation = prior_view.active_content_attestation
         if type(lineage_attestation) is not PortableActiveContentAttestation:
             raise ActivationPreparationError(
@@ -5273,8 +5656,16 @@ class ResourceStoreCoordinator:
             or candidate_attestation.target_identity != identity.target_identity
             or candidate_attestation.expected_prior_generation
             != prior_view.generation
-            or candidate_attestation.canonical_store_id
-            == lineage_attestation.canonical_store_id
+            or (
+                operation == _PORTABLE_REPLACEMENT_OPERATION
+                and candidate_attestation.canonical_store_id
+                == lineage_attestation.canonical_store_id
+            )
+            or (
+                operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION
+                and candidate_attestation.canonical_store_id
+                != lineage_attestation.canonical_store_id
+            )
             or lineage_attestation.resource_id != identity.resource_id
             or lineage_attestation.target_identity != identity.target_identity
             or lineage_attestation.canonical_store_id != self._canonical_store_id
@@ -5339,12 +5730,31 @@ class ResourceStoreCoordinator:
                 identity,
                 journal_id=lineage_attestation.journal_id,
             )
-            schema = _inspect_completed_active_schema_read_only(
-                active_ref,
-                canonical_store_id=lineage_attestation.canonical_store_id,
-                expected_generation=lineage_attestation.generation,
-                expected_activation_digest=lineage_attestation.activation_digest,
-            )
+            if operation == _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+                _require_schema_upgrade_ancestry_provable(
+                    identity.canonical_sidecar_path
+                )
+                schema = inspect_stage_schema(
+                    active_ref,
+                    canonical_store_id=lineage_attestation.canonical_store_id,
+                    _allow_legacy_schema=True,
+                    _allow_active=True,
+                    _expected_active_generation=lineage_attestation.generation,
+                    _expected_activation_digest=(
+                        lineage_attestation.activation_digest
+                    ),
+                )
+                if schema.schema_version != TM_LEGACY_SCHEMA_VERSION:
+                    raise SQLiteStoreSchemaError("STORE.SCHEMA_UNSUPPORTED")
+            else:
+                schema = _inspect_completed_active_schema_read_only(
+                    active_ref,
+                    canonical_store_id=lineage_attestation.canonical_store_id,
+                    expected_generation=lineage_attestation.generation,
+                    expected_activation_digest=(
+                        lineage_attestation.activation_digest
+                    ),
+                )
             with _open_completed_authority_read_connection(
                 identity.canonical_sidecar_path
             ) as connection:
@@ -5379,13 +5789,16 @@ class ResourceStoreCoordinator:
                         raise SQLiteStoreSchemaError(
                             "STORE.ACTIVE_BINDING_INVALID"
                         )
-                    _CoordinatorStorePort(self).validate_candidate_proof_index(
-                        connection,
-                        required_sizes=(
-                            (1, 2) if schema.fts5_available else (1, 2, 3)
-                        ),
-                        fts5_available=schema.fts5_available,
-                    )
+                    if operation == _PORTABLE_REPLACEMENT_OPERATION:
+                        _CoordinatorStorePort(self).validate_candidate_proof_index(
+                            connection,
+                            required_sizes=(
+                                (1, 2)
+                                if schema.fts5_available
+                                else (1, 2, 3)
+                            ),
+                            fts5_available=schema.fts5_available,
+                        )
                 finally:
                     connection.rollback()
             prior_attestation = _create_portable_active_content_attestation(
@@ -5453,6 +5866,419 @@ class ResourceStoreCoordinator:
                         close_error = error
             if active_error is None and close_error is not None:
                 raise close_error
+
+    def _portable_schema_upgrade_report_backup_spec(
+        self,
+        record: _PortableReplacementRecord,
+    ) -> tuple[str, PortableContentFileProof] | None:
+        if type(record) is not _PortableReplacementRecord:
+            raise TypeError("portable transition record is invalid")
+        unsigned = record.unsigned
+        if unsigned.operation == _PORTABLE_REPLACEMENT_OPERATION:
+            return None
+        if unsigned.operation != _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+            raise ActivationPreparationError(
+                "ACTIVATION.REPLACEMENT_CHAIN_INVALID",
+                retryable=False,
+            )
+        identity = self._resource_identity
+        prior = unsigned.prior_active_content_attestation
+        if (
+            unsigned.resource_id != identity.resource_id
+            or unsigned.target_identity != identity.target_identity
+            or unsigned.canonical_database_name
+            != identity.canonical_sidecar_path.name
+            or unsigned.prior_canonical_store_id != prior.canonical_store_id
+            or unsigned.candidate_canonical_store_id
+            != unsigned.prior_canonical_store_id
+            or prior.resource_id != identity.resource_id
+            or prior.target_identity != identity.target_identity
+            or prior.generation != unsigned.prior_generation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.REPLACEMENT_CHAIN_INVALID",
+                retryable=False,
+            )
+        name = _portable_schema_upgrade_report_backup_name(
+            canonical_database_name=unsigned.canonical_database_name,
+            target_identity=unsigned.target_identity,
+            canonical_store_id=unsigned.prior_canonical_store_id,
+            prior_generation=unsigned.prior_generation,
+            prior_database=prior.database,
+        )
+        return name, prior.database
+
+    def _reprove_portable_schema_upgrade_report_backup_facts(
+        self,
+        *,
+        operation: str,
+        canonical_database_name: str,
+        target_identity: str,
+        canonical_store_id: str,
+        prior_generation: int,
+        prior_database: PortableContentFileProof,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        recovery: bool,
+    ) -> tuple[Path, PortableContentFileProof] | None:
+        if operation == _PORTABLE_REPLACEMENT_OPERATION:
+            return None
+        if operation != _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+            raise ValueError("portable transition operation is invalid")
+        if not isinstance(platform, PlatformFileBackend):
+            raise TypeError("platform must satisfy PlatformFileBackend")
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        if type(recovery) is not bool:
+            raise TypeError("recovery must be exact bool")
+        name = _portable_schema_upgrade_report_backup_name(
+            canonical_database_name=canonical_database_name,
+            target_identity=target_identity,
+            canonical_store_id=canonical_store_id,
+            prior_generation=prior_generation,
+            prior_database=prior_database,
+        )
+        opened: BoundRegularFile | None = None
+        private_evidence: Any | None = None
+        try:
+            root.reprove()
+            named = root.inspect_entry(name)
+            if named is None:
+                raise ActivationPreparationError(
+                    (
+                        "ACTIVATION.RECOVERY_REQUIRED"
+                        if recovery
+                        else "ACTIVATION.BACKUP_FAILED"
+                    ),
+                    retryable=recovery,
+                )
+            opened = platform.open_regular(root, PurePath(name))
+            private_evidence = platform.prove_private(opened)
+            facts = opened.content_facts()
+            if (
+                facts.snapshot != named
+                or facts.snapshot.identity.kind != "regular"
+                or facts.snapshot.identity.link_count != 1
+                or root.inspect_entry(name) != facts.snapshot
+                or self._portable_content_proof(facts) != prior_database
+            ):
+                raise ActivationPreparationError(
+                    (
+                        "ACTIVATION.RECOVERY_REQUIRED"
+                        if recovery
+                        else "ACTIVATION.BACKUP_FAILED"
+                    ),
+                    retryable=recovery,
+                )
+            root.reprove()
+            return (
+                self._resource_identity.canonical_sidecar_path.with_name(name),
+                prior_database,
+            )
+        except ActivationPreparationError:
+            raise
+        except (PlatformFileError, OSError) as error:
+            raise ActivationPreparationError(
+                (
+                    "ACTIVATION.RECOVERY_REQUIRED"
+                    if recovery
+                    else "ACTIVATION.BACKUP_FAILED"
+                ),
+                retryable=recovery,
+            ) from error
+        finally:
+            if private_evidence is not None:
+                private_evidence.close()
+            if opened is not None:
+                opened.close()
+
+    def _reprove_portable_schema_upgrade_report_backup(
+        self,
+        record: _PortableReplacementRecord,
+        *,
+        platform: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        recovery: bool,
+    ) -> tuple[Path, PortableContentFileProof] | None:
+        spec = self._portable_schema_upgrade_report_backup_spec(record)
+        if spec is None:
+            return None
+        name, expected = spec
+        unsigned = record.unsigned
+        expected_name = _portable_schema_upgrade_report_backup_name(
+            canonical_database_name=unsigned.canonical_database_name,
+            target_identity=unsigned.target_identity,
+            canonical_store_id=unsigned.prior_canonical_store_id,
+            prior_generation=unsigned.prior_generation,
+            prior_database=expected,
+        )
+        if name != expected_name:
+            raise AssertionError("schema upgrade backup derivation drifted")
+        return self._reprove_portable_schema_upgrade_report_backup_facts(
+            operation=unsigned.operation,
+            canonical_database_name=unsigned.canonical_database_name,
+            target_identity=unsigned.target_identity,
+            canonical_store_id=unsigned.prior_canonical_store_id,
+            prior_generation=unsigned.prior_generation,
+            prior_database=expected,
+            platform=platform,
+            root=root,
+            recovery=recovery,
+        )
+
+    def _publish_or_rebind_portable_schema_upgrade_report_backup(
+        self,
+        preparation: _PortableReplacementPreparation,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> tuple[Path, PortableContentFileProof] | None:
+        if preparation.operation == _PORTABLE_REPLACEMENT_OPERATION:
+            return None
+        if preparation.operation != _PORTABLE_SCHEMA_UPGRADE_OPERATION:
+            raise ValueError("portable transition operation is invalid")
+        if not isinstance(platform, PlatformFileBackend):
+            raise TypeError("platform must satisfy PlatformFileBackend")
+        if persistent_private is not platform:
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                retryable=False,
+            )
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("caller_borrow must be the exact portable borrow")
+
+        identity = self._resource_identity
+        expected = preparation._prior_authority.database_proof
+        name = _portable_schema_upgrade_report_backup_name(
+            canonical_database_name=identity.canonical_sidecar_path.name,
+            target_identity=identity.target_identity,
+            canonical_store_id=preparation.prior_store_id,
+            prior_generation=preparation.expected_prior_generation,
+            prior_database=expected,
+        )
+        candidate_name = name + ".candidate"
+        root, _lease = caller_borrow._publication_authorities(
+            platform,
+            persistent_private,
+            identity,
+        )
+        root.reprove()
+        if root.inspect_entry(name) is not None:
+            return self._reprove_portable_schema_upgrade_report_backup_facts(
+                operation=preparation.operation,
+                canonical_database_name=identity.canonical_sidecar_path.name,
+                target_identity=identity.target_identity,
+                canonical_store_id=preparation.prior_store_id,
+                prior_generation=preparation.expected_prior_generation,
+                prior_database=expected,
+                platform=platform,
+                root=root,
+                recovery=False,
+            )
+        candidate: CandidateFile | None = None
+        candidate_identity: FileObjectIdentity | None = None
+        candidate_guard: BoundExistingFileMutationGuard | None = None
+        candidate_owned_by_attempt = False
+        recovery_attempted = False
+        pending: PendingPublication | None = None
+        try:
+            preparation._prior_authority.reprove()
+            interrupted = root.inspect_entry(candidate_name)
+            recovery_attempted = interrupted is not None
+            quarantine_root = None
+            quarantine_leaf = None
+            try:
+                quarantine_root_entry = root.inspect_entry(
+                    _PORTABLE_ACTIVATION_QUARANTINE_ROOT
+                )
+                quarantine_target = None
+                recovery_leaf = "schema-upgrade-" + hashlib.sha256(
+                    (
+                        "portable-schema-upgrade-candidate-recovery-v1\0"
+                        + candidate_name
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+                if quarantine_root_entry is not None:
+                    quarantine_root = platform.bind_or_create_child_directory(
+                        root,
+                        _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                    )
+                    if quarantine_root.inspect_entry(recovery_leaf) is not None:
+                        quarantine_leaf = platform.bind_or_create_child_directory(
+                            quarantine_root,
+                            recovery_leaf,
+                        )
+                        quarantine_target = quarantine_leaf.inspect_entry(
+                            candidate_name
+                        )
+                        recovery_attempted = (
+                            recovery_attempted or quarantine_target is not None
+                        )
+                if interrupted is not None or quarantine_target is not None:
+                    if not (
+                        isinstance(platform, ExistingCandidateRecovery)
+                        and isinstance(platform, ExistingFileMutationGuard)
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                            retryable=False,
+                        )
+                    if quarantine_root is None:
+                        quarantine_root = platform.bind_or_create_child_directory(
+                            root,
+                            _PORTABLE_ACTIVATION_QUARANTINE_ROOT,
+                        )
+                    if quarantine_leaf is None:
+                        quarantine_leaf = platform.bind_or_create_child_directory(
+                            quarantine_root,
+                            recovery_leaf,
+                        )
+                    candidate_guard = platform.guard_existing_for_mutation(
+                        root,
+                        PurePath(identity.canonical_sidecar_path.name),
+                    )
+                    candidate = platform.recover_existing_candidate(
+                        root,
+                        candidate_name,
+                        quarantine_leaf,
+                        candidate_name,
+                        CandidateContentFacts(
+                            expected.size,
+                            bytes.fromhex(expected.sha256),
+                        ),
+                        owner_lease=_lease,
+                        mutation_guard=candidate_guard,
+                        require_private=True,
+                    )
+                    candidate_identity = candidate.identity()
+                else:
+                    candidate = root.create_candidate(candidate_name, private=True)
+                    candidate_identity = candidate.identity()
+                    candidate_owned_by_attempt = True
+                    chunks, maximum_bytes = preparation._prior_authority._stream_asset(
+                        "DATABASE"
+                    )
+                    written = candidate.write_chunks(
+                        chunks,
+                        maximum_bytes=maximum_bytes,
+                    )
+                    if self._portable_content_proof(written) != expected:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.BACKUP_FAILED",
+                            retryable=True,
+                        )
+                    candidate.flush_content()
+            finally:
+                if quarantine_leaf is not None:
+                    quarantine_leaf.close()
+                if quarantine_root is not None:
+                    quarantine_root.close()
+            preparation._prior_authority.reprove()
+            if candidate_guard is not None:
+                candidate_guard.reprove()
+            pending = root.begin_publish(
+                candidate,
+                name,
+                mode=PublishMode.CREATE_IF_ABSENT,
+                lease=None,
+            )
+            candidate = None
+            candidate_identity = None
+            candidate_owned_by_attempt = False
+            retained = pending.retained_destination()
+            retained_facts = retained.content_facts()
+            preliminary = pending.preliminary_facts()
+            if (
+                retained_facts.snapshot.identity.kind != "regular"
+                or retained_facts.snapshot.identity.link_count != 1
+                or root.inspect_entry(name) != retained_facts.snapshot
+                or self._portable_content_proof(retained_facts) != expected
+                or preliminary.content_sha256.hex() != expected.sha256
+                or preliminary.byte_count != expected.size
+                or pending.terminal_reproof() != preliminary
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            if candidate_guard is not None:
+                candidate_guard.reprove()
+            preparation._prior_authority.reprove()
+        except ActivationPreparationError:
+            raise
+        except (PlatformFileError, OSError) as error:
+            code = (
+                "ACTIVATION.RECOVERY_REQUIRED"
+                if pending is not None or recovery_attempted
+                else "ACTIVATION.BACKUP_FAILED"
+            )
+            raise ActivationPreparationError(
+                code,
+                retryable=True,
+            ) from error
+        finally:
+            active_error = sys.exception()
+            close_error: BaseException | None = None
+            if candidate is not None:
+                try:
+                    candidate.close()
+                except BaseException as error:
+                    close_error = error
+            if candidate_identity is not None and candidate_owned_by_attempt:
+                try:
+                    observed = root.inspect_entry(candidate_name)
+                    if observed is not None:
+                        if observed.identity != candidate_identity:
+                            raise ActivationPreparationError(
+                                "ACTIVATION.RECOVERY_REQUIRED",
+                                retryable=True,
+                            )
+                        root.unlink_owned(candidate_name, candidate_identity)
+                        if root.inspect_entry(candidate_name) is not None:
+                            raise ActivationPreparationError(
+                                "ACTIVATION.RECOVERY_REQUIRED",
+                                retryable=True,
+                            )
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+            if pending is not None:
+                try:
+                    pending.close()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+            if candidate_guard is not None:
+                try:
+                    candidate_guard.close()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+            if close_error is not None:
+                if active_error is None:
+                    raise close_error
+                if type(active_error) not in (
+                    TypeError,
+                    AssertionError,
+                    AttributeError,
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ) from close_error
+
+        return self._reprove_portable_schema_upgrade_report_backup_facts(
+            operation=preparation.operation,
+            canonical_database_name=identity.canonical_sidecar_path.name,
+            target_identity=identity.target_identity,
+            canonical_store_id=preparation.prior_store_id,
+            prior_generation=preparation.expected_prior_generation,
+            prior_database=expected,
+            platform=platform,
+            root=root,
+            recovery=True,
+        )
 
     def _begin_portable_replacement_backups(
         self,
@@ -6478,13 +7304,22 @@ class ResourceStoreCoordinator:
                         "SELECT batch_id, kind, status FROM tm_origin_batch "
                         "ORDER BY batch_id"
                     ).fetchall()
-                    if origin_rows != [
-                        (
-                            sealed_semantic.origin_batch_id,
-                            sealed_semantic.origin_batch_kind,
-                            "completed",
-                        )
-                    ]:
+                    expected_origin = (
+                        sealed_semantic.origin_batch_id,
+                        sealed_semantic.origin_batch_kind,
+                        "completed",
+                    )
+                    schema_upgrade_origin = (
+                        sealed_semantic.origin_batch_kind == "schema_upgrade"
+                        and active_meta.get(_SCHEMA_UPGRADE_META_KEY)
+                        == _SCHEMA_UPGRADE_META_VALUE
+                        and len(origin_rows) == 1
+                        and origin_rows[0][0]
+                        == sealed_semantic.origin_batch_id
+                        and origin_rows[0][1] in {"migration", "import"}
+                        and origin_rows[0][2] == "completed"
+                    )
+                    if origin_rows != [expected_origin] and not schema_upgrade_origin:
                         raise SQLiteStoreSchemaError(
                             "STORE.ACTIVE_COUNT_MISMATCH"
                         )
@@ -7390,6 +8225,78 @@ class ResourceStoreCoordinator:
                         ) from first_cleanup_error
                     raise first_cleanup_error
 
+    def portable_schema_upgrade_report_backup(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> tuple[Path, PortableContentFileProof]:
+        """Reprove the stable prior database reported by a completed upgrade."""
+
+        if not isinstance(platform, PlatformFileBackend):
+            raise TypeError("platform must satisfy PlatformFileBackend")
+        if persistent_private is not platform:
+            raise ActivationPreparationError(
+                "ACTIVATION.PRIVATE_STORAGE_UNPROVEN",
+                retryable=False,
+            )
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("caller_borrow must be the exact portable borrow")
+        with self._condition:
+            record = self._portable_replacement_current_record
+            if (
+                self._state != "READY"
+                or type(record) is not _PortableReplacementRecord
+                or record.unsigned.phase != "READY"
+                or record.unsigned.operation
+                != _PORTABLE_SCHEMA_UPGRADE_OPERATION
+                or record.unsigned.candidate_canonical_store_id
+                != self._canonical_store_id
+                or record.unsigned.next_generation != self.current_generation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_BACKUP_INVALID",
+                    retryable=False,
+                )
+        root, _lease = caller_borrow._fresh_recovery_authorities(
+            platform,
+            persistent_private,
+            self._resource_identity,
+        )
+        result = self._reprove_portable_schema_upgrade_report_backup(
+            record,
+            platform=platform,
+            root=root,
+            recovery=True,
+        )
+        if result is None:
+            raise AssertionError("schema upgrade report backup is missing")
+        with self._condition:
+            if (
+                self._state != "READY"
+                or self._portable_replacement_current_record is not record
+                or self._canonical_store_id
+                != record.unsigned.candidate_canonical_store_id
+                or self.current_generation != record.unsigned.next_generation
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+        repeated = self._reprove_portable_schema_upgrade_report_backup(
+            record,
+            platform=platform,
+            root=root,
+            recovery=True,
+        )
+        if repeated != result:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        return result
+
     def publish_portable_replacement_activation(
         self,
         preparation: _PortableReplacementPreparation,
@@ -7450,7 +8357,7 @@ class ResourceStoreCoordinator:
             )
             prepared_unsigned = _PortableReplacementUnsigned(
                 replacement_version=_PORTABLE_REPLACEMENT_VERSION,
-                operation=_PORTABLE_REPLACEMENT_OPERATION,
+                operation=preparation.operation,
                 phase="PREPARED",
                 predecessor_digest=preparation.prior_authority_digest,
                 journal_id=f"replacement-journal.{preparation.preparation_id}",
@@ -7569,8 +8476,32 @@ class ResourceStoreCoordinator:
                     ).encode("utf-8")
                 ).hexdigest()
 
+            def schema_backup_reprove(
+                record: _PortableReplacementRecord,
+            ) -> None:
+                if record.unsigned.operation == _PORTABLE_REPLACEMENT_OPERATION:
+                    return
+                root, _lease = caller_borrow._publication_authorities(
+                    platform,
+                    persistent_private,
+                    identity,
+                )
+                if self._reprove_portable_schema_upgrade_report_backup(
+                    record,
+                    platform=platform,
+                    root=root,
+                    recovery=True,
+                ) is None:
+                    raise AssertionError("schema upgrade report backup is missing")
+
             try:
                 owner_reprove()
+                self._publish_or_rebind_portable_schema_upgrade_report_backup(
+                    preparation,
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    caller_borrow=caller_borrow,
+                )
                 backup_set = self._begin_portable_replacement_backups(
                     preparation,
                     private_directory_name=private_name,
@@ -7579,11 +8510,12 @@ class ResourceStoreCoordinator:
                     caller_borrow=caller_borrow,
                 )
 
-                def prepared_business(_record: _PortableReplacementRecord) -> None:
+                def prepared_business(record: _PortableReplacementRecord) -> None:
                     if backup_set is None:
                         raise AssertionError("replacement backup set is missing")
                     preparation._prior_authority.reprove()
                     backup_set.reprove()
+                    schema_backup_reprove(record)
 
                 prepared_record = _PortableReplacementRecordOwner.publish(
                     identity=identity,
@@ -7649,7 +8581,7 @@ class ResourceStoreCoordinator:
                     predecessor_digest=prepared_record.record_digest,
                 )
 
-                def db_business(_record: _PortableReplacementRecord) -> None:
+                def db_business(record: _PortableReplacementRecord) -> None:
                     if self._portable_content_proof(
                         db_retained.content_facts()
                     ) != sealed.database:
@@ -7670,6 +8602,7 @@ class ResourceStoreCoordinator:
                             "ACTIVATION.DB_REOPEN_INVALID",
                             retryable=False,
                         )
+                    schema_backup_reprove(record)
 
                 db_record = _PortableReplacementRecordOwner.publish(
                     identity=identity,
@@ -7776,6 +8709,7 @@ class ResourceStoreCoordinator:
                             "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
                             retryable=False,
                         )
+                    schema_backup_reprove(record)
 
                 manifest_record = _PortableReplacementRecordOwner.publish(
                     identity=identity,
@@ -7866,6 +8800,7 @@ class ResourceStoreCoordinator:
                     persistent_private=persistent_private,
                     caller_borrow=caller_borrow,
                 )
+                schema_backup_reprove(ready_record)
                 active_set.reprove()
                 active_set.close()
                 active_set = None
@@ -8294,6 +9229,45 @@ class ResourceStoreCoordinator:
         with self._condition:
             try:
                 return rehydrate_completed_portable_replacement_activation(
+                    _CoordinatorStorePort(self),
+                    platform=platform,
+                    persistent_private=persistent_private,
+                    descendant_inspection=descendant_inspection,
+                    caller_borrow=caller_borrow,
+                )
+            except ActivationPreparationError:
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise
+            except (PlatformFileError, OSError, sqlite3.Error) as error:
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from error
+
+    def rehydrate_portable_schema_upgrade_predecessor(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        existing_retirement: ExistingFileRetirement,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> ActivationRecoveryReport | None:
+        """Hydrate one exact portable v1 owner without granting query READY."""
+
+        if existing_retirement is not platform:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                retryable=False,
+            )
+        with self._condition:
+            try:
+                return _rehydrate_portable_schema_upgrade_predecessor(
                     _CoordinatorStorePort(self),
                     platform=platform,
                     persistent_private=persistent_private,
