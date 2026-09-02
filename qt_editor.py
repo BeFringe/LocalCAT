@@ -753,6 +753,12 @@ def main(argv: list[str] | None = None) -> int:
             root,
             backend=platform_backend,
         )
+        from qt_source_resources import resolve_source_qt_resources
+
+        qt_resources = resolve_source_qt_resources(
+            source_authority,
+            logo_filename=APPLICATION_ICON_FILENAME,
+        )
         data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
         data_root = platform_backend.bind_root(data_dir)
@@ -762,6 +768,7 @@ def main(argv: list[str] | None = None) -> int:
             data_root.close()
 
         from qt_editor_window import QtEditorWindow
+        from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
         from resource_repository import ResourceRepository
 
         repository = ResourceRepository(
@@ -810,12 +817,16 @@ def main(argv: list[str] | None = None) -> int:
         app.setOrganizationName("LocalCAT")
         app.setApplicationVersion(APPLICATION_VERSION)
         app.setDesktopFileName("localcat")
-        logo_path = application_icon_path(root)
-        if logo_path.is_file():
-            app.setWindowIcon(QIcon(str(logo_path)))
+        logo_pixmap = resource_png_pixmap(qt_resources.logo)
+        if logo_pixmap is None:
+            raise ValueError("source Qt logo is not a valid PNG")
+        app.setWindowIcon(QIcon(logo_pixmap))
         window = QtEditorWindow(
             controller,
             chunk_controller=chunk_controller,
+            speaker_avatar_catalog=SpeakerAvatarCatalog(
+                qt_resources.speaker_avatars
+            ),
         )
         # Keep the long-standing window construction seam compatible with
         # bootstrap probes while still installing the run-owned TMX service

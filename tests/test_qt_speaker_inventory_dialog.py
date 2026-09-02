@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,6 +20,7 @@ from editor_contracts import (
 )
 from editor_controller import EditorController
 from qt_editor_window import QtEditorWindow
+from qt_resource_contracts import QtResourceBytes
 from qt_speaker_avatar import SpeakerAvatarCatalog
 from qt_speaker_inventory_dialog import QtSpeakerInventoryDialog
 from resource_repository import ResourceRepository
@@ -60,7 +61,14 @@ class QtSpeakerInventoryDialogTests(unittest.TestCase):
             controller = _InventoryController(self._inventory())
             dialog = QtSpeakerInventoryDialog(  # type: ignore[arg-type]
                 controller,
-                avatar_catalog=SpeakerAvatarCatalog(root),
+                avatar_catalog=SpeakerAvatarCatalog(
+                    (
+                        QtResourceBytes(
+                            "adelaHalf.png",
+                            (root / "adelaHalf.png").read_bytes(),
+                        ),
+                    )
+                ),
             )
             self.addCleanup(dialog.close)
 
@@ -102,16 +110,40 @@ class QtSpeakerInventoryDialogTests(unittest.TestCase):
             valid = QImage(16, 16, QImage.Format.Format_ARGB32)
             valid.fill(0xFF336699)
             self.assertTrue(valid.save(str(root / "AliceHalf.png"), "PNG"))
-            catalog = SpeakerAvatarCatalog(root)
+            catalog = SpeakerAvatarCatalog(
+                (
+                    QtResourceBytes(
+                        "AliceHalf.png",
+                        (root / "AliceHalf.png").read_bytes(),
+                    ),
+                )
+            )
             self.assertIsNotNone(catalog.avatar_pixmap("alice"))
             self.assertIsNone(catalog.avatar_pixmap("../Alice"))
 
-            collided = SpeakerAvatarCatalog(root)
-            collided._paths["alice"] = None
+            collided = SpeakerAvatarCatalog(
+                (
+                    QtResourceBytes(
+                        "AliceHalf.png",
+                        (root / "AliceHalf.png").read_bytes(),
+                    ),
+                    QtResourceBytes(
+                        "ALICEHalf.png",
+                        (root / "AliceHalf.png").read_bytes(),
+                    ),
+                )
+            )
             self.assertIsNone(collided.avatar_pixmap("ALICE"))
 
             (root / "BrokenHalf.png").write_bytes(b"not an image")
-            invalid = SpeakerAvatarCatalog(root)
+            invalid = SpeakerAvatarCatalog(
+                (
+                    QtResourceBytes(
+                        "BrokenHalf.png",
+                        (root / "BrokenHalf.png").read_bytes(),
+                    ),
+                )
+            )
             self.assertIsNone(invalid.avatar_pixmap("Broken"))
 
     def test_empty_inventory_has_explicit_empty_state(self) -> None:
@@ -146,8 +178,15 @@ class QtSpeakerInventoryDialogTests(unittest.TestCase):
                 encoding="utf-8",
             )
             controller.open_project(project_path)
-            window = QtEditorWindow(controller)
+            catalog = SpeakerAvatarCatalog(
+                (QtResourceBytes("AdelaHalf.png", b"not decoded here"),)
+            )
+            window = QtEditorWindow(
+                controller,
+                speaker_avatar_catalog=catalog,
+            )
             self.addCleanup(window.close)
+            self.assertIs(window.speaker_avatar_catalog, catalog)
             project_before = controller.project
             index_before = controller.current_index
             dirty_before = controller.dirty
@@ -157,15 +196,21 @@ class QtSpeakerInventoryDialogTests(unittest.TestCase):
                 window.speaker_inventory_action.text(),
                 "Raw speaker 盘点",
             )
+            execute = Mock(return_value=0)
+
+            def record_exec(dialog: QtSpeakerInventoryDialog) -> int:
+                return execute(dialog)
+
             with patch.object(
                 QtSpeakerInventoryDialog,
                 "exec",
-                autospec=True,
-                return_value=0,
-            ) as execute:
+                new=record_exec,
+            ):
                 window._open_speaker_inventory_dialog()
 
             self.assertEqual(execute.call_count, 1)
+            dialog = execute.call_args.args[0]
+            self.assertIs(dialog._avatar_catalog, catalog)
             self.assertIs(controller.project, project_before)
             self.assertEqual(controller.current_index, index_before)
             self.assertEqual(controller.dirty, dirty_before)
