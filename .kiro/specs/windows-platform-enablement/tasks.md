@@ -385,7 +385,7 @@
   - _Boundary: Windows User-managed Source Launcher_
   - _Depends: 4.4, 6.5_
 
-- [ ] 6.6b 汇总user-managed Windows source产品journey
+- [x] 6.6b 汇总user-managed Windows source产品journey
   - 只接受WA-08 5.4a经6.6a轻量入口产生的fresh evidence，覆盖项目保存/重开、TM激活/退出/重启恢复、TMX导入、FTS5查询、qwindows、资源与头像fallback；同时复核5.5与6.5的owner/recovery证据仍绑定同一commit
   - 完成时记录`WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`与各WA row的`SOURCE_MERGED_PASS`；Requirement 10～12、W3与最终Windows状态继续NO-GO/NOT_VERIFIED
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 7.1, 8.1, 9.1, 9.3, 9.4_
