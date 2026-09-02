@@ -199,6 +199,7 @@
 - [x] 3.3 (P) 实现 LockFileEx persistent lease 与 crash release
   - lock file使用W1 exact protocol-control DACL、exact medium mandatory-label/`NO_WRITE_UP` SACL projection、deterministic name、single-link/`ProtocolControlLockPayloadV1`/entry identity，文件永久保留且不unlink/replace；不得反向依赖W2 attestation private proof
   - 首次creator用`CREATE_NEW`+share-none init handle写完整可重算payload并flush/readback；并发loser在`ERROR_FILE_EXISTS`后先用普通LOCK profile open/复证，完整payload直接进入`LockFileEx`，该open sharing violation才bounded retry INIT。空/strict-prefix须关闭普通handle再争抢INIT share-none handle、二次复证DACL/MIC/identity/bytes后确定性恢复；unknown状态fail closed，恢复后关闭INIT再打开普通LOCK profile
+  - read-only recovery classification使用可选`ExistingProcessFileLock`只取得已存在且exact-payload的W1；缺失、空、strict-prefix或foreign状态不得创建、补写或升级锁文件
   - 实现明确 byte range、blocking/timeout/contention结果；normal unlock/close与 TerminateProcess 后 eventual release不承诺公平/零延迟
   - 完成时，双进程acquire/timeout、two-creator、create/write/flush/readback/close逐边界crash接管、payload/FileId tamper、kill/retry与错误映射全绿
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 8.3_

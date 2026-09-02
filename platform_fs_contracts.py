@@ -2105,6 +2105,46 @@ class ProcessFileLock(Protocol):
 
 
 @runtime_checkable
+class ExistingProcessFileLock(Protocol):
+    """Acquire one already-existing lock without creating or rewriting it."""
+
+    def acquire_existing(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+        policy: LockPolicy,
+    ) -> LockLease:
+        if not isinstance(parent, BoundDirectoryAuthority):
+            raise TypeError("parent must be BoundDirectoryAuthority")
+        parent._require_open()
+        checked_name = validate_relative_name(name)
+        if type(payload) is not bytes:
+            raise TypeError("lock payload must be exact bytes")
+        if type(policy) is not LockPolicy:
+            raise TypeError("policy must be exact LockPolicy")
+        lease = self._acquire_existing(
+            parent,
+            checked_name,
+            payload,
+            policy,
+        )
+        if not isinstance(lease, LockLease):
+            raise TypeError("backend existing acquire must return LockLease")
+        lease._require_open()
+        return lease
+
+    @abstractmethod
+    def _acquire_existing(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        payload: bytes,
+        policy: LockPolicy,
+    ) -> LockLease: ...
+
+
+@runtime_checkable
 class PrivateStorageProof(Protocol):
     def create_private_directory(
         self,

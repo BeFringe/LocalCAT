@@ -23,6 +23,7 @@ APPLICATION_ICON_NAME = "localcat"
 APPLICATION_ICON_SIZE = 512
 LOCALCAT_NATIVE_LAUNCH_ENV = "LOCALCAT_NATIVE_LAUNCH"
 LOCALCAT_DIRECT_HANDOFF_VERSION = 1
+STARTUP_FAILURE_CODE = "LOCALCAT.STARTUP.FAILED"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -773,8 +774,11 @@ def main(argv: list[str] | None = None) -> int:
             print("Qt editor smoke test passed.")
             return 0
         return app.exec()
-    except Exception as exc:
-        print(f"LocalCAT Qt editor could not start: {exc}", file=sys.stderr)
+    except Exception:
+        print(
+            f"LocalCAT Qt editor could not start [{STARTUP_FAILURE_CODE}].",
+            file=sys.stderr,
+        )
         return 1
 
 

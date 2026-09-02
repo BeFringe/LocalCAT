@@ -27,6 +27,7 @@ from tests.windows_process_token_helper import (
 )
 
 from platform_fs_contracts import (
+    ExistingProcessFileLock,
     LedgerEnumerationLimits,
     LockPolicy,
     LockWait,
@@ -58,6 +59,19 @@ EXPECTED = (
     b"LOCALCAT-PROTOCOL-CONTROL-LOCK\x00"
     b"schema=1\nresource-family=0123456789abcdef\nrange-map=exclusive-byte-0\n"
 )
+
+
+def _exact_tree(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
+    facts: list[tuple[str, str, bytes | None]] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.is_dir():
+            facts.append((relative, "directory", None))
+        elif path.is_file():
+            facts.append((relative, "file", path.read_bytes()))
+        else:
+            facts.append((relative, "other", None))
+    return tuple(facts)
 
 
 def _assert_platform_error(
@@ -405,6 +419,38 @@ class WindowsPersistentLockTests(unittest.TestCase):
                 )
                 self._close_authorities()
                 self.assertEqual(lock_path.read_bytes(), hostile)
+                lock_path.unlink()
+                self._rebind()
+
+    def test_existing_only_rejects_incomplete_or_hostile_payload_without_mutation(
+        self,
+    ) -> None:
+        lock_path = self.root_path / "resource.lock"
+        service = WindowsProcessFileLock()
+        self.assertIsInstance(service, ExistingProcessFileLock)
+        for actual in (b"", EXPECTED[:17], EXPECTED + b"hostile"):
+            with self.subTest(actual=actual):
+                self._seed_protocol_file()
+                self._close_authorities()
+                lock_path.write_bytes(actual)
+                before = _exact_tree(self.root_path)
+                self._rebind()
+
+                with self.assertRaises(PlatformFileError) as caught:
+                    service.acquire_existing(
+                        self.parent,
+                        "resource.lock",
+                        EXPECTED,
+                        LockPolicy(LockWait.FAIL_FAST),
+                    )
+                _assert_platform_error(
+                    self,
+                    caught,
+                    PlatformFileErrorCode.LOCK_UNAVAILABLE,
+                )
+                self._close_authorities()
+                self.assertEqual(_exact_tree(self.root_path), before)
+                self.assertEqual(lock_path.read_bytes(), actual)
                 lock_path.unlink()
                 self._rebind()
 

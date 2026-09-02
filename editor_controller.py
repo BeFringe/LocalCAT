@@ -310,6 +310,7 @@ class _PreparedTMActivation:
     service: TMMigrationService
     preflight: MigrationPreflight
     view: TMActivationPreflightView
+    action: str = "INITIAL"
 
     def __post_init__(self) -> None:
         if type(self.config) is not ResourceConfig:
@@ -323,6 +324,8 @@ class _PreparedTMActivation:
         if type(self.view) is not TMActivationPreflightView:
             raise TypeError("prepared activation view must be exact contract")
         self.view.__post_init__()
+        if self.action not in {"INITIAL", "RECOVERY"}:
+            raise TypeError("prepared activation action is unsupported")
 
 
 def _initial_tm_activation_service(config: ResourceConfig) -> TMMigrationService:
@@ -3929,10 +3932,19 @@ class EditorController:
                     "TM activation requires a translation memory resource"
                 )
             service = _initial_tm_activation_service(config)
+            action = "INITIAL"
             try:
                 preflight = service.preflight(config.path)
             except MigrationPreflightError as error:
-                raise EditorControllerError(error.error_code) from error
+                if error.error_code != "MIGRATION.SIDECAR_NOT_REUSABLE":
+                    raise EditorControllerError(error.error_code) from error
+                try:
+                    preflight = service.preflight_pending_recovery(config.path)
+                except MigrationPreflightError as recovery_error:
+                    raise EditorControllerError(
+                        recovery_error.error_code
+                    ) from recovery_error
+                action = "RECOVERY"
             preflight.__post_init__()
             view = TMActivationPreflightView(
                 resource_id=config.id,
@@ -3947,6 +3959,7 @@ class EditorController:
                 service=service,
                 preflight=preflight,
                 view=private_view,
+                action=action,
             )
             prepared.__post_init__()
             self._prepared_tm_activation = prepared
@@ -4169,9 +4182,16 @@ class EditorController:
                     "TM activation resource changed after preflight"
                 )
             try:
-                current_preflight = prepared.service.preflight(
-                    current_config.path
-                )
+                if prepared.action == "RECOVERY":
+                    current_preflight = (
+                        prepared.service.preflight_pending_recovery(
+                            current_config.path
+                        )
+                    )
+                else:
+                    current_preflight = prepared.service.preflight(
+                        current_config.path
+                    )
             except MigrationPreflightError as error:
                 self._prepared_tm_activation = None
                 raise EditorControllerError(error.error_code) from error
@@ -4205,7 +4225,7 @@ class EditorController:
                     "service": prepared.service,
                     "source": current_config.path,
                     "resource_id": current_config.id,
-                    "action": "INITIAL",
+                    "action": prepared.action,
                 },
                 name=f"localcat-tm-activation-{operation.operation_id[:8]}",
                 daemon=True,
@@ -4238,7 +4258,7 @@ class EditorController:
         retryable = False
         service_canonical_store_id: str | None = None
         try:
-            if action == "INITIAL":
+            if action in {"INITIAL", "RECOVERY"}:
                 candidate = service.activate_initial(source, resource_id)
             elif action == "REBUILD":
                 candidate = service.rebuild_from_snapshot(source, resource_id)
@@ -4492,6 +4512,45 @@ class EditorController:
             retrieval_status.__post_init__()
             for status in statuses:
                 status.__post_init__()
+
+            if not activation_in_progress:
+                configs_by_id = {config.id: config for config in configs}
+                classified: list[TMResourceStatus] = []
+                for status in statuses:
+                    if not (
+                        status.mode is TMResourceDisplayMode.UNAVAILABLE
+                        and status.safe_codes
+                        == ("TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE",)
+                    ):
+                        classified.append(status)
+                        continue
+                    config = configs_by_id.get(status.resource_id)
+                    if config is None:
+                        classified.append(status)
+                        continue
+                    service = _initial_tm_activation_service(config)
+                    try:
+                        service.preflight_pending_recovery(config.path)
+                    except MigrationPreflightError as error:
+                        if error.error_code != "MIGRATION.RECOVERY_NOT_APPLICABLE":
+                            raise
+                        classified.append(status)
+                    else:
+                        classified.append(
+                            TMResourceStatus(
+                                resource_id=status.resource_id,
+                                resource_name=status.resource_name,
+                                mode=TMResourceDisplayMode.UNAVAILABLE,
+                                exact_available=False,
+                                context_available=False,
+                                fuzzy_available=False,
+                                safe_codes=(
+                                    "TM.RUNTIME.CANONICAL_RECOVERY_REQUIRED",
+                                ),
+                                retryable=True,
+                            )
+                        )
+                statuses = tuple(classified)
 
             current_report = self._current_tm_report
             if current_report is not None:
