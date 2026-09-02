@@ -16,6 +16,7 @@ from pathlib import Path
 INSTALL_HINT = "python -m pip install -r requirements-ui.txt"
 APPLICATION_ICON_FILENAME = "LocalCAT-logo-silver.png"
 APPLICATION_ICNS_FILENAME = "LocalCAT-logo-silver.icns"
+APPLICATION_VERSION = "1.0"
 APPLICATION_ICON_NAME = "localcat"
 # hicolor's freedesktop theme index declares apps directories only through
 # 512x512; resources installed into an undeclared 1024x1024/apps directory are
@@ -41,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Install the lightweight macOS LocalCAT.app, then exit.",
     )
+    project.add_argument(
+        "--install-windows-launcher",
+        action="store_true",
+        help="Install the user-managed Windows source launcher, then exit.",
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -53,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bundle-smoke-marker",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--source-launch-smoke-marker",
         type=Path,
         help=argparse.SUPPRESS,
     )
@@ -360,6 +371,54 @@ def _write_bundle_smoke_marker(
         temporary.unlink(missing_ok=True)
 
 
+def _write_source_launch_smoke_marker(
+    path: Path,
+    *,
+    app: object,
+    window: object,
+) -> None:
+    """Publish observable source-entry facts after one visible native window."""
+
+    import json
+
+    from windows_source_guardian import DEVELOPER_OVERRIDE_ENVIRONMENT
+
+    marker = path.expanduser()
+    if not marker.is_absolute() or marker.exists() or not marker.parent.is_dir():
+        raise ValueError("source launch smoke marker path is invalid")
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(
+                {
+                    "application_name": app.applicationName(),
+                    "application_version": app.applicationVersion(),
+                    "cwd": str(Path.cwd()),
+                    "developer_overrides_present": sorted(
+                        name
+                        for name in DEVELOPER_OVERRIDE_ENVIRONMENT
+                        if name in os.environ
+                    ),
+                    "pid": os.getpid(),
+                    "platform_name": app.platformName(),
+                    "python_executable": str(Path(sys.executable).resolve()),
+                    "version": 1,
+                    "window_handle": int(window.winId()),
+                    "window_icon_present": not app.windowIcon().isNull(),
+                    "window_title": window.windowTitle(),
+                    "window_visible": window.isVisible(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _fuzzy_validation_display(composition: object):
     """Project the composition-private Gate D lifecycle into a safe DTO."""
 
@@ -632,6 +691,12 @@ def _compose_tmx_export_service(
 def main(argv: list[str] | None = None) -> int:
     launch_argv = tuple(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(launch_argv)
+    if args.source_launch_smoke_marker is not None and not args.smoke_test:
+        print(
+            f"LocalCAT Qt editor could not start [{STARTUP_FAILURE_CODE}].",
+            file=sys.stderr,
+        )
+        return 1
     if args.install_desktop_launcher:
         try:
             launcher = install_desktop_launcher()
@@ -647,6 +712,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Unable to install LocalCAT.app: {exc}", file=sys.stderr)
             return 1
         print(f"Installed LocalCAT.app: {bundle}")
+        return 0
+    if args.install_windows_launcher:
+        try:
+            from windows_source_launcher import install_windows_source_launcher
+
+            report = install_windows_source_launcher()
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"Unable to install LocalCAT Windows launcher: {exc}", file=sys.stderr)
+            return 1
+        print(f"Installed LocalCAT Windows launcher: {report.shortcut}")
         return 0
     if not args.smoke_test and args.bundle_smoke_marker is None:
         _handoff_to_macos_native_launcher(launch_argv)
@@ -723,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
         QApplication.setApplicationName("LocalCAT")
         QApplication.setApplicationDisplayName("LocalCAT")
         QApplication.setOrganizationName("LocalCAT")
+        QApplication.setApplicationVersion(APPLICATION_VERSION)
         existing_app = QApplication.instance()
         app = (
             QApplication([sys.argv[0]])
@@ -732,6 +808,7 @@ def main(argv: list[str] | None = None) -> int:
         app.setApplicationName("LocalCAT")
         app.setApplicationDisplayName("LocalCAT")
         app.setOrganizationName("LocalCAT")
+        app.setApplicationVersion(APPLICATION_VERSION)
         app.setDesktopFileName("localcat")
         logo_path = application_icon_path(root)
         if logo_path.is_file():
@@ -758,6 +835,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.bundle_smoke_marker.expanduser().resolve(),
                 application_name=app.applicationName(),
                 window_title=window.windowTitle(),
+            )
+        if args.source_launch_smoke_marker is not None:
+            _write_source_launch_smoke_marker(
+                args.source_launch_smoke_marker.expanduser().resolve(),
+                app=app,
+                window=window,
             )
 
         if args.smoke_test:
