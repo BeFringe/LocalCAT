@@ -5128,6 +5128,10 @@ def _parse_portable_publication_phase_bytes(
 # protocol and must never be widened to describe N -> N+1 replacement.
 _PORTABLE_REPLACEMENT_VERSION = "activation-replacement-v1"
 _PORTABLE_REPLACEMENT_OPERATION = "REPLACEMENT"
+_PORTABLE_SCHEMA_UPGRADE_OPERATION = "SCHEMA_UPGRADE"
+_PORTABLE_TRANSITION_OPERATIONS = frozenset(
+    {_PORTABLE_REPLACEMENT_OPERATION, _PORTABLE_SCHEMA_UPGRADE_OPERATION}
+)
 _PORTABLE_REPLACEMENT_PHASES = (
     "PREPARED",
     "DB_REPLACED",
@@ -5265,7 +5269,7 @@ class _PortableReplacementUnsigned:
     def __post_init__(self) -> None:
         if self.replacement_version != _PORTABLE_REPLACEMENT_VERSION:
             raise ValueError("portable replacement version is unsupported")
-        if self.operation != _PORTABLE_REPLACEMENT_OPERATION:
+        if self.operation not in _PORTABLE_TRANSITION_OPERATIONS:
             raise ValueError("portable replacement discriminator is invalid")
         if self.phase not in _PORTABLE_REPLACEMENT_PHASES:
             raise ValueError("portable replacement phase is invalid")
@@ -5322,8 +5326,11 @@ class _PortableReplacementUnsigned:
         )
         if self.next_generation != self.prior_generation + 1:
             raise ValueError("portable replacement generation does not advance once")
-        if self.candidate_canonical_store_id == self.prior_canonical_store_id:
-            raise ValueError("portable replacement candidate store must be fresh")
+        if self.operation == _PORTABLE_REPLACEMENT_OPERATION:
+            if self.candidate_canonical_store_id == self.prior_canonical_store_id:
+                raise ValueError("portable replacement candidate store must be fresh")
+        elif self.candidate_canonical_store_id != self.prior_canonical_store_id:
+            raise ValueError("portable schema upgrade must preserve the store id")
         if self.candidate_stage_db_name == self.candidate_manifest_temp_name:
             raise ValueError("portable replacement candidate names must be distinct")
         if self.canonical_database_name == self.canonical_manifest_name:
