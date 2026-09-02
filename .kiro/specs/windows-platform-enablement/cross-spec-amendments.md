@@ -71,7 +71,7 @@ ADR-020～026 promotion、Windows owning scope、WA-01～08 current R/D/T delta�
 | WA-04 | `R1` | `language-resource-portability` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-05 | `R1` | `tmx-context-interchange` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-06 | `R3` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
-| WA-07 | `R1` | `feature5-ui-integration` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-07 | `R1` | `feature5-ui-integration` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
 
 Superseded request history：WA-03 `R1`曾获acknowledgement，现由采用`WindowsDocumentedPublishV1`且移除运行时硬件registry/power-lab前置的`R2`完整取代；WA-06 `R1`曾因V1不能表达MIC authority由`R2`取代，现又由纳入ADR-024 provider-agnostic主体与ADR-025正常发布边界的`R3`完整取代。WA-03 `R1`及WA-06 `R1`/`R2`均标记`SUPERSEDED`，不得驱动实现、integration或evidence。
@@ -162,5 +162,6 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 | WA-04 | `R1` | `language-resource-portability` | `7e28b2b62a0a1c99aff87a3b055463d169a6c9d3` | `SOURCE_MERGED_PASS` | — |
 | WA-05 | `R1` | `tmx-context-interchange` | `7e28b2b62a0a1c99aff87a3b055463d169a6c9d3` | `SOURCE_MERGED_PASS` | — |
 | WA-06 | `R3` | `tm-storage-retrieval-index` | `e7bab7a57283964e9424ea458b222f5b5f65a7fb` | `SOURCE_MERGED_PASS` | — |
+| WA-07 | `R1` | `feature5-ui-integration` | `76f9ea47c7962d2d6d3daaf3c18195dc6afc53e4` | `SOURCE_MERGED_PASS` | — |
 
 `WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
