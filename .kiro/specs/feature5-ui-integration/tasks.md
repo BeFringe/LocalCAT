@@ -116,7 +116,7 @@
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.7_
   - _Boundary: CapabilityHost Gate C_
 
-- [ ] 3.5a 装配Windows source平台服务
+- [x] 3.5a 装配Windows source平台服务
   - source composition先建立ADR-020/021 filesystem/lock/private-proof与rooted source ports，再进入TM resolver/CapabilityHost/Controller graph；缺失或错平台实现只发布安全unavailable，不绕过startup owner或等待frozen authority。
   - _Amendment: WA-07_
   - _Depends: 3.5, ADR-020, ADR-021, windows-platform-enablement 3.7_
@@ -151,7 +151,7 @@
   - _Requirements: 5.1, 5.9, 5.10, 6.5, 6.6, 6.7_
   - _Boundary: TMResourceResolver Lifecycle and Failure_
 
-- [ ] 3.8a 闭合Windows source resource lifecycle
+- [x] 3.8a 闭合Windows source resource lifecycle
   - resolver在clean-user source环境复验resource config、managed root、canonical private proof与generation；source-diverged/unavailable继续资源局部fail closed，不回落JSONL。frozen bundle authority由9.2a重放。
   - _Amendment: WA-07_
   - _Depends: 3.5a, 3.8, WA-06, windows-platform-enablement 3.7_
@@ -224,7 +224,7 @@
   - _Requirements: 5.2, 5.3, 5.4, 5.5_
   - _Boundary: EditorController Activation Start_
 
-- [ ] 5.4a 在 Windows 闭合首次激活 Controller lifecycle
+- [x] 5.4a 在 Windows 闭合首次激活 Controller lifecycle
   - production preflight/worker 只调用 Core public activation contract，覆盖 lock busy、private-proof failure 与 source authority unavailable；UI 不暴露 handle/path/token 或 platform internals。
   - _Amendment: WA-07_
   - _Depends: 3.8a, 5.4, WA-06, windows-platform-enablement 3.7_
@@ -237,7 +237,7 @@
   - _Requirements: 5.6, 5.7, 5.8, 5.9, 5.10, 6.7_
   - _Boundary: EditorController Activation Completion_
 
-- [ ] 5.5a 在 Windows 重启后恢复 activation/runtime projection
+- [x] 5.5a 在 Windows 重启后恢复 activation/runtime projection
   - 成功、published-tail、proven rollback、ambiguous 与 source-diverged 经 fresh process 重新 resolve 并一次换代；不允许旧 JSONL、旧 runtime 或旧 suggestion membership 复活。
   - published-tail恢复提示只消费TM owner在existing-only W1内给出的body-free eligibility；分类与取消零持久修改，确认后仍由既有`activate_initial()` worker恢复，其他unavailable状态不创建operation。
   - _Amendment: WA-07_
@@ -304,7 +304,7 @@
   - _Boundary: ADR-013 Gate D Device Qualification_
   - _Depends: 3.6, 5.1, 6.1, 6.3, 6.4_
 
-- [ ] 6.6a 以ADR-021恢复Windows source设备Fuzzy资格
+- [x] 6.6a 以ADR-021恢复Windows source设备Fuzzy资格
   - compatibility key消费Windows device qualification/private proof与rooted source attestation；缺失、ACL/owner/environment/implementation/source漂移显示“需重新验证”，不静默运行或授权100k结果。
   - _Amendment: WA-07_
   - _Depends: 3.5a, 6.6, ADR-021_
@@ -323,7 +323,7 @@
   - _Boundary: ADR-016 Canonical Device Re-attestation_
   - _Depends: 3.8, 5.5, 6.2_
 
-- [ ] 6.7a 冷重开并重新证明 Windows canonical private storage
+- [x] 6.7a 冷重开并重新证明 Windows canonical private storage
   - 在`ProcessFileLock`下重新绑定rooted live handles并复验exact store/generation、bytes、phase、ACL/owner/MIC、non-reparse root、nested private proof与device-secret MAC；成功只恢复同一runtime authority且不改写v3 durable qualification，失败保持resource-local unavailable并禁止JSONL fallback。
   - _Amendment: WA-07_
   - _Depends: 3.8a, 5.5a, ADR-021_
@@ -347,7 +347,7 @@
   - _Requirements: 9.6, 9.7, 9.8_
   - _Boundary: Canonical TM Integration Fixtures_
 
-- [ ] 7.2a 在 Windows 构建并冷重开真实 activated SQLite
+- [x] 7.2a 在 Windows 构建并冷重开真实 activated SQLite
   - 由 production migration/activation 在 CPython 3.14 x64 生成 canonical store，显式验证 FTS5、generation、variants、query lease 与 fresh-process reopen，不手写 SQLite fixture。
   - _Amendment: WA-07_
   - _Depends: 5.5a, 6.7a, 7.2_
@@ -370,7 +370,7 @@
   - _Boundary: Capability Resource and Activation Failure Validation_
   - _Depends: 3.5, 3.6_
 
-- [ ] 7.4a 扩展Windows source platform/resource failure投影
+- [x] 7.4a 扩展Windows source platform/resource failure投影
   - 覆盖root/lock/private-proof/rooted-source-attestation与resource lifecycle失败，确保Controller和Feature5 TM surface只显示稳定safe code，健康资源结果保留且activated authority不回退JSONL；qwindows/plugin启动诊断仍归WA-08。
   - _Amendment: WA-07_
   - _Depends: 3.5a, 3.8a, 6.7a, 7.4_
@@ -397,7 +397,7 @@
   - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.10_
   - _Boundary: Integration Regression Validation_
 
-- [ ] 7.6a 执行Windows source本地回归
+- [x] 7.6a 执行Windows source本地回归
   - 在用户管理的CPython 3.14 x64 venv/source运行canonical/legacy/Trie/raw-speaker/Qt/JSON/TXT/TMX/Excel-optional边界；Qt主程序不得因未安装Excel/xlwings失败，旧Excel adapter仍明确条件依赖。
   - _Amendment: WA-07_
   - _Depends: 7.2a, 7.4a, windows-platform-enablement 3.7_
