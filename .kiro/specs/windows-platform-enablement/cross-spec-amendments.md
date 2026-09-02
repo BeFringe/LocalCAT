@@ -159,8 +159,8 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 | WA-01 | `R1` | `parser-subsystem-extraction` | `da986925f47fe6d18cb0f316c79a70c0655808b6` | `SOURCE_MERGED_PASS` | — |
 | WA-02 | `R1` | `collaborative-job-chunks` | `9abd9e1a5942ddffa0dad24a4d41e0f863d57ff1` | `SOURCE_MERGED_PASS` | — |
 | WA-03 | `R2` | `multi-document-project-workspace` | `faed77761b39f273563bd39dc51f5e39cd620cf5` | `SOURCE_MERGED_PASS` | — |
-| WA-04 | `R1` | `language-resource-portability` | `e5c9f13bfff9474e0a086b0f2d93ce316daa768b` | `SOURCE_MERGED_PASS` | — |
-| WA-05 | `R1` | `tmx-context-interchange` | `deca46b58578b6903fa31bb80f6074429b2e3478` | `SOURCE_MERGED_PASS` | — |
+| WA-04 | `R1` | `language-resource-portability` | `7e28b2b62a0a1c99aff87a3b055463d169a6c9d3` | `SOURCE_MERGED_PASS` | — |
+| WA-05 | `R1` | `tmx-context-interchange` | `7e28b2b62a0a1c99aff87a3b055463d169a6c9d3` | `SOURCE_MERGED_PASS` | — |
 | WA-06 | `R3` | `tm-storage-retrieval-index` | `e7bab7a57283964e9424ea458b222f5b5f65a7fb` | `SOURCE_MERGED_PASS` | — |
 
 `WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
