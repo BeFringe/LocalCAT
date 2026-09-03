@@ -1594,6 +1594,13 @@ class EditorController:
         with self._tm_query_lock:
             project = self._project
             if project is None:
+                if self._workspace_service is not None:
+                    return ProjectToolCapability(
+                        project_session_id=self._project_session_id,
+                        single_json_tools_available=False,
+                        project_kind="project_package",
+                        unavailable_reason="PROJECT_TOOLS.JSON_REQUIRED",
+                    )
                 return ProjectToolCapability(
                     project_session_id=None,
                     single_json_tools_available=False,
