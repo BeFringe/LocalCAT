@@ -82,6 +82,20 @@ def default_data_dir() -> Path:
     return base / "LocalCAT"
 
 
+def _stabilize_windows_tooltips(application: object) -> None:
+    """Show Windows tooltips without the native first-frame animation flash."""
+
+    if os.name != "nt":
+        return
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    if not isinstance(application, QApplication):
+        raise TypeError("tooltip presentation requires QApplication")
+    application.setEffectEnabled(Qt.UIEffect.UI_AnimateTooltip, False)
+    application.setEffectEnabled(Qt.UIEffect.UI_FadeTooltip, False)
+
+
 def application_icon_path(project_root: Path | None = None) -> Path:
     """Return the one icon asset shared by the launcher and Qt windows."""
 
@@ -860,6 +874,7 @@ def main(argv: list[str] | None = None) -> int:
         app.setOrganizationName("LocalCAT")
         app.setApplicationVersion(APPLICATION_VERSION)
         app.setDesktopFileName("localcat")
+        _stabilize_windows_tooltips(app)
         logo_pixmap = resource_png_pixmap(qt_resources.logo)
         if logo_pixmap is None:
             raise ValueError("source Qt logo is not a valid PNG")

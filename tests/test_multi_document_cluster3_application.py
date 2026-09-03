@@ -188,6 +188,22 @@ class Cluster3ApplicationTests(unittest.TestCase):
         )
         return self.package_service.open(self.package_path).workspace
 
+    def test_project_tool_capability_reports_open_project_package(self) -> None:
+        self._open()
+
+        capability = self.controller.project_tool_capability()
+
+        self.assertEqual(
+            capability.project_session_id,
+            self.controller.project_session_id,
+        )
+        self.assertFalse(capability.single_json_tools_available)
+        self.assertEqual(capability.project_kind, "project_package")
+        self.assertEqual(
+            capability.unavailable_reason,
+            "PROJECT_TOOLS.JSON_REQUIRED",
+        )
+
     def _document_ids(self) -> tuple[str, str]:
         documents = self.controller.workspace_view.documents
         self.assertEqual(len(documents), 2)
