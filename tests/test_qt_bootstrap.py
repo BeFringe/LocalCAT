@@ -108,6 +108,7 @@ class QtBootstrapTest(unittest.TestCase):
             if line.strip() and not line.lstrip().startswith("#")
         )
         self.assertTrue(any(line.startswith("pyside6") for line in requirements))
+
         self.assertTrue(any(line.startswith("openpyxl") for line in requirements))
         self.assertFalse(any(line.startswith("xlwings") for line in requirements))
 
@@ -146,6 +147,35 @@ class QtBootstrapTest(unittest.TestCase):
         self.assertIn("Qt editor smoke test passed", completed.stdout)
         self.assertNotIn("xlwings", completed.stderr.lower())
         self.assertNotIn("Traceback", completed.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Windows tooltip presentation only")
+    def test_windows_tooltips_disable_animated_first_show(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication
+
+        application = QApplication.instance() or QApplication([])
+        effects = (
+            Qt.UIEffect.UI_AnimateTooltip,
+            Qt.UIEffect.UI_FadeTooltip,
+        )
+        previous = tuple(
+            application.isEffectEnabled(effect) for effect in effects
+        )
+        try:
+            for effect in effects:
+                application.setEffectEnabled(effect, True)
+
+            qt_editor._stabilize_windows_tooltips(application)
+
+            self.assertTrue(
+                all(
+                    not application.isEffectEnabled(effect)
+                    for effect in effects
+                )
+            )
+        finally:
+            for effect, enabled in zip(effects, previous, strict=True):
+                application.setEffectEnabled(effect, enabled)
 
     def test_source_authority_failure_is_body_safe_before_business_imports(
         self,
