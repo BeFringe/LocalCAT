@@ -44,6 +44,7 @@ class QtBootstrapTest(unittest.TestCase):
                 "stat",
                 "subprocess",
                 "sys",
+                "time",
             },
         )
         source = (ROOT / "qt_editor.py").read_text(encoding="utf-8")

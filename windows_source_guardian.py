@@ -11,12 +11,14 @@ import argparse
 import ctypes
 from datetime import datetime, timezone
 import importlib.util
+import json
 import os
 from pathlib import Path
 import stat
 import struct
 import subprocess
 import sys
+import time
 from typing import Final
 
 
@@ -127,6 +129,33 @@ def _append_diagnostic(code: str) -> None:
         pass
 
 
+def _append_startup_diagnostic(event: dict[str, object]) -> None:
+    """Persist only bounded metadata; never exception text, arguments or paths."""
+
+    safe: dict[str, object] = {}
+    for key in ("stage", "status", "exception_type", "failure_module"):
+        value = event.get(key)
+        if type(value) is str and value and len(value) <= 80:
+            if all(character.isascii() and (character.isalnum() or character == "_") for character in value):
+                safe[key] = value
+    for key in ("elapsed_ms", "returncode", "errno", "winerror", "failure_line"):
+        value = event.get(key)
+        if type(value) is int:
+            safe[key] = value
+    safe["pid"] = os.getpid()
+    safe["timestamp"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    try:
+        directory = _local_application_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "source-startup.log"
+        if path.exists() and path.stat().st_size >= 256 * 1024:
+            os.replace(path, directory / "source-startup.previous.log")
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(safe, ensure_ascii=True) + "\n")
+    except OSError:
+        pass
+
+
 def _show_failure_dialog(code: str) -> None:
     text = (
         f"LocalCAT could not start [{code}].\n\n"
@@ -177,6 +206,7 @@ def _clear_developer_overrides() -> None:
 
 
 def _run_child(source_root: Path, application_arguments: tuple[str, ...]) -> int:
+    started = time.perf_counter()
     try:
         bootstrap = _require_regular_file(
             (source_root / SOURCE_BOOTSTRAP_FILENAME).resolve()
@@ -189,8 +219,18 @@ def _run_child(source_root: Path, application_arguments: tuple[str, ...]) -> int
         module = importlib.util.module_from_spec(specification)
         sys.modules["qt_editor"] = module
         specification.loader.exec_module(module)
+        module._startup_diagnostic = _append_startup_diagnostic
+        _append_startup_diagnostic({
+            "stage": "bootstrap_import", "status": "ok",
+            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+        })
         result = module.main(list(application_arguments))
-    except Exception:
+    except Exception as exc:
+        _append_startup_diagnostic({
+            "stage": "child_execution", "status": "failed",
+            "exception_type": type(exc).__name__,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+        })
         return 120
     return result if type(result) is int else 120
 
@@ -235,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
         "--",
         *application_arguments,
     ]
+    started = time.perf_counter()
     try:
         completed = subprocess.run(
             command,
@@ -247,6 +288,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except OSError:
         return _fail(CHILD_START_FAILED, show_dialog=show_dialog)
+    _append_startup_diagnostic({
+        "stage": "child_exit",
+        "status": "ok" if completed.returncode == 0 else "failed",
+        "returncode": completed.returncode,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000),
+    })
     if completed.returncode == 0:
         return 0
     if completed.returncode < 0 or completed.returncode >= 0xC0000000:
