@@ -261,7 +261,86 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
             self.assertEqual(controller.issued_tm_suggestions, ())
             self.assertEqual(controller.tm_suggestion_report().suggestions, ())
 
-    def test_persisted_update_refresh_failure_blocks_old_query_apply_and_write(
+    def test_controller_flag_updates_do_not_reopen_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, adapter, runtime, repository = self._controller(
+                Path(temporary)
+            )
+            tm = repository.list_resources()[0]
+            terms = controller.create_resource(
+                "Cached terms",
+                ResourceKind.TERMBASE,
+            )
+            terms.path.write_text("Hello.,你好。\n", encoding="utf-8")
+            controller.reload_resources()
+            query_calls = 0
+            original_query = EditorTMAdapter._query_current_operation
+
+            def counted_query(current, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal query_calls
+                if current is adapter:
+                    query_calls += 1
+                return original_query(current, **kwargs)
+
+            with (
+                patch.object(
+                    EditorTMAdapter,
+                    "_refresh_runtime",
+                    autospec=True,
+                    side_effect=AssertionError("full runtime refresh was used"),
+                ),
+                patch.object(
+                    controller,
+                    "_load_tm_engine",
+                    side_effect=AssertionError("TM was reopened"),
+                ),
+                patch.object(
+                    controller,
+                    "_load_glossary_engine",
+                    side_effect=AssertionError("termbase was reread"),
+                ),
+                patch.object(
+                    EditorTMAdapter,
+                    "_query_current_operation",
+                    new=counted_query,
+                ),
+            ):
+                for resource_id in (tm.id, terms.id):
+                    for field in ("active", "lookup", "update"):
+                        for expected in (False, True):
+                            current = repository.get(resource_id)
+                            updated = controller.update_resource(
+                                replace(current, **{field: expected})
+                            )
+                            self.assertIs(getattr(updated, field), expected)
+                            if resource_id == tm.id:
+                                suggestions = controller.issued_tm_suggestions
+                                should_match = (
+                                    expected
+                                    if field in ("active", "lookup")
+                                    else True
+                                )
+                                self.assertIs(bool(suggestions), should_match)
+                            else:
+                                term_suggestions = controller.term_suggestions()
+                                should_match = (
+                                    expected
+                                    if field in ("active", "lookup")
+                                    else True
+                                )
+                                self.assertIs(bool(term_suggestions), should_match)
+
+            self.assertEqual(query_calls, 12)
+            snapshot = runtime.capture_operation_snapshot()
+            port = snapshot.legacy_ports[0]
+            persisted = repository.get(tm.id)
+            self.assertEqual(
+                (port.active, port.lookup, port.update),
+                (persisted.active, persisted.lookup, persisted.update),
+            )
+            self.assertIn(terms.id, controller._term_record_snapshots)
+
+    def test_structural_update_refresh_failure_blocks_old_query_apply_and_write(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -291,10 +370,14 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
                     EditorControllerError,
                     "TM.RUNTIME.REFRESH_FAILED",
                 ) as update_failure:
-                    controller.update_resource(replace(tm, update=False))
+                    controller.update_resource(
+                        replace(tm, name="Renamed TM", update=False)
+                    )
             self.assertNotIn("secret", str(update_failure.exception))
 
-            self.assertFalse(repository.get(tm.id).update)
+            persisted_tm = repository.get(tm.id)
+            self.assertEqual(persisted_tm.name, "Renamed TM")
+            self.assertFalse(persisted_tm.update)
             self.assertEqual(controller.query_epoch, epoch + 1)
             self.assertEqual(controller.issued_tm_suggestions, ())
             for operation in (
@@ -441,7 +524,7 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
 
             with patch.object(
                 EditorTMAdapter,
-                "_refresh_runtime",
+                "_refresh_runtime_flags",
                 autospec=True,
                 side_effect=AssertionError("/secret/programmer-body"),
             ):
@@ -489,7 +572,9 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
 
             def update_resource() -> None:
                 try:
-                    controller.update_resource(replace(tm, update=False))
+                    controller.update_resource(
+                        replace(tm, name="Renamed TM", update=False)
+                    )
                 except BaseException as error:
                     update_errors.append(error)
 
