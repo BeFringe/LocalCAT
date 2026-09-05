@@ -46,6 +46,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -130,8 +131,14 @@ from qt_settings_dialog import QtSettingsDialog
 from qt_speaker_avatar import SpeakerAvatarCatalog
 from qt_speaker_inventory_dialog import QtSpeakerInventoryDialog
 from qt_termbase_dialog import QtTermbaseDialog
-from qt_control_styles import configure_combo_popup, configure_menu
+from qt_control_styles import (
+    apply_combo_popup_theme,
+    apply_menu_theme,
+    configure_combo_popup,
+    configure_menu,
+)
 from qt_localized_message_box import show_localized_critical
+from qt_theme import system_uses_dark_theme
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -786,7 +793,12 @@ class ResponsiveSplitter(QSplitter):
         return self._stretch_factors.get(index, 0)
 
 
-def render_highlighted_source(text: str, terms: tuple[TermSuggestion, ...]) -> str:
+def render_highlighted_source(
+    text: str,
+    terms: tuple[TermSuggestion, ...],
+    *,
+    dark_theme: bool = False,
+) -> str:
     """Escape project text, then add spans for longest non-overlapping term ranges."""
 
     occupied = [False] * len(text)
@@ -812,14 +824,19 @@ def render_highlighted_source(text: str, terms: tuple[TermSuggestion, ...]) -> s
         pieces.append(html.escape(text[cursor:start]).replace("\n", "<br>"))
         highlighted = html.escape(text[start:end]).replace("\n", "<br>")
         tooltip = html.escape(f"{term.target_term} · {term.resource_name}", quote=True)
+        highlight_background = "#6b5721" if dark_theme else "#fff0ad"
+        highlight_text = "#fff1bd" if dark_theme else "#26384b"
         pieces.append(
-            '<span style="background-color:#fff0ad; color:#26384b; '
-            f'font-weight:600;" title="{tooltip}">{highlighted}</span>'
+            f'<span style="background-color:{highlight_background}; '
+            f'color:{highlight_text}; font-weight:600;" '
+            f'title="{tooltip}">{highlighted}</span>'
         )
         cursor = end
     pieces.append(html.escape(text[cursor:]).replace("\n", "<br>"))
     return (
-        '<div style="white-space:pre-wrap; color:#1c2b3a;">'
+        '<div style="white-space:pre-wrap; color:'
+        + ("#e7edf3" if dark_theme else "#1c2b3a")
+        + ';">'
         + "".join(pieces)
         + "</div>"
     )
@@ -1005,6 +1022,11 @@ class QtEditorWindow(QMainWindow):
         self._project_search_ordinal: int | None = None
         self._project_search_expanded = False
         self.setObjectName("editorWindow")
+        self._dark_theme = system_uses_dark_theme(self)
+        self.setProperty(
+            "localcatTheme",
+            "dark" if self._dark_theme else "light",
+        )
         self.setWindowTitle("LocalCAT · 本地专业翻译编辑器")
         self.setMinimumSize(1080, 700)
         self.resize(1440, 880)
@@ -1044,6 +1066,11 @@ class QtEditorWindow(QMainWindow):
             self._render_project()
         else:
             self._show_empty_state()
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            application.styleHints().colorSchemeChanged.connect(
+                self._apply_system_theme
+            )
 
     def install_chunk_controller(self, chunk_controller: object) -> None:
         """Install the optional collaboration façade after shell construction."""
@@ -1082,7 +1109,43 @@ class QtEditorWindow(QMainWindow):
         status.setObjectName("editorStatusBar")
         status.setSizeGripEnabled(False)
         self.setStatusBar(status)
-        self.setStyleSheet(_EDITOR_STYLE)
+        self._apply_system_theme()
+
+    def _apply_system_theme(self, *_args: object) -> None:
+        """Project the current OS color scheme across every editor mode."""
+
+        self._dark_theme = system_uses_dark_theme(self)
+        self.setProperty(
+            "localcatTheme",
+            "dark" if self._dark_theme else "light",
+        )
+        self.setStyleSheet(
+            _EDITOR_STYLE + (_EDITOR_DARK_STYLE if self._dark_theme else "")
+        )
+        for combo in self.findChildren(QComboBox):
+            apply_combo_popup_theme(combo)
+        for menu in self.findChildren(QMenu):
+            apply_menu_theme(menu)
+        if hasattr(self, "source_display") and self._has_active_project():
+            self.source_display.setHtml(
+                render_highlighted_source(
+                    self.controller.current_segment.source,
+                    self.current_suggestions.terms,
+                    dark_theme=self._dark_theme,
+                )
+            )
+        if hasattr(self, "segment_list"):
+            divider_background = QColor(
+                "#26323a" if self._dark_theme else "#dcecf5"
+            )
+            divider_foreground = QColor(
+                "#79c6df" if self._dark_theme else "#0b5e80"
+            )
+            for row in range(self.segment_list.count()):
+                item = self.segment_list.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) is None:
+                    item.setBackground(divider_background)
+                    item.setForeground(divider_foreground)
 
     def _build_top_bar(self) -> QWidget:
         top_bar = QFrame()
@@ -4279,7 +4342,7 @@ class QtEditorWindow(QMainWindow):
             self._clear_project_search_results(
                 "搜索结果已过期；请按当前项目内容重新搜索。"
             )
-        if self.unconfirmed_filter.isChecked():
+        if self.controller.has_workspace or self.unconfirmed_filter.isChecked():
             self._refreshing = True
             try:
                 self._populate_segment_list()
@@ -4354,8 +4417,12 @@ class QtEditorWindow(QMainWindow):
                     divider.flags() & ~Qt.ItemFlag.ItemIsSelectable
                 )
                 divider.setData(Qt.ItemDataRole.UserRole, None)
-                divider.setBackground(QColor("#dcecf5"))
-                divider.setForeground(QColor("#0b5e80"))
+                divider.setBackground(
+                    QColor("#26323a" if self._dark_theme else "#dcecf5")
+                )
+                divider.setForeground(
+                    QColor("#79c6df" if self._dark_theme else "#0b5e80")
+                )
                 divider_font = divider.font()
                 divider_font.setBold(True)
                 divider.setFont(divider_font)
@@ -5654,7 +5721,11 @@ class QtEditorWindow(QMainWindow):
         self.current_tm_report = report
         self._refresh_tm_threshold_entry()
         self.source_display.setHtml(
-            render_highlighted_source(self.controller.current_segment.source, bundle.terms)
+            render_highlighted_source(
+                self.controller.current_segment.source,
+                bundle.terms,
+                dark_theme=self._dark_theme,
+            )
         )
         self._clear_layout(self.tm_cards_layout)
         self._clear_layout(self.term_cards_layout)
@@ -6883,5 +6954,247 @@ QStatusBar#editorStatusBar {
     background: #f7f9fc;
     border-top: 1px solid #d8e1ea;
     font-size: 11px;
+}
+"""
+
+
+_EDITOR_DARK_STYLE = """
+QMainWindow#editorWindow, QWidget#windowShell, QWidget#emptyPage {
+    background: #17191c;
+    color: #e7edf3;
+}
+QWidget#emptyPage[dragActive="true"] {
+    background: #1d2c33;
+}
+QFrame#emptyCard,
+QFrame#segmentPanel,
+QFrame#editPanel,
+QFrame#suggestionPanel,
+QFrame#projectSearchPanel,
+QFrame#browsePanel {
+    background: #1f2328;
+    border-color: #363d45;
+}
+QLabel#emptyTitle,
+QLabel#panelTitle,
+QLabel#projectSearchTitle {
+    color: #f1f5f9;
+}
+QLabel#emptyHint,
+QLabel#browseHint,
+QLabel#segmentPosition,
+QLabel#projectSearchScopeLabel,
+QLabel#projectSearchStatusLabel,
+QLabel#projectSearchCapability,
+QLabel#tmThresholdState,
+QLabel#suggestionProvenance,
+QLabel#emptySuggestion,
+QLabel[suggestionProvenance="true"],
+QLabel[emptySuggestion="true"] {
+    color: #aab4bf;
+}
+QLabel#privacyHint {
+    color: #8fb1a7;
+}
+QLabel#workspaceChapterTitle,
+QLabel#workspaceBrowseChapterTitle,
+QLabel#sectionEyebrow,
+QLabel[tmMatchType="true"] {
+    color: #66c3df;
+}
+QLabel#workspaceSaveFeedback,
+QLabel#workspaceBrowseSaveFeedback,
+QLabel#projectSearchPreview {
+    color: #c5d0da;
+    background: #252b31;
+}
+QLabel#projectSearchResult,
+QLabel#speakerDisplay,
+QLabel#suggestionSource,
+QLabel#termSource,
+QLabel[tmMatchedSource="true"] {
+    color: #c7d1db;
+}
+QLabel#speakerDisplay {
+    background: #26343a;
+    border-color: #3a4b52;
+}
+QLabel#speakerDisplay[empty="true"] {
+    color: #9ba5af;
+    background: #272b30;
+    border-color: #393f45;
+}
+QLabel#suggestionTarget,
+QLabel#termTarget,
+QLabel[suggestionTarget="true"] {
+    color: #f0f4f8;
+}
+QLabel#confirmationState {
+    color: #ffd58d;
+    background: #493a22;
+}
+QLabel#confirmationState[confirmed="true"] {
+    color: #9be0b8;
+    background: #234032;
+}
+QLabel#countBadge,
+QPushButton#tmThresholdChip {
+    color: #89d9ef;
+    background: #233942;
+    border-color: #376675;
+}
+QPushButton#tmThresholdChip[fuzzyAvailable="false"] {
+    color: #a8b0b8;
+    background: #2a2e33;
+    border-color: #454b52;
+}
+QComboBox#projectSearchStatus,
+QComboBox#workspaceSearchScope,
+QComboBox#segmentDensityCombo,
+QLineEdit#projectSearchQuery,
+QTextBrowser#sourceDisplay,
+QTextEdit#targetEditor {
+    color: #e7edf3;
+    background: #20242a;
+    border-color: #48515b;
+    selection-color: #f7fbff;
+    selection-background-color: #35667a;
+}
+QLineEdit#projectSearchQuery:focus,
+QTextEdit#targetEditor:focus {
+    color: #f3f7fa;
+    background: #242930;
+    border-color: #27a9ce;
+}
+QCheckBox#projectSearchSource,
+QCheckBox#projectSearchTarget,
+QCheckBox#projectSearchSpeaker,
+QCheckBox#projectSearchMatchCase,
+QCheckBox#projectSearchWholeWord,
+QCheckBox#unconfirmedFilter {
+    color: #c3ccd5;
+}
+QCheckBox#projectSearchMatchCase:disabled,
+QCheckBox#projectSearchWholeWord:disabled {
+    color: #737d87;
+}
+QListWidget#segmentList {
+    color: #dce3e9;
+    background: #1d2126;
+}
+QListWidget#segmentList::item {
+    color: #cbd4dc;
+    border-bottom-color: #30363d;
+}
+QListWidget#segmentList::item:hover {
+    color: #f1f6fa;
+    background: #2a343c;
+}
+QListWidget#segmentList::item:selected {
+    color: #f5fbff;
+    background: #294f60;
+    border-left-color: #36b5d8;
+}
+QTableWidget#browseTable {
+    color: #e2e8ee;
+    background: #1f2328;
+    alternate-background-color: #292e34;
+    border-color: #3b424a;
+    selection-color: #f5fbff;
+    selection-background-color: #294f60;
+}
+QTableWidget#browseTable::item {
+    border-bottom-color: #373e46;
+}
+QTableWidget#browseTable::item:hover {
+    color: #f5fbff;
+    background: #33414b;
+}
+QTableWidget#browseTable::item:selected {
+    color: #f5fbff;
+    background: #294f60;
+}
+QTableWidget#browseTable QHeaderView::section {
+    color: #c4ced8;
+    background: #292e34;
+    border-right-color: #414850;
+}
+QPushButton#browseGroupNavigatorButton {
+    color: #d7e1e9;
+    background: #282e34;
+    border-color: #4a535d;
+}
+QPushButton#browseGroupNavigatorButton:hover,
+QPushButton#browseGroupNavigatorButton:focus {
+    color: #ffffff;
+    background: #33414b;
+    border-color: #4aa9c3;
+}
+QPushButton#browseGroupNavigatorButton[groupActive="true"] {
+    color: #ffffff;
+    background: #087f9f;
+    border-color: #28a8c8;
+}
+QPushButton#browseGroupNavigatorButton:disabled {
+    color: #7e8993;
+    background: #24292e;
+    border-color: #3a4148;
+}
+QTabWidget#suggestionTabs::pane,
+QScrollArea#tmSuggestionsScroll,
+QScrollArea#termSuggestionsScroll,
+QScrollArea#tmSuggestionsScroll > QWidget > QWidget,
+QScrollArea#termSuggestionsScroll > QWidget > QWidget {
+    background: #1f2328;
+    border-color: #3b424a;
+}
+QFrame[suggestionCard="true"] {
+    background: #252a30;
+    border-color: #414850;
+}
+QTabBar::tab {
+    color: #aeb8c2;
+    background: #292e34;
+    border-color: #414850;
+}
+QTabBar::tab:hover {
+    color: #f2f6f9;
+    background: #333a42;
+}
+QTabBar::tab:selected {
+    color: #82d7ed;
+    background: #1f2328;
+    border-bottom-color: #1f2328;
+}
+QPushButton {
+    color: #dfe7ee;
+    background: #262b31;
+    border-color: #4a535d;
+}
+QPushButton:hover {
+    color: #ffffff;
+    background: #323940;
+    border-color: #37add0;
+}
+QToolButton#manageTermsButton,
+QPushButton#addTermButton {
+    color: #e3eaf0;
+    background: #2a3036;
+    border-color: #525c66;
+}
+QToolButton#manageTermsButton:hover,
+QToolButton#manageTermsButton:focus,
+QPushButton#addTermButton:hover,
+QPushButton#addTermButton:focus {
+    color: #ffffff;
+    background: #29414a;
+}
+QSplitter::handle {
+    background: #17191c;
+}
+QStatusBar#editorStatusBar {
+    color: #aeb8c2;
+    background: #1d2024;
+    border-top-color: #353b42;
 }
 """

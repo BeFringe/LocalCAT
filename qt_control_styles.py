@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QComboBox, QMenu, QStyledItemDelegate
 
+from qt_theme import system_uses_dark_theme
+
 
 LOCALCAT_COMBO_POPUP_STYLE = """
 QAbstractItemView {
@@ -64,6 +66,65 @@ QMenu::separator {
 """
 
 
+LOCALCAT_DARK_COMBO_POPUP_STYLE = """
+QAbstractItemView {
+    color: #e7edf3;
+    background-color: #20242a;
+    selection-color: #f5fbff;
+    selection-background-color: #294f60;
+    border: 1px solid #48515b;
+    outline: 0;
+}
+QAbstractItemView::item {
+    color: #e7edf3;
+    background-color: #20242a;
+    min-height: 30px;
+    padding: 2px 8px;
+}
+QAbstractItemView::item:hover {
+    color: #f5fbff;
+    background-color: #33414b;
+}
+QAbstractItemView::item:selected {
+    color: #f5fbff;
+    background-color: #294f60;
+}
+"""
+
+
+LOCALCAT_DARK_MENU_STYLE = """
+QMenu {
+    color: #e7edf3;
+    background-color: #20242a;
+    border: 1px solid #48515b;
+    padding: 4px;
+    font-size: 13px;
+}
+QMenu::item {
+    color: #e7edf3;
+    background-color: #20242a;
+    min-height: 28px;
+    padding: 3px 24px 3px 10px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    color: #f5fbff;
+    background-color: #294f60;
+    border-color: #4c8aa3;
+}
+QMenu::item:disabled {
+    color: #7f8993;
+    background-color: #20242a;
+}
+QMenu::separator {
+    height: 1px;
+    background: #3b424a;
+    margin: 4px 7px;
+}
+"""
+
+
 def configure_combo_popup(
     combo: QComboBox,
     *,
@@ -75,11 +136,32 @@ def configure_combo_popup(
     popup = combo.view()
     popup.setObjectName(object_name)
     popup.setAccessibleName(accessible_name)
-    popup.setStyleSheet(LOCALCAT_COMBO_POPUP_STYLE)
+    apply_combo_popup_theme(combo)
     popup.setItemDelegate(QStyledItemDelegate(popup))
+
+
+def apply_combo_popup_theme(combo: QComboBox) -> None:
+    """Refresh an existing combo popup after the system theme changes."""
+
+    popup = combo.view()
+    popup.setStyleSheet(
+        LOCALCAT_DARK_COMBO_POPUP_STYLE
+        if system_uses_dark_theme(combo)
+        else LOCALCAT_COMBO_POPUP_STYLE
+    )
 
 
 def configure_menu(menu: QMenu) -> None:
     """Apply the one LocalCAT action-menu contract."""
 
-    menu.setStyleSheet(LOCALCAT_MENU_STYLE)
+    apply_menu_theme(menu)
+
+
+def apply_menu_theme(menu: QMenu) -> None:
+    """Refresh an existing menu after the system theme changes."""
+
+    menu.setStyleSheet(
+        LOCALCAT_DARK_MENU_STYLE
+        if system_uses_dark_theme(menu)
+        else LOCALCAT_MENU_STYLE
+    )

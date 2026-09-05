@@ -511,6 +511,14 @@ QT_QPA_PLATFORM=offscreen python qt_editor.py --smoke-test
 - 添加术语仍只能写入 `active && update` 的术语表。若不存在可写术语表，Controller/Qt 失败路径必须零写入，并明确引导用户在语言资源设置中为至少一个术语表开启 Active 与 Update。
 - 本修订只闭合已有 Requirements 的跨平台可用性回归；不实现术语 CRUD/管理页，不增加 TM/Termbase 页签或编辑/校对模式的新快捷键，不改变 Feature 5 合同。
 
+## Windows 深色主题与身份刷新维护设计
+
+- 新增单一 `qt_theme` 系统主题桥：优先消费 Qt/OS `colorScheme`，未知时只用应用 `Window` palette 明度回退；主窗口与资源设置监听颜色方案变化并重投影样式。
+- 现有浅色样式保持基础合同，深色样式作为同一组件选择器的末尾覆盖；首页、编辑三栏、建议卡、浏览交替行、资源表、新建资源字段、popup 与菜单共享一组深色 surface/text/hover/selection 语义。
+- 源文安全高亮继续先 HTML 转义；仅由当前主题选择正文和高亮前景/背景，不改变术语范围或 tooltip 数据。
+- Workspace Controller 继续以对象身份拒绝 stale/forged token。译文更新导致 revision 变化后，Qt 重新填充段落列表以接收 Controller 新签发 token，不放宽 `IssuedSegmentIdentity` 校验，也不以索引冒充身份。
+- 验证同时覆盖精确用户复现、浅/深 palette 对比度、浏览交替行、真实 Qt 截图和既有 Qt 导航/撤销/快捷键回归。
+
 ## 任务治理例外
 
 通用 task generation 规则默认排除 documentation task；本规格存在两项更高优先级的显式要求：

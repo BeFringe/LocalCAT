@@ -311,13 +311,23 @@
   - _Requirements: 1.4, 3.3, 3.4, 5.4, 5.5, 6.3, 6.4, 6.7, 6.8, 8.4, 8.5, 8.6_
   - _Boundary: Qt Maintenance Verification_
 
-## Checkpoint M Implementation Notes
+## 交付后维护任务
 
-- Cluster review base：`13adb2a99507238b916f6e62bb3f9a6270cf9229`。
-- Maintenance ledger commit：`2df687055c43839a726d2a98f0ed73b72c4a7129`。
-- Task 11.1：macOS 主 Return、keypad Enter、物理 Control + Return 与 Option 导航均以真实 Qt 键事件通过；Qt editor 定向套件 35/35 通过。`qt_editor_window.py` 的 changed-file basedpyright 在 base/当前均有 42 个既存诊断，本任务未增加；最终零诊断门由 Task 11.4 闭合。
-- Task 11.2：新建资源类型的 closed/popup normal/hover/selected 六态在 offscreen 与 macOS Cocoa 通过真实渲染对比度验收；单深色像素对抗图被 oracle 拒绝。`qt_settings_dialog.py` 的 basedpyright 在 base/当前均有 31 个既存诊断，最终零诊断门由 Task 11.4 闭合。
-- Task 11.3：所有术语表 `Update=false`、无术语表、inactive+Update 对抗与恢复可写资源均已闭合；失败保持 registry、资源字节和项目零变化，成功路径仍确定性选择第一个 active+Update 术语表。Controller/Qt 定向套件及 changed-file basedpyright 均通过。
-- Task 11.4：单一 offscreen 旅程累计闭合确认/导航、新建资源 popup、`Update=false` 零写入与恢复；按用户补充纳入顶栏编辑/校对模式 closed/normal/hover/selected 四态真实渲染，不改 mode payload/偏好，不增加新快捷键。M changed-file basedpyright 从 73 个既存诊断闭合为 0。
-- Parent completion evidence：官方 acceptance 33/33（fingerprint `ee6a2f9ded665567684ef2baaa51beddee1f7d74571a87e45c14cd4a3b7ee43e`），release 86/86 GO（fingerprint `76b387e3bd0ffb719304c0633708647f2ed9e3b08e73d3003d6a03994a92a7ea`）；`QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v` 于当前源码/证据状态 1637/1637 通过，耗时 401.509s，1 个既存明确 opt-in skip；Qt smoke 通过，literal 5000/200 的 FTS5/fallback 均 `missing_above=0`、`missing_top10=0`。
-- Cluster M exit：独立评审以 `13adb2a99507238b916f6e62bb3f9a6270cf9229` 为 base、`ab0a3494ba734d7c770fc76efe94f3b27f58cb76` 为 reviewed tip，结论为 APPROVED。评审后重新运行完整 offscreen suite，1637/1637 通过，耗时 399.159s，1 个既存明确 opt-in skip；Qt smoke 通过，literal 5000/200 的 FTS5/fallback 均 `missing_above=0`、`missing_top10=0`，release 维持 86/86 GO。
+以下任务来自 Windows 实际使用反馈，独立于已结束的 Checkpoint M；编号继续保留以追踪原提交，不属于 Task 11 的子项。维护记录不追溯修改最初的规格批准日期，也不由旧 Qt 规格接管平台或 Core 的证明与恢复设计。
+
+- [x] 12. 修复 workspace 切段并建立主界面深浅主题
+  - 修改已确认译文后允许继续按列表切段，仍拒绝过期或伪造的段落身份
+  - 主界面、浏览交替行和资源设置在两种主题下保持文字及交互状态可读；剩余独立窗口与动态切换遗漏由 Task 14 收尾
+  - _Requirements: 3.1, 3.4, 6.1, 6.8, 10.4, 10.5, 12.1–12.6_
+  - _Boundary: Qt Theme Projection, Qt Workspace Identity Refresh_
+
+## 维护实施记录
+
+### Checkpoint M
+
+- 术语写入资格是 `active && update`；无可写资源时必须零写入，不能靠隐藏禁用控件替代 owner 校验。
+- 原生控件的 closed、popup、hover、selected 状态需分别检查；单一 palette 或截图不能证明所有交互态。
+
+### Task 12：身份刷新
+
+- 编辑已确认译文会改变 workspace revision，Controller 重签 token 后旧列表仍持旧对象才触发 `IDENTITY_NOT_ISSUED`。Qt 刷新列表，Controller 的对象身份校验不放宽。
