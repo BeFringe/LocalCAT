@@ -74,11 +74,12 @@ def _run(project: Path, appdata: Path, marker: Path) -> int:
             data_root.close()
 
         from PySide6.QtCore import QTimer, Qt
-        from PySide6.QtGui import QIcon
+        from PySide6.QtGui import QIcon, QPalette
         from PySide6.QtTest import QTest
         from PySide6.QtWidgets import QApplication
 
         from qt_editor_window import QtEditorWindow
+        from qt_settings_dialog import QtSettingsDialog
         from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
         from qt_speaker_inventory_dialog import QtSpeakerInventoryDialog
         from resource_repository import ResourceRepository
@@ -129,6 +130,29 @@ def _run(project: Path, appdata: Path, marker: Path) -> int:
             raise AssertionError(f"expected windows QPA, got {app.platformName()!r}")
         if not exposed or not window.isVisible():
             raise AssertionError("native Qt editor window did not become visible")
+
+        style_hints = app.styleHints()
+        style_hints.setColorScheme(Qt.ColorScheme.Dark)
+        _events()
+        settings = QtSettingsDialog(controller, window)
+        settings.show()
+        _events()
+        style_hints.setColorScheme(Qt.ColorScheme.Light)
+        _events()
+        settings_layers = (
+            settings.resource_tables_scroll,
+            settings.resource_tables_scroll.viewport(),
+            settings.resource_tables_content,
+        )
+        settings_light_theme = settings.property("localcatTheme") == "light"
+        settings_resource_layers_light = all(
+            widget.palette().color(QPalette.ColorRole.Window).name() == "#f3f6fa"
+            for widget in settings_layers
+        )
+        settings.close()
+        settings.deleteLater()
+        style_hints.unsetColorScheme()
+        _events()
 
         search_visible_before = window.project_search_panel.isVisible()
         window.target_editor.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -204,6 +228,8 @@ def _run(project: Path, appdata: Path, marker: Path) -> int:
             "keyboard_search_visible_before": search_visible_before,
             "pid": os.getpid(),
             "platform_name": app.platformName(),
+            "settings_light_theme": settings_light_theme,
+            "settings_resource_layers_light": settings_resource_layers_light,
             "window_exposed": exposed,
             "window_icon_matches_logo": _icon_matches(
                 window.windowIcon(),

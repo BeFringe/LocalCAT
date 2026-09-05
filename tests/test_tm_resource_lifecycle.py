@@ -1063,6 +1063,159 @@ class TMResourceLifecycleTests(unittest.TestCase):
             assert old_result is not None
             self.assertEqual(old_result.target, old_config.path.stem)
 
+    def test_flag_refresh_reuses_open_backends_without_calling_resolver(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "legacy.flags")
+            backend = _LegacyBackend("stable")
+            resolve_calls = 0
+
+            def open_runtime(
+                _path: Path,
+                _resource_id: str,
+            ) -> RuntimeOpenBinding:
+                nonlocal resolve_calls
+                resolve_calls += 1
+                return LegacyOpenBinding(backend=backend)
+
+            host = TMRuntimeHost(
+                resolver=TMResourceResolver(runtime_open=open_runtime),
+                configs=(config,),
+            )
+            before = host.capture_operation_snapshot()
+            updated = replace(config, active=False, lookup=False, update=False)
+
+            published = host._refresh_flags_validated(
+                (updated,),
+                lambda _candidate: None,
+            )
+
+            after = host.capture_operation_snapshot()
+            self.assertEqual(resolve_calls, 1)
+            self.assertEqual(published.generation, before.generation + 1)
+            self.assertEqual(after.generation, published.generation)
+            self.assertIs(after.legacy_ports[0].backend, backend)
+            self.assertFalse(after.legacy_ports[0].active)
+            self.assertFalse(after.legacy_ports[0].lookup)
+            self.assertFalse(after.legacy_ports[0].update)
+
+    def test_flag_refresh_reuses_canonical_store_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "canonical.flags")
+            digest = "c" * 64
+            store = _LifecycleProbeStore(
+                monitor=_SequenceMonitor(
+                    (
+                        _observation(
+                            canonical_store_id="store-flags",
+                            binding_digest=digest,
+                            resource_id=config.id,
+                        ),
+                        _observation(
+                            canonical_store_id="store-flags",
+                            binding_digest=digest,
+                            resource_id=config.id,
+                        ),
+                    )
+                ),
+                health_binding_digest=digest,
+                resource_id=config.id,
+            )
+            resolved = TMResourceResolver(
+                runtime_open=lambda _path, _resource_id: CanonicalOpenBinding(
+                    resource_id=config.id,
+                    store=cast(TMStore, store),
+                )
+            ).resolve((config,))
+            resolve_calls = 0
+
+            class CountingResolver:
+                def resolve(
+                    self,
+                    _configs: tuple[ResourceConfig, ...],
+                ) -> TMRuntimeSnapshot:
+                    nonlocal resolve_calls
+                    resolve_calls += 1
+                    return resolved
+
+            host = TMRuntimeHost(resolver=CountingResolver(), configs=(config,))
+            before = host.capture_operation_snapshot()
+
+            host._refresh_flags_validated(
+                (replace(config, lookup=False),),
+                lambda _candidate: None,
+            )
+
+            after = host.capture_operation_snapshot()
+            self.assertEqual(resolve_calls, 1)
+            self.assertIs(
+                after.canonical_handles[0].store,
+                before.canonical_handles[0].store,
+            )
+            self.assertFalse(after.canonical_handles[0].lookup)
+
+    def test_flag_refresh_keeps_old_snapshot_visible_until_validation_finishes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "legacy.flags-atomic")
+            host = TMRuntimeHost(
+                resolver=TMResourceResolver(
+                    runtime_open=lambda _path, _resource_id: _legacy_binding("stable")
+                ),
+                configs=(config,),
+            )
+            old = host.snapshot()
+            entered = threading.Event()
+            release = threading.Event()
+            results: list[TMRuntimeSnapshot] = []
+
+            def validate(_candidate: TMRuntimeSnapshot) -> None:
+                entered.set()
+                self.assertTrue(release.wait(timeout=5.0))
+
+            worker = threading.Thread(
+                target=lambda: results.append(
+                    host._refresh_flags_validated(
+                        (replace(config, lookup=False),),
+                        validate,
+                    )
+                ),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(entered.wait(timeout=5.0))
+            self.assertIs(host.snapshot(), old)
+            self.assertTrue(old.legacy_ports[0].lookup)
+
+            release.set()
+            worker.join(timeout=5.0)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(results), 1)
+            self.assertIs(host.snapshot(), results[0])
+            self.assertFalse(host.snapshot().legacy_ports[0].lookup)
+            self.assertTrue(old.legacy_ports[0].lookup)
+
+    def test_flag_refresh_rejects_structural_resource_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root, "legacy.flags-structural")
+            host = TMRuntimeHost(
+                resolver=TMResourceResolver(
+                    runtime_open=lambda _path, _resource_id: _legacy_binding("stable")
+                ),
+                configs=(config,),
+            )
+
+            with self.assertRaisesRegex(ValueError, "flag-only"):
+                host._refresh_flags_validated(
+                    (replace(config, name="renamed"),),
+                    lambda _candidate: None,
+                )
+
     def test_operation_capture_is_defensive_and_rejects_published_handle_drift(
         self,
     ) -> None:

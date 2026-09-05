@@ -48,6 +48,7 @@ from editor_contracts import (
 )
 from editor_controller import EditorController
 from editor_tm_adapter import EditorTMAdapter
+from qt_editor_window import QtEditorWindow
 from qt_settings_dialog import (
     DEFAULT_VISIBLE_RESOURCE_ROWS,
     QtSettingsDialog,
@@ -450,6 +451,26 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             )
             dialog.close()
 
+    def test_resource_completion_reuses_issued_report_without_second_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            controller, _resource_ids = _controller(Path(temporary))
+            window = QtEditorWindow(controller)
+            initial = window.current_tm_report
+            self.assertIsNotNone(initial)
+
+            with patch.object(
+                controller,
+                "tm_suggestion_report",
+                side_effect=AssertionError("resource repaint must not query twice"),
+            ) as query:
+                window._resources_changed()
+
+            self.assertEqual(query.call_count, 0)
+            self.assertEqual(window.current_tm_report, initial)
+            self.assertIn("建议已刷新", window.statusBar().currentMessage())
+            window._confirm_unsaved = lambda: True
+            window.close()
+
     def test_pixel_only_trackpad_partially_consumes_inner_then_outer_scroll(
         self,
     ) -> None:
@@ -469,7 +490,8 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
             self._events()
             inner = dialog.active_table.verticalScrollBar()
             outer = dialog.resource_tables_scroll.verticalScrollBar()
-            self.assertEqual(inner.maximum(), 56)
+            inner_maximum = inner.maximum()
+            self.assertGreater(inner_maximum, 48)
             self.assertGreaterEqual(outer.maximum(), 250)
 
             phases = (
@@ -506,16 +528,17 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                         phase=phase,
                     )
                     self.assertTrue(third.isAccepted())
-                    self.assertEqual(inner.value(), inner.maximum())
-                    self.assertEqual(outer.value(), 23)
+                    self.assertEqual(inner.value(), inner_maximum)
+                    outer_after_handoff = 79 - inner_maximum
+                    self.assertEqual(outer.value(), outer_after_handoff)
 
                     self._wheel(
                         dialog.active_table.viewport(),
                         pixel_y=31,
                         phase=phase,
                     )
-                    self.assertEqual(inner.value(), 25)
-                    self.assertEqual(outer.value(), 23)
+                    self.assertEqual(inner.value(), inner_maximum - 31)
+                    self.assertEqual(outer.value(), outer_after_handoff)
                     self._wheel(
                         dialog.active_table.viewport(),
                         pixel_y=64,

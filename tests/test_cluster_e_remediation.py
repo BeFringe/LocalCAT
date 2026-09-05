@@ -806,7 +806,7 @@ class ClusterERemediationTests(unittest.TestCase):
 
             with patch.object(
                 EditorTMAdapter,
-                "_refresh_runtime",
+                "_refresh_runtime_flags",
                 autospec=True,
                 side_effect=ValueError("/private/runtime/proof"),
             ):
@@ -864,7 +864,7 @@ class ClusterERemediationTests(unittest.TestCase):
             def block_then_update(value: float):
                 with patch.object(
                     EditorTMAdapter,
-                    "_refresh_runtime",
+                    "_refresh_runtime_flags",
                     autospec=True,
                     side_effect=ValueError("/private/runtime/proof"),
                 ):

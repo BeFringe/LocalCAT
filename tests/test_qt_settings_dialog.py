@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 import os
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QModelIndex, QPoint, QRect, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QPoint, QRect, QThread, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QGroupBox,
     QHeaderView,
     QLabel,
     QMessageBox,
@@ -81,6 +83,108 @@ class QtSettingsDialogTest(unittest.TestCase):
             assert tm_name is not None
             self.assertEqual(tm_name.text(), "Primary TM")
             self.assertEqual(inactive_name.text(), "Archive terms")
+            dialog.close()
+
+    def test_constructor_does_not_run_fresh_tm_lifecycle_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            entered: list[bool] = []
+
+            def slow_statuses() -> tuple[object, ...]:
+                entered.append(True)
+                return ()
+
+            with patch.object(controller, "tm_resource_statuses", side_effect=slow_statuses):
+                started = time.perf_counter()
+                dialog = QtSettingsDialog(controller)
+                elapsed = time.perf_counter() - started
+                self.assertLess(elapsed, 0.5)
+                self.assertFalse(entered)
+                dialog.show()
+                self.app.processEvents()
+                self.assertTrue(dialog.isVisible())
+                dialog.close()
+
+    def test_resource_checkbox_updates_without_disabling_resource_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            resource = next(
+                configured
+                for configured in controller.list_resources()
+                if configured.name == "Primary TM"
+            )
+            active = dialog.findChild(QCheckBox, f"active_{resource.id}")
+            self.assertIsNotNone(active)
+            assert active is not None
+            original_update = controller.update_resource
+            changed_signals: list[bool] = []
+            dialog.resources_changed.connect(lambda: changed_signals.append(True))
+
+            def observed_update(updated):
+                self.assertIs(QThread.currentThread(), self.app.thread())
+                self.assertTrue(dialog.active_table.isEnabled())
+                self.assertTrue(dialog.inactive_table.isEnabled())
+                return original_update(updated)
+
+            with patch.object(controller, "update_resource", side_effect=observed_update):
+                active.setChecked(False)
+                self.app.processEvents()
+
+            self.assertEqual(changed_signals, [True])
+            self.assertNotIn("正在更新", dialog.status_label.text())
+            self.assertTrue(dialog.active_table.isEnabled())
+            self.assertTrue(dialog.inactive_table.isEnabled())
+            self.assertFalse(
+                next(
+                    configured
+                    for configured in controller.list_resources()
+                    if configured.id == resource.id
+                ).active
+            )
+            dialog.close()
+
+    def test_lookup_and_update_keep_existing_resource_row_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = self._controller(Path(temp_dir))
+            dialog = QtSettingsDialog(controller)
+            resource = next(
+                configured
+                for configured in controller.list_resources()
+                if configured.name == "Primary TM"
+            )
+            name_cell = dialog.findChild(QWidget, f"tmResource_{resource.id}")
+            lookup = dialog.findChild(QCheckBox, f"lookup_{resource.id}")
+            update = dialog.findChild(QCheckBox, f"update_{resource.id}")
+            self.assertIsNotNone(name_cell)
+            self.assertIsNotNone(lookup)
+            self.assertIsNotNone(update)
+            assert name_cell is not None and lookup is not None and update is not None
+            initial_heights = tuple(
+                dialog.active_table.rowHeight(row)
+                for row in range(dialog.active_table.rowCount())
+            )
+
+            with patch.object(
+                dialog,
+                "_populate_table",
+                wraps=dialog._populate_table,
+            ) as populate:
+                lookup.setChecked(not lookup.isChecked())
+                update.setChecked(not update.isChecked())
+
+            self.assertEqual(populate.call_count, 0)
+            self.assertIs(
+                dialog.findChild(QWidget, f"tmResource_{resource.id}"),
+                name_cell,
+            )
+            self.assertEqual(
+                tuple(
+                    dialog.active_table.rowHeight(row)
+                    for row in range(dialog.active_table.rowCount())
+                ),
+                initial_heights,
+            )
             dialog.close()
 
     def test_dark_system_theme_keeps_settings_content_and_table_states_readable(
@@ -167,6 +271,116 @@ class QtSettingsDialogTest(unittest.TestCase):
             dialog.deleteLater()
             self.app.processEvents()
 
+    def test_color_scheme_signal_clears_dark_resource_qss_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "qt_settings_dialog.system_uses_dark_theme",
+            return_value=True,
+        ) as theme:
+            dialog = QtSettingsDialog(self._controller(Path(temp_dir)))
+            dialog.show()
+            self.app.processEvents()
+            groups = (
+                dialog.findChild(QGroupBox, "activeResourcesGroup"),
+                dialog.findChild(QGroupBox, "inactiveResourcesGroup"),
+            )
+            self.assertTrue(all(group is not None for group in groups))
+            for group in groups:
+                assert group is not None
+                self.assertEqual(group.styleSheet(), "")
+            self.assertIn("#1f2328", dialog.styleSheet().lower())
+
+            self.app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Light)
+
+            self.assertEqual(dialog.property("localcatTheme"), "light")
+            for group in groups:
+                assert group is not None
+                self.assertEqual(group.property("localcatTheme"), "light")
+                self.assertEqual(group.styleSheet(), "")
+                image = group.grab().toImage()
+                self.assertFalse(image.isNull())
+                rendered_colors = Counter(
+                    image.pixelColor(x, y).name()
+                    for y in range(image.height())
+                    for x in range(image.width())
+                )
+                self.assertEqual(rendered_colors["#1f2328"], 0)
+                self.assertEqual(rendered_colors.most_common(1)[0][0], "#ffffff")
+            dialog.close()
+
+    def test_late_application_palette_event_rechecks_system_theme(self) -> None:
+        dark_theme = [True]
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "qt_settings_dialog.system_uses_dark_theme",
+            side_effect=lambda _widget=None: dark_theme[0],
+        ):
+            dialog = QtSettingsDialog(self._controller(Path(temp_dir)))
+            self.assertEqual(dialog.property("localcatTheme"), "dark")
+            dark_theme[0] = False
+
+            QApplication.sendEvent(
+                dialog,
+                QEvent(QEvent.Type.ApplicationPaletteChange),
+            )
+            self.app.processEvents()
+
+            self.assertEqual(dialog.property("localcatTheme"), "light")
+            self.assertNotIn("#1f2328", dialog.styleSheet().lower())
+            dialog.close()
+
+    def test_light_resource_scroll_layers_ignore_stale_dark_palette(self) -> None:
+        previous_palette = self.app.palette()
+        stale_dark_palette = QPalette(previous_palette)
+        for role in (
+            QPalette.ColorRole.Window,
+            QPalette.ColorRole.Base,
+            QPalette.ColorRole.AlternateBase,
+        ):
+            stale_dark_palette.setColor(role, QColor("#1e1e1e"))
+        self.app.setPalette(stale_dark_palette)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir, patch(
+                "qt_settings_dialog.system_uses_dark_theme",
+                return_value=True,
+            ):
+                dialog = QtSettingsDialog(self._controller(Path(temp_dir)))
+                dialog.show()
+                self.app.processEvents()
+
+                self.app.styleHints().colorSchemeChanged.emit(
+                    Qt.ColorScheme.Light
+                )
+
+                for widget in (
+                    dialog.resource_tables_scroll,
+                    dialog.resource_tables_scroll.viewport(),
+                    dialog.resource_tables_content,
+                ):
+                    self.assertEqual(
+                        widget.palette().color(QPalette.ColorRole.Window).name(),
+                        "#f3f6fa",
+                    )
+                image = dialog.resource_tables_content.grab().toImage()
+                self.assertFalse(image.isNull())
+                gap_y = (
+                    dialog.active_group.geometry().bottom()
+                    + dialog.inactive_group.geometry().top()
+                ) // 2
+                sampled_backgrounds = (
+                    image.pixelColor(2, gap_y).name(),
+                    image.pixelColor(image.width() // 2, gap_y).name(),
+                    image.pixelColor(2, image.height() - 2).name(),
+                )
+                self.assertEqual(
+                    sampled_backgrounds,
+                    ("#f3f6fa", "#f3f6fa", "#f3f6fa"),
+                )
+                dialog.close()
+                dialog.deleteLater()
+                self.app.processEvents()
+        finally:
+            self.app.setPalette(previous_palette)
+            self.app.processEvents()
+
     def test_resource_kind_hover_uses_readable_light_and_dark_surfaces(self) -> None:
         for dark_theme, expected_background in (
             (False, "#e7f4f8"),
@@ -227,7 +441,6 @@ class QtSettingsDialogTest(unittest.TestCase):
             assert lookup is not None
             lookup.setChecked(False)
             self.app.processEvents()
-            dialog.refresh_resources()
 
             restored = next(resource for resource in controller.list_resources() if resource.id == created.id)
             reopened = QtSettingsDialog(controller)
@@ -250,14 +463,49 @@ class QtSettingsDialogTest(unittest.TestCase):
             self.assertIsNotNone(active)
             assert active is not None
 
-            active.setChecked(False)
-            self.app.processEvents()
-            dialog.refresh_resources()
+            paint_states: list[bool] = []
+            original_populate = dialog._populate_table
 
+            def observed_populate(*args, **kwargs):
+                paint_states.append(dialog.resource_tables_content.updatesEnabled())
+                return original_populate(*args, **kwargs)
+
+            with patch.object(dialog, "_populate_table", side_effect=observed_populate):
+                active.setChecked(False)
+            immediate_heights = (
+                dialog.active_table.height(),
+                dialog.inactive_table.height(),
+                dialog.active_group.height(),
+                dialog.inactive_group.height(),
+            )
+
+            self.assertEqual(paint_states, [False, False])
             self.assertEqual(dialog.active_table.rowCount(), 0)
             self.assertEqual(dialog.inactive_table.rowCount(), 2)
             self.assertFalse(
                 next(item for item in controller.list_resources() if item.id == resource.id).active
+            )
+            moved_lookup = dialog.findChild(QCheckBox, f"lookup_{resource.id}")
+            self.assertIsNotNone(moved_lookup)
+            assert moved_lookup is not None
+            moved_lookup.setChecked(not moved_lookup.isChecked())
+            self.assertEqual(
+                next(
+                    item
+                    for item in controller.list_resources()
+                    if item.id == resource.id
+                ).lookup,
+                moved_lookup.isChecked(),
+            )
+            self.app.processEvents()
+            self.assertEqual(
+                (
+                    dialog.active_table.height(),
+                    dialog.inactive_table.height(),
+                    dialog.active_group.height(),
+                    dialog.inactive_group.height(),
+                ),
+                immediate_heights,
             )
             dialog.close()
 
