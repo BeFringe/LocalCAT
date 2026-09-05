@@ -162,3 +162,16 @@ LocalCAT Qt 专业编辑器 MVP 为个人译者提供一个完全本地的桌面
 7. When 当前项目段落把说话人和正文分开保存且翻译记忆包含等价的 `speaker "text"` Ren'Py/MateCat 单元, the EditorController shall 将其作为 100% 精确兼容匹配显示，并在应用时只写入解包后的目标正文
 8. If 翻译记忆单元无法按当前段说话人建立无歧义的封装关系, the EditorController shall 保持普通精确匹配行为且不得猜测性移除文本
 9. When 用户安装 Linux 桌面入口且仓库提供 `LocalCAT-logo-silver.png`, the LocalCAT Qt 编辑器 shall 将该图标用于应用菜单和运行窗口，并刷新桌面入口缓存
+
+### Requirement 12：Windows 系统主题与项目身份刷新
+
+**目标：** 作为在 Windows 深色模式下持续翻译的用户，我希望首页、编辑、浏览校对和语言资源设置保持一致可读，并能在修改已确认译文后继续安全切段。
+
+#### 验收标准
+
+1. When Windows/Qt 报告深色系统主题, the LocalCAT Qt 编辑器 shall 对首页、编辑模式、浏览校对模式和语言资源设置应用成套深色前景、背景、边框与交互状态
+2. While 浏览校对模式处于深色主题, the 双语表格 shall 保留可辨识的一深一浅交替行，并让悬停、选中与正文文字维持可读对比度
+3. When 用户在语言资源表或新建资源类型列表上悬停或选择, the 控件 shall 在浅色与深色主题分别使用可辨识状态，且不得出现文字与背景不可辨识
+4. When 系统颜色方案在应用运行期间变化, the 主窗口、设置、菜单与组合框弹层 shall 无需重启即可刷新主题
+5. When 用户修改一个已确认的 workspace 译文使其恢复待确认, the Qt 段落列表 shall 接收当前项目修订重新签发的身份，并允许随后按列表切换段落而不触发 `PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED`
+6. While 系统使用浅色主题, the 已有品牌顶栏、资源设置布局、快捷键、撤销和项目身份安全校验 shall 保持原有行为

@@ -723,6 +723,31 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             view.documents[0].identity.document_id,
         )
 
+    def test_editing_confirmed_target_reissues_list_identity_before_row_switch(
+        self,
+    ) -> None:
+        self._open_workspace()
+        self.assertTrue(self.controller.current_segment.confirmed)
+        stale_next = self.window.segment_list.item(2).data(
+            Qt.ItemDataRole.UserRole
+        )
+
+        self.window.target_editor.setPlainText("修改后恢复待确认")
+        self._events()
+
+        self.assertFalse(self.controller.current_segment.confirmed)
+        current_next = self.controller.workspace_view.segments[1].identity
+        self.assertIsNot(stale_next, current_next)
+        self.window._select_visible_row(2)
+        self._events()
+
+        self.assertEqual(self.errors, [])
+        self.assertEqual(self.controller.workspace_global_index, 1)
+        self.assertIs(
+            self.window.segment_list.item(2).data(Qt.ItemDataRole.UserRole),
+            current_next,
+        )
+
     def test_explicit_json_txt_po_pot_creation_preserves_selection_order_without_scan(
         self,
     ) -> None:
