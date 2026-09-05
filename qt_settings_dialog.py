@@ -83,8 +83,14 @@ from editor_controller import (
     ResourceRecoveryPreview,
 )
 from qt_termbase_dialog import QtTermbaseDialog
-from qt_control_styles import configure_combo_popup, configure_menu
+from qt_control_styles import (
+    apply_combo_popup_theme,
+    apply_menu_theme,
+    configure_combo_popup,
+    configure_menu,
+)
 from qt_localized_message_box import show_localized_critical
+from qt_theme import system_uses_dark_theme
 from qt_tmx_export_dialog import (
     TmxExportDialog,
     TmxExportDialogPreview,
@@ -128,10 +134,48 @@ QToolButton::menu-indicator {
     height: 0;
 }
 """
+_RESOURCE_MORE_BUTTON_DARK_STYLE = """
+QToolButton {
+    border: none;
+    background: transparent;
+    color: #c8d2dc;
+    padding: 0;
+    margin: 0;
+}
+QToolButton:hover,
+QToolButton:focus {
+    border: none;
+    background: transparent;
+    color: #ffffff;
+}
+QToolButton:pressed {
+    border: none;
+    background: transparent;
+    color: #82d7ed;
+}
+QToolButton::menu-indicator {
+    image: none;
+    width: 0;
+    height: 0;
+}
+"""
 _RESOURCE_KIND_COMBO_STYLE = """
 QComboBox#newResourceKind {
     color: #1f3850;
     background-color: #ffffff;
+}
+"""
+_RESOURCE_KIND_COMBO_DARK_STYLE = """
+QComboBox#newResourceKind {
+    color: #e7edf3;
+    background-color: #20242a;
+    border: 1px solid #48515b;
+}
+QComboBox#newResourceKind:hover,
+QComboBox#newResourceKind:focus {
+    color: #ffffff;
+    background-color: #2b3138;
+    border-color: #38a9ca;
 }
 """
 _RESOURCE_PACKAGE_DIALOG_STYLE = """
@@ -829,6 +873,11 @@ class QtSettingsDialog(QDialog):
         self.controller = controller
         self.tmx_export_service = tmx_export_service
         self.setObjectName("settingsDialog")
+        self._dark_theme = system_uses_dark_theme(self)
+        self.setProperty(
+            "localcatTheme",
+            "dark" if self._dark_theme else "light",
+        )
         self.setWindowTitle("LocalCAT · 语言资源设置")
         self.setMinimumSize(860, 560)
         self.resize(1040, 680)
@@ -848,6 +897,11 @@ class QtSettingsDialog(QDialog):
         self._build_ui()
         self.setTabOrder(self.new_resource_button, self.tm_threshold_chip)
         self.refresh_resources()
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            application.styleHints().colorSchemeChanged.connect(
+                self._apply_system_theme
+            )
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -1108,7 +1162,30 @@ class QtSettingsDialog(QDialog):
         content_layout.addLayout(footer)
         root.addWidget(content, 1)
 
-        self.setStyleSheet(_SETTINGS_STYLE)
+        self._apply_system_theme()
+
+    def _apply_system_theme(self, *_args: object) -> None:
+        """Apply the OS theme to settings, prompts, tables, and popups."""
+
+        self._dark_theme = system_uses_dark_theme(self)
+        self.setProperty(
+            "localcatTheme",
+            "dark" if self._dark_theme else "light",
+        )
+        self.setStyleSheet(
+            _SETTINGS_STYLE + (_SETTINGS_DARK_STYLE if self._dark_theme else "")
+        )
+        for combo in self.findChildren(QComboBox):
+            apply_combo_popup_theme(combo)
+        for menu in self.findChildren(QMenu):
+            apply_menu_theme(menu)
+        for button in self.findChildren(QToolButton):
+            if button.property("resourceMoreButton"):
+                button.setStyleSheet(
+                    _RESOURCE_MORE_BUTTON_DARK_STYLE
+                    if self._dark_theme
+                    else _RESOURCE_MORE_BUTTON_STYLE
+                )
 
     @staticmethod
     def _make_table(object_name: str) -> _ResourceTable:
@@ -1395,6 +1472,7 @@ class QtSettingsDialog(QDialog):
                     )
                 )
                 holder = QWidget()
+                holder.setProperty("resourceCell", True)
                 holder_layout = QHBoxLayout(holder)
                 holder_layout.setContentsMargins(0, 0, 0, 0)
                 holder_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1542,7 +1620,12 @@ class QtSettingsDialog(QDialog):
             )
             more_button.setMenu(menu)
             more_button.setAutoRaise(True)
-            more_button.setStyleSheet(_RESOURCE_MORE_BUTTON_STYLE)
+            more_button.setProperty("resourceMoreButton", True)
+            more_button.setStyleSheet(
+                _RESOURCE_MORE_BUTTON_DARK_STYLE
+                if self._dark_theme
+                else _RESOURCE_MORE_BUTTON_STYLE
+            )
             size_policy = more_button.sizePolicy()
             size_policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
             more_button.setSizePolicy(size_policy)
@@ -1632,6 +1715,7 @@ class QtSettingsDialog(QDialog):
         )
         holder = QWidget()
         holder.setObjectName(f"tmKindCell_{resource.id}")
+        holder.setProperty("resourceCell", True)
         holder.setAccessibleName(accessible_text)
         holder.setToolTip(accessible_text)
         layout = QVBoxLayout(holder)
@@ -1665,7 +1749,7 @@ class QtSettingsDialog(QDialog):
         capabilities.setAccessibleName(accessible_text)
         capabilities.setToolTip(accessible_text)
         capabilities.setWordWrap(False)
-        capabilities.setStyleSheet("color: #52677b; font-size: 10px;")
+        capabilities.setProperty("resourceCapability", True)
         capabilities.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
@@ -1744,6 +1828,7 @@ class QtSettingsDialog(QDialog):
     ) -> QWidget:
         holder = QWidget()
         holder.setObjectName(f"tmResource_{resource.id}")
+        holder.setProperty("resourceCell", True)
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(3)
@@ -2074,7 +2159,11 @@ class QtSettingsDialog(QDialog):
         kind_input.setAccessibleName("资源类型")
         kind_input.addItem("翻译记忆库", ResourceKind.TRANSLATION_MEMORY)
         kind_input.addItem("术语表", ResourceKind.TERMBASE)
-        kind_input.setStyleSheet(_RESOURCE_KIND_COMBO_STYLE)
+        kind_input.setStyleSheet(
+            _RESOURCE_KIND_COMBO_DARK_STYLE
+            if self._dark_theme
+            else _RESOURCE_KIND_COMBO_STYLE
+        )
         configure_combo_popup(
             kind_input,
             object_name="newResourceKindPopup",
@@ -2228,7 +2317,7 @@ class QtSettingsDialog(QDialog):
         dialog.setModal(True)
         layout = QVBoxLayout(dialog)
         title = QLabel(f"将“{resource.name}”封装为 TMX ResourcePackage")
-        title.setStyleSheet("font-size: 18px; font-weight: 750; color: #083b5c;")
+        title.setObjectName("tmxPackageLocaleTitle")
         layout.addWidget(title)
         hint = QLabel(
             "资源范围固定为该 managed TM 的完整 canonical snapshot；"
@@ -2761,7 +2850,9 @@ QLabel#resourceSectionTitle {
     font-size: 19px;
     font-weight: 700;
 }
-QLabel#resourceSectionHint, QLabel#settingsStatus {
+QLabel#resourceSectionHint,
+QLabel#resourceStorageHint,
+QLabel#settingsStatus {
     color: #66758a;
 }
 QFrame#settingsTmThresholdPanel {
@@ -2855,6 +2946,41 @@ QTableWidget {
 QTableWidget::item {
     padding: 5px 8px;
 }
+QTableWidget::item:hover {
+    color: #16344e;
+    background: #e7f4f8;
+}
+QTableWidget::item:selected {
+    color: #0b304c;
+    background: #c4e8f2;
+}
+QWidget[resourceCell="true"] {
+    background: transparent;
+}
+QWidget[resourceCell="true"]:hover {
+    background: #e7f4f8;
+}
+QLabel[resourceCapability="true"] {
+    color: #52677b;
+    font-size: 10px;
+}
+QToolButton[resourceMoreButton="true"] {
+    border: none;
+    background: transparent;
+    color: #26435e;
+    padding: 0;
+    margin: 0;
+}
+QToolButton[resourceMoreButton="true"]:hover,
+QToolButton[resourceMoreButton="true"]:focus {
+    color: #0798c6;
+    background: transparent;
+}
+QToolButton[resourceMoreButton="true"]::menu-indicator {
+    image: none;
+    width: 0;
+    height: 0;
+}
 QHeaderView::section {
     background: #eaf0f6;
     color: #53657a;
@@ -2891,5 +3017,141 @@ QLineEdit, QComboBox {
     border-radius: 5px;
     padding: 2px 8px;
     background: #ffffff;
+}
+"""
+
+
+_SETTINGS_DARK_STYLE = """
+QDialog#settingsDialog,
+QDialog#settingsDialog QDialog,
+QWidget#settingsContent,
+QScrollArea#resourceTablesScroll,
+QWidget#resourceTablesContent {
+    color: #e7edf3;
+    background: #17191c;
+}
+QLabel#resourceSectionTitle {
+    color: #f1f5f9;
+}
+QLabel#resourceSectionHint,
+QLabel#resourceStorageHint,
+QLabel#settingsStatus {
+    color: #b8c2cc;
+}
+QFrame#settingsTmThresholdPanel,
+QGroupBox {
+    color: #dfe6ed;
+    background: #1f2328;
+    border-color: #3b424a;
+}
+QGroupBox::title,
+QLabel#settingsTmThresholdTitle {
+    color: #dfe6ed;
+}
+QLabel#settingsTmThresholdState,
+QLabel[resourceCapability="true"] {
+    color: #aeb8c2;
+}
+QPushButton#settingsTmThresholdChip {
+    color: #89d9ef;
+    background: #233942;
+    border-color: #376675;
+}
+QPushButton#settingsTmThresholdChip[fuzzyAvailable="false"] {
+    color: #a8b0b8;
+    background: #2a2e33;
+    border-color: #454b52;
+}
+QTableWidget {
+    color: #e2e8ee;
+    background: #1f2328;
+    alternate-background-color: #292e34;
+    selection-color: #f5fbff;
+    selection-background-color: #294f60;
+}
+QTableWidget::item:hover {
+    color: #f5fbff;
+    background: #33414b;
+}
+QTableWidget::item:selected {
+    color: #f5fbff;
+    background: #294f60;
+}
+QHeaderView::section {
+    color: #c4ced8;
+    background: #292e34;
+    border-bottom-color: #414850;
+}
+QWidget[resourceCell="true"] {
+    color: #e2e8ee;
+    background: transparent;
+}
+QWidget[resourceCell="true"] QLabel {
+    color: #e2e8ee;
+}
+QWidget[resourceCell="true"]:hover {
+    color: #ffffff;
+    background: #33414b;
+}
+QLabel[tmMode="LEGACY_EXACT_ONLY"] {
+    color: #b8c7d6;
+}
+QLabel[tmMode="CANONICAL_ACTIVE"] {
+    color: #8fd3ad;
+}
+QLabel[tmMode="SOURCE_DIVERGED"],
+QLabel[tmMode="DEGRADED"],
+QLabel[tmMode="ACTIVATING"] {
+    color: #efc17d;
+}
+QLabel[tmMode="UNAVAILABLE"] {
+    color: #f2a1a1;
+}
+QLabel#importFeedback {
+    color: #91d1ad;
+}
+QLabel#importFeedback[failed="true"] {
+    color: #f1a0a0;
+}
+QPushButton,
+QLineEdit,
+QComboBox {
+    color: #e7edf3;
+    background: #262b31;
+    border-color: #4a535d;
+    selection-color: #f7fbff;
+    selection-background-color: #35667a;
+}
+QPushButton:hover,
+QPushButton:focus {
+    color: #ffffff;
+    background: #323940;
+    border-color: #37add0;
+}
+QPushButton#newResourceButton {
+    color: #ffffff;
+    background: #078fb5;
+    border-color: #1aa6c9;
+}
+QPushButton#newResourceButton:hover {
+    background: #0a7795;
+}
+QToolButton[resourceMoreButton="true"] {
+    color: #c8d2dc;
+    background: transparent;
+}
+QToolButton[resourceMoreButton="true"]:hover,
+QToolButton[resourceMoreButton="true"]:focus {
+    color: #ffffff;
+    background: transparent;
+}
+QLabel#tmxPackageLocaleTitle {
+    color: #f1f5f9;
+    font-size: 18px;
+    font-weight: 750;
+}
+QProgressBar {
+    background: #262b31;
+    border-color: #48515b;
 }
 """
