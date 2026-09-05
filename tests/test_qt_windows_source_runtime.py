@@ -104,6 +104,8 @@ class WindowsQtSourceRuntimeTests(unittest.TestCase):
             self.assertTrue(payload["dialog_closed_by_escape"])
             self.assertEqual(payload["dialog_accessible_name"], "Raw speaker 盘点")
             self.assertEqual(payload["dialog_rows"], 1)
+            self.assertTrue(payload["settings_light_theme"])
+            self.assertTrue(payload["settings_resource_layers_light"])
             self.assertFalse(payload["keyboard_search_visible_before"])
             self.assertTrue(payload["keyboard_search_visible_after"])
             self.assertTrue(payload["keyboard_search_focused"])

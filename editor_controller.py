@@ -3482,6 +3482,19 @@ class EditorController:
             self._synchronize_tm_query_state(refresh_current=False)
             return self._query_and_issue_current_tm_report()
 
+    def current_tm_suggestion_report(self) -> TMSuggestionReport | None:
+        """Return the already-issued report without resolving or querying again.
+
+        Resource mutations rebuild the runtime and issue the current report before
+        returning.  Presentation code can use this defensive snapshot to repaint
+        after that mutation without repeating the expensive Windows authority
+        inspection on the GUI thread.
+        """
+
+        with self._tm_query_lock:
+            report = self._current_tm_report
+            return None if report is None else _clone_tm_suggestion_report(report)
+
     def _query_and_issue_current_tm_report(self) -> TMSuggestionReport:
         """Run one production query without recursively synchronizing state."""
 
@@ -4482,7 +4495,21 @@ class EditorController:
             return replace(operation)
 
     def tm_resource_statuses(self) -> tuple[TMResourceStatus, ...]:
-        """Return fresh lifecycle facts with same-generation query authority."""
+        """Return freshly resolved lifecycle facts with query authority."""
+
+        return self._tm_resource_statuses(refresh_lifecycle=True)
+
+    def current_tm_resource_statuses(self) -> tuple[TMResourceStatus, ...]:
+        """Return the published runtime projection without filesystem re-resolution."""
+
+        return self._tm_resource_statuses(refresh_lifecycle=False)
+
+    def _tm_resource_statuses(
+        self,
+        *,
+        refresh_lifecycle: bool,
+    ) -> tuple[TMResourceStatus, ...]:
+        """Project lifecycle/query state, optionally re-resolving external facts."""
 
         operation = self.tm_activation_operation()
         activation_in_progress = (
@@ -4504,7 +4531,7 @@ class EditorController:
                     safe_codes=("TM.RETRIEVAL.UNAVAILABLE",),
                 )
             else:
-                if activation_in_progress:
+                if activation_in_progress or not refresh_lifecycle:
                     runtime = adapter._capture_runtime_for_controller(configs)
                     statuses = tuple(
                         replace(status) for status in runtime.statuses
@@ -4520,7 +4547,7 @@ class EditorController:
             for status in statuses:
                 status.__post_init__()
 
-            if not activation_in_progress:
+            if not activation_in_progress and refresh_lifecycle:
                 configs_by_id = {config.id: config for config in configs}
                 classified: list[TMResourceStatus] = []
                 for status in statuses:
@@ -5980,15 +6007,96 @@ class EditorController:
             return resource
 
     def update_resource(self, resource: ResourceConfig) -> ResourceConfig:
-        """Persist resource state through the repository and rebuild engine sets."""
+        """Persist resource state and refresh only the graph that changed."""
 
         with self._tm_query_lock:
             try:
+                previous = self.repository.get(resource.id)
                 updated = self.repository.update_resource(resource)
             except ResourceError as exc:
                 raise EditorControllerError(str(exc)) from exc
-            self._reload_resources_after_persisted_mutation()
+            binding_unchanged = (
+                previous.id,
+                previous.name,
+                previous.kind,
+                previous.path,
+            ) == (
+                updated.id,
+                updated.name,
+                updated.kind,
+                updated.path,
+            )
+            if self._tm_adapter is not None and binding_unchanged:
+                self._reload_resource_flags_after_persisted_mutation()
+            else:
+                self._reload_resources_after_persisted_mutation()
             return updated
+
+    def _reload_resource_flags_after_persisted_mutation(self) -> None:
+        """Publish flag-only changes or fail closed after registry persistence."""
+
+        try:
+            self._reload_resource_flags()
+        except EditorControllerError as error:
+            self._latch_persisted_runtime_refresh_failure()
+            raise EditorControllerError("TM.RUNTIME.REFRESH_FAILED") from error
+        except BaseException:
+            self._latch_persisted_runtime_refresh_failure()
+            raise
+
+    def _reload_resource_flags(self) -> None:
+        """Reuse open TM authorities and cached term records for flag changes."""
+
+        configs = self.repository.list_resources()
+        adapter = self._tm_adapter
+        if adapter is None:
+            self.reload_resources()
+            return
+        term_candidate: tuple[
+            dict[str, _TermEngine],
+            dict[str, tuple[TermRecord, ...]],
+            MatcherHandoffSnapshot | None,
+        ] | None = None
+
+        def validate_candidate(_snapshot: object) -> None:
+            nonlocal term_candidate
+            term_candidate = self._build_term_engine_sets_for_flag_update(configs)
+
+        try:
+            _ = adapter._refresh_runtime_flags(configs, validate_candidate)
+            if term_candidate is None:
+                raise ValueError("resource flag refresh candidate is missing")
+            glossary_engines, term_records, term_handoff = term_candidate
+            for attempt in range(2):
+                if term_handoff is None:
+                    raise AssertionError("configured resource graph lost its handoff")
+                try:
+                    adapter._run_if_text_matcher_handoff_current_for_controller(
+                        term_handoff,
+                        lambda: self._publish_term_engine_graph(
+                            glossary_engines,
+                            term_records,
+                            term_handoff,
+                        ),
+                    )
+                    break
+                except _TMMatcherGenerationChanged:
+                    if attempt == 1:
+                        raise ValueError(
+                            "matcher generation changed during resource flag refresh"
+                        ) from None
+                    glossary_engines, term_records, term_handoff = (
+                        self._build_term_engine_sets_for_flag_update(configs)
+                    )
+            if self._project is not None:
+                self._advance_tm_query_epoch()
+                self._record_current_tm_baseline()
+                _ = self._query_and_issue_current_tm_report()
+            self._tm_runtime_blocked_safe_code = None
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise EditorControllerError(
+                f"unable to refresh language resource flags: {exc}"
+            ) from exc
 
     def delete_resource(self, resource_id: str) -> ResourceConfig:
         """Delete one configured resource and remove it from live engine sets."""
@@ -6324,6 +6432,62 @@ class EditorController:
             )
         ):
             raise ValueError("term matcher handoff changed during candidate build")
+        return engines, snapshots, handoff
+
+    def _build_term_engine_sets_for_flag_update(
+        self,
+        configs: tuple[ResourceConfig, ...],
+    ) -> tuple[
+        dict[str, _TermEngine],
+        dict[str, tuple[TermRecord, ...]],
+        MatcherHandoffSnapshot,
+    ]:
+        """Reuse the current term graph, loading only a newly active termbase."""
+
+        adapter = self._tm_adapter
+        if adapter is None:
+            raise AssertionError("term flag projection requires the TM adapter")
+        handoff = adapter._text_matcher_handoff_for_controller()
+        if not adapter._is_current_text_matcher_handoff_for_controller(handoff):
+            raise ValueError("term matcher handoff is not current-host issued")
+        if self._term_matcher_handoff is not handoff:
+            engines, records, rebuilt_handoff = self._build_term_engine_sets(
+                configs,
+                candidate_records=dict(self._term_record_snapshots),
+            )
+            if rebuilt_handoff is None:
+                raise AssertionError("term matcher rebuild lost its handoff")
+            return engines, records, rebuilt_handoff
+
+        engines = dict(self._glossary_engines)
+        snapshots = dict(self._term_record_snapshots)
+        for resource in configs:
+            if (
+                resource.kind is not ResourceKind.TERMBASE
+                or not resource.active
+                or resource.id in engines
+            ):
+                continue
+            records = snapshots.get(resource.id)
+            if resource.id in self._term_quarantines:
+                if records is None:
+                    raise ValueError("quarantined termbase lost its in-memory LKG")
+            elif records is None:
+                records = self._load_glossary_engine(resource.path)
+            if type(records) is not tuple or any(
+                type(record) is not TermRecord for record in records
+            ):
+                raise TypeError("term engine records must be exact TermRecord values")
+            for record in records:
+                record.__post_init__()
+            snapshots[resource.id] = records
+            engines[resource.id] = ConfiguredTermAdapter(
+                records,
+                resource.name,
+                handoff,
+            )
+        if not adapter._is_current_text_matcher_handoff_for_controller(handoff):
+            raise ValueError("term matcher handoff changed during flag projection")
         return engines, snapshots, handoff
 
     @staticmethod

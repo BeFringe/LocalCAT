@@ -426,6 +426,74 @@ def _clone_runtime_snapshot(
     )
 
 
+def _project_runtime_flags(
+    snapshot: TMRuntimeSnapshot,
+    configs: tuple[ResourceConfig, ...],
+    *,
+    generation: int,
+) -> TMRuntimeSnapshot:
+    """Project declarative flags onto already-open runtime authorities."""
+
+    config_by_id = {config.id: config for config in configs}
+    legacy_ports = tuple(
+        LegacyExactPort(
+            resource_id=port.resource_id,
+            resource_name=port.resource_name,
+            path=port.path,
+            global_order=port.global_order,
+            active=config_by_id[port.resource_id].active,
+            lookup=config_by_id[port.resource_id].lookup,
+            update=config_by_id[port.resource_id].update,
+            backend=port.backend,
+        )
+        for port in snapshot.legacy_ports
+    )
+    canonical_handles: list[TMResourceHandle] = []
+    canonical_ports: list[CanonicalResourcePort] = []
+    for port, handle in zip(
+        snapshot.canonical_ports,
+        snapshot.canonical_handles,
+        strict=True,
+    ):
+        config = config_by_id[port.resource_id]
+        projected_handle = TMResourceHandle(
+            resource_id=handle.resource_id,
+            store=handle.store,
+            active=config.active,
+            lookup=config.lookup,
+            update=config.update,
+            order=handle.order,
+        )
+        canonical_handles.append(projected_handle)
+        canonical_ports.append(
+            CanonicalResourcePort(
+                resource_name=port.resource_name,
+                path=port.path,
+                global_order=port.global_order,
+                handle=projected_handle,
+            )
+        )
+    return TMRuntimeSnapshot(
+        generation=generation,
+        legacy_ports=legacy_ports,
+        canonical_ports=tuple(canonical_ports),
+        canonical_handles=tuple(canonical_handles),
+        global_order_by_resource_id=snapshot.global_order_by_resource_id,
+        statuses=tuple(replace(status) for status in snapshot.statuses),
+    )
+
+
+def _config_binding_signature(
+    configs: tuple[ResourceConfig, ...],
+) -> tuple[tuple[str, str, ResourceKind, Path], ...]:
+    """Return fields whose change requires fresh filesystem resolution."""
+
+    return tuple(
+        (config.id, config.name, config.kind, config.path)
+        for config in configs
+    )
+
+
 def _runtime_snapshot_matches_private_binding(
     published: TMRuntimeSnapshot,
     private: TMRuntimeSnapshot,
@@ -691,6 +759,80 @@ class TMRuntimeHost:
                 private_configs,
             ):
                 raise ValueError("runtime refresh candidate drift")
+            self._configs = private_configs
+            self._operation_template = private
+            self._snapshot = published
+            return published
+
+    def _refresh_flags_validated(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        validate_candidate: Callable[[TMRuntimeSnapshot], None],
+    ) -> TMRuntimeSnapshot:
+        """Publish flag-only config changes without reopening proven resources."""
+
+        _validate_configs(configs)
+        if not callable(validate_candidate):
+            raise TypeError("runtime candidate validator must be callable")
+        private_configs = _clone_resource_configs(configs)
+        with self._lock:
+            if not _runtime_snapshot_matches_private_binding(
+                self._snapshot,
+                self._operation_template,
+                self._configs,
+            ):
+                raise ValueError("runtime snapshot drift")
+            previous_configs = self._configs
+            if _config_binding_signature(previous_configs) != _config_binding_signature(
+                private_configs
+            ):
+                raise ValueError("runtime flag-only refresh changed resource bindings")
+            base_generation = self._operation_template.generation
+            private_candidate = _project_runtime_flags(
+                self._operation_template,
+                private_configs,
+                generation=0,
+            )
+        _validate_snapshot_against_configs(private_candidate, private_configs)
+        published_candidate = _clone_runtime_snapshot(
+            private_candidate,
+            generation=0,
+        )
+        validation_result = validate_candidate(private_candidate)
+        if validation_result is not None:
+            raise TypeError("runtime candidate validator must return None")
+        _validate_snapshot_against_configs(private_candidate, private_configs)
+        if not _runtime_snapshot_matches_private_binding(
+            published_candidate,
+            private_candidate,
+            private_configs,
+        ):
+            raise ValueError("runtime flag-only refresh candidate drift")
+        with self._lock:
+            if (
+                self._configs != previous_configs
+                or self._operation_template.generation != base_generation
+                or not _runtime_snapshot_matches_private_binding(
+                    self._snapshot,
+                    self._operation_template,
+                    self._configs,
+                )
+            ):
+                raise ValueError("runtime changed during flag-only refresh")
+            private = replace(
+                private_candidate,
+                generation=base_generation + 1,
+            )
+            published = replace(
+                published_candidate,
+                generation=private.generation,
+            )
+            if not _runtime_snapshot_matches_private_binding(
+                published,
+                private,
+                private_configs,
+            ):
+                raise ValueError("runtime flag-only refresh candidate drift")
             self._configs = private_configs
             self._operation_template = private
             self._snapshot = published

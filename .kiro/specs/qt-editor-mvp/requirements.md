@@ -175,3 +175,17 @@ LocalCAT Qt 专业编辑器 MVP 为个人译者提供一个完全本地的桌面
 4. When 系统颜色方案在应用运行期间变化, the 主窗口、设置、菜单与组合框弹层 shall 无需重启即可刷新主题
 5. When 用户修改一个已确认的 workspace 译文使其恢复待确认, the Qt 段落列表 shall 接收当前项目修订重新签发的身份，并允许随后按列表切换段落而不触发 `PROJECT.WORKSPACE.IDENTITY_NOT_ISSUED`
 6. While 系统使用浅色主题, the 已有品牌顶栏、资源设置布局、快捷键、撤销和项目身份安全校验 shall 保持原有行为
+
+### Requirement 13：Windows 设置响应与即时控件重绘
+
+**目标：** 作为在 Windows 上配置语言资源的用户，我希望设置窗口和复选框立即响应，并在主题切换后看到完整、正确的控件边框。
+
+#### 验收标准
+
+1. When 用户打开语言资源设置, the Qt GUI shall 从 Controller 已发布的运行时快照渲染资源状态，不得在 GUI 线程重新解析 canonical TM 生命周期
+2. When 用户切换 Active、Lookup 或 Update 且资源的 id、name、kind、path 与顺序未变, the Controller shall 复用当前已证明的 TM backend/store identity，只投影新的路由标志并发布下一 runtime generation；该路径不得重新运行 canonical resolver、重开 TM 或重读无关术语表
+3. When 资源状态更新完成, the 主窗口 shall 复用该次重载已签发的当前段 TM report，并 shall 不再发起第二次同段 TM 查询
+4. While Active、Lookup 或 Update 正在提交, the 设置窗口 shall 保持资源控件可绘制且不得将三列整体置灰或用“正在更新”中间态代替真实完成；失败时 shall 显示安全错误并从 Controller 当前状态重新投影
+5. When 系统主题由深色切换为浅色, the 设置窗口 shall 直接消费 `colorSchemeChanged` 的新方案，并在浅色根 QSS 中显式覆盖资源 scroll、viewport、content、group 与 table；即使 `QApplication.palette()` 仍暂留深色也不得出现黑色标题带、组间空白或底边
+6. While Windows 原生 checkbox style 绘制“仅显示未确认”, the indicator shall 完整位于段落面板内并保留明确的左侧安全间距
+7. When 用户切换 Lookup 或 Update, the 设置窗口 shall 原位投影当前资源行而不得清空重建全表；when Active 导致资源跨分组, the 两表内容、行高与 group 高度 shall 在开放绘制前作为一个 UI 快照同步收敛，不得显示相邻资源短暂换位或重叠

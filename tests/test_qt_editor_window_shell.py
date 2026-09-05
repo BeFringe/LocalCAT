@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QMenu,
     QStyle,
+    QStyleOptionButton,
     QStyleOptionComboBox,
     QStyleOptionToolButton,
     QToolButton,
@@ -166,6 +167,37 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self.assertEqual(window.segment_list.count(), 3)
             self.assertEqual(window.project_name_label.text(), "LocalCAT Welcome")
             self.assertEqual(window.language_label.text(), "en-US  →  zh-CN")
+            window.close()
+
+    def test_unconfirmed_filter_indicator_has_left_breathing_room(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self._window(Path(temp_dir))
+            window.load_sample()
+            window.resize(1180, 680)
+            window.show()
+            self._events()
+
+            checkbox = window.unconfirmed_filter
+            panel = checkbox.parentWidget()
+            self.assertIsNotNone(panel)
+            assert panel is not None
+            option = QStyleOptionButton()
+            option.initFrom(checkbox)
+            option.rect = checkbox.rect()
+            indicator = checkbox.style().subElementRect(
+                QStyle.SubElement.SE_CheckBoxIndicator,
+                option,
+                checkbox,
+            )
+            self.assertGreaterEqual(indicator.left(), 4)
+            self.assertLess(indicator.right(), checkbox.width())
+            indicator_left = checkbox.mapTo(panel, indicator.topLeft()).x()
+
+            self.assertGreaterEqual(indicator_left, 4)
+            self.assertTrue(
+                panel.rect().contains(checkbox.mapTo(panel, indicator.topLeft()))
+            )
+            window._confirm_unsaved = lambda: True
             window.close()
 
     def test_dark_system_theme_covers_home_edit_and_alternating_browse_rows(

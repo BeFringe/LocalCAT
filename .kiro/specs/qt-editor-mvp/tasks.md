@@ -321,6 +321,12 @@
   - _Requirements: 3.1, 3.4, 6.1, 6.8, 10.4, 10.5, 12.1–12.6_
   - _Boundary: Qt Theme Projection, Qt Workspace Identity Refresh_
 
+- [x] 13. 稳定资源标志切换、行投影和控件绘制
+  - 设置打开与三列布尔切换不重复开库，不以全表置灰或等待文案代替响应
+  - 深浅切换无资源分组黑边；“仅显示未确认”描边完整；资源行不短暂换位或重叠
+  - _Requirements: 6.1, 12.1–12.4, 12.6, 13.1–13.7_
+  - _Boundary: Qt Settings Responsiveness, Published TM Projection, Runtime Theme Repaint_
+
 ## 维护实施记录
 
 ### Checkpoint M
@@ -331,3 +337,9 @@
 ### Task 12：身份刷新
 
 - 编辑已确认译文会改变 workspace revision，Controller 重签 token 后旧列表仍持旧对象才触发 `IDENTITY_NOT_ISSUED`。Qt 刷新列表，Controller 的对象身份校验不放宽。
+
+### Task 13：设置与行投影
+
+- 三列延迟来自纯布尔切换被当作结构更新，重新解析全部 TM，并在兼容装配中再次开库；不是 hover 或主页成功提示造成的。
+- 前两版只验证 repolish 或 group 局部 QSS，漏掉 scroll/viewport/content；Light 信号到达时这些层仍能露出旧深色 palette。indicator 的安全间距必须位于控件自身绘制矩形内，单纯移动控件无效。
+- WA08/TM 跳变是清表与后续行高收敛之间的可见中间态，不是资源身份串行；还需防止 DeferredDelete 期间同名旧 checkbox 被查中。

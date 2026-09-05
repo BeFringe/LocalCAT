@@ -8,9 +8,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QEvent,
     QModelIndex,
     QPointF,
     QPersistentModelIndex,
+    QSignalBlocker,
     QThread,
     Qt,
     QTimer,
@@ -90,7 +92,7 @@ from qt_control_styles import (
     configure_menu,
 )
 from qt_localized_message_box import show_localized_critical
-from qt_theme import system_uses_dark_theme
+from qt_theme import color_scheme_uses_dark, system_uses_dark_theme
 from qt_tmx_export_dialog import (
     TmxExportDialog,
     TmxExportDialogPreview,
@@ -874,6 +876,9 @@ class QtSettingsDialog(QDialog):
         self.tmx_export_service = tmx_export_service
         self.setObjectName("settingsDialog")
         self._dark_theme = system_uses_dark_theme(self)
+        self._theme_applied = False
+        self._theme_refresh_pending = False
+        self._theme_refresh_in_progress = False
         self.setProperty(
             "localcatTheme",
             "dark" if self._dark_theme else "light",
@@ -896,12 +901,32 @@ class QtSettingsDialog(QDialog):
         self._tm_operation_timer.timeout.connect(self._poll_tm_operation)
         self._build_ui()
         self.setTabOrder(self.new_resource_button, self.tm_threshold_chip)
-        self.refresh_resources()
+        self._render_cached_resources()
         application = QApplication.instance()
         if isinstance(application, QApplication):
             application.styleHints().colorSchemeChanged.connect(
                 self._apply_system_theme
             )
+            application.paletteChanged.connect(self._queue_system_theme_refresh)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ThemeChange,
+        ):
+            self._queue_system_theme_refresh()
+
+    def _queue_system_theme_refresh(self, *_args: object) -> None:
+        if self._theme_refresh_pending:
+            return
+        self._theme_refresh_pending = True
+        QTimer.singleShot(0, self._apply_queued_system_theme)
+
+    def _apply_queued_system_theme(self) -> None:
+        self._theme_refresh_pending = False
+        self._apply_system_theme()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -948,7 +973,9 @@ class QtSettingsDialog(QDialog):
                         continue
                     layout = cell.layout()
                     if layout is not None and layout.hasHeightForWidth():
-                        cell_height = layout.totalHeightForWidth(max(1, cell.width()))
+                        cell_height = layout.totalHeightForWidth(
+                            max(1, table.columnWidth(column))
+                        )
                     else:
                         cell_height = max(
                             cell.minimumSizeHint().height(),
@@ -1100,6 +1127,9 @@ class QtSettingsDialog(QDialog):
 
         self.resource_tables_scroll = QScrollArea()
         self.resource_tables_scroll.setObjectName("resourceTablesScroll")
+        self.resource_tables_scroll.viewport().setObjectName(
+            "resourceTablesViewport"
+        )
         self.resource_tables_scroll.setWidgetResizable(True)
         self.resource_tables_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.resource_tables_scroll.setHorizontalScrollBarPolicy(
@@ -1111,27 +1141,27 @@ class QtSettingsDialog(QDialog):
         resource_tables_layout.setContentsMargins(0, 0, 0, 0)
         resource_tables_layout.setSpacing(16)
 
-        active_group = QGroupBox("活动资源")
-        active_group.setObjectName("activeResourcesGroup")
-        active_group_policy = active_group.sizePolicy()
+        self.active_group = QGroupBox("活动资源")
+        self.active_group.setObjectName("activeResourcesGroup")
+        active_group_policy = self.active_group.sizePolicy()
         active_group_policy.setVerticalPolicy(QSizePolicy.Policy.Fixed)
-        active_group.setSizePolicy(active_group_policy)
-        active_layout = QVBoxLayout(active_group)
+        self.active_group.setSizePolicy(active_group_policy)
+        active_layout = QVBoxLayout(self.active_group)
         self.active_table = self._make_table("activeResourcesTable")
         active_layout.addWidget(self.active_table)
-        resource_tables_layout.addWidget(active_group)
+        resource_tables_layout.addWidget(self.active_group)
 
-        inactive_group = QGroupBox("非活动资源")
-        inactive_group.setObjectName("inactiveResourcesGroup")
-        inactive_group_policy = inactive_group.sizePolicy()
+        self.inactive_group = QGroupBox("非活动资源")
+        self.inactive_group.setObjectName("inactiveResourcesGroup")
+        inactive_group_policy = self.inactive_group.sizePolicy()
         inactive_group_policy.setVerticalPolicy(QSizePolicy.Policy.Fixed)
-        inactive_group.setSizePolicy(inactive_group_policy)
-        inactive_layout = QVBoxLayout(inactive_group)
+        self.inactive_group.setSizePolicy(inactive_group_policy)
+        inactive_layout = QVBoxLayout(self.inactive_group)
         self.inactive_table = self._make_table("inactiveResourcesTable")
         inactive_layout.addWidget(self.inactive_table)
         self.active_table.set_wheel_handoff_target(self.resource_tables_scroll)
         self.inactive_table.set_wheel_handoff_target(self.resource_tables_scroll)
-        resource_tables_layout.addWidget(inactive_group)
+        resource_tables_layout.addWidget(self.inactive_group)
         resource_tables_layout.addStretch()
         self.resource_tables_scroll.setWidget(self.resource_tables_content)
         content_layout.addWidget(self.resource_tables_scroll, 1)
@@ -1167,25 +1197,70 @@ class QtSettingsDialog(QDialog):
     def _apply_system_theme(self, *_args: object) -> None:
         """Apply the OS theme to settings, prompts, tables, and popups."""
 
-        self._dark_theme = system_uses_dark_theme(self)
+        signaled_theme = color_scheme_uses_dark(_args[0]) if _args else None
+        dark_theme = (
+            system_uses_dark_theme(self)
+            if signaled_theme is None
+            else signaled_theme
+        )
+        target_style = _SETTINGS_STYLE + (
+            _SETTINGS_DARK_STYLE if dark_theme else ""
+        )
+        if self._theme_refresh_in_progress:
+            return
+        if (
+            self._theme_applied
+            and dark_theme == self._dark_theme
+            and self.styleSheet() == target_style
+            and not self.active_group.styleSheet()
+            and not self.inactive_group.styleSheet()
+        ):
+            return
+        self._theme_refresh_in_progress = True
+        self._dark_theme = dark_theme
+        updates_were_enabled = self.updatesEnabled()
+        if updates_were_enabled:
+            self.setUpdatesEnabled(False)
         self.setProperty(
             "localcatTheme",
             "dark" if self._dark_theme else "light",
         )
-        self.setStyleSheet(
-            _SETTINGS_STYLE + (_SETTINGS_DARK_STYLE if self._dark_theme else "")
-        )
-        for combo in self.findChildren(QComboBox):
-            apply_combo_popup_theme(combo)
-        for menu in self.findChildren(QMenu):
-            apply_menu_theme(menu)
-        for button in self.findChildren(QToolButton):
-            if button.property("resourceMoreButton"):
-                button.setStyleSheet(
-                    _RESOURCE_MORE_BUTTON_DARK_STYLE
-                    if self._dark_theme
-                    else _RESOURCE_MORE_BUTTON_STYLE
-                )
+        try:
+            if self._theme_applied:
+                self.setStyleSheet("")
+            for group in (self.active_group, self.inactive_group):
+                # Older builds installed a second, stateful QSS layer here.
+                # Keep the groups owned solely by the dialog stylesheet.
+                group.setStyleSheet("")
+            self.setStyleSheet(target_style)
+            for combo in self.findChildren(QComboBox):
+                apply_combo_popup_theme(combo)
+            for menu in self.findChildren(QMenu):
+                apply_menu_theme(menu)
+            for button in self.findChildren(QToolButton):
+                if button.property("resourceMoreButton"):
+                    button.setStyleSheet(
+                        _RESOURCE_MORE_BUTTON_DARK_STYLE
+                        if self._dark_theme
+                        else _RESOURCE_MORE_BUTTON_STYLE
+                    )
+            theme_name = "dark" if self._dark_theme else "light"
+            for widget in (self, *self.findChildren(QWidget)):
+                widget.setProperty("localcatTheme", theme_name)
+                style = widget.style()
+                style.unpolish(widget)
+                style.polish(widget)
+                widget.updateGeometry()
+                widget.update()
+            self._theme_applied = True
+        finally:
+            if updates_were_enabled:
+                self.setUpdatesEnabled(True)
+            self._theme_refresh_in_progress = False
+        self.repaint()
+        for table in (self.active_table, self.inactive_table):
+            table.viewport().repaint()
+            table.horizontalHeader().viewport().repaint()
 
     @staticmethod
     def _make_table(object_name: str) -> _ResourceTable:
@@ -1229,13 +1304,44 @@ class QtSettingsDialog(QDialog):
             statuses = self.controller.tm_resource_statuses()
         except Exception:
             statuses = ()
+        try:
+            recoveries = self.controller.inspect_resource_portability_recovery()
+        except EditorControllerError:
+            recoveries = ()
+        self._render_resource_snapshot(resources, statuses, recoveries)
+
+    def _render_cached_resources(self) -> None:
+        """Paint current configuration without filesystem diagnostics or queries."""
+
+        try:
+            statuses = self.controller.current_tm_resource_statuses()
+        except Exception:
+            statuses = ()
+        try:
+            recoveries = self.controller.inspect_resource_portability_recovery()
+        except EditorControllerError:
+            recoveries = ()
+        self._render_resource_snapshot(
+            self.controller.list_resources(),
+            statuses,
+            recoveries,
+        )
+
+    def _render_resource_snapshot(
+        self,
+        resources: tuple[ResourceConfig, ...],
+        statuses: tuple[TMResourceStatus, ...],
+        recoveries: tuple[ResourceRecoveryPreview, ...],
+    ) -> None:
+        """Render one already-collected resource presentation snapshot."""
+
         status_by_resource_id = {
             status.resource_id: status
             for status in statuses
             if type(status) is TMResourceStatus
         }
         self._refresh_tm_threshold_entry()
-        self._refresh_resource_recovery()
+        self._refresh_resource_recovery(recoveries)
         try:
             operation = self.controller.tm_activation_operation()
         except Exception:
@@ -1248,20 +1354,31 @@ class QtSettingsDialog(QDialog):
                 self._tm_operation_timer.start()
         active = tuple(resource for resource in resources if resource.active)
         inactive = tuple(resource for resource in resources if not resource.active)
-        self._populate_table(
-            self.active_table,
-            active,
-            status_by_resource_id=status_by_resource_id,
-            operation=operation,
-        )
-        self._populate_table(
-            self.inactive_table,
-            inactive,
-            status_by_resource_id=status_by_resource_id,
-            operation=operation,
-        )
-        self._refresh_resource_menu_tab_order(resources)
-        self._schedule_resource_row_resize()
+        scroll_positions = {
+            table: table.verticalScrollBar().value()
+            for table in (self.active_table, self.inactive_table)
+        }
+        self.resource_tables_content.setUpdatesEnabled(False)
+        try:
+            self._populate_table(
+                self.active_table,
+                active,
+                status_by_resource_id=status_by_resource_id,
+                operation=operation,
+            )
+            self._populate_table(
+                self.inactive_table,
+                inactive,
+                status_by_resource_id=status_by_resource_id,
+                operation=operation,
+            )
+            self._refresh_resource_menu_tab_order(resources)
+            self._resize_resource_rows()
+            for table, position in scroll_positions.items():
+                table.verticalScrollBar().setValue(position)
+        finally:
+            self.resource_tables_content.setUpdatesEnabled(True)
+        self.resource_tables_content.update()
         if operation is not None and not operation.completed:
             self.status_label.setText("Canonical 操作正在进行；重复操作已禁用。")
         else:
@@ -1269,17 +1386,21 @@ class QtSettingsDialog(QDialog):
                 f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
             )
 
-    def _refresh_resource_recovery(self) -> None:
+    def _refresh_resource_recovery(
+        self,
+        recoveries: tuple[ResourceRecoveryPreview, ...] | None = None,
+    ) -> None:
         layout = self.resource_recovery_layout
         while layout.count():
             item = layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        try:
-            recoveries = self.controller.inspect_resource_portability_recovery()
-        except EditorControllerError:
-            recoveries = ()
+        if recoveries is None:
+            try:
+                recoveries = self.controller.inspect_resource_portability_recovery()
+            except EditorControllerError:
+                recoveries = ()
         self.resource_recovery_panel.setVisible(bool(recoveries))
         if not recoveries:
             return
@@ -1442,6 +1563,9 @@ class QtSettingsDialog(QDialog):
                     "tmKindState_",
                     "tmCapabilities_",
                     "resourceKind_",
+                    "active_",
+                    "lookup_",
+                    "update_",
                     "more_",
                 )
             ):
@@ -1637,8 +1761,6 @@ class QtSettingsDialog(QDialog):
             )
             more_button.setFixedWidth(compact_width)
             table.setCellWidget(row, 7, more_button)
-        table.resizeRowsToContents()
-
     def _open_termbase_dialog(self, resource: ResourceConfig) -> None:
         """Open one Controller-only termbase management surface."""
 
@@ -2100,13 +2222,64 @@ class QtSettingsDialog(QDialog):
                 if configured.id == resource_id
             )
             updated = replace(resource, **{field: checked})
-            self.controller.update_resource(updated)
         except (StopIteration, EditorControllerError, ValueError) as exc:
             show_localized_critical(self, title="无法更新资源", text=str(exc))
-            self.refresh_resources()
+            self._render_cached_resources()
             return
+        try:
+            result = self.controller.update_resource(updated)
+        except (EditorControllerError, ValueError) as exc:
+            show_localized_critical(self, title="无法更新资源", text=str(exc))
+            self._render_cached_resources()
+            return
+        if type(result) is not ResourceConfig:
+            raise TypeError("resource update must return ResourceConfig")
+        if field == "active":
+            self._render_cached_resources()
+        else:
+            self._project_resource_flags(result)
         self.resources_changed.emit()
-        QTimer.singleShot(0, self.refresh_resources)
+        self.status_label.setText("资源配置已保存，当前段建议已刷新。")
+
+    def _project_resource_flags(self, resource: ResourceConfig) -> None:
+        """Update one stable row without exposing a transient table rebuild."""
+
+        for column, field in enumerate(("active", "lookup", "update")):
+            checkbox = self._current_resource_checkbox(
+                resource.id,
+                field,
+                column,
+            )
+            if checkbox is None:
+                raise ValueError("resource row is missing from the current projection")
+            blocker = QSignalBlocker(checkbox)
+            checkbox.setChecked(bool(getattr(resource, field)))
+            del blocker
+        manage_action = self.findChild(QAction, f"manageTerms_{resource.id}")
+        if manage_action is not None:
+            manage_action.setEnabled(resource.active and resource.update)
+
+    def _current_resource_checkbox(
+        self,
+        resource_id: str,
+        field: str,
+        column: int,
+    ) -> QCheckBox | None:
+        """Return only the checkbox attached to a current visible table cell."""
+
+        for table in (self.active_table, self.inactive_table):
+            for row in range(table.rowCount()):
+                holder = table.cellWidget(row, column)
+                if holder is None:
+                    continue
+                checkbox = holder.findChild(QCheckBox)
+                if (
+                    checkbox is not None
+                    and checkbox.property("resource_id") == resource_id
+                    and checkbox.property("resource_field") == field
+                ):
+                    return checkbox
+        return None
 
     def create_resource(self, name: str, kind: ResourceKind | str) -> ResourceConfig:
         """Create through the controller; exposed for the prompt and GUI tests."""
@@ -2842,7 +3015,10 @@ QLabel#localBadge {
     font-size: 10px;
     font-weight: 700;
 }
-QWidget#settingsContent {
+QWidget#settingsContent,
+QScrollArea#resourceTablesScroll,
+QWidget#resourceTablesViewport,
+QWidget#resourceTablesContent {
     background: #f3f6fa;
 }
 QLabel#resourceSectionTitle {
@@ -3026,6 +3202,7 @@ QDialog#settingsDialog,
 QDialog#settingsDialog QDialog,
 QWidget#settingsContent,
 QScrollArea#resourceTablesScroll,
+QWidget#resourceTablesViewport,
 QWidget#resourceTablesContent {
     color: #e7edf3;
     background: #17191c;

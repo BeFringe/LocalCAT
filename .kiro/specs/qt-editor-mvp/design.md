@@ -519,6 +519,19 @@ QT_QPA_PLATFORM=offscreen python qt_editor.py --smoke-test
 - Workspace Controller 继续以对象身份拒绝 stale/forged token。译文更新导致 revision 变化后，Qt 重新填充段落列表以接收 Controller 新签发 token，不放宽 `IssuedSegmentIdentity` 校验，也不以索引冒充身份。
 - 验证同时覆盖精确用户复现、浅/深 palette 对比度、浏览交替行、真实 Qt 截图和既有 Qt 导航/撤销/快捷键回归。
 
+## Windows 设置响应与即时重绘维护设计
+
+- 设置构造只消费 `EditorController.current_tm_resource_statuses()` 已发布快照；该接口捕获当前 runtime generation 并合并既有 query projection，但不重新运行 Windows canonical resolver 或 TM 查询。显式生命周期刷新仍使用 `tm_resource_statuses()` 的 fresh 路径。
+- Active/Lookup/Update 是路由元数据，不是新的物理 authority。只要 `id/name/kind/path/order` 未变，`TMRuntimeHost` 从当前 private template 构造下一不可变 snapshot，保留 legacy backend/canonical store 对象身份，仅替换三个 flags，并经既有 validator 后原子发布 `generation + 1`；结构变化继续走完整 resolver。
+- Controller 的 flag-only 路径不重开 TM、不重读既有术语表，也不重建全部 term adapter；inactive→active 仅在该术语表从未进入缓存时读取并构建这一项。持久化后的投影失败继续进入既有 fail-closed latch。
+- 设置复选框同步调用这一内存投影路径并直接完成，不创建资源状态 worker，不把三列整体置灰，也不显示“正在更新”作为等待替代。
+- `update_resource()` 成功返回前已经原子发布新资源图并签发当前段 report；主窗口通过 defensive `current_tm_suggestion_report()` 重绘，不重复调用 `tm_suggestion_report()`。术语建议仍从同一已发布资源图读取。
+- 主页既有“语言资源已更新，当前段建议已刷新”完成提示保持不变；它是成功结果反馈，不属于本修订的问题对象。
+- 深浅主题只保留设置对话框根 QSS 这一所有者，直接消费 `colorSchemeChanged` 携带的新 `ColorScheme`，并在后续 `ApplicationPaletteChange/PaletteChange/ThemeChange` 合并复核。浅色 QSS 对称覆盖 resource scroll、具名 viewport、content、group 与 table，避免 Windows 发出 Light 信号但应用 palette 尚为旧深色时露出黑色组间/底部背景；切换时先移除旧根 QSS，再统一 repolish 子树。
+- Lookup/Update 成功后只用稳定 `resource_id` 在当前 table cell 内原位同步三个 checkbox 与术语菜单，不清表；Active 跨分组时冻结 resource content 绘制，重建两表并以确定列宽同步计算 row/table/group 高度后再一次开放绘制。清表前移除旧 checkbox object name，避免 DeferredDelete 窗口内命中同名隐藏控件。
+- “仅显示未确认”在 checkbox 自身的内容矩形内保留 4px 左侧 padding，而非只把整个控件向右移动，确保 Windows 原生 `SE_CheckBoxIndicator` 的描边完整落在控件绘制边界内。
+- 回归测试证明构造不进入 fresh lifecycle resolver；三列状态变更的 resolver、TM reopen 与无关 termbase reread 均为零，legacy backend/canonical store identity 保持且 generation 只递增一次；同时覆盖 issued-report 复用、旧深色 palette 下的浅色资源背景、真实 scheme 信号、稳定行对象/行高与 indicator 几何。
+
 ## 任务治理例外
 
 通用 task generation 规则默认排除 documentation task；本规格存在两项更高优先级的显式要求：
