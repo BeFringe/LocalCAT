@@ -13,7 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from unittest.mock import patch
 
 from PySide6.QtCore import QCoreApplication, QEventLoop, QRect, Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QImage, QKeySequence, QPalette, QShortcut
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -167,6 +167,62 @@ class QtEditorWindowShellTest(unittest.TestCase):
             self.assertEqual(window.project_name_label.text(), "LocalCAT Welcome")
             self.assertEqual(window.language_label.text(), "en-US  →  zh-CN")
             window.close()
+
+    def test_dark_system_theme_covers_home_edit_and_alternating_browse_rows(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "qt_editor_window.system_uses_dark_theme",
+            return_value=True,
+        ):
+            window = self._window(Path(temp_dir))
+            window.show()
+            self._events()
+
+            self.assertEqual(window.property("localcatTheme"), "dark")
+            self.assertEqual(
+                window.empty_page.palette().color(QPalette.ColorRole.Window).name(),
+                "#17191c",
+            )
+            window.load_sample()
+            self._events()
+            self.assertEqual(
+                window.source_display.palette().color(QPalette.ColorRole.Base).name(),
+                "#20242a",
+            )
+            self.assertGreaterEqual(
+                self._contrast_ratio(
+                    window.source_display.palette().color(QPalette.ColorRole.Text),
+                    window.source_display.palette().color(QPalette.ColorRole.Base),
+                ),
+                4.5,
+            )
+            self.assertIn("#e7edf3", window.source_display.toHtml().lower())
+            self.assertTrue(window.set_workspace_mode(WorkspaceMode.BROWSE))
+            self._events()
+            browse_palette = window.browse_table.palette()
+            self.assertEqual(
+                browse_palette.color(QPalette.ColorRole.Base).name(),
+                "#1f2328",
+            )
+            self.assertEqual(
+                browse_palette.color(QPalette.ColorRole.AlternateBase).name(),
+                "#292e34",
+            )
+            self.assertNotEqual(
+                browse_palette.color(QPalette.ColorRole.Base),
+                browse_palette.color(QPalette.ColorRole.AlternateBase),
+            )
+            self.assertEqual(
+                window.browse_group_button.palette()
+                .color(QPalette.ColorRole.Button)
+                .name(),
+                "#282e34",
+            )
+            window._confirm_unsaved = lambda: True
+            window.close()
+            window.deleteLater()
+            self._events()
 
     def test_top_bar_arrows_render_and_keep_compact_hit_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

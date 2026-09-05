@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QModelIndex, QRect, Qt, QTimer
+from PySide6.QtCore import QEvent, QModelIndex, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QStyleOptionComboBox,
     QStyleOptionViewItem,
     QToolButton,
+    QWidget,
 )
 
 from editor_contracts import EditorProject, EditorSegment, ResourceKind
@@ -81,6 +82,136 @@ class QtSettingsDialogTest(unittest.TestCase):
             self.assertEqual(tm_name.text(), "Primary TM")
             self.assertEqual(inactive_name.text(), "Archive terms")
             dialog.close()
+
+    def test_dark_system_theme_keeps_settings_content_and_table_states_readable(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch(
+                "qt_settings_dialog.system_uses_dark_theme",
+                return_value=True,
+            ),
+            patch(
+                "qt_control_styles.system_uses_dark_theme",
+                return_value=True,
+            ),
+        ):
+            dialog = QtSettingsDialog(self._controller(Path(temp_dir)))
+            dialog.show()
+            self.app.processEvents()
+
+            self.assertEqual(dialog.property("localcatTheme"), "dark")
+            content = dialog.findChild(QLabel, "resourceSectionHint")
+            self.assertIsNotNone(content)
+            assert content is not None
+            content_palette = content.palette()
+            content_surface = dialog.findChild(QWidget, "settingsContent")
+            self.assertIsNotNone(content_surface)
+            assert content_surface is not None
+            self.assertGreaterEqual(
+                self._contrast_ratio(
+                    content_palette.color(QPalette.ColorRole.WindowText),
+                    content_surface.palette().color(QPalette.ColorRole.Window),
+                ),
+                4.5,
+            )
+            table_palette = dialog.active_table.palette()
+            self.assertEqual(
+                table_palette.color(QPalette.ColorRole.Base).name(),
+                "#1f2328",
+            )
+            self.assertEqual(
+                table_palette.color(QPalette.ColorRole.AlternateBase).name(),
+                "#292e34",
+            )
+            self.assertGreaterEqual(
+                self._contrast_ratio(
+                    table_palette.color(QPalette.ColorRole.HighlightedText),
+                    table_palette.color(QPalette.ColorRole.Highlight),
+                ),
+                4.5,
+            )
+            self.assertIn("QTableWidget::item:hover", dialog.styleSheet())
+
+            captured: dict[str, QComboBox] = {}
+
+            def inspect_create_prompt(prompt: QDialog) -> QDialog.DialogCode:
+                kind_input = prompt.findChild(QComboBox, "newResourceKind")
+                self.assertIsNotNone(kind_input)
+                assert kind_input is not None
+                prompt.show()
+                self.app.processEvents()
+                captured["kind"] = kind_input
+                return QDialog.DialogCode.Rejected
+
+            with patch.object(QDialog, "exec", new=inspect_create_prompt):
+                dialog._prompt_create_resource()
+            kind_input = captured["kind"]
+            self.assertGreaterEqual(
+                self._contrast_ratio(
+                    kind_input.palette().color(QPalette.ColorRole.Text),
+                    kind_input.palette().color(QPalette.ColorRole.Base),
+                ),
+                4.5,
+            )
+            popup_palette = kind_input.view().palette()
+            self.assertGreaterEqual(
+                self._contrast_ratio(
+                    popup_palette.color(QPalette.ColorRole.HighlightedText),
+                    popup_palette.color(QPalette.ColorRole.Highlight),
+                ),
+                4.5,
+            )
+            dialog.close()
+            dialog.deleteLater()
+            self.app.processEvents()
+
+    def test_resource_kind_hover_uses_readable_light_and_dark_surfaces(self) -> None:
+        for dark_theme, expected_background in (
+            (False, "#e7f4f8"),
+            (True, "#33414b"),
+        ):
+            with tempfile.TemporaryDirectory() as temp_dir, patch(
+                "qt_settings_dialog.system_uses_dark_theme",
+                return_value=dark_theme,
+            ):
+                controller = self._controller(Path(temp_dir))
+                resource = next(
+                    configured
+                    for configured in controller.list_resources()
+                    if configured.name == "Primary TM"
+                )
+                dialog = QtSettingsDialog(controller)
+                cell = dialog.findChild(QWidget, f"tmKindCell_{resource.id}")
+                label = dialog.findChild(QLabel, f"resourceKind_{resource.id}")
+                self.assertIsNotNone(cell)
+                self.assertIsNotNone(label)
+                assert cell is not None and label is not None
+                dialog.show()
+                self.app.processEvents()
+
+                QApplication.sendEvent(cell, QEvent(QEvent.Type.Enter))
+                self.app.processEvents()
+                image = cell.grab().toImage()
+                label_rect = QRect(
+                    label.mapTo(cell, QPoint(0, 0)),
+                    label.size(),
+                )
+                text_rect = self._to_device_rect(image, label_rect)
+                background = self._dominant_background_outside(image, text_rect)
+                self.assertEqual(background.name(), expected_background)
+                self.assertTrue(
+                    self._has_readable_glyph_population(
+                        image,
+                        text_rect,
+                        background,
+                    )
+                )
+                QApplication.sendEvent(cell, QEvent(QEvent.Type.Leave))
+                dialog.close()
+                dialog.deleteLater()
+                self.app.processEvents()
 
     def test_create_and_checkbox_updates_use_controller_and_persist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
