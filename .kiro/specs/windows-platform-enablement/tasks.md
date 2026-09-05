@@ -289,6 +289,13 @@
   - _Boundary: Windows Source Qt Startup_
   - _Depends: 4.2, 4.3_
 
+- [x] 4.4b 补齐 SOURCE 启动阶段与失败诊断
+  - 保留原有 `CHILD_FAILED` 和 fail-closed 行为，记录固定阶段耗时、异常类型、数字系统错误码及白名单模块/行号；禁止项目正文、路径、参数或异常原文进入日志
+  - guardian 日志限制 256KiB 并只保留一份轮换；日志失败不改变启动结果；已安装 source guardian 与源码一致
+  - _Boundary: Windows Source Qt Startup Diagnostics_
+  - _Depends: 4.4_
+  - 本项仅完成安全诊断，不作为启动性能或偶发失败修复的完成标记
+
 - [x] 5. 集成 Project/Resource/TMX amendments并完成持久化 vertical slices
 
 - [x] 5.1 验证并集成 WA-03 Project、WA-04 Resource、WA-05 TMX commits
