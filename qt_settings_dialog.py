@@ -92,7 +92,12 @@ from qt_control_styles import (
     configure_menu,
 )
 from qt_localized_message_box import show_localized_critical
-from qt_theme import color_scheme_uses_dark, system_uses_dark_theme
+from qt_theme import (
+    ThemeBinding,
+    ThemeSelection,
+    projected_widget_uses_dark,
+    system_uses_dark_theme,
+)
 from qt_tmx_export_dialog import (
     TmxExportDialog,
     TmxExportDialogPreview,
@@ -180,6 +185,16 @@ QComboBox#newResourceKind:focus {
     border-color: #38a9ca;
 }
 """
+_NEW_RESOURCE_DIALOG_STYLE = """
+QDialog#newResourceDialog { color: #182233; background: #f3f6fa; }
+QLabel { color: #182233; background: transparent; }
+QLineEdit { color: #182233; background: #ffffff; placeholder-text-color: #657b8b; }
+""" + _RESOURCE_KIND_COMBO_STYLE
+_NEW_RESOURCE_DIALOG_DARK_STYLE = """
+QDialog#newResourceDialog { color: #e7edf3; background: #17191c; }
+QLabel { color: #e7edf3; background: transparent; }
+QLineEdit { color: #e7edf3; background: #262b31; placeholder-text-color: #a3b1bf; }
+""" + _RESOURCE_KIND_COMBO_DARK_STYLE
 _RESOURCE_PACKAGE_DIALOG_STYLE = """
 QDialog#resourcePackageImportOptionsDialog,
 QDialog#resourcePackageApplyDialog {
@@ -188,6 +203,7 @@ QDialog#resourcePackageApplyDialog {
     font-family: "Inter", "Noto Sans CJK SC", sans-serif;
     font-size: 13px;
 }
+QLabel { color: #17344f; background: transparent; }
 QLabel#resourcePackageDialogTitle {
     color: #082f5b;
     font-size: 24px;
@@ -224,6 +240,10 @@ QLabel#resourcePackageDialogNote {
     color: #55738c;
 }
 QComboBox, QLineEdit {
+    color: #17344f;
+    placeholder-text-color: #657b8b;
+    selection-color: #0b304c;
+    selection-background-color: #c4e8f2;
     background: #ffffff;
     border: 1px solid #bfd3e2;
     border-radius: 7px;
@@ -245,6 +265,28 @@ QPushButton:default {
     color: #ffffff;
     background: #08a4cd;
     border-color: #08a4cd;
+}
+QPushButton:disabled, QLineEdit:disabled, QComboBox:disabled {
+    color: #647888; background: #edf2f5;
+}
+"""
+_RESOURCE_PACKAGE_DIALOG_DARK_STYLE = """
+QDialog#resourcePackageImportOptionsDialog,
+QDialog#resourcePackageApplyDialog { background: #181b20; color: #e7edf3; }
+QLabel { color: #e7edf3; background: transparent; }
+QLabel#resourcePackageDialogTitle { color: #f2f6fa; }
+QLabel#resourcePackageDialogSummary,
+QLabel#resourcePackageDestinationSummary { color: #8eddf0; }
+QFrame#resourcePackageSummaryCard { background: #20242a; border-color: #48515b; }
+QLabel#resourcePackageModeBadge { color: #ffd08a; background: #493824; border-color: #846633; }
+QLabel#resourcePackageCheckPassed { color: #94dcb2; background: #233d30; border-color: #426b53; }
+QLabel#resourcePackageDialogNote { color: #acbac7; }
+QComboBox, QLineEdit { color: #e7edf3; background: #20242a; border-color: #48515b;
+    placeholder-text-color: #a3b1bf; selection-color: #f5fbff; selection-background-color: #294f60; }
+QPushButton { color: #e7edf3; background: #282e35; border-color: #48515b; }
+QPushButton:default { color: #ffffff; background: #087f99; border-color: #169bb5; }
+QPushButton:disabled, QLineEdit:disabled, QComboBox:disabled {
+    color: #a3afba; background: #292e34; border-color: #48515b;
 }
 """
 _TM_MODE_LABELS = {
@@ -350,18 +392,21 @@ def _ask_localized_question(
 class _ResourceMoreButton(QToolButton):
     """Keep the resource menu reachable with standard keyboard activation."""
 
+    def _dot_color(self) -> QColor:
+        dark = projected_widget_uses_dark(self)
+        if self.isDown():
+            return QColor("#69cce5" if dark else "#047fa8")
+        if self.underMouse() or self.hasFocus():
+            return QColor("#8eddf0" if dark else "#0798c6")
+        return QColor("#b8dce8" if dark else "#26435e")
+
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
-        color = QColor("#26435e")
-        if self.isDown():
-            color = QColor("#047fa8")
-        elif self.underMouse() or self.hasFocus():
-            color = QColor("#0798c6")
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
+            painter.setBrush(self._dot_color())
             center_x = self.width() / 2.0
             center_y = self.height() / 2.0
             for offset in (-5.0, 0.0, 5.0):
@@ -538,7 +583,6 @@ class ResourcePackageImportOptionsDialog(QDialog):
         self.setWindowTitle("导入 ResourcePackage")
         self.setModal(True)
         self.setMinimumWidth(620)
-        self.setStyleSheet(_RESOURCE_PACKAGE_DIALOG_STYLE)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 26, 30, 24)
         layout.setSpacing(13)
@@ -630,6 +674,9 @@ class ResourcePackageImportOptionsDialog(QDialog):
         self.mode_combo.currentIndexChanged.connect(self._refresh_mode)
         self.name_input.textChanged.connect(self._refresh_mode)
         self._refresh_mode()
+        self._theme_binding = ThemeBinding(
+            self, _RESOURCE_PACKAGE_DIALOG_STYLE, _RESOURCE_PACKAGE_DIALOG_DARK_STYLE,
+        )
 
     def _refresh_mode(self, _index: int = -1) -> None:
         create = (
@@ -667,7 +714,6 @@ class ResourcePackageApplyDialog(QDialog):
         self.setWindowTitle("预览并导入 ResourcePackage")
         self.setModal(True)
         self.setMinimumWidth(680)
-        self.setStyleSheet(_RESOURCE_PACKAGE_DIALOG_STYLE)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 26, 30, 24)
         layout.setSpacing(14)
@@ -722,6 +768,10 @@ class ResourcePackageApplyDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+        self._theme_binding = ThemeBinding(
+            self, _RESOURCE_PACKAGE_DIALOG_STYLE, _RESOURCE_PACKAGE_DIALOG_DARK_STYLE,
+        )
 
 
 class TermbaseColumnSelectionDialog(QDialog):
@@ -875,10 +925,14 @@ class QtSettingsDialog(QDialog):
         self.controller = controller
         self.tmx_export_service = tmx_export_service
         self.setObjectName("settingsDialog")
-        self._dark_theme = system_uses_dark_theme(self)
+        self._theme_selection = ThemeSelection(self, system_uses_dark_theme)
+        self._dark_theme = self._theme_selection.resolve()
         self._theme_applied = False
         self._theme_refresh_pending = False
         self._theme_refresh_in_progress = False
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.timeout.connect(self._apply_queued_system_theme)
         self.setProperty(
             "localcatTheme",
             "dark" if self._dark_theme else "light",
@@ -892,6 +946,7 @@ class QtSettingsDialog(QDialog):
         self.portability_worker: ResourcePortabilityWorker | None = None
         self._import_busy = False
         self._portability_busy = False
+        self._status_before_import: str | None = None
         self._import_target_kind: ResourceKind | None = None
         self.last_import_report: ImportReport | None = None
         self._tm_operation_id: str | None = None
@@ -922,7 +977,7 @@ class QtSettingsDialog(QDialog):
         if self._theme_refresh_pending:
             return
         self._theme_refresh_pending = True
-        QTimer.singleShot(0, self._apply_queued_system_theme)
+        self._theme_timer.start(0)
 
     def _apply_queued_system_theme(self) -> None:
         self._theme_refresh_pending = False
@@ -1197,12 +1252,7 @@ class QtSettingsDialog(QDialog):
     def _apply_system_theme(self, *_args: object) -> None:
         """Apply the OS theme to settings, prompts, tables, and popups."""
 
-        signaled_theme = color_scheme_uses_dark(_args[0]) if _args else None
-        dark_theme = (
-            system_uses_dark_theme(self)
-            if signaled_theme is None
-            else signaled_theme
-        )
+        dark_theme = self._theme_selection.resolve(_args)
         target_style = _SETTINGS_STYLE + (
             _SETTINGS_DARK_STYLE if dark_theme else ""
         )
@@ -1234,9 +1284,9 @@ class QtSettingsDialog(QDialog):
                 group.setStyleSheet("")
             self.setStyleSheet(target_style)
             for combo in self.findChildren(QComboBox):
-                apply_combo_popup_theme(combo)
+                apply_combo_popup_theme(combo, dark=self._dark_theme)
             for menu in self.findChildren(QMenu):
-                apply_menu_theme(menu)
+                apply_menu_theme(menu, dark=self._dark_theme)
             for button in self.findChildren(QToolButton):
                 if button.property("resourceMoreButton"):
                     button.setStyleSheet(
@@ -2319,6 +2369,7 @@ class QtSettingsDialog(QDialog):
 
     def _prompt_create_resource(self) -> None:
         prompt = QDialog(self)
+        prompt.setObjectName("newResourceDialog")
         prompt.setWindowTitle("新建语言资源")
         layout = QVBoxLayout(prompt)
         layout.addWidget(QLabel("资源名称"))
@@ -2332,11 +2383,6 @@ class QtSettingsDialog(QDialog):
         kind_input.setAccessibleName("资源类型")
         kind_input.addItem("翻译记忆库", ResourceKind.TRANSLATION_MEMORY)
         kind_input.addItem("术语表", ResourceKind.TERMBASE)
-        kind_input.setStyleSheet(
-            _RESOURCE_KIND_COMBO_DARK_STYLE
-            if self._dark_theme
-            else _RESOURCE_KIND_COMBO_STYLE
-        )
         configure_combo_popup(
             kind_input,
             object_name="newResourceKindPopup",
@@ -2351,6 +2397,9 @@ class QtSettingsDialog(QDialog):
         buttons.accepted.connect(prompt.accept)
         buttons.rejected.connect(prompt.reject)
         layout.addWidget(buttons)
+        prompt._theme_binding = ThemeBinding(
+            prompt, _NEW_RESOURCE_DIALOG_STYLE, _NEW_RESOURCE_DIALOG_DARK_STYLE,
+        )
         if prompt.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -2932,6 +2981,8 @@ class QtSettingsDialog(QDialog):
         worker.start()
 
     def _set_import_busy(self, busy: bool, message: str = "") -> None:
+        if busy and self._status_before_import is None:
+            self._status_before_import = self.status_label.text()
         self.active_table.setEnabled(not busy)
         self.inactive_table.setEnabled(not busy)
         self.new_resource_button.setEnabled(not busy)
@@ -2940,6 +2991,10 @@ class QtSettingsDialog(QDialog):
         self.import_progress.setVisible(busy)
         if message:
             self.status_label.setText(message)
+        elif not busy and self._status_before_import is not None:
+            self.status_label.setText(self._status_before_import)
+        if not busy:
+            self._status_before_import = None
 
     def _on_import_finished(self, report: ImportReport) -> None:
         self.last_import_report = report
@@ -2987,12 +3042,14 @@ class QtSettingsDialog(QDialog):
 
 
 _SETTINGS_STYLE = """
-QDialog#settingsDialog {
+QDialog#settingsDialog, QDialog#settingsDialog QDialog {
     background: #f3f6fa;
     color: #182233;
     font-family: "Inter", "Noto Sans CJK SC", sans-serif;
     font-size: 13px;
 }
+QDialog#settingsDialog QDialog QLabel,
+QDialog#settingsDialog QDialog QCheckBox { color: #182233; background: transparent; }
 QFrame#settingsHeader {
     background: #082f5b;
     border: none;
@@ -3188,6 +3245,10 @@ QPushButton#newResourceButton:hover {
     background: #078bb2;
 }
 QLineEdit, QComboBox {
+    color: #182233;
+    placeholder-text-color: #657b8b;
+    selection-color: #0b304c;
+    selection-background-color: #c4e8f2;
     min-height: 32px;
     border: 1px solid #cbd6e1;
     border-radius: 5px;
@@ -3198,6 +3259,8 @@ QLineEdit, QComboBox {
 
 
 _SETTINGS_DARK_STYLE = """
+QDialog#settingsDialog QDialog QLabel,
+QDialog#settingsDialog QDialog QCheckBox { color: #e7edf3; background: transparent; }
 QDialog#settingsDialog,
 QDialog#settingsDialog QDialog,
 QWidget#settingsContent,
