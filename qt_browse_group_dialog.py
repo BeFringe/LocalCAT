@@ -30,6 +30,7 @@ from editor_contracts import (
     BrowseGroupDisplayMode,
     BrowseGroupPreferences,
 )
+from qt_theme import ThemeBinding, projected_widget_uses_dark
 
 
 _CARD_HEIGHT = 92
@@ -196,10 +197,14 @@ class BrowseGroupCard(QAbstractButton):
             outer = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
             selected = self.isChecked()
             hovered = self.underMouse() or self.hasFocus()
+            dark = projected_widget_uses_dark(self)
             background = QColor("#e9f6fa" if selected else "#ffffff")
             if hovered and not selected:
                 background = QColor("#f2f8fb")
             border = QColor("#079fc9" if selected else "#cfdbe5")
+            if dark:
+                background = QColor("#294f60" if selected else ("#33414b" if hovered else "#20242a"))
+                border = QColor("#69cce5" if selected else "#48515b")
             painter.setPen(QPen(border, 1.4 if selected else 1.0))
             painter.setBrush(background)
             painter.drawRoundedRect(outer, 8.0, 8.0)
@@ -254,7 +259,7 @@ class BrowseGroupCard(QAbstractButton):
                 maximum_lines=source_limit,
             )
             y = content.top()
-            painter.setPen(QColor("#17364e"))
+            painter.setPen(QColor("#e7edf3" if dark else "#17364e"))
             for line in source_lines:
                 painter.drawText(
                     QRectF(content.left(), y, content.width(), line_height),
@@ -269,7 +274,7 @@ class BrowseGroupCard(QAbstractButton):
                     width=max(1, int(content.width())),
                     maximum_lines=target_limit,
                 )
-                painter.setPen(QColor("#5b7083"))
+                painter.setPen(QColor("#acbac7" if dark else "#5b7083"))
                 for line in target_lines:
                     painter.drawText(
                         QRectF(content.left(), y, content.width(), line_height),
@@ -350,6 +355,8 @@ class BrowseGroupIndicatorTick(QAbstractButton):
             color = QColor(
                 "#173d56" if selected else ("#5c8198" if hovered else "#bdc7ce")
             )
+            if projected_widget_uses_dark(self):
+                color = QColor("#8eddf0" if selected else ("#b8dce8" if hovered else "#718291"))
             pen = QPen(color, 3.0 if selected else 2.0)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
@@ -479,7 +486,7 @@ class BrowseGroupTurnBar(QFrame):
         self._preview_hide_timer.setSingleShot(True)
         self._preview_hide_timer.setInterval(140)
         self._preview_hide_timer.timeout.connect(self._preview_popup.hide)
-        self.setStyleSheet(_TURN_BAR_STYLE)
+        self._theme_binding = ThemeBinding(self, _TURN_BAR_STYLE, _TURN_BAR_DARK_STYLE)
         self.set_display_mode(BrowseGroupDisplayMode.AUTO_COLLAPSE)
         self.setVisible(False)
 
@@ -783,7 +790,7 @@ class QtBrowseGroupDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-        self.setStyleSheet(_DIALOG_STYLE)
+        self._theme_binding = ThemeBinding(self, _DIALOG_STYLE, _DIALOG_DARK_STYLE)
 
     def _sync_enabled_copy(self, checked: bool) -> None:
         self.enabled_checkbox.setText("启用中" if checked else "不显示")
@@ -826,6 +833,10 @@ QDialog#browseGroupDialog {
     color: #18314a;
     background: #f3f7fa;
 }
+QLabel, QCheckBox { color: #18314a; background: transparent; }
+QPushButton { color: #24445d; background: #ffffff; border: 1px solid #cbd7e2;
+    border-radius: 4px; padding: 5px 12px; }
+QPushButton:disabled, QSpinBox:disabled, QComboBox:disabled { color: #647888; background: #edf2f5; }
 QLabel#browseGroupDialogTitle {
     color: #143650;
     font-size: 19px;
@@ -918,6 +929,27 @@ QScrollArea#browseGroupTurnBarScroll {
 QWidget#browseGroupTurnBarContainer {
     background: transparent;
 }
+"""
+
+_DIALOG_DARK_STYLE = """
+QDialog#browseGroupDialog { background: #181b20; color: #e7edf3; }
+QLabel, QCheckBox { color: #e7edf3; background: transparent; }
+QLabel#browseGroupDialogTitle, QLabel#browseGroupSettingsTitle { color: #f2f6fa; }
+QLabel#browseGroupDocument { color: #8eddf0; background: #213b47; }
+QLabel#browseGroupStatus { color: #acbac7; }
+QFrame#browseGroupSettings { background: #20242a; border-color: #48515b; }
+QSpinBox, QComboBox#browseGroupDisplayMode { background: #20242a; color: #e7edf3; border-color: #48515b; }
+QCheckBox#browseGroupEnabled { color: #94dcb2; }
+QPushButton { color: #e7edf3; background: #282e35; border-color: #48515b; }
+QPushButton:disabled, QSpinBox:disabled, QComboBox:disabled { color: #a3afba; background: #292e34; }
+"""
+
+_TURN_BAR_DARK_STYLE = """
+QFrame#browseGroupTurnBar { color: #e7edf3; }
+QFrame#browseGroupTurnBar[displayMode="fixed"] { background: #181b20; border-color: #48515b; }
+QLabel#browseGroupTurnBarTitle { color: #e7edf3; }
+QLabel#browseGroupTurnBarDocument { color: #8eddf0; }
+QScrollArea#browseGroupIndicatorScroll QScrollBar::handle:vertical { background: #718291; }
 """
 
 

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from html import escape
 
-from PySide6.QtCore import QEvent, QItemSelection, QItemSelectionModel, Qt, Signal
+from PySide6.QtCore import QEvent, QItemSelection, QItemSelectionModel, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -40,6 +41,7 @@ from chunk_controller_contracts import (
     ChunkApplicationSplitChild,
     SegmentIdentity,
 )
+from qt_theme import ThemeSelection
 
 
 _PRIMARY = (
@@ -94,6 +96,12 @@ class QtChunkManagerDialog(QDialog):
 
     def __init__(self, facade: object, view: ChunkApplicationProjectView, parent=None):
         super().__init__(parent)
+        self._theme_refresh_pending = False
+        self._theme_refresh_in_progress = False
+        self._theme_selection = ThemeSelection(self)
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.timeout.connect(self._apply_queued_system_theme)
         if type(view) is not ChunkApplicationProjectView:
             raise TypeError("chunk manager requires an exact application view")
         view.__post_init__()
@@ -138,9 +146,45 @@ class QtChunkManagerDialog(QDialog):
         self.close_button.clicked.connect(self.close)
         footer.addWidget(self.close_button)
         root.addLayout(footer)
-        self.setStyleSheet(_STYLE)
+        self._apply_system_theme()
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            application.styleHints().colorSchemeChanged.connect(self._apply_system_theme)
         self._wire()
         self.refresh(view)
+
+    def changeEvent(self, event):  # noqa: N802 - Qt virtual name
+        super().changeEvent(event)
+        if event.type() in (
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ThemeChange,
+        ) and not self._theme_refresh_in_progress and not self._theme_refresh_pending:
+            self._theme_refresh_pending = True
+            self._theme_timer.start(0)
+
+    def _apply_queued_system_theme(self):
+        self._theme_refresh_pending = False
+        self._apply_system_theme()
+
+    def _apply_system_theme(self, *args):
+        dark = self._theme_selection.resolve(args)
+        target = _STYLE + (_DARK_STYLE if dark else "")
+        if self._theme_refresh_in_progress or self.styleSheet() == target:
+            return
+        self._theme_refresh_in_progress = True
+        enabled = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
+        try:
+            self.setProperty("localcatTheme", "dark" if dark else "light")
+            self.setStyleSheet(target)
+            for widget in (self, *self.findChildren(QWidget)):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+                widget.update()
+        finally:
+            self.setUpdatesEnabled(enabled)
+            self._theme_refresh_in_progress = False
 
     def _build_header(self):
         row = QHBoxLayout()
@@ -293,6 +337,7 @@ class QtChunkManagerDialog(QDialog):
         self.preview_panel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         scroll = QScrollArea()
         scroll.setObjectName("chunkPreviewScroll")
+        scroll.viewport().setObjectName("chunkPreviewViewport")
         scroll.setWidgetResizable(True)
         scroll.setMinimumHeight(120)
         scroll.setWidget(self.preview_panel)
@@ -644,7 +689,6 @@ class QtChunkManagerDialog(QDialog):
                         font = item.font()
                         font.setBold(True)
                         item.setFont(font)
-                        item.setForeground(Qt.GlobalColor.darkCyan)
                 self.chunk_table.setItem(row, column, item)
 
     def _populate_controls(self):
@@ -1296,6 +1340,7 @@ class QtChunkManagerDialog(QDialog):
 
 
 _STYLE = """
+QWidget { color: #143c58; }
 QDialog#chunkManagerDialog { background: #edf5fb; color: #143c58; }
 QLabel#chunkManagerTitle { color: #073b63; font-size: 25px; font-weight: 800; }
 QLabel#chunkManagerSubtitle, QLabel#chunkProjectSummary,
@@ -1314,9 +1359,20 @@ QFrame#chunkSegmentSelectionPanel {
 QLabel#chunkSectionTitle { color: #0b405f; font-size: 16px; font-weight: 800; }
 QLabel#chunkSubsectionTitle { color: #365a72; font-weight: 700; }
 QTableWidget, QListWidget, QLineEdit, QComboBox, QSpinBox {
+    color: #143c58; alternate-background-color: #f0f5f9;
     background: #fbfdff; border: 1px solid #c5d8e6; border-radius: 7px;
     padding: 5px; selection-background-color: #d9f1f8; selection-color: #073b63;
 }
+QTableWidget::item:selected, QListWidget::item:selected {
+    background: #d9f1f8; color: #073b63;
+}
+QComboBox QAbstractItemView {
+    background: #fbfdff; color: #143c58;
+    selection-background-color: #d9f1f8; selection-color: #073b63;
+}
+QCheckBox { color: #143c58; padding: 4px; }
+QCheckBox:disabled { color: #718493; }
+QWidget#chunkPreviewViewport { background: #f8fbfd; }
 QHeaderView::section {
     background: #e6f0f7; border: 0; border-bottom: 1px solid #c5d8e6;
     color: #365a72; font-weight: 700; padding: 7px;
@@ -1340,7 +1396,56 @@ QPushButton#chunkApplyButton, QPushButton#chunkPreviewButton {
     background: #08a5c8; border-color: #08a5c8; color: #ffffff;
 }
 QPushButton#chunkAdvancedButton:checked { background: #e2f4fa; border-color: #74cce0; }
-QPushButton:disabled { background: #e8eef2; border-color: #d5e0e7; color: #8aa0af; }
+QPushButton:disabled, QPushButton#chunkApplyButton:disabled,
+QPushButton#chunkPreviewButton:disabled {
+    background: #e8eef2; border-color: #d5e0e7; color: #8aa0af;
+}
+"""
+
+_DARK_STYLE = """
+QWidget { color: #e7edf3; }
+QDialog#chunkManagerDialog { background: #17191c; color: #e7edf3; }
+QLabel#chunkManagerTitle, QLabel#chunkSectionTitle { color: #e7edf3; }
+QLabel#chunkManagerSubtitle, QLabel#chunkProjectSummary,
+QLabel#chunkSelectionSummary, QLabel#chunkFormHint { color: #a7b5c3; }
+QLabel#chunkSubsectionTitle { color: #c5d3df; }
+QLabel#chunkModeBadge { color: #70d4ed; }
+QLabel#chunkModeBadge[mode="blocked"] { color: #efbf80; }
+QFrame#chunkCard { background: #1f2328; border-color: #3b424a; }
+QFrame#chunkSegmentSelectionPanel { background: #242c33; border-color: #48515b; }
+QTableWidget, QListWidget, QLineEdit, QComboBox, QSpinBox {
+    background: #20242a; color: #e7edf3; border-color: #48515b;
+    alternate-background-color: #292e34;
+    selection-background-color: #294f60; selection-color: #f5fbff;
+}
+QTableWidget::item:selected, QListWidget::item:selected {
+    background: #294f60; color: #f5fbff;
+}
+QComboBox QAbstractItemView {
+    background: #20242a; color: #e7edf3;
+    selection-background-color: #294f60; selection-color: #f5fbff;
+}
+QHeaderView::section { background: #292e34; color: #c5d3df; border-color: #48515b; }
+QSplitter::handle { background: #3b424a; }
+QScrollArea#chunkPreviewScroll { background: #20242a; border-color: #48515b; }
+QWidget#chunkPreviewViewport, QLabel#chunkPreviewPanel { background: #20242a; color: #dfe6ed; }
+QLabel#chunkPreviewPanel[state="blocked"], QLabel#chunkPreviewPanel[state="error"] {
+    background: #493820; color: #f4ce96;
+}
+QLabel#chunkPreviewPanel[state="ready"], QLabel#chunkPreviewPanel[state="success"] {
+    background: #193c30; color: #a5dfc0;
+}
+QPushButton { background: #292e34; color: #e7edf3; border-color: #48515b; }
+QPushButton#chunkApplyButton, QPushButton#chunkPreviewButton {
+    background: #087f9b; border-color: #087f9b; color: #ffffff;
+}
+QPushButton#chunkAdvancedButton:checked { background: #294f60; border-color: #4c8aa3; }
+QPushButton:disabled, QPushButton#chunkApplyButton:disabled,
+QPushButton#chunkPreviewButton:disabled {
+    background: #25292e; border-color: #3b424a; color: #87929e;
+}
+QCheckBox { color: #e7edf3; }
+QCheckBox:disabled { color: #87929e; }
 """
 
 __all__ = ["QtChunkManagerDialog"]

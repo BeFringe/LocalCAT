@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication, QComboBox, QFrame, QLineEdit, QPushButton, QToolButton
 
 from editor_contracts import ResourceKind
@@ -30,6 +31,54 @@ class QtResourcePortabilityTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         current = QApplication.instance()
         cls.app = current if isinstance(current, QApplication) else QApplication([])
+
+    def test_export_worker_clears_busy_status_on_success_and_failure(self) -> None:
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw).resolve()
+                repository = ResourceRepository(root / "app")
+                resource = repository.create_resource("Terms", ResourceKind.TERMBASE)
+                resource.path.write_bytes(b"\xef\xbb\xbfhello,world\n")
+                controller = EditorController(repository)
+                dialog = QtSettingsDialog(controller)
+                original_status = dialog.status_label.text()
+                destination = root / "terms.localcat-resource"
+
+                def export():
+                    if fail:
+                        raise OSError("injected export failure")
+                    return controller.export_resource_package(resource.id, destination)
+
+                loop = QEventLoop()
+                poll = QTimer()
+                poll.setInterval(5)
+                poll.timeout.connect(lambda: None if dialog.is_importing else loop.quit())
+                deadline = QTimer()
+                deadline.setSingleShot(True)
+                deadline.timeout.connect(loop.quit)
+                try:
+                    self.assertTrue(dialog._start_portability_operation(
+                        export, "正在封装 Terms…",
+                        lambda result, error: dialog._finish_resource_export(
+                            result, error, package=True,
+                        ),
+                    ))
+                    self.assertEqual(dialog.status_label.text(), "正在封装 Terms…")
+                    poll.start()
+                    deadline.start(20_000)
+                    loop.exec()
+                    self.assertFalse(dialog.is_importing)
+                    self.assertEqual(dialog.status_label.text(), original_status)
+                    self.assertNotIn("正在封装", dialog.status_label.text())
+                    self.assertEqual(dialog.import_feedback.property("failed"), fail)
+                    self.assertIn("导出未完成" if fail else "ResourcePackage已导出",
+                                  dialog.import_feedback.text())
+                    self.assertEqual(destination.exists(), not fail)
+                    self.assertTrue(dialog.close_button.isEnabled())
+                finally:
+                    poll.stop()
+                    deadline.stop()
+                    dialog.close()
 
     def test_resource_menus_and_global_import_entry_are_reachable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
