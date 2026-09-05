@@ -138,7 +138,7 @@ from qt_control_styles import (
     configure_menu,
 )
 from qt_localized_message_box import show_localized_critical
-from qt_theme import color_scheme_uses_dark, system_uses_dark_theme
+from qt_theme import ThemeSelection, projected_widget_uses_dark, system_uses_dark_theme
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -363,6 +363,12 @@ class _TopBarSearchButton(QToolButton):
 class _InlineMenuButton(QToolButton):
     """Menu button with one app-owned chevron beside its label."""
 
+    def _chevron_color(self) -> QColor:
+        dark = projected_widget_uses_dark(self)
+        if not self.isEnabled():
+            return QColor("#718291" if dark else "#8da2b2")
+        return QColor("#c5d3df" if dark else "#244b68")
+
     def inlineChevronRect(self) -> QRect:
         arrow_size = 8
         return QRect(
@@ -384,7 +390,7 @@ class _InlineMenuButton(QToolButton):
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            pen = QPen(QColor("#244b68" if self.isEnabled() else "#8da2b2"))
+            pen = QPen(self._chevron_color())
             pen.setWidthF(1.6)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -1022,9 +1028,13 @@ class QtEditorWindow(QMainWindow):
         self._project_search_ordinal: int | None = None
         self._project_search_expanded = False
         self.setObjectName("editorWindow")
-        self._dark_theme = system_uses_dark_theme(self)
+        self._theme_selection = ThemeSelection(self, system_uses_dark_theme)
+        self._dark_theme = self._theme_selection.resolve()
         self._theme_refresh_pending = False
         self._theme_refresh_in_progress = False
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.timeout.connect(self._apply_queued_system_theme)
         self.setProperty(
             "localcatTheme",
             "dark" if self._dark_theme else "light",
@@ -1088,7 +1098,7 @@ class QtEditorWindow(QMainWindow):
         if self._theme_refresh_pending:
             return
         self._theme_refresh_pending = True
-        QTimer.singleShot(0, self._apply_queued_system_theme)
+        self._theme_timer.start(0)
 
     def _apply_queued_system_theme(self) -> None:
         self._theme_refresh_pending = False
@@ -1136,12 +1146,7 @@ class QtEditorWindow(QMainWindow):
     def _apply_system_theme(self, *_args: object) -> None:
         """Project the current OS color scheme across every editor mode."""
 
-        signaled_theme = color_scheme_uses_dark(_args[0]) if _args else None
-        dark_theme = (
-            system_uses_dark_theme(self)
-            if signaled_theme is None
-            else signaled_theme
-        )
+        dark_theme = self._theme_selection.resolve(_args)
         target_style = _EDITOR_STYLE + (_EDITOR_DARK_STYLE if dark_theme else "")
         if self._theme_refresh_in_progress:
             return
@@ -1156,9 +1161,9 @@ class QtEditorWindow(QMainWindow):
         try:
             self.setStyleSheet(target_style)
             for combo in self.findChildren(QComboBox):
-                apply_combo_popup_theme(combo)
+                apply_combo_popup_theme(combo, dark=self._dark_theme)
             for menu in self.findChildren(QMenu):
-                apply_menu_theme(menu)
+                apply_menu_theme(menu, dark=self._dark_theme)
             if hasattr(self, "source_display") and self._has_active_project():
                 self.source_display.setHtml(
                     render_highlighted_source(
@@ -1179,6 +1184,13 @@ class QtEditorWindow(QMainWindow):
                     if item.data(Qt.ItemDataRole.UserRole) is None:
                         item.setBackground(divider_background)
                         item.setForeground(divider_foreground)
+                if hasattr(self, "browse_table"):
+                    for row in range(self.browse_table.rowCount()):
+                        for column in range(self.browse_table.columnCount()):
+                            item = self.browse_table.item(row, column)
+                            if item is not None and item.data(Qt.ItemDataRole.UserRole) is None:
+                                item.setBackground(divider_background)
+                                item.setForeground(divider_foreground)
         finally:
             self._theme_refresh_in_progress = False
 
@@ -4702,8 +4714,8 @@ class QtEditorWindow(QMainWindow):
                             item.flags() & ~Qt.ItemFlag.ItemIsSelectable
                         )
                         item.setData(Qt.ItemDataRole.UserRole, None)
-                        item.setBackground(QColor("#dcecf5"))
-                        item.setForeground(QColor("#0b5e80"))
+                        item.setBackground(QColor("#26323a" if self._dark_theme else "#dcecf5"))
+                        item.setForeground(QColor("#79c6df" if self._dark_theme else "#0b5e80"))
                         divider_font = item.font()
                         divider_font.setBold(True)
                         item.setFont(divider_font)

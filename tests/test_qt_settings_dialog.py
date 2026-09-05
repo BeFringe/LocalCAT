@@ -197,7 +197,7 @@ class QtSettingsDialogTest(unittest.TestCase):
                 return_value=True,
             ),
             patch(
-                "qt_control_styles.system_uses_dark_theme",
+                "qt_theme.system_uses_dark_theme",
                 return_value=True,
             ),
         ):

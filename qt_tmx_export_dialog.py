@@ -11,9 +11,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QEvent, QThread, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
@@ -26,11 +27,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from qt_control_styles import configure_combo_popup
+from qt_control_styles import (
+    LOCALCAT_COMBO_POPUP_STYLE, LOCALCAT_DARK_COMBO_POPUP_STYLE,
+    configure_combo_popup,
+)
+from qt_theme import ThemeSelection
 
 
 _DIALOG_STYLE = """
 QDialog { background: #eef6fc; color: #123b5a; }
+QLabel { color: #123b5a; background: transparent; }
 QLabel#tmxExportTitle { font-size: 25px; font-weight: 800; color: #062f4f; }
 QLabel#tmxScopeBadge {
     color: #006f8f; background: #d9f3fb; border: 1px solid #69cfe4;
@@ -43,7 +49,9 @@ QLabel#tmxBinding { color: #58778d; }
 QLabel#tmxStatus { color: #5b778b; padding: 8px; }
 QLabel#tmxStatus[failed="true"] { color: #9c4b00; background: #fff2df; }
 QLineEdit, QComboBox {
-    background: white; border: 1px solid #b6cfdf; border-radius: 7px;
+    background: white; color: #123b5a; placeholder-text-color: #657b8b;
+    selection-background-color: #c4e8f2; selection-color: #0b304c;
+    border: 1px solid #b6cfdf; border-radius: 7px;
     min-height: 32px; padding: 3px 9px;
 }
 QPushButton {
@@ -52,6 +60,26 @@ QPushButton {
 }
 QPushButton#tmxPrimary { background: #00a6c8; color: white; border-color: #00a6c8; }
 QPushButton:disabled { color: #9aafbd; background: #edf2f5; }
+QLineEdit:disabled, QComboBox:disabled { color: #647888; background: #edf2f5; }
+QPushButton#tmxPrimary:disabled { color: #647888; background: #edf2f5; border-color: #aec8da; }
+"""
+
+_DARK_DIALOG_STYLE = """
+QDialog { background: #181b20; color: #e7edf3; }
+QLabel { color: #e7edf3; background: transparent; }
+QLabel#tmxExportTitle { color: #f2f6fa; }
+QLabel#tmxScopeBadge { color: #8eddf0; background: #213b47; border-color: #426677; }
+QFrame#tmxExportCard { background: #20242a; border-color: #48515b; }
+QLabel#tmxBinding, QLabel#tmxStatus { color: #acbac7; background: transparent; }
+QLabel#tmxStatus[failed="true"] { color: #ffd08a; background: #493824; }
+QLineEdit, QComboBox {
+    background: #20242a; color: #e7edf3; placeholder-text-color: #a3b1bf;
+    border-color: #48515b; selection-color: #f5fbff; selection-background-color: #294f60;
+}
+QPushButton { background: #282e35; color: #e7edf3; border-color: #48515b; }
+QPushButton#tmxPrimary { background: #087f99; color: #ffffff; border-color: #169bb5; }
+QPushButton:disabled, QPushButton#tmxPrimary:disabled,
+QLineEdit:disabled, QComboBox:disabled { color: #a3afba; background: #292e34; border-color: #48515b; }
 """
 
 _TMX_ERROR_MESSAGES = {
@@ -128,6 +156,12 @@ class TmxExportDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._theme_refresh_pending = False
+        self._theme_refresh_in_progress = False
+        self._theme_selection = ThemeSelection(self)
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.timeout.connect(self._apply_queued_system_theme)
         if not scopes or not callable(prepare) or not callable(publish):
             raise ValueError("TMX export dialog requires scopes and operations")
         self._prepare = prepare
@@ -139,7 +173,6 @@ class TmxExportDialog(QDialog):
         self.setWindowTitle(title)
         self.setModal(True)
         self.resize(850, 620)
-        self.setStyleSheet(_DIALOG_STYLE)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(34, 28, 34, 28)
@@ -237,6 +270,52 @@ class TmxExportDialog(QDialog):
         self.source_locale.textChanged.connect(self._invalidate_preview)
         self.target_locale.textChanged.connect(self._invalidate_preview)
         self.destination.textChanged.connect(self._invalidate_preview)
+        self._apply_system_theme()
+        application = QApplication.instance()
+        if isinstance(application, QApplication):
+            application.styleHints().colorSchemeChanged.connect(self._apply_system_theme)
+
+    def changeEvent(self, event):  # noqa: N802 - Qt virtual name
+        super().changeEvent(event)
+        if event.type() in (
+            QEvent.Type.ApplicationPaletteChange, QEvent.Type.PaletteChange,
+            QEvent.Type.ThemeChange,
+        ) and not self._theme_refresh_in_progress and not self._theme_refresh_pending:
+            self._theme_refresh_pending = True
+            self._theme_timer.start(0)
+
+    def _apply_queued_system_theme(self):
+        self._theme_refresh_pending = False
+        self._apply_system_theme()
+
+    def _apply_system_theme(self, *args):
+        dark = self._theme_selection.resolve(args)
+        target = _DIALOG_STYLE + (_DARK_DIALOG_STYLE if dark else "")
+        if self._theme_refresh_in_progress or self.styleSheet() == target:
+            return
+        self._theme_refresh_in_progress = True
+        enabled = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
+        try:
+            self.setProperty("localcatTheme", "dark" if dark else "light")
+            self.setStyleSheet("")
+            self.setStyleSheet(target)
+            self.scope_combo.view().setStyleSheet(
+                LOCALCAT_DARK_COMBO_POPUP_STYLE if dark else LOCALCAT_COMBO_POPUP_STYLE
+            )
+            for widget in (self, *self.findChildren(QWidget)):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+                widget.update()
+        finally:
+            self.setUpdatesEnabled(enabled)
+            self._theme_refresh_in_progress = False
+
+    def _set_status_failed(self, failed: bool) -> None:
+        self.status.setProperty("failed", failed)
+        self.status.style().unpolish(self.status)
+        self.status.style().polish(self.status)
+        self.status.update()
 
     def _effective_locales(self) -> tuple[str, str]:
         return (
@@ -261,6 +340,7 @@ class TmxExportDialog(QDialog):
         self._preview = None
         self.export_button.setEnabled(False)
         if self._worker is None:
+            self._set_status_failed(False)
             self.status.setText("范围、语言或目标已变化，请重新生成预览。")
 
     def _set_busy(self, busy: bool) -> None:
@@ -272,9 +352,7 @@ class TmxExportDialog(QDialog):
         self.export_button.setEnabled(not busy and self._preview is not None)
 
     def _set_error(self, message: str) -> None:
-        self.status.setProperty("failed", True)
-        self.status.style().unpolish(self.status)
-        self.status.style().polish(self.status)
+        self._set_status_failed(True)
         self.status.setText(
             f"未完成：{_TMX_ERROR_MESSAGES.get(message, message)}"
         )
@@ -294,7 +372,7 @@ class TmxExportDialog(QDialog):
         source, target = self._effective_locales()
         token = str(self.scope_combo.currentData())
         self._set_busy(True)
-        self.status.setProperty("failed", False)
+        self._set_status_failed(False)
         self.status.setText("正在生成绑定范围与目标的预览…")
         worker = _TmxExportWorker(
             lambda: self._prepare(token, source, target, destination),
@@ -327,7 +405,7 @@ class TmxExportDialog(QDialog):
             f"警告 {preview.warning_count}"
         )
         self.profile.setText(f"Profile：{preview.profile_id}")
-        self.status.setProperty("failed", False)
+        self._set_status_failed(False)
         self.status.setText("预览已绑定；导出前会再次验证范围与目标。")
         self.export_button.setEnabled(True)
 

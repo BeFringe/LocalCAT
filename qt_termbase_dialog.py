@@ -33,6 +33,7 @@ from editor_contracts import (
 )
 from editor_controller import EditorController, EditorControllerError
 from qt_localized_message_box import ask_localized_question
+from qt_theme import ThemeBinding
 
 
 _TERM_ERROR_MESSAGES = {
@@ -291,7 +292,7 @@ class QtTermbaseDialog(QDialog):
         self.setTabOrder(self.create_button, self.save_button)
         self.setTabOrder(self.save_button, self.delete_button)
         self.setTabOrder(self.delete_button, self.close_button)
-        self.setStyleSheet(_TERM_DIALOG_STYLE)
+        self._theme_binding = ThemeBinding(self, _TERM_DIALOG_STYLE, _TERM_DIALOG_DARK_STYLE)
 
     def _load_terms(
         self,
@@ -568,6 +569,7 @@ QDialog#termbaseDialog {
     font-family: "Inter", "Noto Sans CJK SC", sans-serif;
     font-size: 13px;
 }
+QLabel, QCheckBox { color: #182233; background: transparent; }
 QLabel#termDialogTitle {
     color: #10243b;
     font-size: 21px;
@@ -582,6 +584,7 @@ QFrame#termEditorPanel {
     border-radius: 7px;
 }
 QTableWidget {
+    color: #182233; selection-color: #0b304c; selection-background-color: #c4e8f2;
     background: #ffffff;
     alternate-background-color: #f7f9fc;
     border: 1px solid #d7e0ea;
@@ -595,6 +598,7 @@ QHeaderView::section {
     font-weight: 700;
 }
 QLineEdit {
+    color: #182233; placeholder-text-color: #657b8b;
     min-height: 30px;
     border: 1px solid #cbd6e1;
     border-radius: 5px;
@@ -621,4 +625,25 @@ QLabel#termFeedback {
 QLabel#termFeedback[failed="true"] {
     color: #a13434;
 }
+QPushButton:disabled, QPushButton#saveTerm:disabled, QLineEdit:disabled,
+QCheckBox:disabled { color: #647888; background: #edf2f5; }
+"""
+
+_TERM_DIALOG_DARK_STYLE = """
+QDialog#termbaseDialog { background: #181b20; color: #e7edf3; }
+QLabel, QCheckBox { color: #e7edf3; background: transparent; }
+QLabel#termDialogTitle { color: #f2f6fa; }
+QLabel#termResourceName, QLabel#termMatcherCapability { color: #acbac7; }
+QFrame#termEditorPanel { background: #20242a; border-color: #48515b; }
+QTableWidget { color: #e7edf3; background: #20242a; alternate-background-color: #282e35;
+    border-color: #48515b; selection-color: #f5fbff; selection-background-color: #294f60; }
+QHeaderView::section { background: #303740; color: #c5d3df; border-color: #48515b; }
+QLineEdit { background: #20242a; color: #e7edf3; border-color: #48515b;
+    placeholder-text-color: #a3b1bf; selection-color: #f5fbff; selection-background-color: #294f60; }
+QPushButton { background: #282e35; color: #e7edf3; border-color: #48515b; }
+QPushButton#saveTerm { background: #087f99; color: white; border-color: #169bb5; }
+QPushButton:disabled, QPushButton#saveTerm:disabled, QLineEdit:disabled,
+QCheckBox:disabled { color: #a3afba; background: #292e34; }
+QLabel#termFeedback { color: #94dcb2; }
+QLabel#termFeedback[failed="true"] { color: #ffb1a9; }
 """

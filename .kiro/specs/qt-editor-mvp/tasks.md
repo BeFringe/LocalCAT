@@ -327,6 +327,13 @@
   - _Requirements: 6.1, 12.1–12.4, 12.6, 13.1–13.7_
   - _Boundary: Qt Settings Responsiveness, Published TM Projection, Runtime Theme Repaint_
 
+- [x] 14. 补齐协作分工及遗漏窗口的动态深浅主题与导出反馈
+  - 排查全部 Qt 局部 QSS、palette、viewport、popup 和自绘颜色；包括分工管理、TMX 导出、资源包导入、新建资源、术语管理与浏览分组
+  - 已打开窗口即时响应双向主题切换，文字和选择状态可读，不清除输入、选择或待发布预览
+  - 导出完成或失败后移除过期忙碌提示；Resource/TMX 输出副产物修复分别由 owning Spec 和 ADR-027 约束，不在 Qt 删除文件
+  - _Requirements: 12.1–12.4, 12.6；用户追加协作分工管理主题反馈_
+  - _Boundary: Qt Presentation；输出协议依赖 Resource/TMX/平台维护任务_
+
 ## 维护实施记录
 
 ### Checkpoint M
@@ -343,3 +350,12 @@
 - 三列延迟来自纯布尔切换被当作结构更新，重新解析全部 TM，并在兼容装配中再次开库；不是 hover 或主页成功提示造成的。
 - 前两版只验证 repolish 或 group 局部 QSS，漏掉 scroll/viewport/content；Light 信号到达时这些层仍能露出旧深色 palette。indicator 的安全间距必须位于控件自身绘制矩形内，单纯移动控件无效。
 - WA08/TM 跳变是清表与后续行高收敛之间的可见中间态，不是资源身份串行；还需防止 DeferredDelete 期间同名旧 checkbox 被查中。
+
+### Task 14：主题遗漏与导出
+
+- 分工窗口保留独立固定浅色 QSS，但输入控件继承系统深色前景，形成白字白底。主题覆盖必须成套处理前景、背景、viewport 和交互态，而不是只监听信号。
+- Root QSS 重绘不能清除组合框弹层及其他子控件自行安装的一次性 QSS；动态切换测试必须把旧应用 palette 与新 scheme 信号错开。
+- 仅在信号到达后立即断言会漏掉回跳：后续 PaletteChange 若重读旧系统状态，会覆盖明确的 Light 信号；新子窗口也需继承已投影的父级主题。验证应经过真实事件循环，并覆盖父窗口销毁后的待处理回调。
+- 资源包导出的忙碌文案覆盖了原状态但结束时没有恢复，因此成功后仍显示“正在封装”；状态恢复归 Qt，文件副产物不归 Qt。
+- ResourcePackage 的 TMX handler 曾先物化私有临时 TMX 再复制进 carrier；改为携带同一已证明的不可变字节后，不再产生该 TMX 临时正文。此结论不扩展到 JSONL payload 临时文件。
+- Windows Resource/TMX 输出锁是平台迁移后新增行为，Mac 基线没有这些文件；锁的安全闲置回收归 ADR-027 与各 owning Spec，不归主题层。
