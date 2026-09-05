@@ -7,13 +7,15 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEventLoop, QItemSelectionModel, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QHeaderView, QSizePolicy
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import QApplication, QHeaderView, QScrollArea, QSizePolicy
 
 from chunk_controller_contracts import (
     ChunkApplicationAccessView,
@@ -233,6 +235,60 @@ class Cluster4ChunkManagerDialogTests(unittest.TestCase):
         self.assertGreaterEqual(index, 0)
         self.dialog.action_combo.setCurrentIndex(index)
         self._events()
+
+    def test_dark_theme_covers_inputs_selection_preview_and_live_light_switch(self):
+        with patch("qt_theme.system_uses_dark_theme", return_value=True):
+            self.app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
+            self._events()
+        self.assertEqual(self.dialog.property("localcatTheme"), "dark")
+        current = self.dialog.chunk_table.item(0, 0)
+        self.assertTrue(current.font().bold())
+        self.assertIsNone(current.data(Qt.ItemDataRole.ForegroundRole))
+        from PySide6.QtWidgets import QComboBox, QLineEdit, QListWidget, QSpinBox
+
+        controls = [self.dialog.chunk_table, *self.dialog.findChildren(QLineEdit),
+                    *self.dialog.findChildren(QComboBox),
+                    *self.dialog.findChildren(QListWidget),
+                    *self.dialog.findChildren(QSpinBox)]
+        self.assertGreater(len(controls), 5)
+        for control in controls:
+            with self.subTest(control=control.objectName()):
+                palette = control.palette()
+                self.assertEqual(palette.color(QPalette.ColorRole.Text).name(), "#e7edf3")
+                self.assertEqual(palette.color(QPalette.ColorRole.Base).name(), "#20242a")
+        self.assertEqual(self.dialog.preview_panel.palette().color(QPalette.ColorRole.Window).name(), "#20242a")
+        self.assertFalse(self.dialog.apply_button.isEnabled())
+        self.assertEqual(self.dialog.apply_button.palette().color(QPalette.ColorRole.Button).name(), "#25292e")
+        prior_palette = self.app.palette()
+        stale = QPalette(prior_palette)
+        stale.setColor(QPalette.ColorRole.Window, QColor("#17191c"))
+        stale.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+        try:
+            self.app.setPalette(stale)
+            # Windows can deliver Light before QApplication's dark palette changes.
+            self.app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Light)
+            self.assertEqual(self.dialog.property("localcatTheme"), "light")
+            for control in controls:
+                with self.subTest(light_control=control.objectName()):
+                    self.assertEqual(control.palette().color(QPalette.ColorRole.Text).name(), "#143c58")
+                    self.assertEqual(control.palette().color(QPalette.ColorRole.Base).name(), "#fbfdff")
+            viewport = self.dialog.findChild(QScrollArea, "chunkPreviewScroll").viewport()
+            self.assertEqual(viewport.palette().color(QPalette.ColorRole.Window).name(), "#f8fbfd")
+        finally:
+            self.app.setPalette(prior_palette)
+
+    def test_theme_switch_preserves_pending_preview_and_form_values(self):
+        self._choose_primary("merge")
+        self._select_chunk_rows(0, 1)
+        self.dialog.merge_name.setText("保留输入")
+        self._preview()
+        preview = self.dialog._preview
+        self.assertIsNotNone(preview)
+        for scheme in (Qt.ColorScheme.Dark, Qt.ColorScheme.Light):
+            self.app.styleHints().colorSchemeChanged.emit(scheme)
+            self.assertIs(self.dialog._preview, preview)
+            self.assertEqual(self.dialog.merge_name.text(), "保留输入")
+            self.assertEqual(self.dialog.preview_panel.property("state"), "ready")
 
     def _choose_advanced(self, key: str) -> None:
         self.dialog.advanced_button.setChecked(True)
