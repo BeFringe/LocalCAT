@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QComboBox, QMenu, QStyledItemDelegate
 
-from qt_theme import system_uses_dark_theme
+from qt_theme import projected_widget_uses_dark
 
 
 LOCALCAT_COMBO_POPUP_STYLE = """
@@ -140,13 +140,15 @@ def configure_combo_popup(
     popup.setItemDelegate(QStyledItemDelegate(popup))
 
 
-def apply_combo_popup_theme(combo: QComboBox) -> None:
+def apply_combo_popup_theme(combo: QComboBox, *, dark: bool | None = None) -> None:
     """Refresh an existing combo popup after the system theme changes."""
 
     popup = combo.view()
+    if dark is None:
+        dark = projected_widget_uses_dark(combo)
     popup.setStyleSheet(
         LOCALCAT_DARK_COMBO_POPUP_STYLE
-        if system_uses_dark_theme(combo)
+        if dark
         else LOCALCAT_COMBO_POPUP_STYLE
     )
 
@@ -157,11 +159,13 @@ def configure_menu(menu: QMenu) -> None:
     apply_menu_theme(menu)
 
 
-def apply_menu_theme(menu: QMenu) -> None:
+def apply_menu_theme(menu: QMenu, *, dark: bool | None = None) -> None:
     """Refresh an existing menu after the system theme changes."""
 
+    if dark is None:
+        dark = projected_widget_uses_dark(menu)
     menu.setStyleSheet(
         LOCALCAT_DARK_MENU_STYLE
-        if system_uses_dark_theme(menu)
+        if dark
         else LOCALCAT_MENU_STYLE
     )
