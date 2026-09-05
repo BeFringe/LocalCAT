@@ -64,6 +64,71 @@ class WindowsSourceLauncherTests(unittest.TestCase):
                 sys.stdlib_module_names,
             )
 
+    def test_startup_log_contains_only_safe_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="LocalCAT diagnostics ") as temporary:
+            with patch.object(guardian, "_local_application_directory", return_value=Path(temporary)):
+                guardian._append_startup_diagnostic({
+                    "stage": "editor_composition", "status": "failed",
+                    "exception_type": "PermissionError", "winerror": 5,
+                    "elapsed_ms": 40000, "returncode": 1,
+                    "message": "secret project body", "path": "private filename",
+                })
+            payload = json.loads((Path(temporary) / "source-startup.log").read_text(encoding="utf-8"))
+            self.assertEqual(payload["elapsed_ms"], 40000)
+            self.assertEqual(payload["winerror"], 5)
+            self.assertEqual(payload["exception_type"], "PermissionError")
+            self.assertNotIn("secret", json.dumps(payload))
+            self.assertNotIn("private", json.dumps(payload))
+            self.assertNotIn("path", payload)
+
+    def test_startup_diagnostic_rotates_bounded_history(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="LocalCAT log rotation ") as temporary:
+            root = Path(temporary)
+            path = root / "source-startup.log"
+            path.write_bytes(b"x" * (256 * 1024))
+            with patch.object(guardian, "_local_application_directory", return_value=root):
+                guardian._append_startup_diagnostic({"stage": "child_exit", "returncode": 1})
+            self.assertEqual((root / "source-startup.previous.log").stat().st_size, 256 * 1024)
+            self.assertLess(path.stat().st_size, 1024)
+            self.assertEqual(json.loads(path.read_text())["returncode"], 1)
+
+    def test_child_exception_is_diagnosable_without_recording_its_message(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="LocalCAT diagnostic child ") as temporary:
+            root = Path(temporary)
+            (root / "qt_editor.py").write_text(
+                "def main(args):\n    raise ValueError('secret project body')\n",
+                encoding="utf-8",
+            )
+            original_bootstrap = sys.modules.get("qt_editor")
+            original_path = list(sys.path)
+            try:
+                with patch.object(guardian, "_append_startup_diagnostic") as diagnostic:
+                    result = guardian._run_child(root, ())
+                self.assertEqual(result, 120)
+                event = diagnostic.call_args.args[0]
+                self.assertEqual(event["exception_type"], "ValueError")
+                self.assertEqual(event["status"], "failed")
+                self.assertNotIn("secret", json.dumps(event))
+            finally:
+                sys.path[:] = original_path
+                if original_bootstrap is not None:
+                    sys.modules["qt_editor"] = original_bootstrap
+                else:
+                    sys.modules.pop("qt_editor", None)
+
+    def test_stage_timing_uses_elapsed_time_and_diagnostic_failure_is_nonfatal(self) -> None:
+        with patch.object(qt_editor.time, "perf_counter", side_effect=(1.0, 1.25)), patch.object(
+            qt_editor, "_startup_diagnostic"
+        ) as diagnostic:
+            trace = qt_editor._StartupTrace("resource_repository")
+            trace.finish(error=PermissionError(13, "secret path"))
+        event = diagnostic.call_args.args[0]
+        self.assertEqual(event["elapsed_ms"], 250)
+        self.assertEqual(event["errno"], 13)
+        self.assertNotIn("secret", json.dumps(event))
+        with patch.object(qt_editor, "_startup_diagnostic", side_effect=OSError("unwritable")):
+            qt_editor._StartupTrace("source_authority").finish()
+
     def test_default_shortcut_label_marks_the_source_profile(self) -> None:
         with tempfile.TemporaryDirectory(prefix="LocalCAT shortcut label ") as temporary:
             os.environ["APPDATA"] = temporary

@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -25,6 +26,52 @@ APPLICATION_ICON_SIZE = 512
 LOCALCAT_NATIVE_LAUNCH_ENV = "LOCALCAT_NATIVE_LAUNCH"
 LOCALCAT_DIRECT_HANDOFF_VERSION = 1
 STARTUP_FAILURE_CODE = "LOCALCAT.STARTUP.FAILED"
+
+
+def _startup_diagnostic(event: dict[str, object]) -> None:
+    """Optional stdlib guardian sink; direct launches do not persist diagnostics."""
+
+
+class _StartupTrace:
+    """Record fixed phase names and numeric timing, never application content."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        self.started = time.perf_counter()
+
+    def finish(self, next_stage: str | None = None, error: Exception | None = None) -> None:
+        event: dict[str, object] = {
+            "stage": self.stage,
+            "elapsed_ms": round((time.perf_counter() - self.started) * 1000),
+            "status": "failed" if error is not None else "ok",
+        }
+        if error is not None:
+            event["exception_type"] = type(error).__name__
+            traceback = error.__traceback__
+            while traceback is not None:
+                module = traceback.tb_frame.f_globals.get("__name__")
+                if module in {
+                    "qt_editor", "editor_controller", "resource_repository",
+                    "tm_application_composition", "tm_engine", "tm_migration",
+                    "tm_sqlite_store", "capability_host", "platform_fs",
+                    "platform_fs_windows", "platform_source_authority",
+                    "qt_source_resources", "qt_editor_window",
+                }:
+                    event["failure_module"] = module
+                    event["failure_line"] = traceback.tb_lineno
+                traceback = traceback.tb_next
+            for name in ("errno", "winerror"):
+                value = getattr(error, name, None)
+                if type(value) is int:
+                    event[name] = value
+        try:
+            _startup_diagnostic(event)
+        except Exception:
+            # Diagnostics must not change the startup result.
+            pass
+        if next_stage is not None:
+            self.stage = next_stage
+            self.started = time.perf_counter()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -658,30 +705,38 @@ def _compose_editor_controller(
         raise TypeError(
             "editor composition requires one rooted source authority"
         )
-    capability_composition = compose_capability_host(
-        source_authority=source_authority,
-        evaluated_at_utc=datetime.now(timezone.utc),
-        gate_d_attestation_root=(
-            repository.config_dir / "gate-d-qualification"
-        ),
-    )
-    runtime_host = TMRuntimeHost(
-        resolver=TMResourceResolver(),
-        configs=repository.list_resources(),
-    )
-    controller = compose_project_enabled_editor_controller(
-        repository,
-        tm_adapter=EditorTMAdapter(
-            runtime_host=runtime_host,
-            capability_host=capability_composition.host,
-            fuzzy_validation_status=lambda: _fuzzy_validation_display(
-                capability_composition
+    startup_trace = _StartupTrace("capability_composition")
+    try:
+        capability_composition = compose_capability_host(
+            source_authority=source_authority,
+            evaluated_at_utc=datetime.now(timezone.utc),
+            gate_d_attestation_root=(
+                repository.config_dir / "gate-d-qualification"
             ),
-            fuzzy_validation_start=lambda: _request_fuzzy_revalidation(
-                capability_composition
+        )
+        startup_trace.finish("tm_runtime_resolution")
+        runtime_host = TMRuntimeHost(
+            resolver=TMResourceResolver(),
+            configs=repository.list_resources(),
+        )
+        startup_trace.finish("controller_resource_composition")
+        controller = compose_project_enabled_editor_controller(
+            repository,
+            tm_adapter=EditorTMAdapter(
+                runtime_host=runtime_host,
+                capability_host=capability_composition.host,
+                fuzzy_validation_status=lambda: _fuzzy_validation_display(
+                    capability_composition
+                ),
+                fuzzy_validation_start=lambda: _request_fuzzy_revalidation(
+                    capability_composition
+                ),
             ),
-        ),
-    )
+        )
+    except Exception as exc:
+        startup_trace.finish(error=exc)
+        raise
+    startup_trace.finish()
     return controller, capability_composition
 
 
@@ -782,12 +837,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.smoke_test and args.bundle_smoke_marker is None:
         _handoff_to_macos_native_launcher(launch_argv)
+    startup_trace = _StartupTrace("qt_imports")
     try:
         from typing import cast
 
         from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
     except ModuleNotFoundError as exc:
+        startup_trace.finish(error=exc)
         if exc.name == "PySide6" or (exc.name and exc.name.startswith("PySide6.")):
             print(
                 "LocalCAT Qt editor requires PySide6.\n"
@@ -797,6 +854,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         raise
 
+    startup_trace.finish("source_authority")
     try:
         # The source route establishes one live rooted authority before any
         # LocalCAT business module is imported.  Paths below remain locators;
@@ -810,12 +868,14 @@ def main(argv: list[str] | None = None) -> int:
             root,
             backend=platform_backend,
         )
+        startup_trace.finish("qt_source_resources")
         from qt_source_resources import resolve_source_qt_resources
 
         qt_resources = resolve_source_qt_resources(
             source_authority,
             logo_filename=APPLICATION_ICON_FILENAME,
         )
+        startup_trace.finish("data_directory")
         data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
         data_root = platform_backend.bind_root(data_dir)
@@ -824,20 +884,24 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             data_root.close()
 
+        startup_trace.finish("business_imports")
         from qt_editor_window import QtEditorWindow
         from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
         from resource_repository import ResourceRepository
 
+        startup_trace.finish("resource_repository")
         repository = ResourceRepository(
             data_dir,
             default_tm_path=root / "tm.jsonl",
             default_termbase_path=root / "terms.csv",
             backend=platform_backend,
         )
+        startup_trace.finish("editor_composition")
         controller, capability_composition = _compose_editor_controller(
             repository,
             source_authority=source_authority,
         )
+        startup_trace.finish("chunk_and_export_composition")
         chunk_controller = _compose_chunk_controller(controller, repository)
         tmx_export_service = _compose_tmx_export_service(
             controller,
@@ -847,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
         # Retain the owner-only validation ports for the complete QApplication
         # lifetime; the Controller receives only the host read boundary.
         _ = capability_composition
+        startup_trace.finish("initial_project")
         if args.project is not None:
             if args.project.suffix.lower() == ".localcat-project":
                 controller.open_project_package(args.project)
@@ -859,6 +924,7 @@ def main(argv: list[str] | None = None) -> int:
         # macOS a script launched through the Python interpreter otherwise
         # lets the application menu adopt the interpreter's display name
         # (for example, "Python 3.14") before LocalCAT can replace it.
+        startup_trace.finish("application_and_window")
         QApplication.setApplicationName("LocalCAT")
         QApplication.setApplicationDisplayName("LocalCAT")
         QApplication.setOrganizationName("LocalCAT")
@@ -891,6 +957,7 @@ def main(argv: list[str] | None = None) -> int:
         # before the window is shown or any project menu can open.
         window.tmx_export_coordinator = tmx_export_service
         window.show()
+        startup_trace.finish("first_events")
         validation_worker = _start_capability_validation(
             capability_composition,
             window,
@@ -899,6 +966,7 @@ def main(argv: list[str] | None = None) -> int:
         # lifetime. The worker only emits; Qt invokes the window on its thread.
         _ = validation_worker
         app.processEvents()
+        startup_trace.finish()
         if args.bundle_smoke_marker is not None:
             _write_bundle_smoke_marker(
                 args.bundle_smoke_marker.expanduser().resolve(),
@@ -926,7 +994,8 @@ def main(argv: list[str] | None = None) -> int:
             print("Qt editor smoke test passed.")
             return 0
         return app.exec()
-    except Exception:
+    except Exception as exc:
+        startup_trace.finish(error=exc)
         print(
             f"LocalCAT Qt editor could not start [{STARTUP_FAILURE_CODE}].",
             file=sys.stderr,
