@@ -452,6 +452,18 @@ class EditorTMAdapter:
             validate_candidate,
         )
 
+    def _refresh_runtime_flags(
+        self,
+        configs: tuple[ResourceConfig, ...],
+        validate_candidate: Callable[[TMRuntimeSnapshot], None],
+    ) -> TMRuntimeSnapshot:
+        """Publish flag-only changes while retaining proven runtime authorities."""
+
+        return self._runtime_host._refresh_flags_validated(
+            configs,
+            validate_candidate,
+        )
+
     def _capture_runtime_for_controller(
         self,
         configs: tuple[ResourceConfig, ...],

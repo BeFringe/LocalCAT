@@ -138,7 +138,7 @@ from qt_control_styles import (
     configure_menu,
 )
 from qt_localized_message_box import show_localized_critical
-from qt_theme import system_uses_dark_theme
+from qt_theme import color_scheme_uses_dark, system_uses_dark_theme
 from qt_tm_threshold import (
     TMThresholdButton,
     configure_tm_threshold_entry,
@@ -1023,6 +1023,8 @@ class QtEditorWindow(QMainWindow):
         self._project_search_expanded = False
         self.setObjectName("editorWindow")
         self._dark_theme = system_uses_dark_theme(self)
+        self._theme_refresh_pending = False
+        self._theme_refresh_in_progress = False
         self.setProperty(
             "localcatTheme",
             "dark" if self._dark_theme else "light",
@@ -1071,6 +1073,26 @@ class QtEditorWindow(QMainWindow):
             application.styleHints().colorSchemeChanged.connect(
                 self._apply_system_theme
             )
+            application.paletteChanged.connect(self._queue_system_theme_refresh)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ThemeChange,
+        ):
+            self._queue_system_theme_refresh()
+
+    def _queue_system_theme_refresh(self, *_args: object) -> None:
+        if self._theme_refresh_pending:
+            return
+        self._theme_refresh_pending = True
+        QTimer.singleShot(0, self._apply_queued_system_theme)
+
+    def _apply_queued_system_theme(self) -> None:
+        self._theme_refresh_pending = False
+        self._apply_system_theme()
 
     def install_chunk_controller(self, chunk_controller: object) -> None:
         """Install the optional collaboration façade after shell construction."""
@@ -1114,38 +1136,51 @@ class QtEditorWindow(QMainWindow):
     def _apply_system_theme(self, *_args: object) -> None:
         """Project the current OS color scheme across every editor mode."""
 
-        self._dark_theme = system_uses_dark_theme(self)
+        signaled_theme = color_scheme_uses_dark(_args[0]) if _args else None
+        dark_theme = (
+            system_uses_dark_theme(self)
+            if signaled_theme is None
+            else signaled_theme
+        )
+        target_style = _EDITOR_STYLE + (_EDITOR_DARK_STYLE if dark_theme else "")
+        if self._theme_refresh_in_progress:
+            return
+        if dark_theme == self._dark_theme and self.styleSheet() == target_style:
+            return
+        self._theme_refresh_in_progress = True
+        self._dark_theme = dark_theme
         self.setProperty(
             "localcatTheme",
             "dark" if self._dark_theme else "light",
         )
-        self.setStyleSheet(
-            _EDITOR_STYLE + (_EDITOR_DARK_STYLE if self._dark_theme else "")
-        )
-        for combo in self.findChildren(QComboBox):
-            apply_combo_popup_theme(combo)
-        for menu in self.findChildren(QMenu):
-            apply_menu_theme(menu)
-        if hasattr(self, "source_display") and self._has_active_project():
-            self.source_display.setHtml(
-                render_highlighted_source(
-                    self.controller.current_segment.source,
-                    self.current_suggestions.terms,
-                    dark_theme=self._dark_theme,
+        try:
+            self.setStyleSheet(target_style)
+            for combo in self.findChildren(QComboBox):
+                apply_combo_popup_theme(combo)
+            for menu in self.findChildren(QMenu):
+                apply_menu_theme(menu)
+            if hasattr(self, "source_display") and self._has_active_project():
+                self.source_display.setHtml(
+                    render_highlighted_source(
+                        self.controller.current_segment.source,
+                        self.current_suggestions.terms,
+                        dark_theme=self._dark_theme,
+                    )
                 )
-            )
-        if hasattr(self, "segment_list"):
-            divider_background = QColor(
-                "#26323a" if self._dark_theme else "#dcecf5"
-            )
-            divider_foreground = QColor(
-                "#79c6df" if self._dark_theme else "#0b5e80"
-            )
-            for row in range(self.segment_list.count()):
-                item = self.segment_list.item(row)
-                if item.data(Qt.ItemDataRole.UserRole) is None:
-                    item.setBackground(divider_background)
-                    item.setForeground(divider_foreground)
+            if hasattr(self, "segment_list"):
+                divider_background = QColor(
+                    "#26323a" if self._dark_theme else "#dcecf5"
+                )
+                divider_foreground = QColor(
+                    "#79c6df" if self._dark_theme else "#0b5e80"
+                )
+                for row in range(self.segment_list.count()):
+                    item = self.segment_list.item(row)
+                    if item.data(Qt.ItemDataRole.UserRole) is None:
+                        item.setBackground(divider_background)
+                        item.setForeground(divider_foreground)
+        finally:
+            self._theme_refresh_in_progress = False
 
     def _build_top_bar(self) -> QWidget:
         top_bar = QFrame()
@@ -1657,7 +1692,10 @@ class QtEditorWindow(QMainWindow):
         layout.addWidget(self.workspace_chapter_title)
         self.unconfirmed_filter = QCheckBox("仅显示未确认")
         self.unconfirmed_filter.setObjectName("unconfirmedFilter")
-        layout.addWidget(self.unconfirmed_filter)
+        unconfirmed_filter_row = QHBoxLayout()
+        unconfirmed_filter_row.setContentsMargins(0, 0, 0, 0)
+        unconfirmed_filter_row.addWidget(self.unconfirmed_filter)
+        layout.addLayout(unconfirmed_filter_row)
         self.workspace_save_feedback = QLabel("项目包尚未保存。")
         self.workspace_save_feedback.setObjectName("workspaceSaveFeedback")
         self.workspace_save_feedback.setTextFormat(Qt.TextFormat.PlainText)
@@ -5624,7 +5662,7 @@ class QtEditorWindow(QMainWindow):
 
     def _resources_changed(self) -> None:
         if self._has_active_project():
-            self.refresh_suggestions()
+            self.refresh_suggestions(use_current_tm_report=True)
         self.statusBar().showMessage("语言资源已更新，当前段建议已刷新。", 6000)
 
     def _term_suggestions_changed(self) -> None:
@@ -5691,7 +5729,11 @@ class QtEditorWindow(QMainWindow):
         dialog.terms_committed.connect(self._term_suggestions_changed)
         dialog.exec()
 
-    def refresh_suggestions(self) -> SuggestionBundle:
+    def refresh_suggestions(
+        self,
+        *,
+        use_current_tm_report: bool = False,
+    ) -> SuggestionBundle:
         """Render the current controller bundle as safe, actionable cards."""
 
         self._refresh_project_search_controls()
@@ -5705,7 +5747,10 @@ class QtEditorWindow(QMainWindow):
         tm_query_failed = False
         if self.controller.tm_suggestion_reports_enabled:
             try:
-                report = self.controller.tm_suggestion_report()
+                if use_current_tm_report:
+                    report = self.controller.current_tm_suggestion_report()
+                if report is None:
+                    report = self.controller.tm_suggestion_report()
             except EditorControllerError:
                 tm_query_failed = True
                 bundle = SuggestionBundle(
@@ -6699,7 +6744,7 @@ QLabel#countBadge {
 }
 QCheckBox#unconfirmedFilter {
     color: #607387;
-    padding: 4px 0 7px;
+    padding: 4px 0 7px 4px;
 }
 QListWidget#segmentList {
     border: none;
