@@ -116,6 +116,241 @@ def _replacement_bytes(private_root: Path) -> dict[str, bytes]:
 
 @unittest.skipUnless(sys.platform == "win32", "requires real Windows")
 class WindowsPortableReplacementOwnerTests(unittest.TestCase):
+    def test_completed_replacement_runtime_reuses_one_owner_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            try:
+                identity, _coordinator, service = _fixture(root)
+                replaced = service._explicit_disambiguation(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(replaced), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id=replaced.canonical_store_id,
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id=replaced.canonical_store_id,
+                    coordinator=fresh,
+                )
+                captured: list[object] = []
+                real_open = fresh.rehydrate_completed_portable_runtime_open
+                real_recovery_inspection = (
+                    tm_activation_recovery._inspect_portable_replacement_namespace_owned
+                )
+                real_terminal_inspection = (
+                    tm_migration._inspect_portable_replacement_namespace
+                )
+
+                def capture_owner(**arguments: object) -> object:
+                    result = real_open(**arguments)
+                    captured.append(result[1])
+                    self.assertEqual(fresh.state, "ACTIVATING")
+                    return result
+
+                with (
+                    mock.patch.object(
+                        fresh,
+                        "rehydrate_completed_portable_runtime_open",
+                        side_effect=capture_owner,
+                    ),
+                    mock.patch.object(
+                        tm_activation_recovery,
+                        "_inspect_portable_replacement_namespace_owned",
+                        wraps=real_recovery_inspection,
+                    ) as recovery_inspection,
+                    mock.patch.object(
+                        tm_migration,
+                        "_inspect_portable_replacement_namespace",
+                        wraps=real_terminal_inspection,
+                    ) as terminal_inspection,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "NOOP")
+                self.assertEqual(fresh.state, "READY")
+                self.assertEqual(fresh.current_generation, 1)
+                self.assertEqual(len(captured), 1)
+                self.assertIs(
+                    type(captured[0]),
+                    tm_sqlite_store._DeferredPortableRuntimeOwner,
+                )
+                self.assertTrue(captured[0].completed)
+                recovery_inspection.assert_called_once()
+                terminal_inspection.assert_not_called()
+                retained = captured[0]._replacement_inspection
+                self.assertIs(
+                    type(retained),
+                    tm_activation_recovery._RetainedPortableReplacementInspection,
+                )
+                self.assertTrue(retained.closed)
+                self.assertTrue(retained.terminal_reproved)
+            finally:
+                _remove_long_quarantine(root)
+                _remove_long_private(root)
+
+    def test_retained_replacement_owner_rejects_terminal_foreign_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            try:
+                identity, _coordinator, service = _fixture(root)
+                replaced = service._explicit_disambiguation(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(replaced), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id=replaced.canonical_store_id,
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id=replaced.canonical_store_id,
+                    coordinator=fresh,
+                )
+                complete = fresh_service._complete_deferred_runtime_owner
+                foreign: Path | None = None
+
+                def add_foreign_entry(**arguments: object) -> None:
+                    nonlocal foreign
+                    private_roots = tuple(
+                        root.glob(".localcat-activation-private-v1.*")
+                    )
+                    self.assertEqual(len(private_roots), 1)
+                    foreign = private_roots[0] / "foreign.bin"
+                    foreign.write_bytes(b"foreign")
+                    complete(**arguments)
+
+                with mock.patch.object(
+                    fresh_service,
+                    "_complete_deferred_runtime_owner",
+                    side_effect=add_foreign_entry,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+                self.assertIsNotNone(foreign)
+                self.assertEqual(foreign.read_bytes(), b"foreign")
+            finally:
+                _remove_long_quarantine(root)
+                _remove_long_private(root)
+
+    def test_retained_replacement_owner_private_reproof_failure_blocks_ready(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            try:
+                identity, _coordinator, service = _fixture(root)
+                replaced = service._explicit_disambiguation(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(replaced), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id=replaced.canonical_store_id,
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id=replaced.canonical_store_id,
+                    coordinator=fresh,
+                )
+
+                def reject_private_reproof(*_arguments: object) -> None:
+                    raise PlatformFileError(
+                        PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN,
+                        retryable=False,
+                    )
+
+                with mock.patch.object(
+                    WindowsPlatformAdapter,
+                    "_consume_verified",
+                    new=reject_private_reproof,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+            finally:
+                _remove_long_quarantine(root)
+                _remove_long_private(root)
+
+    def test_retained_replacement_owner_close_failure_blocks_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            try:
+                identity, _coordinator, service = _fixture(root)
+                replaced = service._explicit_disambiguation(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(replaced), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id=replaced.canonical_store_id,
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id=replaced.canonical_store_id,
+                    coordinator=fresh,
+                )
+                owner_type = (
+                    tm_activation_recovery._RetainedPortableReplacementInspection
+                )
+                real_close = owner_type._close_authority
+                injected = False
+
+                def close_then_fail(owner: object) -> None:
+                    nonlocal injected
+                    real_close(owner)
+                    if not injected:
+                        injected = True
+                        raise OSError("fixture retained owner close failure")
+
+                with mock.patch.object(
+                    owner_type,
+                    "_close_authority",
+                    new=close_then_fail,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertTrue(injected)
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+            finally:
+                _remove_long_quarantine(root)
+                _remove_long_private(root)
+
     def test_replacement_reuses_sealed_projection_after_full_predecessor_check(
         self,
     ) -> None:

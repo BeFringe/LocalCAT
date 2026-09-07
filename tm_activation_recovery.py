@@ -17,6 +17,7 @@ import os
 import sqlite3
 import stat
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path, PurePath
 from typing import Any, Protocol, cast
@@ -138,12 +139,15 @@ from platform_fs_contracts import (
     BoundRegularFile,
     CandidateContentFacts,
     CandidateFile,
+    EntrySnapshot,
     ExistingFileRetirement,
+    LedgerEntryObservation,
     LedgerEnumerationLimits,
     LockLease,
     LockPolicy,
     LockWait,
     LockedDescendantNamespaceInspection,
+    OpaqueAuthority,
     PendingPublication,
     PrivateProofContext,
     PrivateProofObjectRole,
@@ -153,6 +157,7 @@ from platform_fs_contracts import (
     PublishMode,
     RetainedRetirement,
     RootedDirectoryAuthority,
+    VerifiedPrivateProof,
 )
 
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
@@ -186,6 +191,252 @@ class _PortableReplacementRecoveryRequired(ActivationPreparationError):
             "ACTIVATION.RECOVERY_REQUIRED",
             retryable=True,
         )
+
+
+class _RetainedPortableReplacementInspection(OpaqueAuthority):
+    """One-shot terminal reproof for one already-authenticated CURRENT chain.
+
+    This owner exists only inside one completed-runtime open.  It retains the
+    exact private child handles whose bytes were parsed and authenticated by
+    the initial inspection.  Windows opens those handles without write/delete
+    sharing, so ``content_facts()`` may reuse its captured digest only while it
+    still reproves the same live object, name binding, and change token.  The
+    terminal operation independently reproves the locked namespace and private
+    security facts before consuming the initial private-proof tokens.
+    """
+
+    __slots__ = (
+        "_backend",
+        "_base_generation",
+        "_caller_borrow",
+        "_descendant_inspection",
+        "_files",
+        "_identity",
+        "_lease",
+        "_limits",
+        "_observations",
+        "_persistent_private",
+        "_private_entry",
+        "_private_name",
+        "_private_parent",
+        "_proofs",
+        "_root",
+        "_snapshot",
+        "_terminal_attempted",
+        "_terminal_reproved",
+        "_thread",
+    )
+
+    def __init__(
+        self,
+        *,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        private_name: str,
+        private_entry: EntrySnapshot,
+        private_parent: BoundDirectoryAuthority,
+        files: dict[str, tuple[BoundRegularFile, BoundContentFacts]],
+        proofs: tuple[tuple[VerifiedPrivateProof, PrivateProofContext], ...],
+        observations: tuple[LedgerEntryObservation, ...],
+        limits: LedgerEnumerationLimits,
+        snapshot: _PortableReplacementNamespaceSnapshot,
+        base_generation: _PortablePublicationPhaseRecord,
+    ) -> None:
+        super().__init__()
+        if type(identity) is not CanonicalResourceIdentity:
+            raise TypeError("retained replacement identity is invalid")
+        if not (
+            isinstance(backend, PlatformFileBackend)
+            and persistent_private is backend
+            and descendant_inspection is backend
+        ):
+            raise TypeError("retained replacement backend is invalid")
+        if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
+            raise TypeError("retained replacement borrow is invalid")
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("retained replacement root is invalid")
+        if not isinstance(lease, LockLease):
+            raise TypeError("retained replacement lease is invalid")
+        if type(private_name) is not str or not private_name:
+            raise TypeError("retained replacement private name is invalid")
+        if type(private_entry) is not EntrySnapshot:
+            raise TypeError("retained replacement private entry is invalid")
+        if not isinstance(private_parent, BoundDirectoryAuthority):
+            raise TypeError("retained replacement private parent is invalid")
+        if type(files) is not dict or not files or any(
+            type(name) is not str
+            or not isinstance(value, tuple)
+            or len(value) != 2
+            or not isinstance(value[0], BoundRegularFile)
+            or type(value[1]) is not BoundContentFacts
+            for name, value in files.items()
+        ):
+            raise TypeError("retained replacement files are invalid")
+        if type(proofs) is not tuple or not proofs or any(
+            type(item) is not tuple
+            or len(item) != 2
+            or not isinstance(item[0], VerifiedPrivateProof)
+            or type(item[1]) is not PrivateProofContext
+            for item in proofs
+        ):
+            raise TypeError("retained replacement proofs are invalid")
+        if type(observations) is not tuple or any(
+            type(item) is not LedgerEntryObservation for item in observations
+        ):
+            raise TypeError("retained replacement observations are invalid")
+        if type(limits) is not LedgerEnumerationLimits:
+            raise TypeError("retained replacement limits are invalid")
+        if (
+            type(snapshot) is not _PortableReplacementNamespaceSnapshot
+            or snapshot.state != "CURRENT"
+            or snapshot.current_record is None
+            or snapshot.pending_records
+        ):
+            raise TypeError("retained replacement snapshot is not CURRENT")
+        if type(base_generation) is not _PortablePublicationPhaseRecord:
+            raise TypeError("retained replacement base generation is invalid")
+        self._identity = identity
+        self._backend = backend
+        self._persistent_private = persistent_private
+        self._descendant_inspection = descendant_inspection
+        self._caller_borrow = caller_borrow
+        self._root = root
+        self._lease = lease
+        self._private_name = private_name
+        self._private_entry = private_entry
+        self._private_parent = private_parent
+        self._files = tuple(files.items())
+        self._proofs = proofs
+        self._observations = observations
+        self._limits = limits
+        self._snapshot = snapshot
+        self._base_generation = base_generation
+        self._thread = threading.current_thread()
+        self._terminal_attempted = False
+        self._terminal_reproved = False
+
+    @property
+    def terminal_reproved(self) -> bool:
+        return self._terminal_reproved
+
+    def terminal_reprove(
+        self,
+        *,
+        identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+    ) -> tuple[
+        _PortableReplacementNamespaceSnapshot,
+        RootedDirectoryAuthority,
+        _PortablePublicationPhaseRecord,
+    ]:
+        self._require_open()
+        if self._terminal_attempted or threading.current_thread() is not self._thread:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        self._terminal_attempted = True
+        active_error: BaseException | None = None
+        result: tuple[
+            _PortableReplacementNamespaceSnapshot,
+            RootedDirectoryAuthority,
+            _PortablePublicationPhaseRecord,
+        ] | None = None
+        try:
+            if (
+                identity != self._identity
+                or backend is not self._backend
+                or root is not self._root
+                or lease is not self._lease
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            self._caller_borrow.reprove(backend, identity)
+            lease.reprove()
+            root.reprove()
+            if root.inspect_entry(self._private_name) != self._private_entry:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            self._private_parent.reprove()
+            repeated = self._descendant_inspection.observe_descendant_entries(
+                root,
+                lease,
+                self._private_parent,
+                self._limits,
+            )
+            if repeated != self._observations:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            for name, (authority, expected) in self._files:
+                facts = authority.content_facts()
+                if (
+                    facts != expected
+                    or self._private_parent.inspect_entry(name) != facts.snapshot
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                evidence = backend.prove_private(authority)
+                evidence.close()
+            for verified, context in self._proofs:
+                self._persistent_private.consume_verified(verified, context)
+            self._caller_borrow.reprove(backend, identity)
+            self._private_parent.reprove()
+            if root.inspect_entry(self._private_name) != self._private_entry:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            result = self._snapshot, root, self._base_generation
+        except BaseException as error:
+            active_error = error
+        try:
+            self.close()
+        except BaseException as error:
+            if active_error is None:
+                active_error = error
+        if active_error is not None:
+            raise active_error
+        if result is None:
+            raise AssertionError("retained replacement terminal proof produced no result")
+        self._terminal_reproved = True
+        return result
+
+    def _close_authority(self) -> None:
+        first_error: BaseException | None = None
+        for verified, _context in reversed(self._proofs):
+            try:
+                verified.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        for _name, (authority, _facts) in reversed(self._files):
+            try:
+                authority.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        try:
+            self._private_parent.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 class _StoreValidationPort(Protocol):
@@ -898,17 +1149,19 @@ class _PortableReplacementRecordOwner:
                 raise close_error
 
 
-def _inspect_portable_replacement_namespace(
+def _inspect_portable_replacement_namespace_owned(
     *,
     identity: CanonicalResourceIdentity,
     backend: PlatformFileBackend,
     persistent_private: PersistentPrivateProof,
     descendant_inspection: LockedDescendantNamespaceInspection,
     caller_borrow: _CallerHeldPortableJournalBorrow,
+    retain_current_owner: bool,
 ) -> tuple[
     _PortableReplacementNamespaceSnapshot | None,
     RootedDirectoryAuthority,
     _PortablePublicationPhaseRecord,
+    _RetainedPortableReplacementInspection | None,
 ]:
     """Authenticate the base gen0 chain plus the bounded replacement subset."""
 
@@ -925,6 +1178,8 @@ def _inspect_portable_replacement_namespace(
         )
     if type(caller_borrow) is not _CallerHeldPortableJournalBorrow:
         raise TypeError("portable replacement recovery borrow is invalid")
+    if type(retain_current_owner) is not bool:
+        raise TypeError("retain_current_owner must be exact bool")
     root, lease = caller_borrow._fresh_recovery_authorities(
         backend,
         persistent_private,
@@ -933,6 +1188,8 @@ def _inspect_portable_replacement_namespace(
     private_name = f".localcat-activation-private-v1.{identity.target_identity}"
     private_parent: BoundDirectoryAuthority | None = None
     authorities: list[object] = []
+    retained_files: dict[str, tuple[BoundRegularFile, BoundContentFacts]] = {}
+    retained_proofs: list[tuple[VerifiedPrivateProof, PrivateProofContext]] = []
     try:
         private_entry = root.inspect_entry(private_name)
         if (
@@ -956,10 +1213,12 @@ def _inspect_portable_replacement_namespace(
             PurePath(private_name, "device.key"),
         )
         authorities.append(key_file)
+        key_capture = key_file.capture_content()
+        retained_files["device.key"] = (key_file, key_capture.facts)
         if (
-            key_file.identity().kind != "regular"
-            or key_file.identity().link_count != 1
-            or len(key_file.read_all()) != 32
+            key_capture.facts.snapshot.identity.kind != "regular"
+            or key_capture.facts.snapshot.identity.link_count != 1
+            or len(key_capture.content) != 32
         ):
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
@@ -981,8 +1240,9 @@ def _inspect_portable_replacement_namespace(
                 PurePath(private_name, name),
             )
             authorities.append(opened)
-            snapshot = opened.snapshot()
-            payload = opened.read_all()
+            capture = opened.capture_content()
+            snapshot = capture.facts.snapshot
+            payload = capture.content
             if (
                 snapshot.identity.kind != "regular"
                 or snapshot.identity.link_count != 1
@@ -1006,6 +1266,8 @@ def _inspect_portable_replacement_namespace(
                 context,
             )
             authorities.append(verified)
+            retained_files[name] = (opened, capture.facts)
+            retained_proofs.append((verified, context))
             caller_borrow.reprove(backend, identity)
             return record
 
@@ -1104,6 +1366,7 @@ def _inspect_portable_replacement_namespace(
                 )
             proof_evidence = backend.prove_private(opened)
             authorities.append(proof_evidence)
+            retained_files[proof.backup_name] = (opened, facts)
             backups[proof.backup_name] = observed
 
         expected_names = {
@@ -1137,7 +1400,7 @@ def _inspect_portable_replacement_namespace(
             )
         caller_borrow.reprove(backend, identity)
         if not replacement_records:
-            return None, root, base_generation
+            return None, root, base_generation, None
         try:
             classified = _parse_portable_replacement_namespace(
                 replacement_records,
@@ -1149,7 +1412,45 @@ def _inspect_portable_replacement_namespace(
                 "ACTIVATION.RECOVERY_REQUIRED",
                 retryable=True,
             ) from error
-        return classified, root, base_generation
+        retained_owner: _RetainedPortableReplacementInspection | None = None
+        if retain_current_owner and classified.state == "CURRENT":
+            transferred = {
+                id(private_parent),
+                *(id(authority) for authority, _facts in retained_files.values()),
+                *(id(verified) for verified, _context in retained_proofs),
+            }
+            for authority in reversed(authorities):
+                if id(authority) not in transferred:
+                    getattr(authority, "close")()
+            authorities[:] = [
+                authority for authority in authorities if id(authority) in transferred
+            ]
+            retained_owner = _RetainedPortableReplacementInspection(
+                identity=identity,
+                backend=backend,
+                persistent_private=persistent_private,
+                descendant_inspection=descendant_inspection,
+                caller_borrow=caller_borrow,
+                root=root,
+                lease=lease,
+                private_name=private_name,
+                private_entry=private_entry,
+                private_parent=private_parent,
+                files=retained_files,
+                proofs=tuple(retained_proofs),
+                observations=observations,
+                limits=LedgerEnumerationLimits(
+                    maximum_entries=16,
+                    maximum_name_bytes=4096,
+                    maximum_total_bytes=(
+                        replacement_limit.maximum_total_bytes + 8 * 1024 * 1024
+                    ),
+                ),
+                snapshot=classified,
+                base_generation=base_generation,
+            )
+            authorities.clear()
+        return classified, root, base_generation, retained_owner
     except ActivationPreparationError:
         raise
     except (PlatformFileError, OSError) as error:
@@ -1168,6 +1469,57 @@ def _inspect_portable_replacement_namespace(
                     close_error = error
         if active_error is None and close_error is not None:
             raise close_error
+
+
+def _inspect_portable_replacement_namespace(
+    *,
+    identity: CanonicalResourceIdentity,
+    backend: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> tuple[
+    _PortableReplacementNamespaceSnapshot | None,
+    RootedDirectoryAuthority,
+    _PortablePublicationPhaseRecord,
+]:
+    snapshot, root, base_generation, retained_owner = (
+        _inspect_portable_replacement_namespace_owned(
+            identity=identity,
+            backend=backend,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+            retain_current_owner=False,
+        )
+    )
+    if retained_owner is not None:
+        retained_owner.close()
+        raise AssertionError("ordinary replacement inspection retained an owner")
+    return snapshot, root, base_generation
+
+
+def _inspect_portable_replacement_namespace_for_runtime_open(
+    *,
+    identity: CanonicalResourceIdentity,
+    backend: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> tuple[
+    _PortableReplacementNamespaceSnapshot | None,
+    RootedDirectoryAuthority,
+    _PortablePublicationPhaseRecord,
+    _RetainedPortableReplacementInspection | None,
+]:
+    return _inspect_portable_replacement_namespace_owned(
+        identity=identity,
+        backend=backend,
+        persistent_private=persistent_private,
+        descendant_inspection=descendant_inspection,
+        caller_borrow=caller_borrow,
+        retain_current_owner=True,
+    )
 
 
 class _PortableRecoveryStorePort(Protocol):
@@ -1294,6 +1646,24 @@ class _PortableRecoveryStorePort(Protocol):
         descendant_inspection: LockedDescendantNamespaceInspection,
         caller_borrow: _CallerHeldPortableJournalBorrow,
     ) -> ActivationRecoveryReport | None: ...
+
+    def rehydrate_completed_portable_base_for_runtime_open(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> tuple[ActivationRecoveryReport | None, object | None]: ...
+
+    def defer_completed_portable_replacement_runtime_owner(
+        self,
+        *,
+        view: _SQLiteGenerationView,
+        database: BoundContentFacts,
+        base_generation: _PortablePublicationPhaseRecord,
+        replacement_inspection: _RetainedPortableReplacementInspection,
+    ) -> object: ...
 
     def rehydrate_portable_schema_upgrade_predecessor_base(
         self,
@@ -1863,6 +2233,30 @@ def rehydrate_completed_portable_replacement_activation(
 ) -> ActivationRecoveryReport | None:
     """Read-only hydrate only a current-schema portable authority."""
 
+    report, deferred_owner = _rehydrate_completed_portable_replacement_activation(
+        port,
+        platform=platform,
+        persistent_private=persistent_private,
+        descendant_inspection=descendant_inspection,
+        caller_borrow=caller_borrow,
+        schema_upgrade_predecessor=False,
+        runtime_open=False,
+    )
+    if deferred_owner is not None:
+        raise AssertionError("ordinary hydration returned a deferred owner")
+    return report
+
+
+def rehydrate_completed_portable_replacement_runtime_open(
+    port: _PortableRecoveryStorePort,
+    *,
+    platform: PlatformFileBackend,
+    persistent_private: PersistentPrivateProof,
+    descendant_inspection: LockedDescendantNamespaceInspection,
+    caller_borrow: _CallerHeldPortableJournalBorrow,
+) -> tuple[ActivationRecoveryReport | None, object | None]:
+    """Hydrate for one caller-retained open, deferring only its terminal owner."""
+
     return _rehydrate_completed_portable_replacement_activation(
         port,
         platform=platform,
@@ -1870,6 +2264,7 @@ def rehydrate_completed_portable_replacement_activation(
         descendant_inspection=descendant_inspection,
         caller_borrow=caller_borrow,
         schema_upgrade_predecessor=False,
+        runtime_open=True,
     )
 
 
@@ -1883,14 +2278,18 @@ def rehydrate_portable_schema_upgrade_predecessor(
 ) -> ActivationRecoveryReport | None:
     """Hydrate one exact portable v1 owner as upgrade-only authority."""
 
-    return _rehydrate_completed_portable_replacement_activation(
+    report, deferred_owner = _rehydrate_completed_portable_replacement_activation(
         port,
         platform=platform,
         persistent_private=persistent_private,
         descendant_inspection=descendant_inspection,
         caller_borrow=caller_borrow,
         schema_upgrade_predecessor=True,
+        runtime_open=False,
     )
+    if deferred_owner is not None:
+        raise AssertionError("schema-upgrade hydration returned a deferred owner")
+    return report
 
 
 def _rehydrate_completed_portable_replacement_activation(
@@ -1901,11 +2300,39 @@ def _rehydrate_completed_portable_replacement_activation(
     descendant_inspection: LockedDescendantNamespaceInspection,
     caller_borrow: _CallerHeldPortableJournalBorrow,
     schema_upgrade_predecessor: bool,
-) -> ActivationRecoveryReport | None:
+    runtime_open: bool,
+) -> tuple[ActivationRecoveryReport | None, object | None]:
     """Shared strict hydration; legacy mode is upgrade-only and explicit."""
 
     if type(schema_upgrade_predecessor) is not bool:
         raise TypeError("schema upgrade predecessor mode must be exact bool")
+    if type(runtime_open) is not bool:
+        raise TypeError("runtime open mode must be exact bool")
+    if runtime_open and schema_upgrade_predecessor:
+        raise ValueError("runtime open cannot defer a schema-upgrade predecessor")
+
+    def hydrate_base() -> tuple[ActivationRecoveryReport | None, object | None]:
+        if runtime_open:
+            return port.rehydrate_completed_portable_base_for_runtime_open(
+                platform=platform,
+                persistent_private=persistent_private,
+                descendant_inspection=descendant_inspection,
+                caller_borrow=caller_borrow,
+            )
+        operation = (
+            port.rehydrate_portable_schema_upgrade_predecessor_base
+            if schema_upgrade_predecessor
+            else port.rehydrate_completed_portable_base
+        )
+        return (
+            operation(
+                platform=platform,
+                persistent_private=persistent_private,
+                descendant_inspection=descendant_inspection,
+                caller_borrow=caller_borrow,
+            ),
+            None,
+        )
 
     if not (
         isinstance(platform, PlatformFileBackend)
@@ -1929,39 +2356,57 @@ def _rehydrate_completed_portable_replacement_activation(
         f"{port.resource_identity.target_identity}"
     )
     if root.inspect_entry(private_name) is None:
-        hydrate_base = (
-            port.rehydrate_portable_schema_upgrade_predecessor_base
-            if schema_upgrade_predecessor
-            else port.rehydrate_completed_portable_base
-        )
-        return hydrate_base(
-            platform=platform,
-            persistent_private=persistent_private,
-            descendant_inspection=descendant_inspection,
-            caller_borrow=caller_borrow,
-        )
-    snapshot, _root, _base_generation = (
-        _inspect_portable_replacement_namespace(
-            identity=port.resource_identity,
-            backend=platform,
-            persistent_private=persistent_private,
-            descendant_inspection=descendant_inspection,
-            caller_borrow=caller_borrow,
+        return hydrate_base()
+    replacement_names = tuple(
+        _portable_replacement_phase_name(phase)
+        for phase in (
+            "PREPARED",
+            "DB_REPLACED",
+            "MANIFEST_PUBLISHED",
+            "GENERATION_PUBLISHED",
+            "READY",
         )
     )
+    replacement_parent = platform.bind_parent(
+        root,
+        PurePath(private_name, "replacement-presence-placeholder"),
+    )
+    try:
+        replacement_present = any(
+            replacement_parent.inspect_entry(name) is not None
+            for name in replacement_names
+        )
+    finally:
+        replacement_parent.close()
+    caller_borrow.reprove(platform, port.resource_identity)
+    if not replacement_present:
+        return hydrate_base()
+    replacement_inspection: _RetainedPortableReplacementInspection | None = None
+    if runtime_open:
+        snapshot, _root, base_generation, replacement_inspection = (
+            _inspect_portable_replacement_namespace_for_runtime_open(
+                identity=port.resource_identity,
+                backend=platform,
+                persistent_private=persistent_private,
+                descendant_inspection=descendant_inspection,
+                caller_borrow=caller_borrow,
+            )
+        )
+    else:
+        snapshot, _root, base_generation = (
+            _inspect_portable_replacement_namespace(
+                identity=port.resource_identity,
+                backend=platform,
+                persistent_private=persistent_private,
+                descendant_inspection=descendant_inspection,
+                caller_borrow=caller_borrow,
+            )
+        )
     if snapshot is None:
-        hydrate_base = (
-            port.rehydrate_portable_schema_upgrade_predecessor_base
-            if schema_upgrade_predecessor
-            else port.rehydrate_completed_portable_base
-        )
-        return hydrate_base(
-            platform=platform,
-            persistent_private=persistent_private,
-            descendant_inspection=descendant_inspection,
-            caller_borrow=caller_borrow,
-        )
+        return hydrate_base()
     if snapshot.state != "CURRENT":
+        if replacement_inspection is not None:
+            replacement_inspection.close()
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_REQUIRED",
             retryable=True,
@@ -1973,10 +2418,14 @@ def _rehydrate_completed_portable_replacement_activation(
         or type(current.unsigned.active_content_attestation)
         is not PortableActiveContentAttestation
     ):
+        if replacement_inspection is not None:
+            replacement_inspection.close()
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_REQUIRED",
             retryable=True,
         )
+    if runtime_open and replacement_inspection is None:
+        raise AssertionError("runtime replacement hydration retained no inspection")
     active = current.unsigned.active_content_attestation
     identity = port.resource_identity
     authorities: list[BoundRegularFile] = []
@@ -2066,20 +2515,21 @@ def _rehydrate_completed_portable_replacement_activation(
             active_content_attestation=active,
         )
         caller_borrow.reprove(platform, identity)
-        repeated, _repeated_root, _repeated_base = (
-            _inspect_portable_replacement_namespace(
-                identity=identity,
-                backend=platform,
-                persistent_private=persistent_private,
-                descendant_inspection=descendant_inspection,
-                caller_borrow=caller_borrow,
+        if not runtime_open:
+            repeated, _repeated_root, _repeated_base = (
+                _inspect_portable_replacement_namespace(
+                    identity=identity,
+                    backend=platform,
+                    persistent_private=persistent_private,
+                    descendant_inspection=descendant_inspection,
+                    caller_borrow=caller_borrow,
+                )
             )
-        )
-        if repeated != snapshot:
-            raise ActivationPreparationError(
-                "ACTIVATION.RECOVERY_REQUIRED",
-                retryable=True,
-            )
+            if repeated != snapshot:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
         for name, authority in zip(
             (identity.canonical_sidecar_path.name,),
             authorities,
@@ -2116,25 +2566,46 @@ def _rehydrate_completed_portable_replacement_activation(
         if active_error is None and close_error is not None:
             active_error = close_error
     if active_error is not None:
+        if replacement_inspection is not None:
+            try:
+                replacement_inspection.close()
+            except BaseException:
+                pass
         raise active_error
-    if staged_view is None:
-        raise AssertionError("portable replacement hydration produced no view")
-    port.state = "ACTIVATING"
-    port.view = None
-    port._activate_candidate_store_id(active.canonical_store_id)
-    port.adopt_portable_replacement_current(current)
-    port.view = staged_view
-    port.state = (
-        _PORTABLE_UPGRADE_REQUIRED_STATE
-        if legacy_upgrade_only
-        else "READY"
-    )
-    port.notify_all()
-    return ActivationRecoveryReport(
-        phase="GENERATION_PUBLISHED",
-        action="COMPLETED",
-        generation=active.generation,
-    )
+    try:
+        if staged_view is None:
+            raise AssertionError("portable replacement hydration produced no view")
+        port.state = "ACTIVATING"
+        port.view = None
+        port._activate_candidate_store_id(active.canonical_store_id)
+        port.adopt_portable_replacement_current(current)
+        port.view = staged_view
+        port.state = (
+            _PORTABLE_UPGRADE_REQUIRED_STATE
+            if legacy_upgrade_only
+            else ("ACTIVATING" if runtime_open else "READY")
+        )
+        report = ActivationRecoveryReport(
+            phase="GENERATION_PUBLISHED",
+            action="COMPLETED",
+            generation=active.generation,
+        )
+        if not runtime_open:
+            port.notify_all()
+            return report, None
+        if replacement_inspection is None:
+            raise AssertionError("runtime replacement inspection was lost")
+        deferred_owner = port.defer_completed_portable_replacement_runtime_owner(
+            view=staged_view,
+            database=observed[identity.canonical_sidecar_path.name],
+            base_generation=base_generation,
+            replacement_inspection=replacement_inspection,
+        )
+    except BaseException:
+        if replacement_inspection is not None:
+            replacement_inspection.close()
+        raise
+    return report, deferred_owner
 
 
 def _portable_recovery_activation_digest(

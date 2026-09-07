@@ -327,10 +327,25 @@ def open_canonical_tm_store(
             canonical_store_id=canonical_store_id,
             drain_timeout_seconds=drain_timeout_seconds,
         )
-        report = _rehydrate_canonical_runtime_authority(
-            coordinator,
-            identity,
-        )
+        opened_windows_store: SQLiteTMStore | None = None
+        windows_recovery = None
+        if sys.platform == "win32":
+            from tm_migration import TMMigrationService
+
+            (
+                report,
+                opened_windows_store,
+                windows_recovery,
+            ) = TMMigrationService(
+                resource_identity=identity,
+                canonical_store_id=coordinator.canonical_store_id,
+                coordinator=coordinator,
+            ).open_completed_portable_runtime()
+        else:
+            report = _rehydrate_canonical_runtime_authority(
+                coordinator,
+                identity,
+            )
         if sys.platform == "win32" and report is None:
             facts = _activation_facts(path)
             if facts is None:
@@ -346,24 +361,39 @@ def open_canonical_tm_store(
             report.action == "CANCELLED" and report.generation is None
         ):
             return None
+        if sys.platform == "win32" and windows_recovery is not None:
+            from tm_snapshot_recovery import RefreshRecoveryState
+
+            if windows_recovery.state is RefreshRecoveryState.BLOCKED:
+                raise ValueError(
+                    f"{_CANONICAL_RECOVERY_FAILED_CODE}:"
+                    f"{windows_recovery.error_code or 'RECOVERY.BLOCKED'}"
+                )
         if coordinator.current_generation is None:
             raise ValueError(_CANONICAL_UNHEALTHY_CODE)
-        store = SQLiteTMStore.from_coordinator(coordinator)
+        store = (
+            opened_windows_store
+            if opened_windows_store is not None
+            else SQLiteTMStore.from_coordinator(coordinator)
+        )
         if sys.platform == "win32":
             from tm_migration import TMMigrationService
             from tm_snapshot_recovery import RefreshRecoveryState
 
-            recovery = TMMigrationService(
-                resource_identity=identity,
-                canonical_store_id=coordinator.canonical_store_id,
-                coordinator=coordinator,
-            ).recover_configured_refresh(store)
+            recovery = windows_recovery
+            if recovery is None:
+                recovery = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id=coordinator.canonical_store_id,
+                    coordinator=coordinator,
+                ).recover_configured_refresh(store)
             if recovery.state is RefreshRecoveryState.BLOCKED:
                 raise ValueError(
                     f"{_CANONICAL_RECOVERY_FAILED_CODE}:"
                     f"{recovery.error_code or 'RECOVERY.BLOCKED'}"
                 )
-        _ = store.canonical_revision()
+        if opened_windows_store is None:
+            _ = store.canonical_revision()
     except (
         ActivationPreparationError,
         SQLiteStoreSchemaError,

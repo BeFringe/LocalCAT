@@ -480,6 +480,15 @@
   - _Boundary: ResourceStoreCoordinator / canonical health，现有发布与恢复协议不改_
   - _Depends: 8.8b_
 
+- [x] 8.8d 在同一冷开 owner 窗口复用 replacement namespace 内容事实
+  - replacement `CURRENT` hydration首次完整认证private namespace后，保留exact child handles、内容事实和private-proof token到同一次`open_completed_portable_runtime()`的terminal owner；不再次path-walk、读取或解析同一批未变记录。
+  - terminal仍重新证明W1/root/private-directory绑定、完整闭集、child live identity/name binding/DACL/MIC、device secret/MAC与owned close；任何漂移或close失败均不发布READY。
+  - owner仅限原线程、exact coordinator/view/generation和单次同步调用，不能序列化、复制或跨调用/进程复用；base generation、pending/READY_CLEANUP recovery、schema upgrade及历史activation路径保持原完整检查。
+  - 覆盖单次full inspection、terminal foreign entry、private reproof与close失败、one-shot/thread边界，并保留既有DB/lease/root故障矩阵。
+  - _Requirements: 2.9, 2.10, 2.11, 7.4, 7.5, 8.7；WA-06.6_
+  - _Boundary: Windows completed-runtime replacement owner / WA-06 owning amendment_
+  - _Depends: 8.8c, windows-platform-enablement 3.4_
+
 - [x] 8.9 刷新 oracle、双路径性能与 Gate D 发布证据
   - 先在固定 5k oracle 重算 threshold 集与真实 top-10 完备性，再在真实 100k 上分别执行 FTS5_TRIGRAM 与 GRAM_FALLBACK 的迁移、query child 和 portable evidence bundle
   - 不改变 scorer、threshold、top-k、candidate budget、corpus/cohort/seed/digest、硬门或迁移阶段口径；失败路径不得被成功路径掩盖

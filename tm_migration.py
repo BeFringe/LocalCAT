@@ -14,6 +14,7 @@ from pathlib import Path, PurePath
 import sqlite3
 import stat
 import sys
+import threading
 import time
 from types import MappingProxyType
 from typing import Any, cast
@@ -22,6 +23,7 @@ import uuid
 from tm_activation_journal import (
     ActivationRecoveryReport,
     _ActivationPreparation,
+    _PortablePublicationPhaseRecord,
     _PortableReplacementRecord,
     _WindowsPortableFreshRecoveryOwner,
     _activation_journal_path,
@@ -38,6 +40,7 @@ from tm_activation_journal import (
 from tm_activation_recovery import (
     _inspect_portable_replacement_namespace,
     _PortableReplacementRecoveryRequired,
+    _RetainedPortableReplacementInspection,
 )
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
@@ -95,6 +98,7 @@ from tm_sqlite_store import (
     SQLiteStoreLifecycleError,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
+    _DeferredPortableRuntimeOwner,
     _APPROVED_SCHEMA_DIGESTS,
     _FTS5_STATEMENT,
     _SCHEMA_STATEMENTS,
@@ -2605,6 +2609,12 @@ class TMMigrationService:
         # its callback window.  It is deliberately instance-local: callers
         # create one service per operation, and no second W1 may be minted.
         self._active_owner_reservation: _InitialActivationResourceReservation | None = None
+        # Cold-open configured recovery uses the same service seam while the
+        # completed-runtime W1/root remains live.  The projection exists only
+        # for that synchronous call and is always cleared before return.
+        self._active_open_reservation: _InitialActivationResourceReservation | None = None
+        self._active_open_owner: _DeferredPortableRuntimeOwner | None = None
+        self._active_open_thread: threading.Thread | None = None
 
     @property
     def resource_identity(self) -> CanonicalResourceIdentity:
@@ -2654,6 +2664,89 @@ class TMMigrationService:
                 store.health()
                 reservation.reprove()
                 return portable
+        except _InitialActivationReservationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
+
+    def open_completed_portable_runtime(
+        self,
+    ) -> tuple[
+        ActivationRecoveryReport | None,
+        SQLiteTMStore | None,
+        RefreshRecoveryOutcome | None,
+    ]:
+        """Open one completed Windows runtime under a single retained owner.
+
+        Normal cold open no longer releases W1/root after hydration only to
+        reacquire and authenticate the same namespace for configured-refresh
+        recovery.  The clean no-op path retains that operation authority
+        through first health, database recovery-fact classification, fixed
+        artifact absence, and one terminal full owner reproof.  Any non-clean
+        fact falls through to the unchanged recovery state machine under the
+        same reservation; no proof is reused across calls or processes.
+        """
+
+        coordinator = self._coordinator
+        if coordinator is None or (
+            coordinator._resource_identity != self._resource_identity
+            or coordinator.canonical_store_id != self._canonical_store_id
+        ):
+            raise MigrationPreflightError(
+                "MIGRATION.COORDINATOR_IDENTITY_MISMATCH"
+            )
+        if sys.platform != "win32":
+            return None, None, None
+        try:
+            reservation = self._acquire_initial_reservation()
+        except _InitialActivationReservationError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            ) from error
+        deferred_owner: _DeferredPortableRuntimeOwner | None = None
+        try:
+            with reservation:
+                try:
+                    portable, deferred_owner = (
+                        coordinator.rehydrate_completed_portable_runtime_open(
+                            **reservation.portable_runtime_inputs(),
+                        )
+                    )
+                    if portable is None:
+                        reservation.reprove()
+                        return None, None, None
+                    store = (
+                        SQLiteTMStore._from_deferred_runtime_owner(
+                            coordinator,
+                            deferred_owner,
+                        )
+                        if deferred_owner is not None
+                        else SQLiteTMStore.from_coordinator(coordinator)
+                    )
+                    self._active_open_reservation = reservation
+                    self._active_open_owner = deferred_owner
+                    self._active_open_thread = threading.current_thread()
+                    recovery = self.recover_configured_refresh(store)
+                finally:
+                    self._active_open_reservation = None
+                    self._active_open_owner = None
+                    self._active_open_thread = None
+                    if deferred_owner is not None and not deferred_owner.completed:
+                        deferred_owner.abort()
+                if (
+                    deferred_owner is not None
+                    and recovery.state is not RefreshRecoveryState.BLOCKED
+                    and not deferred_owner.completed
+                ):
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                if deferred_owner is None:
+                    reservation.reprove()
+                return portable, store, recovery
         except _InitialActivationReservationError as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
@@ -5007,52 +5100,44 @@ class TMMigrationService:
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be exact SQLiteTMStore")
         if sys.platform == "win32":
+            active_open_reservation = self._active_open_reservation
+            if active_open_reservation is not None:
+                try:
+                    if self._active_open_thread is not threading.current_thread():
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_REQUIRED",
+                            retryable=True,
+                        )
+                    return self._recover_bound_configured_refresh_reserved(
+                        store,
+                        reservation=active_open_reservation,
+                        completed_runtime_open=True,
+                        deferred_owner=self._active_open_owner,
+                    )
+                except (
+                    _InitialActivationReservationError,
+                    ActivationPreparationError,
+                    PlatformFileError,
+                    SQLiteStoreLifecycleError,
+                    SQLiteStoreSchemaError,
+                    sqlite3.DatabaseError,
+                    OSError,
+                ) as error:
+                    return RefreshRecoveryOutcome(
+                        state=RefreshRecoveryState.BLOCKED,
+                        error_code=_recovery_error_code(error),
+                        retryable=_recovery_retryable(error),
+                    )
             reservation: _InitialActivationResourceReservation | None = None
-            sidecar_guard: BoundExistingFileMutationGuard | None = None
-            family: _BoundConfiguredRefreshRecoveryFamily | None = None
             try:
                 reservation = self._acquire_initial_reservation()
                 with reservation:
-                    backend, root, lease, _lock_name, _payload = (
-                        reservation.bound_family_inputs()
-                    )
-                    revision = store.canonical_revision()
-                    if (
-                        revision.resource_id
-                        != self._resource_identity.resource_id
-                        or revision.canonical_store_id
-                        != self._canonical_store_id
-                    ):
-                        raise SQLiteStoreSchemaError(
-                            "STORE.RESOURCE_IDENTITY_MISMATCH"
-                        )
-                    reservation.reprove_bound_refresh_owner(
-                        self._canonical_store_id, revision.generation
-                    )
-                    sidecar_guard = (
-                        self._acquire_bound_refresh_sidecar_guard(
-                            reservation=reservation,
-                            backend=backend,
-                            root=root,
-                        )
-                    )
-                    family = self._compose_bound_refresh_recovery_family(
+                    return self._recover_bound_configured_refresh_reserved(
+                        store,
                         reservation=reservation,
-                        backend=backend,
-                        root=root,
-                        lease=lease,
-                        sidecar_guard=sidecar_guard,
-                        generation=revision.generation,
+                        completed_runtime_open=False,
+                        deferred_owner=None,
                     )
-                    outcome = store.recover_bound_configured_refresh(family)
-                    close_error = _close_bound_export_authorities(
-                        family, sidecar_guard
-                    )
-                    family = None
-                    sidecar_guard = None
-                    if close_error is not None:
-                        raise close_error
-                    return outcome
             except (
                 _InitialActivationReservationError,
                 ActivationPreparationError,
@@ -5068,7 +5153,6 @@ class TMMigrationService:
                     retryable=_recovery_retryable(error),
                 )
             finally:
-                _close_bound_export_authorities(family, sidecar_guard)
                 if reservation is not None:
                     try:
                         reservation.release()
@@ -5090,6 +5174,204 @@ class TMMigrationService:
                 error_code=_recovery_error_code(error),
                 retryable=_recovery_retryable(error),
             )
+
+    def _recover_bound_configured_refresh_reserved(
+        self,
+        store: SQLiteTMStore,
+        *,
+        reservation: _InitialActivationResourceReservation,
+        completed_runtime_open: bool,
+        deferred_owner: _DeferredPortableRuntimeOwner | None,
+    ) -> RefreshRecoveryOutcome:
+        """Recover under one caller-retained Windows W1/root operation."""
+
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        if type(reservation) is not _InitialActivationResourceReservation:
+            raise TypeError("reservation must be exact initial reservation")
+        if type(completed_runtime_open) is not bool:
+            raise TypeError("completed_runtime_open must be exact bool")
+        if deferred_owner is not None and type(deferred_owner) is not (
+            _DeferredPortableRuntimeOwner
+        ):
+            raise TypeError("deferred_owner must be exact runtime owner or None")
+        if deferred_owner is not None and not completed_runtime_open:
+            raise ValueError("deferred owner requires completed runtime open")
+        sidecar_guard: BoundExistingFileMutationGuard | None = None
+        family: _BoundConfiguredRefreshRecoveryFamily | None = None
+        try:
+            backend, root, lease, _lock_name, _payload = (
+                reservation.bound_family_inputs()
+            )
+            with store.configured_refresh_reservation():
+                sidecar_guard = self._acquire_bound_refresh_sidecar_guard(
+                    reservation=reservation,
+                    backend=backend,
+                    root=root,
+                )
+                if completed_runtime_open:
+                    store.health()
+                revision = store.canonical_revision()
+                if (
+                    revision.resource_id != self._resource_identity.resource_id
+                    or revision.canonical_store_id != self._canonical_store_id
+                ):
+                    raise SQLiteStoreSchemaError(
+                        "STORE.RESOURCE_IDENTITY_MISMATCH"
+                    )
+                startup_noop: RefreshRecoveryOutcome | None = None
+                artifacts_absent = False
+                if completed_runtime_open:
+                    startup_noop = (
+                        store._classify_bound_configured_refresh_startup_noop()
+                    )
+                    paths = _export_artifact_paths(
+                        self._resource_identity.configured_jsonl_path
+                    )
+                    artifacts_absent = all(
+                        root.inspect_entry(path.name) is None
+                        for path in (
+                            paths.jsonl_temp,
+                            paths.manifest_temp,
+                            paths.jsonl_recovery,
+                            paths.manifest_recovery,
+                        )
+                    )
+                if startup_noop is not None and artifacts_absent:
+                    if deferred_owner is None:
+                        reservation.reprove_bound_refresh_owner(
+                            self._canonical_store_id,
+                            revision.generation,
+                        )
+                        sidecar_guard.reprove()
+                        lease.reprove()
+                        root.reprove()
+                    outcome = startup_noop
+                else:
+                    reservation.reprove_bound_refresh_owner(
+                        self._canonical_store_id,
+                        revision.generation,
+                    )
+                    family = self._compose_bound_refresh_recovery_family(
+                        reservation=reservation,
+                        backend=backend,
+                        root=root,
+                        lease=lease,
+                        sidecar_guard=sidecar_guard,
+                        generation=revision.generation,
+                    )
+                    outcome = store.recover_bound_configured_refresh(family)
+                    close_error = _close_bound_export_authorities(
+                        family,
+                        sidecar_guard,
+                    )
+                    family = None
+                    sidecar_guard = None
+                    if close_error is not None:
+                        raise close_error
+                    if (
+                        deferred_owner is not None
+                        and outcome.state is not RefreshRecoveryState.BLOCKED
+                    ):
+                        # Strict recovery may legitimately commit recovery rows.
+                        # Re-health the resulting DB so completion can require its
+                        # exact current semantic/index witness.
+                        store.health()
+                        sidecar_guard = self._acquire_bound_refresh_sidecar_guard(
+                            reservation=reservation,
+                            backend=backend,
+                            root=root,
+                        )
+            if (
+                deferred_owner is not None
+                and outcome.state is not RefreshRecoveryState.BLOCKED
+            ):
+                assert sidecar_guard is not None
+                self._complete_deferred_runtime_owner(
+                    store=store,
+                    deferred_owner=deferred_owner,
+                    reservation=reservation,
+                    backend=backend,
+                    root=root,
+                    lease=lease,
+                    sidecar_guard=sidecar_guard,
+                    generation=revision.generation,
+                )
+                sidecar_guard = None
+            return outcome
+        finally:
+            _close_bound_export_authorities(family, sidecar_guard)
+
+    def _complete_deferred_runtime_owner(
+        self,
+        *,
+        store: SQLiteTMStore,
+        deferred_owner: _DeferredPortableRuntimeOwner,
+        reservation: _InitialActivationResourceReservation,
+        backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority,
+        lease: LockLease,
+        sidecar_guard: BoundExistingFileMutationGuard,
+        generation: int,
+    ) -> None:
+        """Close one cold-open bracket only over fresh complete DB facts."""
+
+        reservation.reprove_bound_refresh_owner(
+            self._canonical_store_id,
+            generation,
+            replacement_inspection=(
+                deferred_owner.retained_replacement_inspection()
+            ),
+        )
+        base_generation = reservation.take_reproved_base_generation()
+        sidecar_guard.reprove()
+        lease.reprove()
+        database = backend.open_regular(
+            root,
+            PurePath(self._resource_identity.canonical_sidecar_path.name),
+        )
+        try:
+            facts = database.content_facts()
+            if root.inspect_entry(
+                self._resource_identity.canonical_sidecar_path.name
+            ) != facts.snapshot:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            lease.reprove()
+            root.reprove()
+
+            def terminal_cleanup() -> None:
+                close_error = _close_bound_export_authorities(
+                    database, sidecar_guard,
+                )
+                release_error: BaseException | None = None
+                try:
+                    reservation.release()
+                except BaseException as error:
+                    release_error = error
+                if close_error is not None:
+                    raise close_error
+                if release_error is not None:
+                    raise release_error
+
+            deferred_owner.complete(
+                coordinator=store.coordinator,
+                resource_identity=self._resource_identity,
+                canonical_store_id=self._canonical_store_id,
+                generation=generation,
+                base_generation=base_generation,
+                database=facts,
+                terminal_cleanup=terminal_cleanup,
+            )
+        except BaseException:
+            _close_bound_export_authorities(database, sidecar_guard)
+            try:
+                reservation.release()
+            except BaseException:
+                pass
+            raise
 
     def _run_bound_arbitrary_export(
         self,
@@ -9861,6 +10143,7 @@ class _InitialActivationResourceReservation:
         "_journal_borrow_minted",
         "_recovery_borrow_minted",
         "_initial_attempt",
+        "_last_reproved_base_generation",
     )
 
     def __init__(
@@ -9888,6 +10171,9 @@ class _InitialActivationResourceReservation:
         self._journal_borrow_minted = False
         self._recovery_borrow_minted = False
         self._initial_attempt: _InitialStageAttempt | None = None
+        self._last_reproved_base_generation: (
+            _PortablePublicationPhaseRecord | None
+        ) = None
 
     @classmethod
     def acquire_with_backend(
@@ -10284,6 +10570,8 @@ class _InitialActivationResourceReservation:
         self,
         canonical_store_id: str,
         expected_generation: int,
+        *,
+        replacement_inspection: _RetainedPortableReplacementInspection | None = None,
     ) -> None:
         """Authenticate the completed private activation chain under W1.
 
@@ -10302,17 +10590,38 @@ class _InitialActivationResourceReservation:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
-        inputs = self.fresh_refresh_owner_inputs()
+        if replacement_inspection is not None and type(
+            replacement_inspection
+        ) is not _RetainedPortableReplacementInspection:
+            raise TypeError("replacement_inspection is invalid")
+        self._last_reproved_base_generation = None
         try:
-            snapshot, inspected_root, base_generation = (
-                _inspect_portable_replacement_namespace(
-                    identity=self._identity,
-                    backend=cast(PlatformFileBackend, inputs["platform"]),
-                    persistent_private=inputs["persistent_private"],
-                    descendant_inspection=inputs["descendant_inspection"],
-                    caller_borrow=inputs["caller_borrow"],
+            if replacement_inspection is None:
+                inputs = self.fresh_refresh_owner_inputs()
+                snapshot, inspected_root, base_generation = (
+                    _inspect_portable_replacement_namespace(
+                        identity=self._identity,
+                        backend=cast(PlatformFileBackend, inputs["platform"]),
+                        persistent_private=inputs["persistent_private"],
+                        descendant_inspection=inputs["descendant_inspection"],
+                        caller_borrow=inputs["caller_borrow"],
+                    )
                 )
-            )
+            else:
+                if self._backend is None or self._root is None or self._lease is None:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    )
+                self.reprove()
+                snapshot, inspected_root, base_generation = (
+                    replacement_inspection.terminal_reprove(
+                        identity=self._identity,
+                        backend=self._backend,
+                        root=self._root,
+                        lease=self._lease,
+                    )
+                )
         except ActivationPreparationError:
             raise
         except (PlatformFileError, OSError) as error:
@@ -10351,6 +10660,21 @@ class _InitialActivationResourceReservation:
                 retryable=True,
             )
         self.reprove()
+        self._last_reproved_base_generation = base_generation
+
+    def take_reproved_base_generation(
+        self,
+    ) -> _PortablePublicationPhaseRecord:
+        """Consume the generation record from the immediately prior full scan."""
+
+        record = self._last_reproved_base_generation
+        self._last_reproved_base_generation = None
+        if type(record) is not _PortablePublicationPhaseRecord:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        return record
 
     def stage_seal_inputs(
         self,
@@ -10669,6 +10993,7 @@ class _InitialActivationResourceReservation:
         if self._released:
             return
         self._released = True
+        self._last_reproved_base_generation = None
         if self._backend is not None:
             deferred: BaseException | None = None
             if self._lease is not None:
