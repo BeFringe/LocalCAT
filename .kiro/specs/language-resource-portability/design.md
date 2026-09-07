@@ -86,6 +86,12 @@ ResourcePackage 可以复用或后续抽取以下无语义原语：
 - **Frozen resources**：package/profile data 的 relative layout 由 ADR-022 manifest 与 trusted bundle root 解析；Resource 模块不从 CWD、checkout absolute path 或待验证 `__file__` 推断发行数据。
 - **Verification**：direct/package export→validate→preview→create/replace→cold reopen 覆盖 Windows junction/swap/share/kill/recovery 和 non-repo CWD；最终由 TM/Termbase owner reader 与 receipt 闭合，不以 ZIP 可打开代替。
 
+### ADR-027：ResourcePackage 输出锁收尾
+
+- **Scope amendment**：已批准；只对 Windows `.localcat-resource` 导出使用平台输出锁闲置回收。普通锁和输出权威继续遵循 ADR-020/023；direct CSV/JSONL、import/apply、payload stage 清理、POSIX 与 frozen trust 不属于本修订。
+- **Steering sync**：继承 Governance owner 的 ADR-027 与 ADR-020/023 取代元数据，不由本 Spec 重复修改 Steering。
+- **Downstream revalidation**：Task 3.3a 依赖平台 Task 3.3a；重新验证 package 三种既有 payload profile 的 success/ledger failure/terminal failure 和 direct CSV/JSONL 不触发回收。Qt 仍只消费原 outcome，receipt/pending schema 不扩展。
+
 ## Architecture
 
 ### Dependency Map
@@ -547,6 +553,24 @@ STAGED -> VALIDATED -> LKG_READY -> PUBLISHED -> READBACK_PROVEN
 - target 未知或恢复结果不可证明：只返回 recovery-required/manual-required，不 unlink/replace；
 - actual destination 冷重开与 receipt durable 之前不返回 success；receipt-ready 的终止清理可在 fresh process 中幂等完成。
 
+### ResourcePackage 终结回调与输出锁收尾
+
+当前 `ResourceArtifactSaveService.publish()` 的 `owner_commit` 只把 durable pending 推进到 receipt-ready；最终 `ResourceReceiptLedger.commit()` 在发布器返回后发生。因此不能在原发布器 `finally` 中凭“正常返回”直接回收锁。
+
+`publish(..., owner_commit: Callable[[ResourceArtifactPublication, ValidationT], None], owner_finalize: Callable[[], None] | None = None)` 保留既有 tuple 返回值、validator 与 owner_commit 语义。只有 `export_package()` 提供 `owner_finalize`，由该回调提交同一 exact ready receipt；publisher 完成 retained readback、owner_commit、terminal reproof 与 owned LKG 清理后才调用它，且至多调用一次。原 package 调用方在返回后不重复 commit；direct CSV 不传该回调，原返回后 commit 路径不变。
+
+```text
+发布并读回 -> receipt-ready -> terminal reproof -> owned LKG 清理
+        -> owner_finalize 提交既有 receipt -> 正常结束 retained publication
+        -> finish_output_lock 消费 lease -> 返回原导出 outcome
+```
+
+- publisher 不导入 ledger，不持久化新的 operation 状态，也不把 parent/lease 暴露给 Qt 或公开 receipt。`resource_portability.py` 仍拥有 pending 与最终回执，`resource_artifact_save.py` 只调回调并在安全的终结位置消费可选平台 port。
+- owner_finalize 或之前任何 publish/readback/terminal/cleanup 失败，不请求锁回收；沿既有 receipt-ready/manual/recovery-required 语义传播，保留恢复事实，不因 callback 迁移而把失败变为 success 或重复写回执。
+- 回调正常结束且 retained publication 正常 close 后，才在 parent 仍存活时请求 `finish_output_lock(parent, lease)`；缺少可选能力时普通 close。平台 `IN_USE`/`NOT_PROVEN` 不改变已闭合 outcome；retained publication close 不确定时只保留普通锁，不宣称清理完成。
+- 终结资格仅说明本次 operation 已闭合，不证明没有另一进程的 pending/recovery。不扩展 path-free receipt 格式，不建立跨进程输出路径映射，不扫描 AppData 或输出目录认领其他 operation。
+- **文件边界与验证**：修改 `resource_artifact_save.py` 的可选终结 seam 和 `resource_portability.py` 的 package 单次 commit 编排；新增 `tests/test_resource_output_lock_retirement_windows.py` 验证无竞争时只保留最终包、三种既有 profile 冷验证与原 receipt 一致、ledger/terminal 失败保留锁、平台收尾失败不推翻回执、direct CSV/JSONL 不调用能力。payload handler 与随机临时正文的清理不归本修订。对应 6.7–6.8。
+
 ## Receipt Ledger（Cluster 1 通用基座）
 
 `ResourceReceiptLedger` 是 Core/Application-owned 本地操作证据，不是 resource canonical store。建议布局：
@@ -697,6 +721,7 @@ Port 不暴露 path、member lookup、manifest parser 或 apply handle。Provide
 | 4 Manifest/profile/limits | contracts + canonical codec | hostile JSON/limit matrix |
 | 5 Carrier | resource package reader/writer | raw ZIP adversarial suite |
 | 6 Export publication | artifact save/recovery | full fault matrix + cold recovery |
+| 6.7–6.8 Windows 输出收尾 | package finalization、可选平台输出锁能力 | 单次 ledger commit、异常保留、无竞争目录结果与 direct 路径隔离 |
 | 7 Validate/preview | sealed package + prepared import | zero-write/stale/forgery tests |
 | 8 Import/apply | repository + TM/Termbase owner ports | create/replace/cold reopen/faults |
 | 9 Reports/receipts | receipt codec/ledger | closure/serialization/restart tests |

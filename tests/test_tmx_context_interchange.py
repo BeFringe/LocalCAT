@@ -31,7 +31,6 @@ from tmx_context_interchange import (
     inspect_tmx_payload,
     prepare_tmx_payload,
 )
-from tmx_resource_package_handler import _write_private_payload
 
 
 class TmxContextInterchangeTests(unittest.TestCase):
@@ -66,7 +65,7 @@ class TmxContextInterchangeTests(unittest.TestCase):
         self.assertEqual(len(set(part.split('"', 1)[0] for part in text.split('tuid="')[1:])), 2)
         self.assertIn("same &amp; &lt;source&gt;", text)
 
-    def test_private_package_writer_preserves_proved_payload_bytes(self) -> None:
+    def test_proved_payload_bytes_roundtrip_through_parser(self) -> None:
         payload = prepare_tmx_payload(
             self.binding(1),
             TmxEffectiveLocales("en-US", "zh-CN"),
@@ -74,7 +73,7 @@ class TmxContextInterchangeTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary).resolve() / "private-payload.tmx"
-            _write_private_payload(path, payload.data)
+            path.write_bytes(payload.data)
 
             self.assertEqual(path.read_bytes(), payload.data)
             self.assertEqual(
