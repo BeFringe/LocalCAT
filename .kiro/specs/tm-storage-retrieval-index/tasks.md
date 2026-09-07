@@ -472,7 +472,7 @@
   - _Boundary: Migration Content Attestation / WA-06 owning amendment_
   - _Depends: 8.8a_
 
-- [ ] 8.8c 复用当前进程内已完整验证的 canonical 索引事实
+- [x] 8.8c 复用当前进程内已完整验证的 canonical 索引事实
   - 由Core coordinator私有保存exact view/generation绑定的当前DB验证结果，不改写历史active attestation；首次恢复与health全验后须经retained DB终端复证和close成功才可保存。
   - 每次health仍完整证明当前DB活身份与SHA-256，保持meta/ledger/binding检查；DB变化重新全验，身份漂移拒绝，跨coordinator/view/generation/进程不得借用结果。
   - RED/GREEN覆盖追加后冷开仅一次全验、连续health、相同大小篡改、同字节替换、合法写入、源对分歧、validator/终端/close失败、并发与过期query lease；Windows真实配置取证区分首页首帧与全部TM可用。

@@ -1112,6 +1112,14 @@ facade 每次进程级打开都必须重建同一权威判定，不得把“本�
 
 冷打开先恢复 canonical generation/lineage，再由 `SourceBindingMonitor` 对 completed binding 派生 CURRENT、HISTORY 或 DIVERGED；不得反过来要求 binding revision 必须等于 head 才允许恢复 generation。
 
+### 当前进程的 canonical 索引验证结果复用
+
+合法append后的DB不再匹配历史active attestation，冷重开仍须完整验证当前DB，但不能因此在同一进程、同一generation、未变内容的后续health里反复执行相同索引语义扫描。Core coordinator私有地保留一份当前验证结果，绑定exact coordinator/view、resource/store/generation、当前DB完整size/SHA-256与本次rooted观察的文件身份，以及实际验证过的schema/index能力。它不是activation authority，不修改历史attestation、journal、receipt、generation或持久格式，不跨进程恢复，不由UI、caller布尔值或公开构造参数注入。
+
+首次portable hydration仅在完整candidate validator、其后的DB/namespace终端复证与owned handle关闭全部成功后保存当前结果。health消费它之前仍以新rooted handle完整捕获DB，并独立证明当前文件authority；历史记录的FileId不得代替当前活句柄证明。exact view/generation不匹配时不复用，当前文件身份漂移拒绝，稳定内容变化回到完整validator。health的SQLite只读事务和retained DB读取窗口覆盖验证/复用与终端复证；失败或close异常不发行新结果。失败时撤销索引语义复用，但保留该exact view已验证的身份锚点，禁止把第一次拒绝的外来替换在第二次重试时重新接纳；锚点只用于否决漂移，不能代替新rooted proof或授予语义复用。后续合法写入造成的新内容只在重新全验并闭合相同窗口后替换旧结果。
+
+该结果只决定是否重复调用candidate索引validator。meta、generation、当前ledger/binding检查与历史active attestation的独立命中条件保持原样；不能把当前record_count或receipt塞回历史attestation。JSONL/manifest分歧继续归SourceBindingMonitor。恢复namespace、W1/W2、publication及terminal证明均不因本项跳过或缓存；跨线程交接不携带SQLite连接或尚未结束的临时句柄。
+
 ### TMBenchmark
 
 ```python
