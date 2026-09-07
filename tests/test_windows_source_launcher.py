@@ -149,6 +149,102 @@ class WindowsSourceLauncherTests(unittest.TestCase):
                 launcher.install_windows_source_launcher(target)
             self.assertFalse(target.exists())
 
+    def test_installer_rejects_package_redirected_appdata_before_writing(self) -> None:
+        redirected = Path(
+            r"C:\Users\tester\AppData\Local\Packages"
+            r"\Example.Package_123\LocalCache\Local\LocalCAT"
+        )
+        with patch.object(
+            launcher,
+            "_local_application_directory",
+            return_value=redirected,
+        ), patch.object(launcher, "_current_venv_pythonw") as runtime, patch.object(
+            launcher,
+            "_install_guardian_assets",
+        ) as install_assets, self.assertRaisesRegex(
+            RuntimeError,
+            "unpackaged process",
+        ):
+            launcher.install_windows_source_launcher()
+        runtime.assert_not_called()
+        install_assets.assert_not_called()
+
+    def test_installer_rejects_packaged_process_before_replacing_existing_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="LocalCAT packaged installer ") as temporary:
+            target = Path(temporary) / "LocalCAT Source.lnk"
+            target.write_bytes(b"existing shortcut")
+            with patch.object(
+                launcher,
+                "_current_process_has_package_identity",
+                return_value=True,
+            ), patch.object(launcher, "_current_venv_pythonw") as runtime, patch.object(
+                launcher,
+                "_install_guardian_assets",
+            ) as install_assets, self.assertRaisesRegex(
+                RuntimeError,
+                "unpackaged process",
+            ):
+                launcher.install_windows_source_launcher(target)
+            runtime.assert_not_called()
+            install_assets.assert_not_called()
+            self.assertEqual(target.read_bytes(), b"existing shortcut")
+
+    def test_native_path_mismatch_is_rejected(self) -> None:
+        logical = Path(r"C:\Users\tester\AppData\Local\LocalCAT")
+        physical = Path(
+            r"C:\Users\tester\AppData\Local\Packages"
+            r"\Example.Package_123\LocalCache\Local\LocalCAT"
+        )
+        with patch.object(
+            launcher,
+            "_native_final_path",
+            return_value=physical,
+        ), self.assertRaisesRegex(RuntimeError, "package-redirected"):
+            launcher._require_native_path_match(
+                logical,
+                label="Windows source guardian directory",
+            )
+
+    def test_native_extended_path_normalization_preserves_real_name(self) -> None:
+        self.assertEqual(
+            launcher._normalized_native_path(r"\\?\C:\Users\tester\LocalCAT"),
+            launcher._normalized_native_path(r"C:\Users\tester\LocalCAT"),
+        )
+
+    def test_package_redirected_path_detection_requires_appdata_localcache_shape(self) -> None:
+        self.assertTrue(
+            launcher._is_package_redirected_path(
+                Path(
+                    r"C:\Users\tester\AppData\Local\Packages"
+                    r"\Example.Package_123\LocalCache\Local\LocalCAT"
+                )
+            )
+        )
+        for ordinary in (
+            Path(r"C:\Users\tester\AppData\Local\LocalCAT"),
+            Path(r"D:\Packages\Example.Package_123\LocalCache\LocalCAT"),
+            Path(r"C:\Users\tester\AppData\Local\Packages\LocalCache"),
+        ):
+            with self.subTest(path=ordinary):
+                self.assertFalse(launcher._is_package_redirected_path(ordinary))
+
+    def test_guardian_candidate_is_removed_when_file_reveals_redirection(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="LocalCAT redirected candidate ") as temporary:
+            os.environ["LOCALAPPDATA"] = temporary
+
+            def redirected(path: Path) -> bool:
+                return path.name.endswith(".candidate")
+
+            with patch.object(
+                launcher,
+                "_is_package_redirected_path",
+                side_effect=redirected,
+            ), self.assertRaisesRegex(RuntimeError, "unpackaged process"):
+                launcher._install_guardian_assets(Path(launcher.__file__).resolve().parent)
+
+            launcher_directory = Path(temporary) / "LocalCAT" / "Launcher"
+            self.assertEqual(list(launcher_directory.iterdir()), [])
+
     def test_installed_shortcut_binds_absolute_runtime_source_icon_and_cwd(self) -> None:
         with tempfile.TemporaryDirectory(prefix="LocalCAT launcher 验收 ") as temporary:
             root = Path(temporary).resolve()
