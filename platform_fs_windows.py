@@ -47,6 +47,8 @@ from platform_fs_contracts import (
     MutableFileReservation,
     MutableFileReservationService,
     OwnedNamespaceRetirement,
+    OutputArtifactLockRetirement,
+    OutputLockFinishResult,
     PendingPublication,
     PersistentPrivateProof,
     PlatformFileError,
@@ -98,6 +100,7 @@ from windows_file_api import (
 
 __all__ = [
     "WindowsHostFacts",
+    "WindowsOutputArtifactLockRetirement",
     "WindowsPlatformAdapter",
     "WindowsProcessFileLock",
     "WindowsRootedFileSystem",
@@ -156,6 +159,11 @@ ERROR_LOCK_VIOLATION = 33
 ERROR_FILE_EXISTS = 80
 ERROR_INSUFFICIENT_BUFFER = 122
 ERROR_ALREADY_EXISTS = 183
+
+_RESOURCE_OUTPUT_LOCK_NAME_PREFIX = ".resource-artifact-"
+_RESOURCE_OUTPUT_LOCK_PAYLOAD_PREFIX = b"localcat.resource-artifact.lock.v1\0"
+_TMX_OUTPUT_LOCK_NAME_PREFIX = ".localcat-tmx-"
+_TMX_OUTPUT_LOCK_PAYLOAD_PREFIX = b"localcat.tmx-direct.lock.v1\0"
 
 _FILE_ID_EXTD_DIR_HEADER = struct.Struct("<IIqqqqqqIIII16s")
 _FILE_ID_EXTD_DIR_HEADER_BYTES = 88
@@ -3137,6 +3145,216 @@ def _read_lock_payload_without_named_open(
     if before.snapshot != after.snapshot or len(payload) != after.snapshot.byte_count:
         raise _lock_unavailable()
     return payload
+
+
+def _approved_output_lock_binding(name: str, payload: bytes) -> bool:
+    families = (
+        (
+            _RESOURCE_OUTPUT_LOCK_NAME_PREFIX,
+            _RESOURCE_OUTPUT_LOCK_PAYLOAD_PREFIX,
+        ),
+        (
+            _TMX_OUTPUT_LOCK_NAME_PREFIX,
+            _TMX_OUTPUT_LOCK_PAYLOAD_PREFIX,
+        ),
+    )
+    for name_prefix, payload_prefix in families:
+        if not name.startswith(name_prefix) or not name.endswith(".lock"):
+            continue
+        suffix = name[len(name_prefix) : -len(".lock")]
+        if (
+            len(suffix) != 32
+            or suffix != suffix.casefold()
+            or any(character not in "0123456789abcdef" for character in suffix)
+            or len(payload) != len(payload_prefix) + hashlib.sha256().digest_size
+            or not payload.startswith(payload_prefix)
+        ):
+            return False
+        return suffix == payload[len(payload_prefix) :].hex()[:32]
+    return False
+
+
+def _same_output_lock_parent(
+    parent: BoundDirectoryAuthority,
+    lease: _WindowsLockLease,
+) -> bool:
+    if (
+        parent._api is not lease._api
+        or parent._issuer is not lease._issuer
+        or parent._root_anchor is not lease._root_anchor
+        or len(parent._records) != len(lease._records)
+    ):
+        return False
+    return all(
+        left.expected_final_path == right.expected_final_path
+        and left.identity == right.identity
+        for left, right in zip(parent._records, lease._records, strict=True)
+    )
+
+
+class WindowsOutputArtifactLockRetirement(OutputArtifactLockRetirement):
+    """Reauthenticate and retire one approved idle Windows output lock."""
+
+    def __init__(
+        self,
+        *,
+        _fault_injector: _FaultInjector | None = None,
+    ) -> None:
+        if _fault_injector is not None and not callable(_fault_injector):
+            raise TypeError("_fault_injector must be callable")
+        self._fault_injector = _fault_injector
+
+    def _finish_output_lock(
+        self,
+        parent: BoundDirectoryAuthority,
+        lease: LockLease,
+    ) -> OutputLockFinishResult:
+        if type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}:
+            raise TypeError("parent must be an exact Windows directory authority")
+        if type(lease) is not _WindowsLockLease:
+            raise TypeError("lease must be an exact Windows lock lease")
+        if not _same_output_lock_parent(parent, lease):
+            raise ValueError("output lock lease belongs to a different rooted parent")
+        name = lease._entry_name
+        payload = lease._payload
+        if not _approved_output_lock_binding(name, payload):
+            raise ValueError("lock lease is not an approved output-control family")
+
+        normally_proven = True
+        deferred: BaseException | None = None
+        try:
+            try:
+                parent._reprove()
+                lease.reprove_binding(parent, name, payload)
+                _hit_fault(
+                    self._fault_injector,
+                    "output_lock_retirement_before_lease_close",
+                )
+            except Exception:
+                normally_proven = False
+            except BaseException as error:
+                deferred = error
+            try:
+                lease.close()
+            except Exception:
+                normally_proven = False
+            except BaseException as error:
+                if deferred is None:
+                    deferred = error
+            if deferred is not None:
+                raise deferred
+            if not normally_proven:
+                return OutputLockFinishResult.NOT_PROVEN
+            try:
+                _hit_fault(
+                    self._fault_injector,
+                    "output_lock_retirement_after_lease_close",
+                )
+            except Exception:
+                return OutputLockFinishResult.NOT_PROVEN
+
+            try:
+                parent._reprove()
+                entry_path = _append_component(
+                    parent._records[-1].expected_final_path,
+                    name,
+                    maximum_units=parent._maximum_component_units,
+                )
+                handle = parent._api.open_handle(
+                    entry_path,
+                    desired_access=(
+                        GENERIC_READ
+                        | GENERIC_WRITE
+                        | DELETE
+                        | FILE_READ_ATTRIBUTES
+                        | READ_CONTROL
+                        | SYNCHRONIZE
+                    ),
+                    share_mode=0,
+                    creation_disposition=OPEN_EXISTING,
+                    flags=FILE_FLAG_OPEN_REPARSE_POINT,
+                )
+            except Win32CallError as error:
+                if error.winerror in {ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND}:
+                    return OutputLockFinishResult.ABSENT
+                if error.winerror == ERROR_SHARING_VIOLATION:
+                    return OutputLockFinishResult.IN_USE
+                return OutputLockFinishResult.NOT_PROVEN
+            except Exception:
+                return OutputLockFinishResult.NOT_PROVEN
+
+            result = OutputLockFinishResult.NOT_PROVEN
+            try:
+                current_user_sid = _current_primary_user_sid(parent._api)
+                _hit_fault(
+                    self._fault_injector,
+                    "output_lock_retirement_after_exclusive_open",
+                )
+                actual = _read_lock_payload_without_named_open(
+                    parent._api,
+                    parent._records,
+                    handle,
+                    entry_path,
+                    current_user_sid,
+                )
+                if actual != payload:
+                    return OutputLockFinishResult.NOT_PROVEN
+                _hit_fault(
+                    self._fault_injector,
+                    "output_lock_retirement_before_terminal_reproof",
+                )
+                parent._reprove()
+                terminal = _read_lock_payload_without_named_open(
+                    parent._api,
+                    parent._records,
+                    handle,
+                    entry_path,
+                    current_user_sid,
+                )
+                if terminal != payload:
+                    return OutputLockFinishResult.NOT_PROVEN
+                _hit_fault(
+                    self._fault_injector,
+                    "output_lock_retirement_before_delete_mark",
+                )
+                with handle.borrow() as raw:
+                    disposition = FILE_DISPOSITION_INFO(DeleteFile=1)
+                    parent._api.checked_bool(
+                        "SetFileInformationByHandle",
+                        parent._api.SetFileInformationByHandle,
+                        raw,
+                        FILE_DISPOSITION_INFO_CLASS,
+                        ctypes.byref(disposition),
+                        ctypes.sizeof(disposition),
+                    )
+                _hit_fault(
+                    self._fault_injector,
+                    "output_lock_retirement_after_delete_mark",
+                )
+                handle.close()
+                handle = None
+                _hit_fault(
+                    self._fault_injector,
+                    "output_lock_retirement_after_delete_close",
+                )
+                parent._reprove()
+                if parent.inspect_entry(name) is None:
+                    result = OutputLockFinishResult.RETIRED
+            except Exception:
+                result = OutputLockFinishResult.NOT_PROVEN
+            finally:
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        result = OutputLockFinishResult.NOT_PROVEN
+            return result
+        finally:
+            if not lease.closed:
+                try:
+                    lease.close()
+                except Exception:
+                    pass
 
 
 class _WindowsBoundRegularFile(BoundRegularFile):
@@ -7145,6 +7363,7 @@ def _verify_private_proof_material(
 class WindowsPlatformAdapter(
     WindowsRootedFileSystem,
     WindowsProcessFileLock,
+    WindowsOutputArtifactLockRetirement,
     PrivateStorageProof,
     PersistentPrivateProof,
 ):
