@@ -21,6 +21,7 @@ WA-06 `R3`依据ADR-024/025完整取代`R2`，`R1`与`R2`只保留在dispatch le
 3. FileId 只证明一次 live handle observation，不是永久资源身份；recreate/reuse、ACL drift、mixed proof、pending/ambiguous recovery必须 fail closed，设备本地资格只能在同一 owner envelope 内复证。
 4. SQLite FTS5/trigram 和 fallback 必须在 Windows 创建、查询、关闭、进程重开后分别验证；activation、snapshot与export消费`WindowsDocumentedPublishV1`，不确定时平台返回`RECOVERY_REQUIRED`，owner-visible durable state在fault/process kill/app restart/正常OS reboot后只允许完整old、完整new或recovery-only，不得以可打开SQLite或FTS5 available代替capability gate。
 5. source与frozen运行时均不依赖硬件`DurabilityProfile` registry；frozen manifest移除该registry输入，但ADR-022的其他strict bootstrap/source closure要求不变。本 amendment不改变exact/context/fuzzy/scorer、100k门、Excel三态或UI。
+6. When Windows completed-runtime cold open 已在同一resource W1、同一root与同一线程内完整认证一个无pending的replacement `CURRENT` namespace, Core可把该次认证的exact child handles与内容事实保留到同一次同步open的terminal owner；terminal仍须重新证明W1/root/private-directory绑定、完整有界闭集、每个child的live identity/name binding/private profile、device-secret/MAC及全部owned close。任一漂移或close失败shall保持`ACTIVATING`并返回recovery-required；该证明窗口不得跨open调用、线程、coordinator、generation或进程复用，也不得改变base generation、pending recovery、schema upgrade或历史activation语义。
 
 ## 需求
 
