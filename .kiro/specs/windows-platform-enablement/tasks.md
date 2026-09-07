@@ -557,3 +557,4 @@
 
 - Task 4.4b：历史 `CHILD_FAILED` 只有包装码且子进程输出被丢弃，无法从旧日志追溯原始偶发失败。新增诊断必须继续限制在白名单安全事实，不记录项目正文、路径、参数或异常原文。
 - 隔离空资源或单条 TM 的启动测试不能替代用户实际 Start Menu 配置计时；性能调查和偶发失败保持独立验收。
+- Task 3.3 已规定完整既有 W1 payload 在活身份、私有安全与内容复证后直接进入 `LockFileEx`；无写入的普通取得不执行 `FlushFileBuffers`，首次创建和 strict-prefix 恢复仍须 write/flush/readback。

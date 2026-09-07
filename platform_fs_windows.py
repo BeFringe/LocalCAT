@@ -2493,8 +2493,13 @@ def _prove_lock_handle(
     handle: object,
     entry_path: str,
     expected_user_sid: bytes,
+    *,
+    reprove_chain: bool = True,
 ) -> _WindowsHandleProof:
-    _reprove_directory_chain(api, records)
+    if type(reprove_chain) is not bool:
+        raise TypeError("reprove_chain must be exact bool")
+    if reprove_chain:
+        _reprove_directory_chain(api, records)
     try:
         with handle.borrow() as raw:
             proof = _capture_handle_proof(
@@ -2522,7 +2527,8 @@ def _prove_lock_handle(
     )
     if named is None or named.identity != proof.identity or named.identity.link_count != 1:
         raise _lock_unavailable()
-    _reprove_directory_chain(api, records)
+    if reprove_chain:
+        _reprove_directory_chain(api, records)
     return proof
 
 
@@ -2533,7 +2539,20 @@ def _read_lock_payload(
     entry_path: str,
     expected_user_sid: bytes,
 ) -> tuple[bytes, _WindowsHandleProof]:
-    before = _prove_lock_handle(api, records, handle, entry_path, expected_user_sid)
+    # One explicit directory-chain bracket is sufficient for this single
+    # retained-handle read.  The inner proofs still validate lock identity,
+    # private security, live metadata and rooted name before and after bytes;
+    # they do not need to traverse the unchanged retained directory chain four
+    # additional times inside the same synchronous operation.
+    _reprove_directory_chain(api, records)
+    before = _prove_lock_handle(
+        api,
+        records,
+        handle,
+        entry_path,
+        expected_user_sid,
+        reprove_chain=False,
+    )
     try:
         with handle.borrow() as raw:
             payload = _read_exact_count(api, raw, before.snapshot.byte_count)
@@ -2541,37 +2560,18 @@ def _read_lock_payload(
         raise
     except Exception:
         raise _lock_unavailable() from None
-    after = _prove_lock_handle(api, records, handle, entry_path, expected_user_sid)
-    if before.snapshot != after.snapshot or len(payload) != after.snapshot.byte_count:
-        raise _lock_unavailable()
-    return payload, after
-
-
-def _flush_and_readback(
-    api: WindowsFileAPI,
-    records: tuple[_WindowsDirectoryRecord, ...],
-    handle: object,
-    entry_path: str,
-    expected_user_sid: bytes,
-    expected_payload: bytes,
-) -> _WindowsHandleProof:
-    try:
-        with handle.borrow() as raw:
-            api.checked_bool("FlushFileBuffers", api.FlushFileBuffers, raw)
-    except PlatformFileError:
-        raise
-    except Exception:
-        raise _lock_unavailable() from None
-    actual, proof = _read_lock_payload(
+    after = _prove_lock_handle(
         api,
         records,
         handle,
         entry_path,
         expected_user_sid,
+        reprove_chain=False,
     )
-    if actual != expected_payload:
+    _reprove_directory_chain(api, records)
+    if before.snapshot != after.snapshot or len(payload) != after.snapshot.byte_count:
         raise _lock_unavailable()
-    return proof
+    return payload, after
 
 
 def _retry_contention(policy: LockPolicy, deadline: float | None) -> None:
@@ -2715,7 +2715,6 @@ class _WindowsLockLease(LockLease):
                 self._entry_path,
                 self._user_sid,
             )
-            _reprove_directory_chain(self._api, self._records)
             if proof.identity != self._identity or payload != self._payload:
                 raise _lock_unavailable()
         except (TypeError, AssertionError):
@@ -2740,6 +2739,9 @@ class _WindowsLockLease(LockLease):
                 or len(records) != len(self._records)
             ):
                 return False
+            # The payload bracket proves the lease's retained duplicate chain.
+            # Binding additionally requires a live proof of the exact parent
+            # authority supplied by the caller before comparing both chains.
             _reprove_directory_chain(api, records)
             return all(
                 left.expected_final_path == right.expected_final_path
@@ -2978,14 +2980,6 @@ class WindowsProcessFileLock(ProcessFileLock, ExistingProcessFileLock):
                     user_sid,
                 )
                 if actual == payload:
-                    proof = _flush_and_readback(
-                        api,
-                        records,
-                        handle,
-                        entry_path,
-                        user_sid,
-                        payload,
-                    )
                     break
                 if existing_only:
                     raise _lock_unavailable()

@@ -156,6 +156,20 @@ class WindowsPersistentLockTests(unittest.TestCase):
         self.assertNotIsInstance(service, PrivateStorageProof)
         self.assertNotIsInstance(service, PlatformFileBackend)
 
+    def test_lease_reproof_uses_one_directory_chain_bracket(self) -> None:
+        lease = self._acquire()
+        real_reprove = platform_fs_windows._reprove_directory_chain
+        try:
+            with mock.patch.object(
+                platform_fs_windows,
+                "_reprove_directory_chain",
+                wraps=real_reprove,
+            ) as directory_reproof:
+                lease.reprove()
+            self.assertEqual(directory_reproof.call_count, 2)
+        finally:
+            lease.close()
+
     def test_acl_parser_requires_exact_ace_size_and_closed_used_bytes(self) -> None:
         sid = platform_fs_windows._canonical_sid(5, 18)
 
@@ -1428,6 +1442,39 @@ class WindowsPersistentLockTests(unittest.TestCase):
         self.parent.close()
         self.root.close()
         lease.close()
+
+    def test_exact_existing_lock_is_proved_without_empty_flush(self) -> None:
+        self._seed_protocol_file()
+        api = self.parent._api
+        with mock.patch.object(
+            api,
+            "FlushFileBuffers",
+            wraps=api.FlushFileBuffers,
+        ) as flush:
+            lease = WindowsProcessFileLock().acquire_existing(
+                self.parent,
+                "resource.lock",
+                EXPECTED,
+                LockPolicy(LockWait.FAIL_FAST),
+            )
+            lease.reprove()
+            lease.close()
+        flush.assert_not_called()
+
+    def test_strict_prefix_lock_upgrade_still_flushes_written_payload(self) -> None:
+        prefix = EXPECTED[:19]
+        seeded = self._acquire(payload=prefix)
+        seeded.close()
+        api = self.parent._api
+        with mock.patch.object(
+            api,
+            "FlushFileBuffers",
+            wraps=api.FlushFileBuffers,
+        ) as flush:
+            lease = self._acquire()
+            lease.close()
+        self.assertEqual(flush.call_count, 1)
+        self.assertEqual((self.root_path / "resource.lock").read_bytes(), EXPECTED)
 
     def test_init_and_lock_handle_profiles_and_label_projection_are_exact(self) -> None:
         api = self.parent._api
