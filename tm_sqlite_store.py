@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -1478,6 +1478,15 @@ class _PortableReplacementBackupSet(OpaqueAuthority):
 
 
 
+@dataclass(frozen=True)
+class _CurrentCanonicalIndexValidation:
+    """Process-private semantic result, not an activation or file authority."""
+
+    coordinator: object
+    view: _SQLiteGenerationView
+    database: BoundContentFacts
+
+
 class _CoordinatorStorePort:
     """Narrow store-side adapter exposing coordinator state to recovery.
 
@@ -2700,6 +2709,14 @@ def _rehydrate_completed_portable_authority(
     if staged_view is None:
         raise AssertionError("portable completed hydration produced no view")
     port.view = staged_view
+    if not reuse_semantic_facts and schema.schema_version == TM_SCHEMA_VERSION:
+        # The validator, terminal namespace/DB proof and all owned closes have
+        # succeeded. Preserve only that current index result, never rewrite the
+        # historical active attestation or grant publication authority from it.
+        _remember_current_index_validation(
+            port._coordinator, staged_view,
+            observed[identity.canonical_sidecar_path.name][1],
+        )
     legacy_upgrade_only = schema.schema_version == TM_LEGACY_SCHEMA_VERSION
     if legacy_upgrade_only and not schema_upgrade_predecessor:
         raise AssertionError("legacy schema escaped explicit predecessor mode")
@@ -3462,6 +3479,13 @@ class ResourceStoreCoordinator:
         self._state = "READY"
         self._active_lease_count = 0
         self._view = view
+        self._current_index_validation: _CurrentCanonicalIndexValidation | None = None
+        # A failed health revokes semantic reuse, not the identity of a DB
+        # already validated for this exact view. Otherwise a second attempt
+        # could bless the foreign replacement rejected by the first attempt.
+        self._current_index_identity: tuple[
+            _SQLiteGenerationView, FileObjectIdentity
+        ] | None = None
         self._drain_timeout_seconds = timeout
         registry_type = getattr(
             importlib.import_module("tm_stage_sealer"),
@@ -14839,7 +14863,7 @@ class SQLiteTMStore:
         """
 
         with self._coordinator._operation_lease() as lease:
-            return _store_health_body(lease)
+            return _store_health_body(lease, coordinator=self._coordinator)
 
     def export_records(self) -> Iterator[TMRecord]:
         with self._coordinator._operation_lease() as lease:
@@ -16763,11 +16787,12 @@ def _active_attestation_for_health(
     return active
 
 
-def _rebind_portable_attestation_for_health(
+@contextmanager
+def _portable_health_database_window(
     lease: _SQLiteGenerationView,
-    active: PortableActiveContentAttestation,
-) -> PortableActiveContentAttestation | None:
-    """Bind portable semantic facts to the current rooted canonical database.
+    coordinator: ResourceStoreCoordinator,
+) -> Iterator[BoundContentFacts]:
+    """Keep the current rooted DB alive through health and its terminal proof.
 
     Portable attestations deliberately persist only byte count and SHA-256.
     A health call may therefore reuse their semantic facts only after fresh
@@ -16798,7 +16823,6 @@ def _rebind_portable_attestation_for_health(
         ) from error
 
     database_capture = None
-    reuse_semantic_facts = True
     try:
         try:
             database_capture = _capture_platform_content_file(
@@ -16806,13 +16830,18 @@ def _rebind_portable_attestation_for_health(
                 root_path,
                 PurePath(database_path.name),
             )
+            database_facts = database_capture.reprove()
+        except (ContentAttestationError, PlatformFileError, OSError) as error:
+            raise SQLiteStoreSchemaError(
+                "STORE.ACTIVE_ATTESTATION_INVALID"
+            ) from error
+        yield database_facts
+        try:
             database_capture.reprove()
         except (ContentAttestationError, PlatformFileError, OSError) as error:
             raise SQLiteStoreSchemaError(
                 "STORE.ACTIVE_ATTESTATION_INVALID"
             ) from error
-        if database_capture.persisted_proof() != active.database:
-            reuse_semantic_facts = False
     finally:
         active_error = sys.exception()
         database_close_error: BaseException | None = None
@@ -16821,18 +16850,93 @@ def _rebind_portable_attestation_for_health(
                 database_capture.close()
             except (ContentAttestationError, PlatformFileError, OSError) as error:
                 database_close_error = error
+        if active_error is not None or database_close_error is not None:
+            with coordinator._condition:
+                coordinator._current_index_validation = None
         if active_error is None and database_close_error is not None:
             raise SQLiteStoreSchemaError(
                 "STORE.ACTIVE_ATTESTATION_INVALID"
             ) from database_close_error
-    return active if reuse_semantic_facts else None
 
 
-def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
+def _current_index_validation_matches(
+    coordinator: ResourceStoreCoordinator,
+    lease: _SQLiteGenerationView,
+    database: BoundContentFacts,
+) -> bool:
+    with coordinator._condition:
+        _require_current_index_identity(coordinator, lease, database)
+        prior = coordinator._current_index_validation
+        if (
+            type(prior) is not _CurrentCanonicalIndexValidation
+            or prior.coordinator is not coordinator
+            or prior.view is not lease
+            or coordinator._view is not lease
+        ):
+            return False
+    # Current rooted authority was proved independently. A stored FileId is
+    # neither a replacement for that proof nor a durable resource identity.
+    if prior.database.snapshot.identity != database.snapshot.identity:
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+    return prior.database == database
+
+
+def _require_current_index_identity(
+    coordinator: ResourceStoreCoordinator,
+    lease: _SQLiteGenerationView,
+    database: BoundContentFacts,
+) -> None:
+    """Compare only after fresh rooted proof, with the coordinator lock held."""
+
+    anchor = coordinator._current_index_identity
+    if (
+        anchor is not None
+        and anchor[0] is lease
+        and anchor[1] != database.snapshot.identity
+    ):
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+
+
+def _remember_current_index_validation(
+    coordinator: ResourceStoreCoordinator,
+    lease: _SQLiteGenerationView,
+    database: BoundContentFacts,
+) -> None:
+    with coordinator._condition:
+        if coordinator._view is not lease:
+            return
+        _require_current_index_identity(coordinator, lease, database)
+        coordinator._current_index_identity = (lease, database.snapshot.identity)
+        coordinator._current_index_validation = _CurrentCanonicalIndexValidation(
+            coordinator, lease, database,
+        )
+
+
+def _store_health_body(
+    lease: _SQLiteGenerationView,
+    *,
+    coordinator: ResourceStoreCoordinator,
+) -> StoreHealth:
+    """Revoke process-local reuse on every failed health/close boundary."""
+
+    try:
+        return _store_health_snapshot(lease, coordinator=coordinator)
+    except BaseException:
+        with coordinator._condition:
+            coordinator._current_index_validation = None
+        raise
+
+
+def _store_health_snapshot(
+    lease: _SQLiteGenerationView,
+    *,
+    coordinator: ResourceStoreCoordinator,
+) -> StoreHealth:
     """Build one health snapshot from one already-held canonical lease."""
 
     active_attestation = _active_attestation_for_health(lease)
-    with _open_health_connection(lease) as connection:
+    validated_database: BoundContentFacts | None = None
+    with _open_health_connection(lease) as connection, ExitStack() as captures:
         connection.execute("BEGIN")
         try:
             identity = lease.stage.resource_identity
@@ -16853,14 +16957,24 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
             index_kind = meta["candidate_index_kind"]
             if type(index_kind) is not str or not index_kind.strip():
                 raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
+            database_facts: BoundContentFacts | None = None
+            reuse_current_index = False
             if type(active_attestation) is PortableActiveContentAttestation:
-                active_attestation = _rebind_portable_attestation_for_health(
-                    lease,
-                    active_attestation,
+                database_facts = captures.enter_context(
+                    _portable_health_database_window(lease, coordinator)
                 )
+                reuse_current_index = _current_index_validation_matches(
+                    coordinator, lease, database_facts,
+                )
+                if (
+                    database_facts.snapshot.byte_count != active_attestation.database.size
+                    or database_facts.content_sha256.hex() != active_attestation.database.sha256
+                ):
+                    active_attestation = None
             if (
                 schema_version == TM_SCHEMA_VERSION
                 and active_attestation is None
+                and not reuse_current_index
             ):
                 fts5_available = _meta_bool(meta, "fts5_available")
                 try:
@@ -16875,6 +16989,7 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
                     raise SQLiteStoreSchemaError(
                         "STORE.CANDIDATE_INDEX_INVALID"
                     ) from error
+                validated_database = database_facts
             facts = _read_source_binding_facts_in_transaction(
                 connection,
                 lease,
@@ -16918,6 +17033,10 @@ def _store_health_body(lease: _SQLiteGenerationView) -> StoreHealth:
             | availability_codes
         )
     )
+    if validated_database is not None:
+        # Both the retained DB window and SQLite connection closed successfully.
+        # This records index work only, never receipt or publication authority.
+        _remember_current_index_validation(coordinator, lease, validated_database)
     return StoreHealth(
         healthy=True,
         schema_version=schema_version,
@@ -17311,7 +17430,7 @@ class SQLiteTMQueryView:
         """Return the same truthful health snapshot on the captured lease."""
 
         self._check_lifetime()
-        return _store_health_body(self._lease)
+        return _store_health_body(self._lease, coordinator=self._coordinator)
 
 
 @dataclass(frozen=True)
