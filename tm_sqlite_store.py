@@ -263,6 +263,7 @@ from tm_activation_journal import (
 from tm_activation_recovery import (
     _ActivationGateBGrant,
     _CoordinatorPublishPort,
+    _RetainedPortableReplacementInspection,
     _PortableReplacementRecordOwner,
     _StoreValidationPort,
     _activation_exact_parity_digest,
@@ -330,6 +331,7 @@ from tm_activation_recovery import (
     recover_portable_activation,
     recover_portable_replacement_activation,
     rehydrate_completed_portable_replacement_activation,
+    rehydrate_completed_portable_replacement_runtime_open,
     rehydrate_portable_schema_upgrade_predecessor as _rehydrate_portable_schema_upgrade_predecessor,
     _PORTABLE_UPGRADE_REQUIRED_STATE,
     rollback_durable_activation,
@@ -1487,6 +1489,273 @@ class _CurrentCanonicalIndexValidation:
     database: BoundContentFacts
 
 
+class _DeferredPortableRuntimeOwner:
+    """One-shot process-private closure of a cold-open owner bracket."""
+
+    __slots__ = (
+        "_base_generation",
+        "_completed",
+        "_coordinator",
+        "_database",
+        "_remember_index",
+        "_replacement_inspection",
+        "_thread",
+        "_view",
+    )
+
+    def __init__(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        view: _SQLiteGenerationView,
+        database: BoundContentFacts,
+        base_generation: _PortablePublicationPhaseRecord,
+        remember_index: bool,
+        replacement_inspection: _RetainedPortableReplacementInspection | None = None,
+    ) -> None:
+        if type(coordinator) is not ResourceStoreCoordinator:
+            raise TypeError("deferred owner requires ResourceStoreCoordinator")
+        if type(view) is not _SQLiteGenerationView:
+            raise TypeError("deferred owner requires exact generation view")
+        if type(database) is not BoundContentFacts:
+            raise TypeError("deferred owner requires exact database facts")
+        if type(base_generation) is not _PortablePublicationPhaseRecord:
+            raise TypeError("deferred owner requires exact base generation record")
+        if type(remember_index) is not bool:
+            raise TypeError("remember_index must be exact bool")
+        if replacement_inspection is not None and (
+            type(replacement_inspection)
+            is not _RetainedPortableReplacementInspection
+            or replacement_inspection.closed
+            or replacement_inspection.terminal_reproved
+        ):
+            raise TypeError("replacement_inspection is invalid")
+        self._coordinator = coordinator
+        self._view = view
+        self._database = database
+        self._base_generation = base_generation
+        self._remember_index = remember_index
+        self._replacement_inspection = replacement_inspection
+        # Retain the originating Thread object, not its recyclable integer id.
+        # A failed owner cannot accidentally authorize a later thread whose
+        # native id happens to be reused by the runtime.
+        self._thread = threading.current_thread()
+        self._completed = False
+        with coordinator._condition:
+            if (
+                coordinator._deferred_runtime_open_owner is not None
+                or coordinator._state != "ACTIVATING"
+                or coordinator._view is not view
+            ):
+                # Refusing a second owner must not roll back the first owner's
+                # view or process-private witness.
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            prior_identity = coordinator._current_index_identity
+            prior_validation = coordinator._current_index_validation
+            try:
+                if self._remember_index:
+                    # Hydration has already completed the full candidate-index
+                    # validation for these exact live database facts.  Make that
+                    # result visible only while this one-shot owner authorizes the
+                    # originating thread; the coordinator remains ACTIVATING and
+                    # every public operation stays blocked until terminal proof.
+                    _require_current_index_identity(
+                        coordinator, self._view, self._database,
+                    )
+                    provisional = _CurrentCanonicalIndexValidation(
+                        coordinator, self._view, self._database,
+                    )
+                    coordinator._current_index_identity = (
+                        self._view, self._database.snapshot.identity,
+                    )
+                    coordinator._current_index_validation = provisional
+                # Register last: every operation above may fail, while these final
+                # assignments are confined to this condition critical section.
+                coordinator._deferred_runtime_open_owner = self
+            except BaseException:
+                coordinator._current_index_identity = prior_identity
+                coordinator._current_index_validation = prior_validation
+                if coordinator._deferred_runtime_open_owner is self:
+                    coordinator._deferred_runtime_open_owner = None
+                raise
+
+    @property
+    def completed(self) -> bool:
+        return self._completed
+
+    def _authorizes_current_thread(
+        self,
+        view: _SQLiteGenerationView | None,
+    ) -> bool:
+        return (
+            not self._completed
+            and threading.current_thread() is self._thread
+            and view is self._view
+        )
+
+    def retained_replacement_inspection(
+        self,
+    ) -> _RetainedPortableReplacementInspection | None:
+        if (
+            self._completed
+            or threading.current_thread() is not self._thread
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        return self._replacement_inspection
+
+    def complete(
+        self,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        resource_identity: CanonicalResourceIdentity,
+        canonical_store_id: str,
+        generation: int,
+        base_generation: _PortablePublicationPhaseRecord,
+        database: BoundContentFacts,
+        terminal_cleanup: Callable[[], None],
+    ) -> None:
+        if self._completed:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if threading.current_thread() is not self._thread:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if not callable(terminal_cleanup):
+            raise TypeError("terminal_cleanup must be callable")
+        if type(database) is not BoundContentFacts:
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if (
+            coordinator is not self._coordinator
+            or resource_identity != coordinator._resource_identity
+            or canonical_store_id != coordinator.canonical_store_id
+            or generation != self._view.generation
+            or base_generation != self._base_generation
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        if self._replacement_inspection is not None and not (
+            self._replacement_inspection.closed
+            and self._replacement_inspection.terminal_reproved
+        ):
+            raise ActivationPreparationError(
+                "ACTIVATION.RECOVERY_REQUIRED",
+                retryable=True,
+            )
+        with coordinator._condition:
+            if (
+                coordinator._state != "ACTIVATING"
+                or coordinator._view is not self._view
+                or coordinator._deferred_runtime_open_owner is not self
+                or coordinator._active_lease_count != 0
+            ):
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            terminal_changed = database != self._database
+            current = coordinator._current_index_validation
+            if terminal_changed and not (
+                type(current) is _CurrentCanonicalIndexValidation
+                and current.coordinator is coordinator
+                and current.view is self._view
+                and current.database == database
+            ):
+                # A strict recovery may legitimately update recovery-owned DB
+                # rows.  It may close this owner only after health has fully
+                # validated the resulting DB and installed its exact witness.
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            terminal_validation: _CurrentCanonicalIndexValidation | None = None
+            terminal_identity: tuple[
+                _SQLiteGenerationView, FileObjectIdentity
+            ] | None = None
+            if self._remember_index or terminal_changed:
+                _require_current_index_identity(
+                    coordinator, self._view, database,
+                )
+                terminal_validation = _CurrentCanonicalIndexValidation(
+                    coordinator, self._view, database,
+                )
+                terminal_identity = (
+                    self._view, database.snapshot.identity,
+                )
+
+            # READY is provisional and cannot be observed while this condition
+            # is held.  The retained DB pin and W1/root authorities remain live
+            # across the logical READY point; all fallible terminal cleanup is
+            # performed before the state is published to another thread.
+            coordinator._state = "READY"
+            try:
+                terminal_cleanup()
+            except BaseException:
+                coordinator._current_index_validation = None
+                coordinator._deferred_runtime_open_owner = None
+                if coordinator._view is self._view:
+                    coordinator._view = None
+                    coordinator._state = "ACTIVATING"
+                coordinator._condition.notify_all()
+                raise
+            if terminal_validation is not None:
+                coordinator._current_index_identity = terminal_identity
+                coordinator._current_index_validation = terminal_validation
+            coordinator._deferred_runtime_open_owner = None
+            # Cleanup and all allocations have succeeded.  Mark completed
+            # before waking waiters; notification failure cannot invalidate the
+            # already-closed authority boundary.
+            self._completed = True
+            coordinator._condition.notify_all()
+
+    def abort(self) -> None:
+        coordinator = self._coordinator
+        replacement_error: BaseException | None = None
+        if self._replacement_inspection is not None:
+            try:
+                self._replacement_inspection.close()
+            except BaseException as error:
+                replacement_error = error
+        with coordinator._condition:
+            if not self._completed:
+                provisional = coordinator._current_index_validation
+                if (
+                    type(provisional) is _CurrentCanonicalIndexValidation
+                    and provisional.coordinator is coordinator
+                    and provisional.view is self._view
+                ):
+                    coordinator._current_index_validation = None
+                if coordinator._deferred_runtime_open_owner is self:
+                    coordinator._deferred_runtime_open_owner = None
+                if coordinator._view is self._view:
+                    coordinator._view = None
+                    coordinator._state = "ACTIVATING"
+                coordinator._condition.notify_all()
+        if replacement_error is not None:
+            raise replacement_error
+
+    def __reduce__(self) -> object:
+        raise TypeError("deferred portable runtime owner is process-private")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise TypeError("deferred portable runtime owner is process-private")
+
+
 class _CoordinatorStorePort:
     """Narrow store-side adapter exposing coordinator state to recovery.
 
@@ -1570,6 +1839,27 @@ class _CoordinatorStorePort:
         descendant_inspection: LockedDescendantNamespaceInspection,
         caller_borrow: _CallerHeldPortableJournalBorrow,
     ) -> ActivationRecoveryReport | None:
+        report, deferred_owner = _rehydrate_completed_portable_authority(
+            self,
+            platform=platform,
+            persistent_private=persistent_private,
+            descendant_inspection=descendant_inspection,
+            caller_borrow=caller_borrow,
+            schema_upgrade_predecessor=False,
+            defer_terminal_owner=False,
+        )
+        if deferred_owner is not None:
+            raise AssertionError("ordinary base hydration deferred its owner")
+        return report
+
+    def rehydrate_completed_portable_base_for_runtime_open(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> tuple[ActivationRecoveryReport | None, object | None]:
         return _rehydrate_completed_portable_authority(
             self,
             platform=platform,
@@ -1577,6 +1867,7 @@ class _CoordinatorStorePort:
             descendant_inspection=descendant_inspection,
             caller_borrow=caller_borrow,
             schema_upgrade_predecessor=False,
+            defer_terminal_owner=True,
         )
 
     def rehydrate_portable_schema_upgrade_predecessor_base(
@@ -1587,13 +1878,34 @@ class _CoordinatorStorePort:
         descendant_inspection: LockedDescendantNamespaceInspection,
         caller_borrow: _CallerHeldPortableJournalBorrow,
     ) -> ActivationRecoveryReport | None:
-        return _rehydrate_completed_portable_authority(
+        report, deferred_owner = _rehydrate_completed_portable_authority(
             self,
             platform=platform,
             persistent_private=persistent_private,
             descendant_inspection=descendant_inspection,
             caller_borrow=caller_borrow,
             schema_upgrade_predecessor=True,
+            defer_terminal_owner=False,
+        )
+        if deferred_owner is not None:
+            raise AssertionError("schema-upgrade base hydration deferred its owner")
+        return report
+
+    def defer_completed_portable_replacement_runtime_owner(
+        self,
+        *,
+        view: _SQLiteGenerationView,
+        database: BoundContentFacts,
+        base_generation: _PortablePublicationPhaseRecord,
+        replacement_inspection: _RetainedPortableReplacementInspection,
+    ) -> object:
+        return _DeferredPortableRuntimeOwner(
+            coordinator=self._coordinator,
+            view=view,
+            database=database,
+            base_generation=base_generation,
+            remember_index=False,
+            replacement_inspection=replacement_inspection,
         )
 
     def adopt_portable_replacement_current(
@@ -2305,7 +2617,8 @@ def _rehydrate_completed_portable_authority(
     descendant_inspection: LockedDescendantNamespaceInspection,
     caller_borrow: _CallerHeldPortableJournalBorrow,
     schema_upgrade_predecessor: bool,
-) -> ActivationRecoveryReport | None:
+    defer_terminal_owner: bool,
+) -> tuple[ActivationRecoveryReport | None, _DeferredPortableRuntimeOwner | None]:
     """Read-only cold hydration for one complete Windows portable chain.
 
     This entry cannot advance, cancel, retire, or create any durable fact.  A
@@ -2320,6 +2633,10 @@ def _rehydrate_completed_portable_authority(
 
     if type(schema_upgrade_predecessor) is not bool:
         raise TypeError("schema upgrade predecessor mode must be exact bool")
+    if type(defer_terminal_owner) is not bool:
+        raise TypeError("defer_terminal_owner must be exact bool")
+    if defer_terminal_owner and schema_upgrade_predecessor:
+        raise ValueError("schema-upgrade predecessor cannot defer its owner")
     identity = port.resource_identity
     snapshot = _WindowsPortableFreshRecoveryOwner.inspect(
         identity=identity,
@@ -2330,7 +2647,7 @@ def _rehydrate_completed_portable_authority(
         caller_borrow=caller_borrow,
     )
     if snapshot.state == "NO_FACTS":
-        return None
+        return None, None
     port.state = "ACTIVATING"
     port.view = None
     port.notify_all()
@@ -2474,6 +2791,7 @@ def _rehydrate_completed_portable_authority(
                 )
 
         observed: dict[str, tuple[PortableContentFileProof, BoundContentFacts]] = {}
+        marker_content: bytes | None = None
         for name in (
             identity.canonical_sidecar_path.name,
             marker_name,
@@ -2481,7 +2799,12 @@ def _rehydrate_completed_portable_authority(
             opened = platform.open_regular(root, PurePath(name))
             authorities.append(opened)
             canonical_authorities[name] = opened
-            facts = opened.content_facts()
+            if name == marker_name:
+                capture = opened.capture_content()
+                facts = capture.facts
+                marker_content = capture.content
+            else:
+                facts = opened.content_facts()
             if (
                 facts.snapshot.identity.kind != "regular"
                 or facts.snapshot.identity.link_count != 1
@@ -2506,8 +2829,7 @@ def _rehydrate_completed_portable_authority(
         if (
             active.manifest != sealed.manifest
             or active.source != sealed.source
-            or canonical_authorities[marker_name].read_all()
-            != _activation_lineage_marker_payload(identity)
+            or marker_content != _activation_lineage_marker_payload(identity)
         ):
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
@@ -2643,15 +2965,18 @@ def _rehydrate_completed_portable_authority(
         quarantine_root.reprove()
         quarantine_target.reprove()
         if (
-            _WindowsPortableFreshRecoveryOwner.inspect(
-                identity=identity,
-                canonical_store_id=port.canonical_store_id,
-                backend=platform,
-                persistent_private=persistent_private,
-                descendant_inspection=descendant_inspection,
-                caller_borrow=caller_borrow,
+            (
+                not defer_terminal_owner
+                and _WindowsPortableFreshRecoveryOwner.inspect(
+                    identity=identity,
+                    canonical_store_id=port.canonical_store_id,
+                    backend=platform,
+                    persistent_private=persistent_private,
+                    descendant_inspection=descendant_inspection,
+                    caller_borrow=caller_borrow,
+                )
+                != snapshot
             )
-            != snapshot
             or any(root.inspect_entry(name) is not None for name in stage_names)
             or root.inspect_entry(marker_temp_name) is not None
             or _completed_authority_sqlite_sidecar_present(
@@ -2709,7 +3034,10 @@ def _rehydrate_completed_portable_authority(
     if staged_view is None:
         raise AssertionError("portable completed hydration produced no view")
     port.view = staged_view
-    if not reuse_semantic_facts and schema.schema_version == TM_SCHEMA_VERSION:
+    remember_index = (
+        not reuse_semantic_facts and schema.schema_version == TM_SCHEMA_VERSION
+    )
+    if remember_index and not defer_terminal_owner:
         # The validator, terminal namespace/DB proof and all owned closes have
         # succeeded. Preserve only that current index result, never rewrite the
         # historical active attestation or grant publication authority from it.
@@ -2723,13 +3051,34 @@ def _rehydrate_completed_portable_authority(
     port.state = (
         _PORTABLE_UPGRADE_REQUIRED_STATE
         if legacy_upgrade_only
-        else "READY"
+        else ("ACTIVATING" if defer_terminal_owner else "READY")
     )
-    port.notify_all()
-    return ActivationRecoveryReport(
+    if not defer_terminal_owner:
+        port.notify_all()
+    report = ActivationRecoveryReport(
         phase="GENERATION_PUBLISHED",
         action="COMPLETED",
         generation=0,
+    )
+    if not defer_terminal_owner:
+        return report, None
+    if (
+        len(snapshot.phase_records) != 3
+        or type(snapshot.phase_records[-1]) is not _PortablePublicationPhaseRecord
+    ):
+        port.view = None
+        port.state = "ACTIVATING"
+        port.notify_all()
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED",
+            retryable=True,
+        )
+    return report, _DeferredPortableRuntimeOwner(
+        coordinator=port._coordinator,
+        view=staged_view,
+        database=observed[identity.canonical_sidecar_path.name][1],
+        base_generation=snapshot.phase_records[-1],
+        remember_index=remember_index,
     )
 
 
@@ -3479,6 +3828,9 @@ class ResourceStoreCoordinator:
         self._state = "READY"
         self._active_lease_count = 0
         self._view = view
+        self._deferred_runtime_open_owner: (
+            _DeferredPortableRuntimeOwner | None
+        ) = None
         self._current_index_validation: _CurrentCanonicalIndexValidation | None = None
         # A failed health revokes semantic reuse, not the identity of a DB
         # already validated for this exact view. Otherwise a second attempt
@@ -3678,7 +4030,13 @@ class ResourceStoreCoordinator:
     def _operation_lease(self) -> Iterator[_SQLiteGenerationView]:
         with self._condition:
             view = self._view
-            if self._state != "READY":
+            deferred_owner = self._deferred_runtime_open_owner
+            deferred_authorized = (
+                self._state == "ACTIVATING"
+                and type(deferred_owner) is _DeferredPortableRuntimeOwner
+                and deferred_owner._authorizes_current_thread(view)
+            )
+            if self._state != "READY" and not deferred_authorized:
                 raise SQLiteStoreLifecycleError(
                     "STORE.RESOURCE_DRAINING",
                     resource_id=self._resource_id,
@@ -3757,7 +4115,13 @@ class ResourceStoreCoordinator:
                     )
                 self._condition.wait(remaining)
             if require_ready_resource:
-                if self._state != "READY":
+                deferred_owner = self._deferred_runtime_open_owner
+                deferred_authorized = (
+                    self._state == "ACTIVATING"
+                    and type(deferred_owner) is _DeferredPortableRuntimeOwner
+                    and deferred_owner._authorizes_current_thread(self._view)
+                )
+                if self._state != "READY" and not deferred_authorized:
                     raise SQLiteStoreLifecycleError(
                         "STORE.RESOURCE_DRAINING",
                         resource_id=self._resource_id,
@@ -9234,6 +9598,71 @@ class ResourceStoreCoordinator:
                     retryable=True,
                 ) from error
 
+    def rehydrate_completed_portable_runtime_open(
+        self,
+        *,
+        platform: PlatformFileBackend,
+        persistent_private: PersistentPrivateProof,
+        descendant_inspection: LockedDescendantNamespaceInspection,
+        caller_borrow: _CallerHeldPortableJournalBorrow,
+    ) -> tuple[
+        ActivationRecoveryReport | None,
+        _DeferredPortableRuntimeOwner | None,
+    ]:
+        """Hydrate one cold open while retaining its terminal owner boundary."""
+
+        with self._condition:
+            if self._deferred_runtime_open_owner is not None or self._view is not None:
+                # A fresh runtime coordinator is the sole valid caller.  Do not
+                # let a concurrent/reentrant open erase an existing owner or an
+                # already published READY view in the generic failure cleanup.
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                )
+            try:
+                report, deferred_owner = (
+                    rehydrate_completed_portable_replacement_runtime_open(
+                        _CoordinatorStorePort(self),
+                        platform=platform,
+                        persistent_private=persistent_private,
+                        descendant_inspection=descendant_inspection,
+                        caller_borrow=caller_borrow,
+                    )
+                )
+                if deferred_owner is not None and type(deferred_owner) is not (
+                    _DeferredPortableRuntimeOwner
+                ):
+                    raise TypeError("runtime hydration returned a foreign owner")
+                return report, deferred_owner
+            except ActivationPreparationError:
+                self._deferred_runtime_open_owner = None
+                self._current_index_validation = None
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise
+            except (PlatformFileError, OSError, sqlite3.Error) as error:
+                self._deferred_runtime_open_owner = None
+                self._current_index_validation = None
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_REQUIRED",
+                    retryable=True,
+                ) from error
+            except BaseException:
+                # The helper normally constructs its owner as the final return
+                # value.  Fail closed even if an unexpected error is injected
+                # after registration but before tuple delivery to the caller.
+                self._deferred_runtime_open_owner = None
+                self._current_index_validation = None
+                self._view = None
+                self._state = "ACTIVATING"
+                self._condition.notify_all()
+                raise
+
     def rehydrate_portable_schema_upgrade_predecessor(
         self,
         *,
@@ -11331,6 +11760,45 @@ class SQLiteTMStore:
                 ),
                 retryable=False,
             )
+        store = cls.__new__(cls)
+        store._canonical_store_id = coordinator.canonical_store_id
+        store._coordinator = coordinator
+        store._source_binding_monitor = SourceBindingMonitor(
+            coordinator,
+            store=store,
+        )
+        store._query_view_tokens = set()
+        return store
+
+    @classmethod
+    def _from_deferred_runtime_owner(
+        cls,
+        coordinator: ResourceStoreCoordinator,
+        owner: _DeferredPortableRuntimeOwner,
+    ) -> SQLiteTMStore:
+        """Construct only for the thread closing one cold-open owner bracket."""
+
+        if type(coordinator) is not ResourceStoreCoordinator:
+            raise TypeError("coordinator must be ResourceStoreCoordinator")
+        if type(owner) is not _DeferredPortableRuntimeOwner:
+            raise TypeError("owner must be exact deferred runtime owner")
+        with coordinator._condition:
+            if (
+                coordinator._state != "ACTIVATING"
+                or coordinator._view is None
+                or coordinator._deferred_runtime_open_owner is not owner
+                or not owner._authorizes_current_thread(coordinator._view)
+            ):
+                raise SQLiteStoreLifecycleError(
+                    "STORE.CANONICAL_UNAVAILABLE",
+                    resource_id=coordinator.resource_id,
+                    generation=(
+                        0
+                        if coordinator._view is None
+                        else coordinator._view.generation
+                    ),
+                    retryable=False,
+                )
         store = cls.__new__(cls)
         store._canonical_store_id = coordinator.canonical_store_id
         store._coordinator = coordinator
@@ -14278,6 +14746,53 @@ class SQLiteTMStore:
             return snapshot_recovery_module.recover_bound_configured_snapshot_publication(
                 _BoundSnapshotRecoveryPort(self), family
             )
+
+    def _classify_bound_configured_refresh_startup_noop(
+        self,
+    ) -> snapshot_recovery_module.RefreshRecoveryOutcome | None:
+        """Return the exact read-only no-op startup classification, if clean.
+
+        The Windows migration owner calls this only while it retains W1 and the
+        coordinator refresh gate.  It deliberately classifies database facts
+        only: the caller must separately prove the deterministic filesystem
+        artifact family absent and finish with a full live owner reproof.  Any
+        receipt, handoff, invalid binding, or ambiguous combination returns
+        ``None`` so the established recovery state machine handles it.
+        """
+
+        facts = self._read_refresh_recovery_facts()
+        if facts.binding_invalid:
+            return None
+        issued = tuple(
+            receipt
+            for receipt in facts.receipts
+            if receipt.status == "issued"
+            and receipt.destination_jsonl_path
+            == facts.configured_jsonl_path
+            and receipt.destination_manifest_path
+            == facts.snapshot_manifest_path
+        )
+        configured_receipt_ids = {
+            receipt.snapshot_id
+            for receipt in facts.receipts
+            if receipt.destination_jsonl_path == facts.configured_jsonl_path
+            and receipt.destination_manifest_path == facts.snapshot_manifest_path
+        }
+        legacy_handoff_ids = {
+            handoff.snapshot_id
+            for handoff in facts.handoffs
+            if handoff.snapshot_id in configured_receipt_ids
+        }
+        if issued or legacy_handoff_ids or facts.bound_refresh_handoffs:
+            return None
+        if facts.divergence_latched:
+            return snapshot_recovery_module.RefreshRecoveryOutcome(
+                state=snapshot_recovery_module.RefreshRecoveryState.NOOP,
+                diagnostics=("RECOVERY.DIVERGENCE_PRESERVED",),
+            )
+        return snapshot_recovery_module.RefreshRecoveryOutcome(
+            state=snapshot_recovery_module.RefreshRecoveryState.NOOP
+        )
 
     def require_bound_refresh_observation_ready(self) -> None:
         """Reject a Windows observation until its bound owner is terminal."""
