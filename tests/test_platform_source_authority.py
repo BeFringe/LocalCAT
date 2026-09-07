@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from platform_fs_contracts import PlatformFileError
 from platform_source_authority import compose_rooted_source_authority
@@ -74,6 +75,84 @@ class RootedSourceAuthorityTests(unittest.TestCase):
                 self.assertFalse(source.is_current())
                 with self.assertRaises(PlatformFileError):
                     authority.bind_path(source_path)
+            finally:
+                authority.close()
+
+    def test_proof_window_rejects_a_source_changed_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "module.py"
+            source_path.write_bytes(b"VALUE = 1\n")
+            authority = compose_rooted_source_authority(root)
+            try:
+                with self.assertRaises(PlatformFileError):
+                    with authority.proof_window():
+                        _ = authority.bind_path(source_path)
+                        try:
+                            source_path.write_bytes(b"VALUE = 2\n")
+                        except PermissionError:
+                            # Windows can deny the attack while the retained
+                            # source handle is open.  In that case there is no
+                            # changed source for the terminal proof to reject.
+                            raise unittest.SkipTest(
+                                "platform retained handle denied source mutation"
+                            )
+            finally:
+                authority.close()
+
+    def test_proof_window_cache_does_not_cross_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "module.py"
+            source_path.write_bytes(b"VALUE = 1\n")
+            authority = compose_rooted_source_authority(root)
+            try:
+                with authority.proof_window():
+                    source = authority.bind_path(source_path)
+                    self.assertTrue(source.is_current())
+
+                replacement = root / "replacement.py"
+                replacement.write_bytes(b"VALUE = 2\n")
+                try:
+                    os.replace(replacement, source_path)
+                except PermissionError:
+                    try:
+                        source_path.write_bytes(b"VALUE = 2\n")
+                    except PermissionError:
+                        self.assertTrue(source.is_current())
+                        return
+
+                with self.assertRaises(PlatformFileError):
+                    with authority.proof_window():
+                        self.assertFalse(source.is_current())
+            finally:
+                authority.close()
+
+    def test_root_reproof_is_reused_only_inside_one_proof_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authority = compose_rooted_source_authority(root)
+            root_authority = authority._RootedSourceAuthority__root
+            root_type = type(root_authority)
+            original_reprove = root_type._reprove
+            reproof_count = 0
+
+            def counted_reprove(current: object) -> None:
+                nonlocal reproof_count
+                reproof_count += 1
+                original_reprove(current)
+
+            try:
+                with patch.object(root_type, "_reprove", new=counted_reprove):
+                    with authority.proof_window():
+                        after_entry = reproof_count
+                        authority.reprove()
+                        authority.reprove()
+                        self.assertEqual(reproof_count, after_entry)
+                    self.assertEqual(reproof_count, after_entry + 1)
+
+                    authority.reprove()
+                    self.assertEqual(reproof_count, after_entry + 2)
             finally:
                 authority.close()
 
