@@ -14,6 +14,7 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
 - **审批状态**：ADR-020～026、owning scope、WA-01～08 current R/D/T amendment acknowledgement及平台Requirements/Design/Tasks均已批准；ADR-024/025对主体环境矩阵与发布耐久门的后续取代关系由Task 0.6同步，ADR-026对Parser发布状态的收窄由Task 0.7同步；实施仍仅按本Spec task依赖逐簇进入，审批不代替实现或发布证据。
 - **交付路线**：Windows source compatibility 与 ADR-022 frozen distribution 是两个累计验收阶段。source 阶段可先形成依赖用户管理 CPython 3.14 x64、venv、`requirements-ui.txt` 与受审 source tree 的本地运行入口；它不铸造 `TrustedSourceAuthority`、不满足 Requirement 10～12，也不改变 frozen 最终发行门。W3 custom in-process entry 的规划可与 source 平台迁移并行，gate-quality spike 在 W1 rooted contract 冻结后、任何 frozen consumer merge前完成。
+- **导出输出收尾修订**：ADR-027 已获批准，仅修订 Windows ResourcePackage/TMX 正常完成后留下内部协调锁文件的行为；相邻 `language-resource-portability` 6.7–6.8 与 `tmx-context-interchange` 8.8–8.9 分别承载导出结果。既有 Requirement 3 的并发互斥继续成立，其他持久锁、直接 CSV/JSONL 导出与 POSIX 行为不在本修订范围。
 
 ## 需求
 
@@ -48,6 +49,9 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 4. While 锁已持有, the 文件打开共享语义 shall 允许协议要求的读取、flush 与原子发布，同时拒绝会破坏互斥和身份证明的冲突操作。
 5. The Windows 锁合同 shall 不对公平性或排队顺序作超出操作系统可证明范围的承诺，并 shall 为竞争、超时、身份不匹配与平台不可用提供稳定结果。
 6. When persistent lock file 首次由两个进程并发创建或 creator 在 payload durable 前退出, the 锁能力 shall 在`CREATE_NEW`返回`ERROR_FILE_EXISTS`后先用普通LOCK profile打开并复证：完整payload直接进入`LockFileEx`，该open的sharing violation才表示INIT进行中；空/严格前缀须关闭普通handle后争抢INIT share-none handle并二次复证再恢复。未知bytes/状态shall fail closed，且不得unlink/replace该载体。
+7. When Windows ResourcePackage 或 TMX 导出已成功结束且不存在冲突占用或系统清理故障, the 平台输出收尾能力 shall 使输出目录不遗留该次导出的内部协调锁文件，且不改变最终导出文件。
+8. If 本次导出结果不明、仍需恢复、协调文件无法安全确认或存在冲突占用, the 平台输出收尾能力 shall 不强行清理未经确认的文件、不扩大删除范围，且不因收尾失败把已经成功的导出改报为失败或把未确认的文件报成已清理。
+9. When 新旧版本同时访问同一导出目标且旧版本因收尾竞争而未能开始操作, the Windows 锁能力 shall 明确失败并允许重新发起完整操作，且不得使两个进程同时进入该目标的排他写入区段。
 
 ### Requirement 4：原子发布、durability 与恢复
 **目标：** 作为项目和 TM 数据的所有者，我希望 Windows 上的保存与发布在成功返回后满足已声明的持久化合同，并在中断后恢复到有效状态，以便不会出现静默丢失或半发布。

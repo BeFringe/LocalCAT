@@ -276,6 +276,15 @@ class LockWait(str, Enum):
     TIMEOUT = "timeout"
 
 
+class OutputLockFinishResult(str, Enum):
+    """Stable, body-free result of optional output-control lock retirement."""
+
+    RETIRED = "retired"
+    ABSENT = "absent"
+    IN_USE = "in_use"
+    NOT_PROVEN = "not_proven"
+
+
 @dataclass(frozen=True, slots=True)
 class LockPolicy:
     wait: LockWait
@@ -2142,6 +2151,37 @@ class ExistingProcessFileLock(Protocol):
         payload: bytes,
         policy: LockPolicy,
     ) -> LockLease: ...
+
+
+@runtime_checkable
+class OutputArtifactLockRetirement(Protocol):
+    """Optionally retire one approved, already-finished output lock carrier."""
+
+    def finish_output_lock(
+        self,
+        parent: BoundDirectoryAuthority,
+        lease: LockLease,
+    ) -> OutputLockFinishResult:
+        if not isinstance(parent, BoundDirectoryAuthority):
+            raise TypeError("parent must be BoundDirectoryAuthority")
+        parent._require_open()
+        if not isinstance(lease, LockLease):
+            raise TypeError("lease must be LockLease")
+        lease._require_open()
+        result = self._finish_output_lock(parent, lease)
+        if type(result) is not OutputLockFinishResult:
+            raise TypeError(
+                "backend output lock retirement must return exact "
+                "OutputLockFinishResult"
+            )
+        return result
+
+    @abstractmethod
+    def _finish_output_lock(
+        self,
+        parent: BoundDirectoryAuthority,
+        lease: LockLease,
+    ) -> OutputLockFinishResult: ...
 
 
 @runtime_checkable

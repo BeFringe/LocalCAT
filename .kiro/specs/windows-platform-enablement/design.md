@@ -23,6 +23,7 @@
 
 ### This Spec Owns
 - `RootedFileSystem`、`MutableFileReservationService`、`OwnedNamespaceRetirement`、`BoundDirectoryPublisher`、`ExistingFileDurability`、`ProcessFileLock`、`ExistingProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
+- ADR-027 的可选 `OutputArtifactLockRetirement` 合同及 Windows 实现；仅重新认证和回收获批输出族的闲置控制载体，不判断业务 receipt、journal 或恢复结果。
 - Windows 11 native handle implementation、支持 volume capability gate、Win32 error normalization 和平台专属反例 harness。
 - 提供 POSIX adapter 参考实现和 parity contract；各 consumer 的现有 POSIX 原语迁移由其 owning Spec amendment 实施并提交可追踪 merge。
 - 定义 Parser、collaborative chunk、项目/资源/TMX、TM activation/snapshot/attestation/recovery 的接入验收合同、amendment dispatch ledger 与最终合并证据，但不越权直接拥有相邻业务实现。
@@ -57,6 +58,11 @@
 - **Scope amendment**: **Approved**；`windows-platform-enablement` 只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence；consumer business invariants 继续归相邻 owning Specs。`tmx-context-interchange` 是唯一 owning Spec，`ui-mvp` 只记录其 amendment 提交血缘；Qt avatar 仅作 Windows 功能回归。
 - **Steering sync**: Approved；Governance owner 同步 `spec-ownership.md`、`roadmap.md` 和长期技术边界；`structure.md` 等待真实 runtime/build 文件落地后再按实际结构更新。本 feature branch 不产生重复 Steering 提交。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
+
+### ADR-027 输出锁收尾修订
+- **Scope amendment**：已批准；仅取代 ADR-020 决策 7、ADR-023 决策 1 在 Windows ResourcePackage/TMX 输出 owner 已终结时的永久载体限制。普通持锁、初始化、安全 profile、业务发布/恢复、POSIX 和 frozen 信任启动不变。
+- **Steering sync**：由 Governance owner 在治理分支闭合 ADR-027、ADR 索引及 ADR-020/023 取代关系元数据，再由本分支继承；不重复修改长期层级规则。
+- **Downstream revalidation**：平台 Task 3.3a 交付可选能力；`language-resource-portability` Task 3.3a 与 `tmx-context-interchange` Task 3.4b 分别验证自身终结条件和原始异常语义。三项通过独立评审前不得标记该修订完成。
 
 ### Implementation Authorization
 **GO for staged implementation**。ADR-020～026、Windows owning scope、WA-01～08 current R/D/T request、ledger/dependency authority与独立对抗性设计评审均已闭合；ADR-024/025活动合同同步由Task 0.6记录，ADR-026的Parser收窄由Task 0.7记录。本授权只允许按Tasks依赖逐簇实现；任一required amendment尚未形成commit/merge/evidence时，仍阻塞其对应consumer cluster和最终EXE gate，且任何新跨门槛事实必须返回ADR/Spec治理。
@@ -278,6 +284,9 @@ class ProcessFileLock(Protocol):
 class ExistingProcessFileLock(Protocol):
     def acquire_existing(self, parent: BoundDirectoryAuthority, name: str, payload: bytes, policy: LockPolicy) -> LockLease: ...
 
+class OutputArtifactLockRetirement(Protocol):
+    def finish_output_lock(self, parent: BoundDirectoryAuthority, lease: LockLease) -> OutputLockFinishResult: ...
+
 class PrivateStorageProof(Protocol):
     def create_private_directory(self, parent: BoundDirectoryAuthority, name: str) -> BoundDirectoryAuthority: ...
     def prove_private(self, authority: BoundDirectoryAuthority | BoundRegularFile) -> PrivateAccessEvidence: ...
@@ -322,6 +331,7 @@ Task 3.1 的host probe只返回诊断性的`WindowsHostFacts`，不提前铸造�
 | RETAINED_READ | generic read + read attributes + synchronize | READ，**无 WRITE/DELETE** | OPEN_REPARSE_POINT + SEQUENTIAL_SCAN | target最终read-only reproof；与live reservation creator handle完成三方identity handoff |
 | CANDIDATE | read + write + delete + synchronize | none | CREATE_NEW + OPEN_REPARSE_POINT + WRITE_THROUGH | 写/flush/handle-relative rename 全程同一 handle |
 | LOCK | read + write + synchronize | READ + WRITE，**无 DELETE** | OPEN_REPARSE_POINT | persistent lock file + `LockFileEx` |
+| OUTPUT_LOCK_RETIRE | read + write + delete + read attributes + read control + synchronize | none | OPEN_EXISTING + OPEN_REPARSE_POINT | 普通 lease 关闭后，只重新认证当前输出族闲置载体并按句柄删除 |
 
 具体 access mask 由 ADR W1 固定；实现不得以“修复 sharing violation”为由随意增加 share bits。
 
@@ -399,13 +409,26 @@ stateDiagram-v2
 - fresh process只在source absent且deterministic target可由新rooted handle证明为regular single-link、exact size+SHA-256并通过双parent terminal sandwich时重绑retirement authority。source+target并存、两者皆缺、target内容或安全shape不匹配、issuer漂移，以及前项`LockedDescendantNamespaceInspection`的ancestor/lease漂移均fail closed；同字节对象只在fresh live proof存续期间获得authority，不依据历史FileId声称它与先前物理对象相同。不按basename、历史FileId或pathname推断所有权，也不执行unlink、replace或自动收养。rename arm前programmer/capability失败保持零命名mutation；arm后任一operational不确定统一为`RECOVERY_REQUIRED`，程序错误保持穿透。
 
 ### Lock Flow
-- persistent lock file 使用 W1 自有的 protocol-control integrity ACL profile、显式medium mandatory-integrity label/`NO_WRITE_UP`、deterministic basename、single-link与identity payload；文件从不unlink/replace。DACL与mandatory-label SACL projection分别handle-bound重验；audit ACE不参与discretionary或MIC授权，额外/漂移mandatory label fail closed。该profile只保护锁协议完整性，不铸造W2 attestation private proof，因此W1不反向依赖W2。
+- persistent lock file 使用 W1 自有的 protocol-control integrity ACL profile、显式medium mandatory-integrity label/`NO_WRITE_UP`、deterministic basename、single-link与identity payload；普通初始化/加锁/释放不unlink/replace，唯一输出收尾例外见下节 ADR-027。DACL与mandatory-label SACL projection分别handle-bound重验；audit ACE不参与discretionary或MIC授权，额外/漂移mandatory label fail closed。该profile只保护锁协议完整性，不铸造W2 attestation private proof，因此W1不反向依赖W2。
 - `LockLease.reprove_binding`只对调用方给出的live rooted parent、exact basename与exact payload复证当前lease绑定；它不转移lease或parent ownership，也不代替owner的业务reservation生命周期。
 - `ExistingProcessFileLock`只为read-only recovery classification取得已存在且payload完整相等的W1；锁文件缺失、为空、strict-prefix或foreign时直接拒绝，不创建、补写、升级或替换protocol-control文件。
 - payload固定为可重算的`ProtocolControlLockPayloadV1`（magic/schema/resource-family digest/range-map digest），不保存随机token或跨重启FileId。首次creator以`CREATE_NEW`+`INIT` share-none handle一次写入、flush、handle-readback后关闭。并发loser得到规范化`ERROR_FILE_EXISTS`后先以普通`LOCK` profile执行`OPEN_EXISTING`：若sharing violation，才把INIT creator/recoverer视为初始化进行中并bounded retry；若open成功，则在该handle上复证root/entry/exact DACL/MIC/single-link并读取payload，完整expected bytes直接进入普通flush/readback与`LockFileEx`路径。空或expected strict-prefix必须先关闭普通handle，再争抢`OPEN_EXISTING`+`INIT` share-none handle；取得后重新复证全部安全事实与bytes，只有仍为空/strict-prefix才确定性rewrite/flush/readback，若已完整则只补flush/readback，unknown/超长/非前缀则`LOCK_UNAVAILABLE`。两名recoverer由INIT share-none open互斥；完成后关闭INIT并重新用普通LOCK profile打开。任何未识别create/open状态fail closed，载体从不unlink/replace。
 - bootstrap serialization 与 long-lived resource lock 使用不同 byte ranges 或不同 lock objects，防止一个 active resource 阻塞同目录其他资源初始化。
 - `LockFileEx` 默认阻塞/timeout policy 由 caller contract 给出；release 先 `UnlockFileEx` 后 close，进程终止依赖 OS eventual unlock。
 - acquire/reprove 同时比较 open handle identity、entry identity、payload 和 parent authority。
+
+### 输出锁闲置回收（ADR-027）
+
+`OutputArtifactLockRetirement` 是可选 Windows capability，不加入 `PlatformFileBackend` 的强制组合、不改变 `LockLease.close()`、不为 POSIX 实现空壳能力。调用方只在自身成功终结后探测并调用它；未实现时仍普通 close。平台不接收“导出成功”布尔凭据，不导入 Resource/TMX 业务模块，不探测其他进程的 receipt/pending inventory。
+
+- **输入和所有权**：`finish_output_lock(parent, lease)` 接收同一 adapter issuer、同一 exact rooted parent 的仍存活输出 lease；仅消费 lease 的 close ownership，parent 仍归调用方。精确类型、issuer、parent 或生命周期误用在 mutation 前拒绝。目标名字和完整 expected payload 只取自已签发 lease，不接收任意待删路径、历史 identity 或可序列化删除 token。
+- **获批控制族**：只接受既有 `.resource-artifact-<digest-prefix>.lock` / `localcat.resource-artifact.lock.v1` 和 `.localcat-tmx-<digest-prefix>.lock` / `localcat.tmx-direct.lock.v1` 的 canonical name/payload 配对；完整 payload 内 digest 与名字后缀必须一致。这里只识别平台控制载体，不解析 payload 正文或业务恢复状态；Resource 的调用范围仍由 owner 限于 ResourcePackage，不包含 direct CSV/JSONL。
+- **两段生命周期**：先按原合同复证、unlock 并 close 旧 lease，只有正常完成才对同一 rooted parent 的 exact name 作一次已有文件独占打开。不得等待 holder/waiter 退出、创建缺失载体、修复空/prefix、扩大普通 share mask、改名迁址或使用 DeleteOnClose。活 holder/已打开 waiter 的无 DELETE share 会阻止新的 DELETE 独占访问。
+- **新授权证明**：fresh exclusive handle 全程保留；重新复证 parent/root、regular/single-link、named/live identity、当前 primary TokenUser 与 exact `ProtocolControlLockSecurityV2`、完整 expected payload，并在删除前作 terminal sandwich。只有这些当前事实成立才按同一 handle 标记删除并关闭。旧 lease 关闭后的 FileId 不参与授予权力，也不声称 current carrier 与旧 creator 文件连续同一；符合当前合同的同族闲置控制载体可以重新认证。未知内容、安全事实或 namespace 漂移不能被“同字节”或历史 identity 绕过。
+- **结果合同**：`OutputLockFinishResult` 是无路径、无原始 OS 文本的稳定枚举：`RETIRED` 仅表示删除与 close 均已确认；`ABSENT` 表示 rooted exact name 当前不存在且未创建；`IN_USE` 表示独占打开被冲突共享阻止；`NOT_PROVEN` 覆盖正常 lease 关闭失败、证明失败或删除/close 不确定，不表示已删除，也不保证文件仍存在。收尾的 operational 故障转换为该结果，不推翻 caller 已闭合 receipt；程序错误不伪装为成功。所有分支释放新取得的句柄，不能吞掉原发布错误。
+- **混合版本边界**：保持原 name/payload/security/byte range。旧进程处在 init-close→ordinary-open 间隙时允许明确 `LOCK_UNAVAILABLE` 后重试完整 acquire；已打开的 waiter 不能被绕过。进程被终止后只按既有 acquire 初始化规则重新进入，不扫描目录回收其他锁。
+
+**文件边界与验证**：`platform_fs_contracts.py` 增加可选 port/result；`platform_fs_windows.py` 实现 profile、proof 与 lifecycle，复用 `windows_file_api.py` 既有 handle disposition ABI。平台回归放在 `tests/test_platform_fs_windows_output_lock_retirement.py`，覆盖真实 holder/opened waiter、旧初始化间隙、缺失/有效同族重认证、未知/空/prefix payload、ACL/MIC/link/reparse/parent 漂移、terminal/delete/close 故障与进程终止。普通 acquire/close 和 POSIX shape 必须保持原行为；consumer 的 receipt/recovery 判定不进入这些平台测试。对应 3.7–3.9。
 
 ### Private Storage Proof
 - W2主体是进程primary token的canonical `TokenUser` SID；以SID bytes比较，不查询或按local/domain/Entra provider、账户显示名、UPN或domain join状态分流。首版支持profile要求`TokenPrimary`、有效SID、medium/high integrity、非AppContainer及必要session/access facts；standard与UAC elevated token若SID相同必须访问同一私有对象，thread impersonation不得改变process-primary主体。service/非交互、AppContainer、impersonation-only或无法取得必要token/session事实时返回`CAPABILITY_UNAVAILABLE`。
@@ -526,6 +549,7 @@ flowchart TD
 | 1.1-1.5 | capability discovery/fail closed/parity | composition, both adapters, Qt | factory, PlatformFileError | startup gate |
 | 2.1-2.6 | rooted identity/reparse/containment | Windows adapter, API wrapper, Parser | RootedFileSystem, FileObjectIdentity | Rooted Open |
 | 3.1-3.6 | cross-process lock/reservation | lock adapter, chunk, TM migration | ProcessFileLock, LockLease | Lock Flow |
+| 3.7-3.9 | 已终结导出的安全输出收尾 | Windows lock adapter、Resource/TMX owners | OutputArtifactLockRetirement、OutputLockFinishResult | ADR-027 输出锁闲置回收 |
 | 4.1-4.5 | atomic publish/durability/recovery | publisher, business journals/LKG | BoundDirectoryAuthority, CandidateFile | Atomic Publish |
 | 5.1-5.4 | shared boundary/consumer parity | migration clusters | platform contracts | Consumer Integration |
 | 6.1-6.6 | dependency/Qt startup/avatar regression、user-managed source entry | Qt composition, avatar catalog, source launcher, release validator | source/runtime smoke | Source + Build + E2E |
