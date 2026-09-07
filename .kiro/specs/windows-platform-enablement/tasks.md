@@ -197,7 +197,7 @@
   - _Depends: 3.1_
 
 - [x] 3.3 (P) 实现 LockFileEx persistent lease 与 crash release
-  - lock file使用W1 exact protocol-control DACL、exact medium mandatory-label/`NO_WRITE_UP` SACL projection、deterministic name、single-link/`ProtocolControlLockPayloadV1`/entry identity，文件永久保留且不unlink/replace；不得反向依赖W2 attestation private proof
+  - lock file使用W1 exact protocol-control DACL、exact medium mandatory-label/`NO_WRITE_UP` SACL projection、deterministic name、single-link/`ProtocolControlLockPayloadV1`/entry identity，普通初始化与持锁基线不unlink/replace；ADR-027 的输出终结例外由新增 3.3a 独立交付，不回填为本任务已完成；不得反向依赖W2 attestation private proof
   - 首次creator用`CREATE_NEW`+share-none init handle写完整可重算payload并flush/readback；并发loser在`ERROR_FILE_EXISTS`后先用普通LOCK profile open/复证，完整payload直接进入`LockFileEx`，该open sharing violation才bounded retry INIT。空/strict-prefix须关闭普通handle再争抢INIT share-none handle、二次复证DACL/MIC/identity/bytes后确定性恢复；unknown状态fail closed，恢复后关闭INIT再打开普通LOCK profile
   - read-only recovery classification使用可选`ExistingProcessFileLock`只取得已存在且exact-payload的W1；缺失、空、strict-prefix或foreign状态不得创建、补写或升级锁文件
   - 实现明确 byte range、blocking/timeout/contention结果；normal unlock/close与 TerminateProcess 后 eventual release不承诺公平/零延迟
@@ -205,6 +205,15 @@
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 8.3_
   - _Boundary: Windows Process File Lock_
   - _Depends: 3.2_
+
+- [x] 3.3a 实现已终结输出锁的安全闲置回收
+  - 由本平台 Spec 闭合 ADR-027 继承与 ResourcePackage/TMX amendment 依赖；确认治理分支的 ADR 索引、ADR-020/023 取代元数据已进入当前树，不把其他 persistent lock 或 POSIX 路径纳入例外。
+  - 新增可选输出收尾能力；先正常释放原 lease，再重新认证 exact parent 中的当前 canonical family 控制载体，不能使用已关闭旧 identity 授权、扩大普通 share 或绕过等待者。
+  - 完成时，无竞争的合法输出控制载体可被安全回收；缺失、占用、无法证明和删除/close 不确定各有准确有界结果，任一失败都不会误删外来文件或铸造新的业务恢复权威。
+  - 真实进程验证 holder、已打开 waiter、旧初始化间隙、kill/retry；故障覆盖未知/空/prefix payload、ACL/MIC、link/reparse/parent 漂移及 terminal/delete/close，并验证普通 acquire/close 与 POSIX 组合未变。
+  - _Requirements: 3.1, 3.3, 3.7, 3.8, 3.9_
+  - _Boundary: Windows Process File Lock、OutputArtifactLockRetirement_
+  - _Depends: 3.3, ADR-027_
 
 - [x] 3.4 (P) 实现 W2 private storage 与跨重启 proof重新证明
   - 按ADR-021经ADR-023接管、ADR-024收窄主体环境后的`WindowsPrivateSecurityV2`，对private dir/device key/attestation/candidate显式创建owner=process-primary TokenUser SID、DACL present/protected且非defaulted/auto-inherited，exact三条AceFlags=0的TokenUser/`S-1-5-18`/`S-1-5-32-544` `ACCESS_ALLOWED_ACE(FILE_ALL_ACCESS)`，并显式设置/重验单一medium `SYSTEM_MANDATORY_LABEL_ACE`+`NO_WRITE_UP` projection；在`READ_CONTROL` handle上以`LABEL_SECURITY_INFORMATION`读取label，不请求完整`SACL_SECURITY_INFORMATION`/`ACCESS_SYSTEM_SECURITY`。audit ACE分开解析，拒绝额外/漂移mandatory label及未知授权ACE/principal，V1/unknown profile不兼容读取
@@ -543,3 +552,8 @@
   - _Requirements: 1.1, 1.2, 2.1, 3.1, 4.1, 4.2, 5.1, 6.2, 6.5, 7.1, 7.2, 8.1, 8.2, 9.1, 9.3, 9.4, 10.1, 10.2, 11.1, 11.2, 11.3, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7_
   - _Boundary: Final Windows Packaged Feature GO_
   - _Depends: 9.4_
+
+## Source 维护实施记录
+
+- Task 4.4b：历史 `CHILD_FAILED` 只有包装码且子进程输出被丢弃，无法从旧日志追溯原始偶发失败。新增诊断必须继续限制在白名单安全事实，不记录项目正文、路径、参数或异常原文。
+- 隔离空资源或单条 TM 的启动测试不能替代用户实际 Start Menu 配置计时；性能调查和偶发失败保持独立验收。
