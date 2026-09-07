@@ -27,6 +27,13 @@
 - [x] 3.4a 将 TMX destination publication 接入 `BoundDirectoryPublisher` 与 `ProcessFileLock`，保持 candidate/LKG/cold validate/receipt 顺序。
   - _Amendment: WA-05_
   - _Depends: 3.4, ADR-020, WA-01, windows-platform-enablement 2.1_
+- [x] 3.4b 集成 direct TMX 成功终结与 Windows 输出锁收尾
+  - 在本次 retained readback、receipt-ready、terminal 与 owned sidecar/journal 收尾全部完成后消费可选平台能力；稳定 journal 仍存在或原 recovery-required 时保留锁，不改变原恢复状态机。
+  - 完成时，resource/project/chunk 三种 direct 导出在无竞争时只保留最终 TMX，Parser 冷重开、scope/loss 和原 receipt 一致；收尾占用或不确定不推翻已闭合结果。
+  - 覆盖正常冷恢复、无 journal 返回、未闭合 journal/sidecar、原发布/恢复异常、平台收尾失败和真实 holder/waiter 竞争；ResourcePackage 仍由 LRP 收尾，POSIX 与其他锁不变。
+  - _Requirements: 8.5, 8.7, 8.8, 8.9, 11.1_
+  - _Boundary: TMX Direct Artifact Saver 与平台输出锁终结集成_
+  - _Depends: 3.4a, windows-platform-enablement 3.3a, ADR-027_
 - [x] 3.5 完成 resource/project/chunk exact scope、inclusion/loss 与 publication fault matrix。
 - [x] 3.5a 在 Windows 覆盖 publish phase crash、锁竞争、destination replacement 与 clean-process recovery，失败不改 scope owner 或 source artifact。
   - 每个失败必须证明target-before exact不变；rename后事实不确定时只进入recovery-required并保留LKG/journal，不得报告成功或猜测清理。

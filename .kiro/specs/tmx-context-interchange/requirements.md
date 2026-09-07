@@ -12,6 +12,13 @@ LocalCAT 已有拒绝 DTD/ENTITY、限额流式读取和语言对选择的 TMX L
 - **范围外**：ProjectPackage、Workspace/Chunk identity 或 membership 生成、ResourcePackage manifest/ZIP/preview/apply/receipt、provider/网络、MyMemory API、Fuzzy、复杂内联标签编辑、Job 身份。
 - **上游**：Parser 安全 reader；canonical TM snapshot；Workspace session/universe projection；Chunk exact scope projection；ResourcePackage carrier/transaction owner。
 
+### Scope Lineage：Windows 导出输出收尾
+
+- **Owning spec**：`tmx-context-interchange`；本修订只覆盖三个既有 scope 的 direct `.tmx` 导出。
+- **被修订的既有范围说明**：WA-05 与 Requirement 8 的 Windows direct publication 正常完成后，输出目录仍保留迁移新增的内部协调锁文件。
+- **相邻规格 / 契约**：`windows-platform-enablement` 3.7–3.9 提供安全收尾能力；ResourcePackage 仍由 `language-resource-portability` 收尾，不迁入 TMX。
+- **审批状态**：ADR-027 已获批准；其他持久锁、导入、payload grammar、scope 身份与 POSIX 行为不在修订范围。
+
 ### Windows Compatibility Amendment WA-05
 
 1. Windows TMX source 必须通过 Parser 的 ADR-020 rooted sealed-source contract；invalid/escaped/reparse/stale source 在任何 import mutation 前失败，valid record count 与 terminal 继续由 Parser/TMX owner闭合。
@@ -95,6 +102,8 @@ LocalCAT 已有拒绝 DTD/ENTITY、限额流式读取和语言对选择的 TMX L
 5. Pre-publication failure shall 保持 destination exact 不变；post-publication readback failure shall 仅在能证明 target 仍是本 operation candidate 时恢复 prior，否则返回 recovery-required。
 6. Cancel shall 不创建或修改 destination；preview 不可序列化或重放。
 7. Success shall 返回 body-safe receipt，绑定 scope/profile/locale/destination before/after digest/counts 与 durable outcome。
+8. When Windows direct TMX 导出已成功终结且没有冲突占用或系统清理故障时, the TMX exporter shall 不在输出目录遗留该次导出的内部协调锁文件，并保持最终 `.tmx` 文件不变。
+9. If 本次 TMX 发布仍需恢复或输出收尾无法安全完成, the TMX exporter shall 保留未经确认可清理的恢复物，不扩大清理范围，不因协调文件收尾失败改变已闭合的成功结果，也不声称未确认的文件已被清理。
 
 ### Requirement 9：ResourcePackage TMX 后继 Profile
 

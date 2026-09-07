@@ -18,6 +18,7 @@ from platform_fs_contracts import (
     LockLease,
     LockPolicy,
     LockWait,
+    OutputArtifactLockRetirement,
     PendingPublication,
     PlatformFileBackend,
     PlatformFileError,
@@ -446,7 +447,11 @@ class TmxDirectArtifactSaver:
             journal = None
             published.close()
             published = None
-            return recovery.receipt(preview.destination)
+            receipt = recovery.receipt(preview.destination)
+            _finish_output_lock(backend, parent, lease)
+            if lease.closed:
+                lease = None
+            return receipt
         except BaseException as primary:
             if operation_uncertain:
                 if isinstance(primary, TmxContextError) and primary.code == "TMX.RECOVERY_REQUIRED":
@@ -504,6 +509,9 @@ class TmxDirectArtifactSaver:
             )
             journal_observed = parent.inspect_entry(_journal_name(destination.name))
             if journal_observed is None:
+                _finish_output_lock(backend, parent, lease)
+                if lease.closed:
+                    lease = None
                 return None
             journal_source = backend.open_regular(
                 parent,
@@ -556,6 +564,9 @@ class TmxDirectArtifactSaver:
             parent.unlink_owned(_journal_name(destination.name), journal_observed.identity)
             if parent.inspect_entry(_journal_name(destination.name)) is not None:
                 raise _recovery_required()
+            _finish_output_lock(backend, parent, lease)
+            if lease.closed:
+                lease = None
             return receipt
         except TmxContextError:
             raise
@@ -1006,6 +1017,19 @@ def _close_authorities(*authorities: object) -> None:
                 authority.close()  # type: ignore[attr-defined]
             except PlatformFileError:
                 pass
+
+
+def _finish_output_lock(
+    backend: PlatformFileBackend,
+    parent: BoundDirectoryAuthority,
+    lease: LockLease,
+) -> None:
+    if not isinstance(backend, OutputArtifactLockRetirement):
+        return
+    try:
+        backend.finish_output_lock(parent, lease)
+    except Exception:
+        pass
 
 
 __all__ = ["TmxDirectArtifactSaver"]
