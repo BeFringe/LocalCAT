@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pickle
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -20,6 +22,7 @@ import platform_fs_contracts
 import platform_fs_windows
 import tm_sqlite_store
 import tm_stage_sealer
+from tm_engine import open_canonical_tm_store
 from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
 from tm_candidate_store_contracts import SQLiteStoreSchemaError
 from tm_contracts import (
@@ -35,6 +38,7 @@ from tm_migration import MigrationFailure, MigrationReport, TMMigrationService
 from tm_sqlite_store import (
     ActivationPreparationError,
     ResourceStoreCoordinator,
+    SQLiteStoreLifecycleError,
     SQLiteTMStore,
 )
 
@@ -549,6 +553,655 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                 self.assertEqual(
                     fresh.active_store_path,
                     identity.canonical_sidecar_path,
+                )
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_runtime_open_reuses_clean_refresh_owner_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                real_owner_inspection = (
+                    tm_migration._inspect_portable_replacement_namespace
+                )
+                with mock.patch.object(
+                    tm_migration,
+                    "_inspect_portable_replacement_namespace",
+                    wraps=real_owner_inspection,
+                ) as owner_inspection:
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "NOOP")
+                self.assertEqual(owner_inspection.call_count, 1)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_runtime_open_reuses_hydrated_current_index_once(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                SQLiteTMStore.from_coordinator(coordinator).append(
+                    TMRecordDraft(
+                        source_raw="changed canonical source",
+                        target_raw="changed canonical target",
+                        speaker_raw=None,
+                        context_prev_raw=None,
+                        context_next_raw=None,
+                        file_source=None,
+                        provenance=(("source", "runtime-open-test"),),
+                    )
+                )
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                real_validator = tm_sqlite_store.validate_candidate_proof_index
+                with mock.patch.object(
+                    tm_sqlite_store,
+                    "validate_candidate_proof_index",
+                    wraps=real_validator,
+                ) as validator:
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+                    self.assertTrue(store.health().healthy)
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "NOOP")
+                validator.assert_called_once()
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_owner_is_private_one_shot_and_not_publicly_ready(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                real_rehydrate = (
+                    fresh.rehydrate_completed_portable_runtime_open
+                )
+                captured: list[tm_sqlite_store._DeferredPortableRuntimeOwner] = []
+
+                def capture_owner(**kwargs: object) -> tuple[object, object]:
+                    result = real_rehydrate(**kwargs)
+                    owner = result[1]
+                    self.assertIs(
+                        type(owner),
+                        tm_sqlite_store._DeferredPortableRuntimeOwner,
+                    )
+                    captured.append(owner)
+                    self.assertEqual(fresh.state, "ACTIVATING")
+                    prior_witness = fresh._current_index_validation
+                    with self.assertRaisesRegex(
+                        ActivationPreparationError,
+                        "^ACTIVATION.RECOVERY_REQUIRED$",
+                    ):
+                        tm_sqlite_store._DeferredPortableRuntimeOwner(
+                            coordinator=fresh,
+                            view=owner._view,
+                            database=owner._database,
+                            base_generation=owner._base_generation,
+                            remember_index=owner._remember_index,
+                        )
+                    self.assertIs(fresh._deferred_runtime_open_owner, owner)
+                    self.assertIs(fresh._view, owner._view)
+                    self.assertIs(
+                        fresh._current_index_validation, prior_witness,
+                    )
+                    failures: list[BaseException] = []
+
+                    def public_probe() -> None:
+                        try:
+                            SQLiteTMStore.from_coordinator(fresh)
+                        except BaseException as error:
+                            failures.append(error)
+
+                    probe = threading.Thread(target=public_probe)
+                    probe.start()
+                    probe.join(timeout=2.0)
+                    self.assertFalse(probe.is_alive())
+                    self.assertEqual(len(failures), 1)
+                    self.assertIs(type(failures[0]), SQLiteStoreLifecycleError)
+                    with self.assertRaises(TypeError):
+                        pickle.dumps(owner)
+                    return result
+
+                with mock.patch.object(
+                    fresh,
+                    "rehydrate_completed_portable_runtime_open",
+                    side_effect=capture_owner,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "NOOP")
+                self.assertEqual(fresh.state, "READY")
+                self.assertEqual(len(captured), 1)
+                owner = captured[0]
+                self.assertTrue(owner.completed)
+                with self.assertRaises(ActivationPreparationError):
+                    owner.complete(
+                        coordinator=fresh,
+                        resource_identity=identity,
+                        canonical_store_id="store.primary",
+                        generation=0,
+                        base_generation=owner._base_generation,
+                        database=owner._database,
+                        terminal_cleanup=lambda: None,
+                    )
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_owner_aborts_when_terminal_reproof_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                SQLiteTMStore.from_coordinator(coordinator).append(
+                    TMRecordDraft(
+                        source_raw="abort provisional source",
+                        target_raw="abort provisional target",
+                        speaker_raw=None,
+                        context_prev_raw=None,
+                        context_next_raw=None,
+                        file_source=None,
+                        provenance=(("source", "runtime-open-test"),),
+                    )
+                )
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                with mock.patch.object(
+                    tm_migration,
+                    "_inspect_portable_replacement_namespace",
+                    side_effect=ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_REQUIRED",
+                        retryable=True,
+                    ),
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._current_index_validation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_owner_aborts_on_unexpected_completion_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                with mock.patch.object(
+                    fresh_service,
+                    "_complete_deferred_runtime_owner",
+                    side_effect=RuntimeError("fixture completion failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "fixture completion failure",
+                    ):
+                        fresh_service.open_completed_portable_runtime()
+
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+                self.assertIsNone(fresh._current_index_validation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_owner_constructor_failure_is_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                SQLiteTMStore.from_coordinator(_coordinator).append(
+                    TMRecordDraft(
+                        source_raw="constructor failure source",
+                        target_raw="constructor failure target",
+                        speaker_raw=None,
+                        context_prev_raw=None,
+                        context_next_raw=None,
+                        file_source=None,
+                        provenance=(("source", "runtime-open-test"),),
+                    )
+                )
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                with mock.patch.object(
+                    tm_sqlite_store,
+                    "_CurrentCanonicalIndexValidation",
+                    side_effect=RuntimeError("fixture witness failure"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "fixture witness failure",
+                    ):
+                        fresh_service.open_completed_portable_runtime()
+
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+                self.assertIsNone(fresh._current_index_validation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_terminal_cleanup_keeps_ready_unobservable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                entered = threading.Event()
+                release = threading.Event()
+                opened: list[object] = []
+                probed: list[object] = []
+                failures: list[BaseException] = []
+                probe_started = threading.Event()
+                real_complete = tm_sqlite_store._DeferredPortableRuntimeOwner.complete
+
+                def block_terminal_cleanup(owner: object, **arguments: object) -> None:
+                    cleanup = arguments["terminal_cleanup"]
+                    self.assertTrue(callable(cleanup))
+
+                    def blocking_cleanup() -> None:
+                        entered.set()
+                        if not release.wait(5.0):
+                            raise AssertionError("terminal cleanup was not released")
+                        cleanup()
+
+                    arguments["terminal_cleanup"] = blocking_cleanup
+                    real_complete(owner, **arguments)
+
+                def open_runtime() -> None:
+                    try:
+                        opened.append(
+                            fresh_service.open_completed_portable_runtime()
+                        )
+                    except BaseException as error:
+                        failures.append(error)
+
+                def probe_runtime() -> None:
+                    try:
+                        probe_started.set()
+                        probed.append(SQLiteTMStore.from_coordinator(fresh))
+                    except BaseException as error:
+                        failures.append(error)
+
+                with mock.patch.object(
+                    tm_sqlite_store._DeferredPortableRuntimeOwner,
+                    "complete",
+                    new=block_terminal_cleanup,
+                ):
+                    opener = threading.Thread(target=open_runtime)
+                    opener.start()
+                    self.assertTrue(entered.wait(5.0))
+                    probe = threading.Thread(target=probe_runtime)
+                    probe.start()
+                    self.assertTrue(probe_started.wait(2.0))
+                    probe.join(timeout=0.1)
+                    self.assertTrue(probe.is_alive())
+                    release.set()
+                    opener.join(timeout=10.0)
+                    probe.join(timeout=10.0)
+
+                self.assertFalse(opener.is_alive())
+                self.assertFalse(probe.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(len(opened), 1)
+                self.assertEqual(len(probed), 1)
+                self.assertEqual(fresh.state, "READY")
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_terminal_close_failure_never_publishes_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                regular_type = platform_fs_windows._WindowsBoundRegularFile
+                real_close = regular_type._close_authority
+                injected = False
+
+                def close_then_fail(authority: object) -> None:
+                    nonlocal injected
+                    real_close(authority)
+                    if (
+                        fresh._state == "READY"
+                        and fresh._deferred_runtime_open_owner is not None
+                        and not injected
+                    ):
+                        injected = True
+                        raise OSError("fixture terminal database close failure")
+
+                with mock.patch.object(
+                    regular_type,
+                    "_close_authority",
+                    new=close_then_fail,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertTrue(injected)
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+                self.assertIsNone(fresh._current_index_validation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_reservation_release_failure_never_publishes_ready(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                reservation_type = tm_migration._InitialActivationResourceReservation
+                real_release = reservation_type.release
+                injected = False
+
+                def release_then_fail(reservation: object) -> None:
+                    nonlocal injected
+                    real_release(reservation)
+                    if not injected:
+                        injected = True
+                        raise tm_migration._InitialActivationReservationError(
+                            "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                        )
+
+                with mock.patch.object(
+                    reservation_type,
+                    "release",
+                    new=release_then_fail,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertTrue(injected)
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+                self.assertIsNone(fresh._current_index_validation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_runtime_open_owner_rejects_database_change_before_completion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+                complete = fresh_service._complete_deferred_runtime_owner
+
+                def mutate_database(**arguments):
+                    payload = bytearray(
+                        identity.canonical_sidecar_path.read_bytes()
+                    )
+                    payload[-1] ^= 0x01
+                    identity.canonical_sidecar_path.write_bytes(payload)
+                    return complete(**arguments)
+
+                with mock.patch.object(
+                    fresh_service,
+                    "_complete_deferred_runtime_owner",
+                    side_effect=mutate_database,
+                ):
+                    report, store, recovery = (
+                        fresh_service.open_completed_portable_runtime()
+                    )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+                self.assertIsNone(fresh._current_index_validation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_completed_runtime_open_sends_artifact_to_strict_recovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                paths = tm_migration._export_artifact_paths(
+                    identity.configured_jsonl_path
+                )
+                paths.jsonl_temp.write_bytes(b"unowned")
+                fresh = ResourceStoreCoordinator(
+                    canonical_store_id="store.primary",
+                    resource_identity=identity,
+                )
+                fresh_service = TMMigrationService(
+                    resource_identity=identity,
+                    canonical_store_id="store.primary",
+                    coordinator=fresh,
+                )
+
+                report, store, recovery = (
+                    fresh_service.open_completed_portable_runtime()
+                )
+
+                self.assertIsNotNone(report)
+                self.assertIsNotNone(store)
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.state.value, "BLOCKED")
+                self.assertEqual(
+                    recovery.error_code,
+                    "RECOVERY.UNJOURNALED_ARTIFACTS",
+                )
+                self.assertEqual(paths.jsonl_temp.read_bytes(), b"unowned")
+                self.assertEqual(fresh.state, "ACTIVATING")
+                self.assertIsNone(fresh.current_generation)
+                self.assertIsNone(fresh._deferred_runtime_open_owner)
+                self.assertIsNone(fresh._current_index_validation)
+            finally:
+                _remove_long_quarantine(root)
+
+    def test_canonical_open_preserves_specific_blocked_recovery_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            identity, _coordinator, service = _fixture(root)
+            try:
+                activated = service.activate_initial(
+                    identity.configured_jsonl_path,
+                    identity.resource_id,
+                )
+                self.assertIs(type(activated), MigrationReport)
+                paths = tm_migration._export_artifact_paths(
+                    identity.configured_jsonl_path
+                )
+                paths.jsonl_temp.write_bytes(b"unowned")
+
+                with self.assertRaises(ValueError) as caught:
+                    open_canonical_tm_store(
+                        identity.configured_jsonl_path,
+                        expected_resource_id=identity.resource_id,
+                    )
+
+                self.assertEqual(
+                    str(caught.exception),
+                    "TM.CANONICAL_RECOVERY_FAILED:"
+                    "RECOVERY.UNJOURNALED_ARTIFACTS",
                 )
             finally:
                 _remove_long_quarantine(root)

@@ -1120,6 +1120,14 @@ facade 每次进程级打开都必须重建同一权威判定，不得把“本�
 
 该结果只决定是否重复调用candidate索引validator。meta、generation、当前ledger/binding检查与历史active attestation的独立命中条件保持原样；不能把当前record_count或receipt塞回历史attestation。JSONL/manifest分歧继续归SourceBindingMonitor。恢复namespace、W1/W2、publication及terminal证明均不因本项跳过或缓存；跨线程交接不携带SQLite连接或尚未结束的临时句柄。
 
+### 同一次 Windows replacement 冷开的 retained inspection owner
+
+Task 8.8c 的coordinator索引结果仍不授权复用恢复namespace。另由Task 8.8d把一次`open_completed_portable_runtime()`内原本前后两次重建的replacement `CURRENT`认证组织为单一retained-handle窗口：hydration首次仍完整打开并认证private directory、device key、base publication chain与replacement READY record，严格解析codec、outer digest、predecessor、private proof和device MAC，并执行有界闭集观察。只有状态为`CURRENT`、无pending/backups且canonical DB hydration成功时，才把该次已认证的child handles、`BoundContentFacts`、完整`LedgerEntryObservation`、private-proof token、base-generation record及exact backend/root/W1/borrow/thread绑定进process-private one-shot owner；其他状态立即关闭并继续既有恢复路径。
+
+terminal不得只信任解析后的snapshot。owner先后复证同一W1 lease、root及private-directory basename→identity，使用同一private directory authority重做完整有界闭集观察并比较每个`LedgerEntryObservation`，再对每个retained child要求当前`content_facts`与初次事实相等、basename仍绑定同一live object并重新证明individual private profile。Windows child handle在窗口内保持read-only且不共享write/delete；后续`content_facts`即使复用已捕获SHA-256，也必须重新证明live handle、完整directory chain、named entry、size、LastWrite/ChangeTime/attributes均未漂移。最后逐一消费首次验证产生的`VerifiedPrivateProof`，重新证明private-directory DACL/MIC、exact device secret和record MAC，并再次复证borrow/root；任何identity、内容、闭集、DACL/MIC、secret/MAC或close异常均废弃owner、保持coordinator为`ACTIVATING`且不得公开view/generation。
+
+retained inspection owner不写持久状态，不进入resource registry或公开API，不允许复制、序列化、跨线程转移，也不保存到service/coordinator供后续调用使用。terminal成功或失败都关闭全部owned child/proof/private-parent authorities；外层W1/root仍只由原reservation关闭。base generation 0冷开仍执行既有terminal private-owner认证；pending、`READY_CLEANUP`、显式replacement/schema-upgrade与fresh recovery仍重新取得并完整认证其所需namespace，历史activation/publication/retirement语义不变。
+
 ### TMBenchmark
 
 ```python

@@ -7419,8 +7419,9 @@ class _WindowsPortableFreshRecoveryOwner:
                     PurePath(private_name, "device.key"),
                 )
                 authorities.append(key_file)
-                key_snapshot = key_file.snapshot()
-                key_bytes = key_file.read_all()
+                key_capture = key_file.capture_content()
+                key_snapshot = key_capture.facts.snapshot
+                key_bytes = key_capture.content
                 if (
                     key_snapshot != observations["device.key"]
                     or key_snapshot.identity.kind != "regular"
@@ -7458,8 +7459,9 @@ class _WindowsPortableFreshRecoveryOwner:
                         PurePath(private_name, name),
                     )
                     authorities.append(record_file)
-                    record_snapshot = record_file.snapshot()
-                    payload = record_file.read_all()
+                    record_capture = record_file.capture_content()
+                    record_snapshot = record_capture.facts.snapshot
+                    payload = record_capture.content
                     if (
                         record_snapshot != observations[name]
                         or record_snapshot.identity.kind != "regular"
