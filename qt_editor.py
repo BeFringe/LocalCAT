@@ -826,15 +826,10 @@ def _run_empty_home_startup(
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
 
-    from capability_host import CapabilityHostComposition
-    from chunk_controller_adapter import ChunkControllerAdapter
-    from editor_controller import EditorController
-    from qt_editor_window import QtEditorWindow
     from qt_resource_contracts import SourceQtResources
-    from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
+    from qt_speaker_avatar import resource_png_pixmap
     from qt_startup_loader import QtStartupLoader
     from qt_startup_window import QtStartupWindow
-    from tmx_application import TmxExportApplicationService
 
     resources = cast(SourceQtResources, qt_resources)
 
@@ -867,6 +862,11 @@ def _run_empty_home_startup(
             )
             chunks = _compose_chunk_controller(controller, repository)
             exports = _compose_tmx_export_service(controller, repository, chunks)
+            # Keep the full editor and avatar surfaces off the first-paint path.
+            # Import them on the loader thread before publication so the GUI
+            # thread only constructs the already-loaded ready window.
+            import qt_editor_window  # noqa: F401
+            import qt_speaker_avatar  # noqa: F401
         except Exception as error:
             trace.finish(error=error)
             raise
@@ -876,9 +876,11 @@ def _run_empty_home_startup(
     def publish(result: object) -> None:
         if home.closed:
             return
+        from qt_editor_window import QtEditorWindow
+        from qt_speaker_avatar import SpeakerAvatarCatalog
+
         controller, capabilities, chunks, exports = cast(
-            tuple[EditorController, CapabilityHostComposition,
-                  ChunkControllerAdapter, TmxExportApplicationService], result,
+            tuple[object, object, object, object], result,
         )
         trace = _StartupTrace("ready_editor_window")
         window = None
@@ -1012,8 +1014,6 @@ def main(argv: list[str] | None = None) -> int:
             data_root.close()
 
         startup_trace.finish("business_imports")
-        from qt_editor_window import QtEditorWindow
-        from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
         from resource_repository import ResourceRepository
 
         startup_trace.finish("resource_repository")
@@ -1034,6 +1034,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_empty_home_startup(
                 repository, source_authority, qt_resources, startup_trace
             )
+        from qt_editor_window import QtEditorWindow
+        from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
         startup_trace.finish("editor_composition")
         controller, capability_composition = _compose_editor_controller(
             repository,
