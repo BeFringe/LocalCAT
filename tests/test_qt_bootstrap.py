@@ -47,8 +47,15 @@ class QtBootstrapTest(unittest.TestCase):
                 "time",
             },
         )
-        source = (ROOT / "qt_editor.py").read_text(encoding="utf-8")
-        self.assertNotIn("from qt_editor_window import", source.split("def main", 1)[0])
+        # A deferred helper may appear before main in the source. Verify the
+        # import boundary itself, not the textual position of its definition.
+        completed = subprocess.run(
+            [sys.executable, "-c", "import sys; import qt_editor; "
+             "assert 'qt_editor_window' not in sys.modules; "
+             "assert 'PySide6' not in sys.modules"],
+            cwd=ROOT, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_missing_pyside_reports_install_command_without_traceback(self) -> None:
         original_import = builtins.__import__
