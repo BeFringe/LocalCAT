@@ -43,17 +43,15 @@ class _FakeTmxPayloadHandler:
         self.mutate_source = mutate_source
         self.fail_validation_call = fail_validation_call
 
-    def export_snapshot(
+    def prepare_export_payload(
         self,
         resource: ResourceConfig,
-        destination: Path,
-    ) -> PortableResourceSnapshot:
+    ) -> tuple[PortableResourceSnapshot, bytes]:
         self.export_calls += 1
         baseline = hashlib.sha256(resource.path.read_bytes()).hexdigest()
-        destination.write_bytes(_TMX)
         if self.mutate_source:
             resource.path.write_bytes(resource.path.read_bytes() + b"drift")
-        return self._snapshot(baseline)
+        return self._snapshot(baseline), _TMX
 
     def validate_snapshot(self, source: Path) -> PortableResourceSnapshot:
         self.validate_calls += 1
