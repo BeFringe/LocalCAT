@@ -39,6 +39,12 @@ class QtStartupWindowTests(unittest.TestCase):
         self.assertIn("完成", self.window.open_project_button.toolTip())
         self.assertTrue(self.window.progress_bar.isVisible())
         self.assertEqual(self.window.progress_bar.maximum(), 0)
+        self.assertEqual(self.window.styleSheet(), "")
+        self.assertEqual(self.window.root.styleSheet(), "")
+        self.assertEqual(self.window.card.styleSheet(), "")
+        self.assertEqual(self.window.open_project_button.styleSheet(), "")
+        self.assertEqual(self.window.retry_button.styleSheet(), "")
+        self.assertEqual(self.window.progress_bar.styleSheet(), "")
         self.assertFalse(self.window.retry_button.isVisible())
 
     def test_failure_and_retry_are_safe_explicit_and_single_shot(self):
