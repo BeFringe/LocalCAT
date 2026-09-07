@@ -126,6 +126,7 @@
   - evidence path 在调用前必须不存在；旧 evidence 或 receipt 不得在后续进程重铸授权
   - 只有配对的 Gate C fuzzy-core 与本次 intended-path Gate D 同时通过才开放 FUZZY；失败保留 canonical exact 与已开放 context，不得提升 fuzzy
   - Gate D 在后台运行，不阻塞 Qt；`GATE_D.CLEANUP_PENDING` 或 identity drift 时保留现场并保持 closed，application 不递归清理或推断通过
+  - source 启动窗口内仍绑定 Gate D-only 文件的活身份、exact bytes 与 digest；其 AST/code anchor 只在既有后台 restore/run 的 fresh proof window 中物化，任一源码或运行时代码漂移继续 fail closed
   - 完成时，Gate D success、old receipt、absent evidence、cleanup pending、identity drift、非阻塞与 exact/context preservation tests 全部通过
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.7_
   - _Boundary: CapabilityHost Gate D_

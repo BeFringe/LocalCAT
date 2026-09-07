@@ -672,15 +672,17 @@ def _source_default_value(
 def _source_declarations(
     content: bytes,
     *,
+    path: Path,
     named_defaults: dict[str, object],
 ) -> tuple[
+    ast.Module,
     tuple[str, ...],
     tuple[str, ...],
     tuple[tuple[str, _SourceFunctionDefaults], ...],
     tuple[tuple[str, str, str], ...],
     tuple[_DataclassSourceShape, ...],
 ]:
-    tree = ast.parse(content)
+    tree = ast.parse(content, filename=str(path))
     resolved_defaults = dict(named_defaults)
     for node in tree.body:
         name: str | None = None
@@ -774,6 +776,7 @@ def _source_declarations(
 
     visit_body(tree.body, "")
     return (
+        tree,
         tuple(sorted(set(functions))),
         tuple(sorted(set(classes))),
         tuple(sorted(defaults.items(), key=lambda item: item[0])),
@@ -783,7 +786,7 @@ def _source_declarations(
 
 
 def _compiled_code_anchors(
-    content: bytes,
+    tree: ast.Module,
     path: Path,
     declared_functions: tuple[str, ...],
 ) -> tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]:
@@ -803,7 +806,7 @@ def _compiled_code_anchors(
                 )
             visit(nested)
 
-    visit(compile(content, str(path), "exec"))
+    visit(compile(tree, str(path), "exec"))
     if any(not values for values in observed.values()):
         raise RuntimeError("trusted source callable code is incomplete")
     return tuple(
@@ -839,9 +842,30 @@ class _ModuleSourceCodeAnchor:
         named_defaults: dict[str, object] | None = None,
     ) -> _ModuleSourceCodeAnchor:
         source = _TrackedFileAnchor.capture(path, source_authority)
-        functions, classes, defaults, core_imports, dataclass_shapes = (
+        return cls.capture_from_tracked(
+            module_name=module_name,
+            source=source,
+            named_defaults=named_defaults,
+        )
+
+    @classmethod
+    def capture_from_tracked(
+        cls,
+        *,
+        module_name: str,
+        source: _TrackedFileAnchor,
+        named_defaults: dict[str, object] | None = None,
+    ) -> _ModuleSourceCodeAnchor:
+        """Compile declarations from bytes already pinned by source authority."""
+
+        if type(module_name) is not str or not module_name:
+            raise TypeError("module source anchor requires a module name")
+        if type(source) is not _TrackedFileAnchor:
+            raise TypeError("module source anchor requires tracked source")
+        tree, functions, classes, defaults, core_imports, dataclass_shapes = (
             _source_declarations(
                 source.content,
+                path=source.path,
                 named_defaults=(
                     {} if named_defaults is None else named_defaults
                 ),
@@ -851,7 +875,7 @@ class _ModuleSourceCodeAnchor:
             module_name=module_name,
             source=source,
             function_codes=_compiled_code_anchors(
-                source.content,
+                tree,
                 source.path,
                 functions,
             ),
@@ -903,6 +927,54 @@ class _ModuleSourceCodeAnchor:
             and spec_origin == self.source.path
             and loader_path == self.source.path
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingModuleSourceCodeAnchor:
+    """Rooted Gate D source whose AST work is deferred to its worker."""
+
+    module_name: str
+    source: _TrackedFileAnchor
+    named_defaults: tuple[tuple[str, object], ...]
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        module_name: str,
+        path: Path,
+        source_authority: RootedSourceAuthority,
+        named_defaults: dict[str, object] | None = None,
+    ) -> _PendingModuleSourceCodeAnchor:
+        if type(module_name) is not str or not module_name:
+            raise TypeError("pending module source anchor requires a module name")
+        frozen_defaults = tuple(
+            sorted(
+                ({} if named_defaults is None else named_defaults).items(),
+                key=lambda item: item[0],
+            )
+        )
+        if any(type(name) is not str for name, _value in frozen_defaults):
+            raise TypeError("pending module defaults require string names")
+        return cls(
+            module_name=module_name,
+            source=_TrackedFileAnchor.capture(path, source_authority),
+            named_defaults=frozen_defaults,
+        )
+
+    def materialize(self) -> _ModuleSourceCodeAnchor:
+        if not self.source.is_current():
+            raise RuntimeError("tracked module source changed before compilation")
+        try:
+            return _ModuleSourceCodeAnchor.capture_from_tracked(
+                module_name=self.module_name,
+                source=self.source,
+                named_defaults=dict(self.named_defaults),
+            )
+        except (SyntaxError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "tracked module source declarations are invalid"
+            ) from error
 
 
 def _resolve_static_object(module: ModuleType, qualname: str) -> object | None:
@@ -1672,7 +1744,9 @@ class _SourceAnchorGraph:
     retrieval_validation_module_anchor: _ModuleSourceCodeAnchor
     retrieval_runtime_module_bindings: tuple[_RuntimeModuleCodeBinding, ...]
     gate_d_contract_anchor: _TrackedFileAnchor
-    gate_d_module_anchors: tuple[_ModuleSourceCodeAnchor, ...]
+    gate_d_module_anchors: tuple[
+        _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
+    ]
     matcher_factory_binding: _CoreMatcherFactoryBinding
     application_checkout_identity: _ApplicationCheckoutIdentity
 
@@ -1725,12 +1799,17 @@ class _SourceAnchorGraph:
             for anchor in build_anchors
             if anchor.module_name != _RETRIEVAL_VALIDATION_MODULE_NAME
         )
+        build_anchors_by_name = {
+            anchor.module_name: anchor for anchor in build_anchors
+        }
         gate_d_contract = _TrackedFileAnchor.capture(
             root / _GATE_D_CONTRACT_RELATIVE_PATH,
             source_authority,
         )
         gate_d_anchors = tuple(
-            _ModuleSourceCodeAnchor.capture(
+            build_anchors_by_name[module_name]
+            if module_name in build_anchors_by_name
+            else _PendingModuleSourceCodeAnchor.capture(
                 module_name=module_name,
                 path=root / f"{module_name}.py",
                 source_authority=source_authority,
@@ -2643,27 +2722,64 @@ class _CoreGateDPublication:
 class _RealGateDExecution:
     """Load and invoke the pinned offline Core owner on the worker thread."""
 
-    __slots__ = ("__contract_anchor", "__module_anchors")
+    __slots__ = (
+        "__contract_anchor",
+        "__materialize_lock",
+        "__module_anchor_seeds",
+        "__module_anchors",
+        "__source_authority",
+    )
 
     def __init__(
         self,
         *,
-        module_anchors: tuple[_ModuleSourceCodeAnchor, ...],
+        module_anchors: tuple[
+            _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
+        ],
         contract_anchor: _TrackedFileAnchor,
+        source_authority: RootedSourceAuthority,
     ) -> None:
         if type(module_anchors) is not tuple or any(
-            type(anchor) is not _ModuleSourceCodeAnchor
+            type(anchor) not in {
+                _ModuleSourceCodeAnchor,
+                _PendingModuleSourceCodeAnchor,
+            }
             for anchor in module_anchors
         ):
             raise TypeError("Gate D execution requires module source anchors")
         if type(contract_anchor) is not _TrackedFileAnchor:
             raise TypeError("Gate D execution requires a contract source anchor")
-        self.__module_anchors = module_anchors
+        if type(source_authority) is not RootedSourceAuthority:
+            raise TypeError("Gate D execution requires rooted source authority")
+        self.__module_anchor_seeds = module_anchors
+        self.__module_anchors: tuple[_ModuleSourceCodeAnchor, ...] | None = None
         self.__contract_anchor = contract_anchor
+        self.__source_authority = source_authority
+        self.__materialize_lock = Lock()
 
     @property
     def contract_path(self) -> Path:
         return self.__contract_anchor.path
+
+    def _capture_binding(self) -> _CoreGateDBinding:
+        """Materialize pending Gate D anchors under a fresh proof window."""
+
+        with self.__materialize_lock:
+            with self.__source_authority.proof_window():
+                anchors = self.__module_anchors
+                if anchors is None:
+                    anchors = tuple(
+                        seed.materialize()
+                        if type(seed) is _PendingModuleSourceCodeAnchor
+                        else cast(_ModuleSourceCodeAnchor, seed)
+                        for seed in self.__module_anchor_seeds
+                    )
+                binding = _CoreGateDBinding.capture(
+                    module_anchors=anchors,
+                    contract_anchor=self.__contract_anchor,
+                )
+            self.__module_anchors = anchors
+            return binding
 
     def run(
         self,
@@ -2675,11 +2791,8 @@ class _RealGateDExecution:
         publication_graph_nonce: object,
     ) -> _CoreGateDPublication:
         try:
-            binding = _CoreGateDBinding.capture(
-                module_anchors=self.__module_anchors,
-                contract_anchor=self.__contract_anchor,
-            )
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            binding = self._capture_binding()
+        except (ImportError, OSError, RuntimeError, SyntaxError, ValueError) as error:
             raise _GateDOperationalError(
                 "GATE_D.IMPLEMENTATION_CHANGED"
             ) from error
@@ -2701,11 +2814,8 @@ class _RealGateDExecution:
         publication_graph_nonce: object,
     ) -> _CoreGateDPublication:
         try:
-            binding = _CoreGateDBinding.capture(
-                module_anchors=self.__module_anchors,
-                contract_anchor=self.__contract_anchor,
-            )
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            binding = self._capture_binding()
+        except (ImportError, OSError, RuntimeError, SyntaxError, ValueError) as error:
             raise _GateDOperationalError(
                 "GATE_D.IMPLEMENTATION_CHANGED"
             ) from error
@@ -4446,6 +4556,7 @@ def compose_capability_host(
         gate_d_execution = _RealGateDExecution(
             module_anchors=source_graph.gate_d_module_anchors,
             contract_anchor=source_graph.gate_d_contract_anchor,
+            source_authority=source_graph.source_authority,
         )
         host = CapabilityHost(evaluated_at_utc=evaluated_at_utc)
         return CapabilityHostComposition(
