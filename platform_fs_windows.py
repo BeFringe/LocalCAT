@@ -19,6 +19,7 @@ import time
 from typing import Callable, Iterator
 
 from platform_fs_contracts import (
+    BoundContentCapture,
     BoundContentFacts,
     BoundDirectoryAuthority,
     BoundExistingFileMutationGuard,
@@ -3649,12 +3650,26 @@ class _WindowsBoundRegularFile(BoundRegularFile):
 
     def read_all(self) -> bytes:
         self._require_open()
-        _snapshot, payload, _content_sha256 = self._capture_whole_file(
-            materialize=True,
-        )
-        if payload is None:
-            raise AssertionError("materialized whole-file capture omitted payload")
+        with self._read_lock:
+            snapshot, payload, content_sha256 = self._capture_whole_file_locked(
+                materialize=True,
+            )
+            if payload is None:
+                raise AssertionError("materialized whole-file capture omitted payload")
+            self._content_facts_cache = BoundContentFacts(snapshot, content_sha256)
         return payload
+
+    def _capture_content(self) -> BoundContentCapture:
+        self._require_open()
+        with self._read_lock:
+            snapshot, payload, content_sha256 = self._capture_whole_file_locked(
+                materialize=True,
+            )
+            if payload is None:
+                raise AssertionError("materialized whole-file capture omitted payload")
+            facts = BoundContentFacts(snapshot, content_sha256)
+            self._content_facts_cache = facts
+        return BoundContentCapture(payload, facts)
 
     def _identity(self) -> FileObjectIdentity:
         return self._reprove().identity
