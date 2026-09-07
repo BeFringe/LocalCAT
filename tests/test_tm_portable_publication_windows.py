@@ -316,11 +316,8 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     ) as validator,
                 ):
                     fresh, outcome = _fresh_completed_rehydrate(identity)
-                self.assertEqual(
-                    checks,
-                    ["PRAGMA INTEGRITY_CHECK", "PRAGMA FOREIGN_KEY_CHECK"],
-                )
-                validator.assert_called_once()
+                self.assertEqual(checks, [])
+                validator.assert_not_called()
                 self.assertEqual(outcome.action, "COMPLETED")
                 observation = (
                     SQLiteTMStore.from_coordinator(fresh)
@@ -333,7 +330,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
             finally:
                 _remove_long_quarantine(root)
 
-    def test_completed_rehydrate_validates_after_manifest_mismatch(
+    def test_completed_rehydrate_reuses_db_after_manifest_mismatch(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -362,18 +359,15 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     ) as validator,
                 ):
                     fresh, outcome = _fresh_completed_rehydrate(identity)
-                self.assertEqual(
-                    checks,
-                    ["PRAGMA INTEGRITY_CHECK", "PRAGMA FOREIGN_KEY_CHECK"],
-                )
-                validator.assert_called_once()
+                self.assertEqual(checks, [])
+                validator.assert_not_called()
                 self.assertEqual(outcome.action, "COMPLETED")
                 self.assertEqual(fresh.state, "READY")
                 self.assertEqual(fresh.current_generation, 0)
             finally:
                 _remove_long_quarantine(root)
 
-    def test_completed_rehydrate_treats_stable_missing_source_as_reuse_miss(
+    def test_completed_rehydrate_reuses_db_when_source_is_missing(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -393,7 +387,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     wraps=real_validator,
                 ) as validator:
                     fresh, outcome = _fresh_completed_rehydrate(identity)
-                validator.assert_called_once()
+                validator.assert_not_called()
                 self.assertEqual(outcome.action, "COMPLETED")
                 observation = (
                     SQLiteTMStore.from_coordinator(fresh)
@@ -406,7 +400,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
             finally:
                 _remove_long_quarantine(root)
 
-    def test_completed_rehydrate_falls_back_for_source_hardlink(self) -> None:
+    def test_completed_rehydrate_reuses_db_for_source_hardlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             identity, _coordinator, service = _fixture(root)
@@ -425,7 +419,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     wraps=real_validator,
                 ) as validator:
                     fresh, outcome = _fresh_completed_rehydrate(identity)
-                validator.assert_called_once()
+                validator.assert_not_called()
                 self.assertEqual(outcome.action, "COMPLETED")
                 observation = (
                     SQLiteTMStore.from_coordinator(fresh)
@@ -440,7 +434,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     alias.unlink()
                 _remove_long_quarantine(root)
 
-    def test_completed_rehydrate_falls_back_for_source_reparse_point(self) -> None:
+    def test_completed_rehydrate_reuses_db_for_source_reparse_point(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             identity, _coordinator, service = _fixture(root)
@@ -479,7 +473,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     wraps=real_validator,
                 ) as validator:
                     fresh, outcome = _fresh_completed_rehydrate(identity)
-                validator.assert_called_once()
+                validator.assert_not_called()
                 self.assertEqual(outcome.action, "COMPLETED")
                 observation = (
                     SQLiteTMStore.from_coordinator(fresh)
@@ -496,7 +490,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     junction_target.rmdir()
                 _remove_long_quarantine(root)
 
-    def test_completed_rehydrate_falls_back_for_optional_authority_failure(
+    def test_completed_rehydrate_reuses_db_despite_optional_authority_failure(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -548,7 +542,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                     outcome = fresh.rehydrate_completed_portable_activation(
                         **reservation.portable_runtime_inputs()
                     )
-                validator.assert_called_once()
+                validator.assert_not_called()
                 self.assertEqual(outcome.action, "COMPLETED")
                 self.assertEqual(fresh.state, "READY")
                 self.assertEqual(fresh.current_generation, 0)
@@ -665,7 +659,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
             finally:
                 _remove_long_quarantine(root)
 
-    def test_portable_health_rebinds_three_files_and_falls_back_after_write(
+    def test_portable_health_rebinds_database_and_falls_back_after_write(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -697,7 +691,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                 ):
                     health = store.health()
                 self.assertTrue(health.healthy)
-                self.assertEqual(capture.call_count, 3)
+                self.assertEqual(capture.call_count, 1)
 
                 with mock.patch(
                     "tm_sqlite_store._capture_platform_content_file",
@@ -733,7 +727,7 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
             finally:
                 _remove_long_quarantine(root)
 
-    def test_portable_health_treats_optional_pair_capture_failure_as_cache_miss(
+    def test_portable_health_reuses_db_despite_optional_pair_capture_failure(
         self,
     ) -> None:
         cases = (
@@ -792,9 +786,39 @@ class WindowsPortableInitialPublicationTests(unittest.TestCase):
                                 coordinator
                             ).health()
                         self.assertTrue(health.healthy)
-                        validator.assert_called_once()
+                        validator.assert_not_called()
                     finally:
                         _remove_long_quarantine(root)
+
+    def test_portable_health_reuses_unchanged_db_with_missing_pair_and_monitor_detects_divergence(self) -> None:
+        for role in ("source", "manifest"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                identity, coordinator, service = _fixture(root)
+                try:
+                    outcome = service.activate_initial(
+                        identity.configured_jsonl_path, identity.resource_id
+                    )
+                    self.assertIs(type(outcome), MigrationReport)
+                    original_db = identity.canonical_sidecar_path.read_bytes()
+                    missing = (
+                        identity.configured_jsonl_path
+                        if role == "source" else identity.snapshot_manifest_path
+                    )
+                    missing.unlink()
+                    store = SQLiteTMStore.from_coordinator(coordinator)
+                    with mock.patch.object(
+                        tm_sqlite_store, "validate_candidate_proof_index",
+                        side_effect=AssertionError("unchanged DB must reuse semantic facts"),
+                    ):
+                        self.assertTrue(store.health().healthy)
+                    self.assertEqual(identity.canonical_sidecar_path.read_bytes(), original_db)
+                    self.assertIs(
+                        store.source_binding_monitor.observe().state,
+                        SourceBindingState.SOURCE_DIVERGED,
+                    )
+                finally:
+                    _remove_long_quarantine(root)
 
     def test_public_activation_publishes_exact_generation_zero_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
