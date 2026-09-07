@@ -198,6 +198,7 @@ sequenceDiagram
 - 初始 exact-only service 可使用 Core default closed publisher，但该 sentinel publisher **不得**接收批准 Gate C roots。`recompute_retrieval_validation()` 成功后，host 必须用同一 `release.expectation` 新建 Core evaluator/publisher，先以 `initial_manifest=None` 保持关闭，再只刷新 `release.manifest`，并原子替换整套 retrieval service。
 - Gate D 只能消费上述新 publisher 和同一 base manifest。真实重验仍固定 current `benchmark_tm_contract.json`，创建新的 `0700` private temporary `work_root` 与 absent evidence path；成功 real run 由 Core 写入 ADR-013 的设备本地 HMAC attestation。后续进程只能在 strict bundle、设备密钥、运行环境、implementation/proof/contract 与 Gate C identity 全部复证后重铸一次性 receipt；Qt/application 不解析、不重铸。
 - 启动先执行 Matcher 与 Gate C，再快速尝试 attestation restore；不得自动运行 100k Gate D。缺失、损坏或 compatibility drift 时保留 exact/context 并显示显式重验入口。用户启动的 Gate D 在后台运行，不阻塞 Qt 主线程；失败保持当前较低能力。
+- Source composition 在启动 proof window 中保留 Gate D-only 模块的 rooted file handle、exact bytes 与 digest，但不在资源就绪临界路径构造其 AST/code anchor。后台 attestation restore 或显式 run 必须进入新的 sequential proof window，只从该 retained content 构造完整 anchor，并在调用 Core owner前再次闭合 source/runtime binding；只有 terminal reproof 成功后才可在本次 composition 内复用完整 anchor，后续每次 binding 仍须执行 fresh source/runtime recheck，且不得跨进程持久化。不得用 `pyc`、loader cache、runtime `__code__` 或持久摘要替代。
 - Qt 可经 Controller-only、process-local 的安全 lifecycle 投影区分 Gate D `IDLE/RUNNING/SUCCEEDED/FAILED`。该投影只驱动“Fuzzy 性能验证中”或有限失败原因，不参与 query、threshold 或 capability 判定；Exact/Context/Fuzzy 可用性仍只来自同代 `RetrievalDisplayState`。RUNNING 时阈值入口持续可发现但不可提交，正式 Gate D publication 后沿既有 queued generation bridge 刷新当前建议与入口。
 
 ### 当前段 mixed query
