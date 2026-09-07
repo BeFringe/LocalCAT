@@ -1014,6 +1014,11 @@ class _TMEngineLegacyBackend:
             raise ValueError("legacy backend requires the classified legacy engine")
         self._engine = engine
 
+    def _compatibility_engine(self) -> TMEngine:
+        """Retain the exact owner selected by this runtime's classification."""
+
+        return self._engine
+
     def query_exact(
         self,
         source: str,

@@ -438,6 +438,38 @@ class TMEngine:
         if self._store is None:
             self._load_tm()
 
+    @classmethod
+    def from_open_canonical_store(
+        cls,
+        store: SQLiteTMStore,
+        *,
+        configured_jsonl: Path,
+        expected_resource_id: str,
+    ) -> TMEngine:
+        """Attach compatibility operations without reopening the canonical owner.
+
+        This does not hydrate or publish authority. Operations still acquire the
+        same store's generation lease and fail closed if that owner is retired.
+        """
+
+        if cls is not TMEngine or type(store) is not SQLiteTMStore:
+            raise TypeError("compatibility binding requires an exact canonical store")
+        if type(expected_resource_id) is not str or not expected_resource_id:
+            raise TypeError("compatibility binding requires a resource id")
+        identity = store.coordinator._resource_identity
+        if (
+            store.resource_id != expected_resource_id
+            or identity.configured_jsonl_path != _configured_jsonl_path(configured_jsonl)
+            or store.coordinator.current_generation is None
+        ):
+            raise ValueError("canonical compatibility binding does not match")
+        engine = cls.__new__(cls)
+        engine.tm_path = identity.configured_jsonl_path
+        engine._active = engine._lookup = engine._update = True
+        engine._exact_index = {}
+        engine._store = store
+        return engine
+
     @property
     def canonical_active(self) -> bool:
         """True when this facade is bound to the canonical store."""
