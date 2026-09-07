@@ -83,8 +83,40 @@ class WindowsHostGateStaticTests(unittest.TestCase):
                 probe_windows_host_facts(ROOT)
         _assert_capability_error(self, caught)
 
+    def test_final_path_reads_each_live_handle_without_a_length_only_query(self) -> None:
+        calls: list[tuple[int, int, int]] = []
+        paths = iter((r"\\?\E:\first", r"\\?\E:\renamed"))
+
+        class API:
+            def GetFinalPathNameByHandleW(
+                self,
+                handle: int,
+                buffer: object,
+                size: int,
+                flags: int,
+            ) -> int:
+                calls.append((handle, size, flags))
+                buffer.value = next(paths)
+                return len(buffer.value)
+
+            @staticmethod
+            def checked_length(name: str, result: int) -> int:
+                del name
+                return result
+
+        api = API()
+        flags = platform_fs_windows.VOLUME_NAME_GUID
+        self.assertEqual(
+            platform_fs_windows._final_path(api, 7, flags), r"\\?\E:\first"
+        )
+        self.assertEqual(
+            platform_fs_windows._final_path(api, 7, flags), r"\\?\E:\renamed"
+        )
+        self.assertEqual(calls, [(7, 512, flags), (7, 512, flags)])
+
     def test_final_path_query_grows_buffer_before_accepting_facts(self) -> None:
         sizes: list[int] = []
+        expected_path = "\\\\?\\E:\\" + "long" * 300
 
         class API:
             def GetFinalPathNameByHandleW(
@@ -96,11 +128,11 @@ class WindowsHostGateStaticTests(unittest.TestCase):
             ) -> int:
                 del handle, flags
                 sizes.append(size)
-                if buffer is None:
-                    return 4
+                if len(sizes) == 1:
+                    return 1024
                 if len(sizes) == 2:
-                    return 12
-                buffer.value = r"\\?\E:\root"
+                    return 1300
+                buffer.value = expected_path
                 return len(buffer.value)
 
             @staticmethod
@@ -115,8 +147,8 @@ class WindowsHostGateStaticTests(unittest.TestCase):
             7,
             platform_fs_windows.VOLUME_NAME_GUID,
         )
-        self.assertEqual(sizes, [0, 5, 13])
-        self.assertEqual(result, r"\\?\E:\root")
+        self.assertEqual(sizes, [512, 1025, 1301])
+        self.assertEqual(result, expected_path)
 
     def test_final_path_rejects_initial_and_grown_oversize_before_allocation(self) -> None:
         class API:
@@ -140,8 +172,8 @@ class WindowsHostGateStaticTests(unittest.TestCase):
 
         real_allocate = platform_fs_windows.ctypes.create_unicode_buffer
         for results, expected_allocations in (
-            ([platform_fs_windows._MAX_PATH_BUFFER], []),
-            ([4, platform_fs_windows._MAX_PATH_BUFFER], [5]),
+            ([platform_fs_windows._MAX_PATH_BUFFER], [512]),
+            ([1024, platform_fs_windows._MAX_PATH_BUFFER], [512, 1025]),
         ):
             allocations: list[int] = []
 
@@ -161,6 +193,44 @@ class WindowsHostGateStaticTests(unittest.TestCase):
                 )
             _assert_capability_error(self, caught)
             self.assertEqual(allocations, expected_allocations)
+
+    def test_final_path_rejects_continuous_growth_after_four_attempts(self) -> None:
+        sizes: list[int] = []
+
+        class API:
+            def GetFinalPathNameByHandleW(
+                self,
+                handle: int,
+                buffer: object,
+                size: int,
+                flags: int,
+            ) -> int:
+                del handle, buffer, flags
+                sizes.append(size)
+                return size * 2
+
+            @staticmethod
+            def checked_length(name: str, result: int) -> int:
+                del name
+                return result
+
+        with self.assertRaises(PlatformFileError) as caught:
+            platform_fs_windows._final_path(
+                API(), 7, platform_fs_windows.VOLUME_NAME_GUID
+            )
+        _assert_capability_error(self, caught)
+        self.assertEqual(sizes, [512, 1025, 2051, 4103])
+
+    def test_final_path_rejects_empty_payload_after_nonzero_native_result(self) -> None:
+        class API:
+            GetFinalPathNameByHandleW = staticmethod(lambda *args: 1)
+            checked_length = staticmethod(lambda name, result: result)
+
+        with self.assertRaises(PlatformFileError) as caught:
+            platform_fs_windows._final_path(
+                API(), 7, platform_fs_windows.VOLUME_NAME_GUID
+            )
+        _assert_capability_error(self, caught)
 
     def test_runtime_gate_rejects_wrong_python_or_emulated_architecture(self) -> None:
         valid = {
