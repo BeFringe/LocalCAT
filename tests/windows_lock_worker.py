@@ -24,6 +24,25 @@ from windows_file_api import (
 
 
 def main() -> int:
+    if sys.argv[1] == "open-carrier":
+        api = WindowsFileAPI.load()
+        handle = api.open_handle(
+            sys.argv[2],
+            desired_access=platform_fs_windows.GENERIC_READ
+            | platform_fs_windows.GENERIC_WRITE
+            | platform_fs_windows.SYNCHRONIZE,
+            share_mode=platform_fs_windows.FILE_SHARE_READ
+            | platform_fs_windows.FILE_SHARE_WRITE,
+            creation_disposition=platform_fs_windows.OPEN_EXISTING,
+            flags=platform_fs_windows.FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        print("READY", flush=True)
+        try:
+            while True:
+                time.sleep(60)
+        finally:
+            handle.close()
+
     if sys.argv[1] == "range-once":
         path = sys.argv[2]
         offset_high = int(sys.argv[3])
