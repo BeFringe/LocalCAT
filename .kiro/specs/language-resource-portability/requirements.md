@@ -18,6 +18,7 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 - **Upstream facts**：`TMMigrationService.export_jsonl()` / `ExportReport`、TM snapshot import/rebuild transaction、`TermbaseStore` mixed legacy/v1 grammar/transaction、`ResourceRepository` local identity/path authority。
 - **Borrowed lesson, not authority**：`multi-document-project-workspace` C2C 的 sealed source、strict ZIP、preview/apply stale binding、candidate/LKG/readback/recovery 经验；不复用其 manifest 或项目身份。
 - **Contract state**：本 R/D/T 已冻结并可实施；本文只描述目标合同，不表示 runtime 已实现。
+- **导出输出收尾修订**：ADR-027 已获批准，修订本规格 6.5 成功完成后的 Windows ResourcePackage 输出文件收尾，依赖 `windows-platform-enablement` 3.7–3.9；只覆盖 `.localcat-resource` 导出，直接 CSV/JSONL、导入、其他持久锁与 POSIX 行为保持不变。
 
 ### Windows Compatibility Amendment WA-04
 
@@ -105,6 +106,8 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 4. If 故障发生在 publication 前，the exporter shall 证明 destination 未变；If publication 后验证失败，it shall 只在证明 target 仍为本 operation candidate 时恢复 exact prior destination，否则返回 recovery-required 而不报成功。
 5. When publication 完成时，the exporter shall 独立冷重开实际 destination，核对 artifact/payload digest、profile 与 counts，再清理 owned LKG 并写入 durable receipt。
 6. When 冷启动发现 pending export receipt 时，the recovery service shall 只完成已证明 receipt-ready 的事实；无法从 path-free pending evidence 判定的外部目标进入 manual-required，未知 target 字节不得被自动删除或覆盖。
+7. When Windows ResourcePackage 导出已完成验证和成功回执，且没有冲突占用或系统清理故障时，the exporter shall 不在输出目录遗留该次导出的内部协调锁文件，并保持最终 `.localcat-resource` 文件不变。
+8. If 本次导出仍需恢复或输出收尾无法安全完成，the exporter shall 保留未经确认可清理的恢复物，不扩大清理范围，不因协调文件收尾失败改变已闭合的成功回执，也不声称未确认的文件已被清理。
 
 ### Requirement 7：只读 Validate 与 Body-safe Preview
 
