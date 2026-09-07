@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
+import sys
 from pathlib import Path
 import tempfile
 from typing import Callable
@@ -29,6 +30,7 @@ from resource_package import (
     SealedResourcePackage,
     open_resource_package,
     write_resource_package,
+    write_resource_package_bytes,
 )
 from resource_package_contracts import (
     RECEIPT_SCHEMA,
@@ -283,14 +285,17 @@ class ResourcePortabilityService:
         package_candidate_snapshot: EntrySnapshot | None = None
         companion: Path | None = None
         term_snapshot: TermbasePortableSnapshot | None = None
+        tmx_payload: bytes | None = None
         armed = False
         owner_phase_started = False
         receipt: ResourceOperationReceipt | None = None
         try:
             if profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
-                handler = self._require_tmx_payload_handler()
-                snapshot = handler.export_snapshot(resource, payload)
-                self._validate_handler_snapshot(snapshot, payload)
+                tmx_handler = self._require_tmx_payload_handler()
+                snapshot, tmx_payload = tmx_handler.prepare_export_payload(resource)
+                if type(tmx_payload) is not bytes:
+                    raise TypeError("TMX package payload must be exact immutable bytes")
+                self._validate_handler_snapshot(snapshot, tmx_payload)
             elif resource.kind is ResourceKind.TRANSLATION_MEMORY:
                 snapshot = self._tm.export_snapshot(resource, payload)
                 companion = self._tm.companion_path(payload)
@@ -302,10 +307,11 @@ class ResourcePortabilityService:
                 snapshot = _portable_term_snapshot(term_snapshot)
             self._reprove_source(resource, snapshot)
             manifest = _manifest_for_snapshot(snapshot)
-            write_resource_package(
+            writer = write_resource_package if tmx_payload is None else write_resource_package_bytes
+            writer(
                 package_candidate,
                 manifest,
-                payload,
+                payload if tmx_payload is None else tmx_payload,
                 backend=self.repository.platform_backend,
             )
             package_candidate_snapshot = _file_snapshot(
@@ -366,15 +372,22 @@ class ResourcePortabilityService:
                 )
                 self._mark_pending_receipt_ready(receipt)
 
+            def finalize_package_owner() -> None:
+                if receipt is None:
+                    raise AssertionError(
+                        "package export owner commit did not issue receipt"
+                    )
+                self._commit_ready_receipt(receipt)
+
             self._artifact_save.publish(
                 package_candidate,
                 destination,
                 self.validate_resource_package,
                 owner_commit=commit_package_owner,
+                owner_finalize=finalize_package_owner,
             )
             if receipt is None:
                 raise AssertionError("package export owner commit did not issue receipt")
-            self._commit_ready_receipt(receipt)
             armed = False
             return ResourceExportOutcome(receipt=receipt, destination_preserved=True)
         except BaseException as error:
@@ -382,11 +395,15 @@ class ResourcePortabilityService:
                 self._resolve_failed_pending(operation_id, error)
             raise
         finally:
+            primary = sys.exception()
             if term_snapshot is not None:
                 try:
                     self._termbase.discard_portable_snapshot(payload, term_snapshot)
                 except (PlatformFileError, ValueError):
                     pass
+                except BaseException:
+                    if primary is None:
+                        raise
             if package_candidate_snapshot is not None:
                 try:
                     _unlink_snapshot(
@@ -396,8 +413,15 @@ class ResourcePortabilityService:
                     )
                 except PlatformFileError:
                     pass
+                except BaseException:
+                    if primary is None:
+                        raise
             if companion is not None:
-                companion.unlink(missing_ok=True)
+                try:
+                    companion.unlink(missing_ok=True)
+                except BaseException:
+                    if primary is None:
+                        raise
 
     def validate_resource_package(
         self,
@@ -1144,7 +1168,7 @@ class ResourcePortabilityService:
     @staticmethod
     def _validate_handler_snapshot(
         snapshot: PortableResourceSnapshot,
-        payload: Path,
+        payload: Path | bytes,
     ) -> None:
         if type(snapshot) is not PortableResourceSnapshot:
             raise TypeError("package payload handler snapshot must be exact")
@@ -1157,7 +1181,7 @@ class ResourcePortabilityService:
                 "RESOURCE.PORTABILITY.PAYLOAD_HANDLER_INVALID"
             )
         try:
-            payload_bytes = payload.read_bytes()
+            payload_bytes = payload if type(payload) is bytes else payload.read_bytes()
         except OSError as error:
             raise ResourcePortabilityError(
                 "RESOURCE.EXPORT.VALIDATION_FAILED"

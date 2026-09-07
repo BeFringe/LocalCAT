@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from editor_contracts import ResourceConfig, ResourceKind
@@ -13,7 +12,7 @@ from resource_package_contracts import (
     ResourcePortabilityError,
 )
 from tm_engine import TMEngine
-from tmx_context_contracts import TmxEffectiveLocales
+from tmx_context_contracts import TmxEffectiveLocales, TmxPayloadProof
 from tmx_context_interchange import (
     cold_validate_tmx_file,
     inspect_tmx_payload,
@@ -33,17 +32,16 @@ class TmxResourcePackagePayloadHandler:
             raise TypeError("TMX package handler locales must be exact")
         self._locales = effective_locales
         self._issued: dict[str, ManagedResourceScopeMaterialization] = {}
-        self._validated: dict[str, PortableResourceSnapshot] = {}
+        self._validated: dict[str, tuple[PortableResourceSnapshot, TmxPayloadProof]] = {}
 
     @property
     def profile(self) -> ResourcePayloadProfile:
         return ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1
 
-    def export_snapshot(
+    def prepare_export_payload(
         self,
         resource: ResourceConfig,
-        destination: Path,
-    ) -> PortableResourceSnapshot:
+    ) -> tuple[PortableResourceSnapshot, bytes]:
         if self._locales is None:
             raise ResourcePortabilityError(
                 "RESOURCE.PORTABILITY.PAYLOAD_HANDLER_UNAVAILABLE"
@@ -56,30 +54,24 @@ class TmxResourcePackagePayloadHandler:
             self._locales,
             materialized.units,
         )
-        _write_private_payload(destination, payload.data)
-        try:
-            cold_validate_tmx_file(destination, payload.proof)
-        except BaseException:
-            destination.unlink(missing_ok=True)
-            raise
         safe_issues = tuple(item.code for item in payload.proof.loss_report.counts)
         snapshot = PortableResourceSnapshot(
-            kind=PortableResourceKind.TRANSLATION_MEMORY,
-            profile=ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1,
-            payload_digest=payload.proof.payload_digest,
-            payload_byte_count=len(payload.data),
-            record_count=payload.proof.included_count,
-            legacy_record_count=0,
-            v1_record_count=0,
-            source_baseline_digest=materialized.tmx_binding.binding_digest,
-            owner_receipt_digest=None,
-            owner_generation=materialized.binding.generation,
-            owner_revision=materialized.binding.head_revision,
-            safe_issues=safe_issues,
-        )
+                kind=PortableResourceKind.TRANSLATION_MEMORY,
+                profile=ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1,
+                payload_digest=payload.proof.payload_digest,
+                payload_byte_count=len(payload.data),
+                record_count=payload.proof.included_count,
+                legacy_record_count=0,
+                v1_record_count=0,
+                source_baseline_digest=materialized.tmx_binding.binding_digest,
+                owner_receipt_digest=None,
+                owner_generation=materialized.binding.generation,
+                owner_revision=materialized.binding.head_revision,
+                safe_issues=safe_issues,
+            )
         self._issued[snapshot.source_baseline_digest] = materialized
-        self._validated = {snapshot.payload_digest: snapshot}
-        return snapshot
+        self._validated = {snapshot.payload_digest: (snapshot, payload.proof)}
+        return snapshot, payload.data
 
     def validate_snapshot(self, source: Path) -> PortableResourceSnapshot:
         try:
@@ -89,8 +81,15 @@ class TmxResourcePackagePayloadHandler:
             raise ResourcePortabilityError(
                 "RESOURCE.EXPORT.VALIDATION_FAILED"
             ) from error
-        issued = self._validated.get(proof.payload_digest)
-        if issued is not None:
+        prepared = self._validated.get(proof.payload_digest)
+        if prepared is not None:
+            issued, expected_proof = prepared
+            # Stateless inspection proves grammar; exporting also has to prove
+            # that Parser observes the original prepared bodies and ordered props.
+            try:
+                cold_validate_tmx_file(source, expected_proof)
+            except Exception as error:
+                raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED") from error
             if (
                 issued.payload_byte_count != byte_count
                 or issued.record_count != proof.included_count
@@ -152,38 +151,6 @@ def _canonical_owner(resource: ResourceConfig):
     if store is None or store.coordinator.resource_id != resource.id:
         raise ResourcePortabilityError("RESOURCE.EXPORT.SNAPSHOT_UNAVAILABLE")
     return store
-
-
-def _write_private_payload(destination: Path, data: bytes) -> None:
-    if not isinstance(destination, Path) or not destination.is_absolute():
-        raise TypeError("TMX package payload destination must be absolute")
-    # TMX payload bytes are already sealed and hashed by the proof.  Open the
-    # destination in binary mode so Windows CRT newline translation cannot
-    # change those bytes before the cold validation below.
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_BINARY", 0)
-    )
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(destination, flags, 0o600)
-        try:
-            view = memoryview(data)
-            written = 0
-            while written < len(view):
-                count = os.write(fd, view[written:])
-                if count <= 0:
-                    raise OSError("short TMX payload write")
-                written += count
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except Exception as error:
-        destination.unlink(missing_ok=True)
-        raise ResourcePortabilityError("RESOURCE.EXPORT.VALIDATION_FAILED") from error
 
 
 __all__ = ["TmxResourcePackagePayloadHandler"]

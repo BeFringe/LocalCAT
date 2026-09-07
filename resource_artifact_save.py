@@ -17,6 +17,7 @@ from platform_fs_contracts import (
     LockLease,
     LockPolicy,
     LockWait,
+    OutputArtifactLockRetirement,
     PendingPublication,
     PlatformFileBackend,
     PlatformFileError,
@@ -59,6 +60,7 @@ class ResourceArtifactSaveService:
         validator: Callable[[Path], _ValidationT],
         *,
         owner_commit: Callable[[ResourceArtifactPublication, _ValidationT], None],
+        owner_finalize: Callable[[], None] | None = None,
     ) -> tuple[ResourceArtifactPublication, _ValidationT]:
         if type(candidate) is not type(Path()) or not candidate.is_absolute():
             raise TypeError("artifact candidate must be an absolute concrete Path")
@@ -70,6 +72,8 @@ class ResourceArtifactSaveService:
             raise TypeError("artifact validator must be callable")
         if not callable(owner_commit):
             raise TypeError("artifact owner commit must be callable")
+        if owner_finalize is not None and not callable(owner_finalize):
+            raise TypeError("artifact owner finalize must be callable or None")
         backend = self._backend
         if backend is None:
             from platform_fs import compose_platform_file_backend
@@ -230,6 +234,21 @@ class ResourceArtifactSaveService:
                 parent.unlink_owned(lkg_name, lkg_identity)
                 lkg_name = None
                 lkg_identity = None
+            if owner_finalize is not None:
+                owner_finalize()
+                try:
+                    pending.close()
+                except PlatformFileError:
+                    pending = None
+                else:
+                    pending = None
+                    if isinstance(backend, OutputArtifactLockRetirement):
+                        try:
+                            backend.finish_output_lock(parent, lease)
+                        except Exception:
+                            pass
+                        if lease.closed:
+                            lease = None
             return publication, validation
         except BaseException as primary:
             if (

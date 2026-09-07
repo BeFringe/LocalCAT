@@ -151,6 +151,15 @@ Cluster 0 治理/characterization
   - _Requirements: 2.2–2.5, 3.4–3.5, 5.1–5.6, 6.1–6.6, 9.1–9.7_
   - _Depends: 2.5, 3.2_
 
+- [x] 3.3a 集成 ResourcePackage 成功终结与 Windows 输出锁收尾
+  - 在发布终端证明及 owned LKG 清理之后、释放输出锁之前闭合原成功回执；终结回调至多执行一次，原 package 返回路径不重复提交回执，receipt/pending 格式和异常语义不变。
+  - 只有该次 package 操作完整终结后才请求可选平台回收；ledger/readback/terminal 或原恢复失败保留锁，收尾本身无法完成不推翻已经闭合的成功结果。
+  - 完成时，三种既有 payload profile 的无竞争 Windows 资源包导出不遗留 coordination lock；最终 package、receipt 对账与冷验证结果保持不变。direct CSV/JSONL、导入、payload stage 与 POSIX 路径不触发本能力，且本条不声称清理 JSONL 等 payload 临时正文。
+  - 回归覆盖单次 commit、终结回调异常、平台占用/无法证明结果、原恢复事实保留及公开 outcome 不变。
+  - _Requirements: 6.5, 6.6, 6.7, 6.8, 9.1, 9.7_
+  - _Boundary: ResourceArtifactSaveService 与 ResourcePortabilityService 导出终结集成_
+  - _Depends: 3.3, 3.4a, windows-platform-enablement 3.3a, ADR-027_
+
 - [x] 3.4 实现独立 package validate 与 sealed handle
   - raw carrier -> manifest -> payload digest -> matching owner profile validation 的顺序不可跳过。
   - public report 只返回 schema/profile/digest/count/safe issues，private handle 不可串行化或伪造。

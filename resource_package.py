@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import binascii
 import hashlib
 import os
+import sys
 from pathlib import Path
 import stat
 import struct
@@ -342,11 +343,34 @@ def write_resource_package(
 ) -> ResourcePackageValidationReport:
     """Write one canonical ResourcePackage to a new caller-owned path."""
 
-    _require_absolute_path(destination, "package destination")
     _require_absolute_path(payload_source, "package payload source")
+    return _write_resource_package(destination, manifest, payload_source, backend=backend)
+
+
+def write_resource_package_bytes(
+    destination: Path,
+    manifest: ResourcePackageManifest,
+    payload_bytes: bytes,
+    *,
+    backend: PlatformFileBackend | None = None,
+) -> ResourcePackageValidationReport:
+    """Stream exact immutable payload bytes through the ordinary carrier publisher."""
+    if type(payload_bytes) is not bytes:
+        raise TypeError("package payload must be exact immutable bytes")
+    return _write_resource_package(destination, manifest, payload_bytes, backend=backend)
+
+
+def _write_resource_package(
+    destination: Path,
+    manifest: ResourcePackageManifest,
+    payload_source: Path | bytes,
+    *,
+    backend: PlatformFileBackend | None,
+) -> ResourcePackageValidationReport:
+    _require_absolute_path(destination, "package destination")
     manifest_bytes = manifest_to_bytes(manifest)
     resolved_backend = _platform_backend(backend, destination.parent)
-    payload = bind_rooted_regular(resolved_backend, payload_source)
+    payload = None
     root = None
     parent = None
     candidate = None
@@ -354,12 +378,19 @@ def write_resource_package(
     candidate_name: str | None = None
     candidate_identity = None
     try:
-        payload_snapshot = payload.snapshot()
-        payload_digest, payload_crc = _measure_bound_payload(
-            payload,
-            payload_snapshot,
-        )
-        payload_size = payload_snapshot.byte_count
+        if type(payload_source) is bytes:
+            payload_size = len(payload_source)
+            if payload_size > MAX_PAYLOAD_BYTES:
+                raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
+            payload_digest = hashlib.sha256(payload_source).hexdigest()
+            payload_crc = binascii.crc32(payload_source) & 0xFFFFFFFF
+            payload_chunks = _bounded_chunks(payload_source)
+        else:
+            payload = bind_rooted_regular(resolved_backend, payload_source)
+            payload_snapshot = payload.snapshot()
+            payload_digest, payload_crc = _measure_bound_payload(payload, payload_snapshot)
+            payload_size = payload_snapshot.byte_count
+            payload_chunks = iter_bound_chunks(payload, payload_snapshot)
         if (
             payload_digest != manifest.payload.sha256
             or payload_size != manifest.payload.byte_count
@@ -368,8 +399,8 @@ def write_resource_package(
         chunks, artifact_size = _package_chunks(
             manifest_bytes,
             manifest.payload.path.encode("utf-8"),
-            payload,
-            payload_snapshot,
+            payload_chunks,
+            payload_size,
             payload_crc,
         )
         if artifact_size > MAX_ARTIFACT_BYTES:
@@ -419,14 +450,17 @@ def write_resource_package(
         return report
     except BaseException:
         if candidate is not None:
-            candidate.close()
-        if pending is not None and parent is not None:
-            published_identity = pending.preliminary_facts().destination_identity
-            pending.close()
-            pending = None
             try:
+                candidate.close()
+            except BaseException:
+                pass
+        if pending is not None and parent is not None:
+            try:
+                published_identity = pending.preliminary_facts().destination_identity
+                pending.close()
+                pending = None
                 parent.unlink_owned(destination.name, published_identity)
-            except PlatformFileError:
+            except BaseException:
                 pass
         if (
             candidate_name is not None
@@ -435,13 +469,21 @@ def write_resource_package(
         ):
             try:
                 parent.unlink_owned(candidate_name, candidate_identity)
-            except PlatformFileError:
+            except BaseException:
                 pass
         raise
     finally:
+        primary = sys.exception()
+        close_error = None
         for authority in (pending, parent, root, payload):
             if authority is not None:
-                authority.close()
+                try:
+                    authority.close()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+        if primary is None and close_error is not None:
+            raise close_error
 
 
 def open_resource_package(
@@ -565,8 +607,8 @@ def _measure_bound_payload(
 def _package_chunks(
     manifest_bytes: bytes,
     payload_name: bytes,
-    payload: BoundRegularFile,
-    payload_snapshot: EntrySnapshot,
+    payload_chunks: Iterator[bytes],
+    payload_size: int,
     payload_crc: int,
 ) -> tuple[Iterator[bytes], int]:
     manifest_crc = binascii.crc32(manifest_bytes) & 0xFFFFFFFF
@@ -581,7 +623,7 @@ def _package_chunks(
     second = _CarrierMember(
         name=payload_name,
         crc32=payload_crc,
-        byte_count=payload_snapshot.byte_count,
+        byte_count=payload_size,
         local_offset=second_offset,
         data_offset=second_offset + _LOCAL.size + len(payload_name),
     )
@@ -606,7 +648,7 @@ def _package_chunks(
         yield from _bounded_chunks(manifest_bytes)
         yield from _bounded_chunks(_local_header(second))
         yield from _bounded_chunks(second.name)
-        yield from iter_bound_chunks(payload, payload_snapshot)
+        yield from payload_chunks
         for central in central_parts:
             yield from _bounded_chunks(central)
         yield from _bounded_chunks(eocd)
@@ -847,6 +889,7 @@ def _platform_backend(
 
 
 __all__ = [
+    "write_resource_package_bytes",
     "ResourcePackageArtifact",
     "SealedResourcePackage",
     "open_resource_package",

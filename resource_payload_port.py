@@ -20,12 +20,11 @@ class ResourcePackagePayloadHandler(Protocol):
     def profile(self) -> ResourcePayloadProfile:
         """Return the one exact payload profile handled by this port."""
 
-    def export_snapshot(
+    def prepare_export_payload(
         self,
         resource: ResourceConfig,
-        destination: Path,
-    ) -> PortableResourceSnapshot:
-        """Write one deterministic payload from a complete managed resource."""
+    ) -> tuple[PortableResourceSnapshot, bytes]:
+        """Prepare immutable bytes; carrier extraction is independently cold-validated."""
 
     def validate_snapshot(self, source: Path) -> PortableResourceSnapshot:
         """Cold-validate one private payload and return body-safe facts."""
@@ -35,7 +34,7 @@ class ResourcePackagePayloadHandler(Protocol):
         resource: ResourceConfig,
         snapshot: PortableResourceSnapshot,
     ) -> None:
-        """Reprove the owner binding captured by ``export_snapshot``."""
+        """Reprove the owner binding captured by ``prepare_export_payload``."""
 
 
 __all__ = ["ResourcePackagePayloadHandler"]
