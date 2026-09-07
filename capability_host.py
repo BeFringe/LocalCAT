@@ -4438,33 +4438,34 @@ def compose_capability_host(
 
     if type(source_authority) is not RootedSourceAuthority:
         raise TypeError("capability host requires RootedSourceAuthority")
-    source_graph = _SourceAnchorGraph.capture(source_authority)
-    retrieval_binding, retrieval_checkout = (
-        _load_retrieval_validation_binding(source_graph)
-    )
-    gate_d_execution = _RealGateDExecution(
-        module_anchors=source_graph.gate_d_module_anchors,
-        contract_anchor=source_graph.gate_d_contract_anchor,
-    )
-    host = CapabilityHost(evaluated_at_utc=evaluated_at_utc)
-    return CapabilityHostComposition(
-        host=host,
-        matcher_validation_owner=host._composition_matcher_owner(
-            _COMPOSITION_MINT_IDENTITY,
-            checkout_identity=source_graph.application_checkout_identity,
-            factory_binding=source_graph.matcher_factory_binding,
-        ),
-        retrieval_gate_c_validation_owner=host._composition_gate_c_owner(
-            _COMPOSITION_MINT_IDENTITY,
-            checkout_identity=retrieval_checkout,
-            validation_binding=retrieval_binding,
-        ),
-        retrieval_gate_d_owner=host._composition_gate_d_owner(
-            _COMPOSITION_MINT_IDENTITY,
-            attestation_root=gate_d_attestation_root,
-            execution=gate_d_execution,
-        ),
-    )
+    with source_authority.proof_window():
+        source_graph = _SourceAnchorGraph.capture(source_authority)
+        retrieval_binding, retrieval_checkout = (
+            _load_retrieval_validation_binding(source_graph)
+        )
+        gate_d_execution = _RealGateDExecution(
+            module_anchors=source_graph.gate_d_module_anchors,
+            contract_anchor=source_graph.gate_d_contract_anchor,
+        )
+        host = CapabilityHost(evaluated_at_utc=evaluated_at_utc)
+        return CapabilityHostComposition(
+            host=host,
+            matcher_validation_owner=host._composition_matcher_owner(
+                _COMPOSITION_MINT_IDENTITY,
+                checkout_identity=source_graph.application_checkout_identity,
+                factory_binding=source_graph.matcher_factory_binding,
+            ),
+            retrieval_gate_c_validation_owner=host._composition_gate_c_owner(
+                _COMPOSITION_MINT_IDENTITY,
+                checkout_identity=retrieval_checkout,
+                validation_binding=retrieval_binding,
+            ),
+            retrieval_gate_d_owner=host._composition_gate_d_owner(
+                _COMPOSITION_MINT_IDENTITY,
+                attestation_root=gate_d_attestation_root,
+                execution=gate_d_execution,
+            ),
+        )
 
 
 __all__ = [
