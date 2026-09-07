@@ -334,6 +334,19 @@
   - _Requirements: 12.1–12.4, 12.6；用户追加协作分工管理主题反馈_
   - _Boundary: Qt Presentation；输出协议依赖 Resource/TMX/平台维护任务_
 
+- [x] 15. 消除 SOURCE 装配中的重复 TM 冷开
+  - 同一次启动的 Controller 兼容层使用已装配资源，不重复加载同一库；保持查询、确认写回和错误资源拒绝
+  - 本项只记录装配去重，不代表首次加载或整体启动时延已达标
+  - _Scope: 用户追加 SOURCE 启动性能维护；不是 Requirement 13 的设置响应验收_
+  - _Boundary: TM Runtime / Controller Compatibility Composition_
+
+- [ ] 16. 继续定位并缩减 Windows 完整启动时延
+  - 以真实 Start Menu 入口和实际资源配置测量资源完全就绪，不以空首页出现或隔离小库计时代替
+  - Core/平台优化只在对应 owning Spec 的获批边界内实施；保留完整性、身份、权限及恢复失败语义
+  - 启动慢与偶发 CHILD_FAILED 分开验收
+  - _Scope: 用户追加 Windows SOURCE 启动性能维护_
+  - _Boundary: Source Integration；Core/平台拥有内部证明设计_
+
 ## 维护实施记录
 
 ### Checkpoint M
@@ -359,3 +372,9 @@
 - 资源包导出的忙碌文案覆盖了原状态但结束时没有恢复，因此成功后仍显示“正在封装”；状态恢复归 Qt，文件副产物不归 Qt。
 - ResourcePackage 的 TMX handler 曾先物化私有临时 TMX 再复制进 carrier；改为携带同一已证明的不可变字节后，不再产生该 TMX 临时正文。此结论不扩展到 JSONL payload 临时文件。
 - Windows Resource/TMX 输出锁是平台迁移后新增行为，Mac 基线没有这些文件；锁的安全闲置回收归 ADR-027 与各 owning Spec，不归主题层。
+
+### Task 15–16：启动调查边界
+
+- MSIX 工具进程读取的资源注册表可能与 Explorer 启动的实际配置不同；必须记录入口上下文。`child_exit` 是进程存活时间，不是启动时间。
+- 空项目仍解析配置的全局 TM，当前也会检查非活动 TM；只启用小库不代表实际启动仅打开小库。
+- 后台预加载只改善首屏响应。用户仍报告小 TM 配置完整启动超过五秒，Task 16 保持未完成；Mac 与 Windows 的差距不能笼统归因于 POSIX。

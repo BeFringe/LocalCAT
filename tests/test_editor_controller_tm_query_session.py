@@ -96,6 +96,62 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
                 all(type(suggestion) is TMSuggestion for suggestion in report.suggestions)
             )
 
+    def test_startup_reuses_legacy_runtime_engine_without_second_cold_open(self):
+        import tm_engine
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(tm_engine, "open_canonical_tm_store", wraps=tm_engine.open_canonical_tm_store) as opened:
+                controller, _adapter, runtime, repository = self._controller(Path(temporary))
+            self.assertEqual(opened.call_count, 1)
+            config = repository.list_resources()[0]
+            port = runtime.snapshot().legacy_ports[0]
+            self.assertIs(controller._tm_engines[config.id], port.backend._compatibility_engine())
+            self.assertEqual(controller.suggestions().tm_matches[0].target, "你好。")
+            controller.update_target("新译文")
+            controller.confirm_current()
+            controller.go_to(0)
+            self.assertEqual(controller.suggestions().tm_matches[0].target, "新译文")
+
+    def test_startup_reuses_canonical_runtime_store_without_second_cold_open(self):
+        import tm_engine
+        from editor_controller import _initial_tm_activation_service
+        from tm_contracts import MigrationReport
+
+        # Windows activation quarantine handles can outlive the fixture scope.
+        # Do not turn cleanup of disposable files into a query-contract failure.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+            root = Path(temporary)
+            repository = ResourceRepository(root / "data")
+            resource = repository.create_resource("Canonical", ResourceKind.TRANSLATION_MEMORY)
+            path = resource.path
+            path.write_text('{"source":"Hello.","target":"Canonical"}\n', encoding="utf-8")
+            outcome = _initial_tm_activation_service(resource).activate_initial(path, resource.id)
+            self.assertIs(type(outcome), MigrationReport)
+            with patch.object(tm_engine, "open_canonical_tm_store", wraps=tm_engine.open_canonical_tm_store) as opened:
+                runtime = TMRuntimeHost(resolver=TMResourceResolver(), configs=repository.list_resources())
+                adapter = EditorTMAdapter(runtime_host=runtime, capability_host=CapabilityHost(evaluated_at_utc=_EVALUATED_AT))
+                controller = EditorController(repository, tm_adapter=adapter)
+            self.assertEqual(opened.call_count, 1)
+            store = runtime.snapshot().canonical_ports[0].handle.store
+            self.assertIs(controller._tm_engines[resource.id].canonical_store, store)
+            controller.set_project(EditorProject(name="Test", segments=(EditorSegment(id="1", source="Hello."),)))
+            self.assertEqual(controller.suggestions().tm_matches[0].target, "Canonical")
+            controller.set_project(EditorProject(name="Write", segments=(EditorSegment(id="2", source="New source"),)))
+            controller.update_target("New canonical")
+            controller.confirm_current()
+            self.assertEqual(controller.suggestions().tm_matches[0].target, "New canonical")
+            self.assertEqual(store.exact_records("New source")[0].target_raw, "New canonical")
+            normalized = tm_engine.TMEngine.from_open_canonical_store(
+                store,
+                configured_jsonl=path.parent / ".." / path.parent.name / path.name,
+                expected_resource_id=resource.id,
+            )
+            self.assertIs(normalized.canonical_store, store)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                tm_engine.TMEngine.from_open_canonical_store(store, configured_jsonl=path, expected_resource_id="wrong")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                tm_engine.TMEngine.from_open_canonical_store(store, configured_jsonl=root / "other.jsonl", expected_resource_id=resource.id)
+
     def test_same_state_requery_keeps_epoch_membership_and_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             controller, _adapter, _runtime, _repository = self._controller(

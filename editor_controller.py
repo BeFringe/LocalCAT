@@ -6521,34 +6521,40 @@ class EditorController:
     ) -> dict[str, TMEngine]:
         """Build only TM compatibility engines before activation publication."""
 
-        from tm_application_composition import TMRuntimeSnapshot
+        from tm_application_composition import TMRuntimeSnapshot, _TMEngineLegacyBackend
 
         if type(runtime_snapshot) is not TMRuntimeSnapshot:
             raise TypeError("resource runtime candidate must be TMRuntimeSnapshot")
         runtime_snapshot.__post_init__()
-        legacy_ids = {
-            port.resource_id for port in runtime_snapshot.legacy_ports
-        }
-        canonical_ids = {
-            port.resource_id for port in runtime_snapshot.canonical_ports
-        }
+        legacy_ports = {port.resource_id: port for port in runtime_snapshot.legacy_ports}
+        canonical_ports = {port.resource_id: port for port in runtime_snapshot.canonical_ports}
         tm_engines: dict[str, TMEngine] = {}
         for resource in configs:
             if (
                 resource.kind is not ResourceKind.TRANSLATION_MEMORY
                 or not resource.active
-                or resource.id not in legacy_ids | canonical_ids
+                or resource.id not in legacy_ports.keys() | canonical_ports.keys()
             ):
                 continue
-            engine = self._load_tm_engine(resource.path, resource.id)
-            if resource.id in legacy_ids:
+            port = legacy_ports.get(resource.id) or canonical_ports[resource.id]
+            if port.path != resource.path:
+                raise ValueError("compatibility resource path differs from runtime")
+            if resource.id in legacy_ports:
+                if type(port.backend) is _TMEngineLegacyBackend:
+                    engine = port.backend._compatibility_engine()
+                    self._validate_legacy_tm_path(resource.path)
+                else:
+                    # Custom resolver backends retain the existing compatibility seam.
+                    engine = self._load_tm_engine(resource.path, resource.id)
                 if engine.canonical_store is not None:
                     raise ValueError(
                         "legacy compatibility engine became canonical"
                     )
-            elif engine.canonical_store is None:
-                raise ValueError(
-                    "canonical compatibility engine lost canonical authority"
+            else:
+                engine = TMEngine.from_open_canonical_store(
+                    port.handle.store,
+                    configured_jsonl=resource.path,
+                    expected_resource_id=resource.id,
                 )
             tm_engines[resource.id] = engine
         return tm_engines
@@ -6560,6 +6566,11 @@ class EditorController:
         engine = TMEngine(str(path), expected_resource_id=resource_id)
         if engine.canonical_store is not None:
             return engine
+        EditorController._validate_legacy_tm_path(path)
+        return engine
+
+    @staticmethod
+    def _validate_legacy_tm_path(path: Path) -> None:
         if not path.exists() or not path.is_file():
             raise ValueError("translation memory does not exist")
         for line_number, line in enumerate(
@@ -6577,7 +6588,6 @@ class EditorController:
                 raise ValueError(f"translation memory line {line_number} has no source")
             if not isinstance(target, str) or not target.strip():
                 raise ValueError(f"translation memory line {line_number} has no target")
-        return engine
 
 
 def compose_project_enabled_editor_controller(
