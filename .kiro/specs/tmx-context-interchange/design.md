@@ -23,6 +23,12 @@ Parser TMX reader ─> prop-preserving ResourceRecord ─> semantic TM importer 
 - **Frozen journey**：packaged import/export 从 trusted source/bundle authority 获取声明的 fixtures/resources，不从 CWD 或 checkout 推断；ResourcePackage profile仍通过既有 handler边界组合。
 - **Verification**：hostile source zero mutation、canonical byte/reopen、target-before preservation、publish/readback/restart recovery 与 clean-user packaged journey全部使用真实业务 reader/writer。
 
+### ADR-027：Direct TMX 输出锁收尾
+
+- **Scope amendment**：已批准；仅对 Windows direct `.tmx` 的三个既有 scope 复用平台输出锁闲置回收。既有 TMX payload/scope/journal/receipt、ResourcePackage owner、普通锁和 POSIX 路径不变。
+- **Steering sync**：继承 Governance owner 的 ADR-027 及 ADR-020/023 取代元数据，不重复修改 Steering。
+- **Downstream revalidation**：Task 3.4b 依赖平台 Task 3.3a，验证成功终结、journal 未闭合、原 recovery-required、收尾异常和真实跨进程互斥。Qt 不取得锁或 Win32 authority。
+
 ## 模块
 
 ### `tmx_context_contracts.py`
@@ -51,7 +57,15 @@ Coordinator 按 exact segment identity join，产生 ordered units 与 source bi
 
 ### `tmx_artifact_save.py` / `tmx_bound_artifact_save.py` / `tmx_platform_io.py`
 
-`tmx_artifact_save.py` 保持 direct saver 的公开导入面；bound implementation 拥有 destination binding、persistent family lock、candidate/LKG/journal、atomic publish、readback 和 cold recovery，bounded I/O 只消费 platform rooted handles。它只抛 TMX domain error，不返回 Resource/ProjectPackage receipt。
+`tmx_artifact_save.py` 保持 direct saver 的公开导入面；bound implementation 拥有 destination binding、persistent family lock、candidate/LKG/journal、atomic publish、readback 和 cold recovery，bounded I/O 只消费 platform rooted handles。普通持锁/恢复仍保留载体，只有下述 ADR-027 成功终结路径允许请求闲置回收。它只抛 TMX domain error，不返回 Resource/ProjectPackage receipt。
+
+#### 输出锁终结条件
+
+- `apply` 只有在 retained readback、receipt-ready journal durable commit、terminal reproof、owned LKG/stage/journal 清理和 retained publication 正常 close 全部完成后，才请求可选 `OutputArtifactLockRetirement.finish_output_lock(parent, lease)`；parent 在调用期间仍存活。原 direct receipt 内容和签发条件不变。
+- `recover` 只有按既有冷恢复判定完成且本次 journal/sidecar 收尾完成后，才可请求同一能力；无 journal 的正常返回也可结束它本次已取得的输出 lease。若稳定 journal 仍存在或其 absence 无法证明，不请求回收。未知 journal、恢复结果不明或任何 `TMX.RECOVERY_REQUIRED` 路径只普通 close，保留载体和恢复证据。
+- 本次 owner 终结判据在普通 lease 仍持有时完成；平台独占重开只重新认证当前控制载体，不证明全局没有另一进程的 recovery。现有稳定 journal 的检查归 TMX，不引入通用 recovery guard、跨进程 receipt 索引或新 journal schema。
+- `finish_output_lock` 消费 lease close ownership；没有该能力时普通 close。`IN_USE`/`NOT_PROVEN` 不推翻已闭合 TMX receipt，也不得被映射成新的 publication/recovery failure；原发布/恢复异常必须保留。`RETIRED`/`ABSENT` 不授予 TMX 清理其他文件的权力。
+- **文件边界与验证**：`tmx_bound_artifact_save.py` 接入终结能力；新增 `tests/test_tmx_output_lock_retirement_windows.py` 覆盖 resource/project/chunk direct 成功只留最终 TMX、冷 reader/receipt 不变、journal/sidecar 未闭合与原 recovery-required 不回收、收尾故障不推翻成功、正常冷恢复和 holder/waiter 竞争。不改变 `tmx_context_contracts.py`、scope adapters 或 ResourcePackage handler。对应 8.8–8.9。
 
 ### Parser / Import adaptation
 
