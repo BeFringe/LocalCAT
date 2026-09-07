@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import unittest
@@ -64,6 +65,33 @@ def _activated_resource(root: Path) -> Path:
             ),
         )
     return _activate_resource(root)
+
+
+def _remove_windows_activation_quarantine(root: Path) -> None:
+    """Remove test-owned long quarantine paths through Win32 extended paths."""
+
+    quarantine = root / ".localcat-activation-quarantine-v1"
+    if not quarantine.exists():
+        return
+    for attempt_directory in quarantine.iterdir():
+        for path in attempt_directory.iterdir():
+            os.unlink("\\\\?\\" + str(path))
+        os.rmdir("\\\\?\\" + str(attempt_directory))
+    os.rmdir("\\\\?\\" + str(quarantine))
+
+
+@contextmanager
+def _activated_test_root() -> Iterator[Path]:
+    if os.name != "nt":
+        with tempfile.TemporaryDirectory() as temporary:
+            yield Path(temporary)
+        return
+    root = Path(tempfile.mkdtemp())
+    try:
+        yield root
+    finally:
+        _remove_windows_activation_quarantine(root)
+        shutil.rmtree(root)
 
 
 class _LegacyBackend:
@@ -906,8 +934,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
             self.assertEqual(config.path.read_bytes(), original)
 
     def test_corrupt_activated_sidecar_is_unavailable_never_legacy(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activated_test_root() as root:
             path = _activated_resource(root)
             config = ResourceConfig(
                 id="tm.primary",
@@ -938,8 +965,7 @@ class TMResourceLifecycleTests(unittest.TestCase):
     def test_real_activated_source_divergence_keeps_canonical_lkg(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+        with _activated_test_root() as root:
             path = _activated_resource(root)
             config = ResourceConfig(
                 id="tm.primary",
