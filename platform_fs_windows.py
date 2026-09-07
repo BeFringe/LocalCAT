@@ -142,6 +142,7 @@ IMAGE_FILE_MACHINE_UNKNOWN = 0x0000
 IMAGE_FILE_MACHINE_AMD64 = 0x8664
 
 _MAX_PATH_BUFFER = 32768
+_INITIAL_FINAL_PATH_BUFFER = 512
 _MAX_EXTENDED_PATH_UTF16_UNITS = 32767
 _READ_CHUNK_BYTES = 64 * 1024
 FILE_BEGIN = 0
@@ -296,10 +297,10 @@ def _volume_facts_by_handle(
 
 
 def _final_path(api: WindowsFileAPI, raw_handle: int, flags: int) -> str:
-    required = api.checked_length(
-        "GetFinalPathNameByHandleW",
-        api.GetFinalPathNameByHandleW(raw_handle, None, 0, flags),
-    )
+    # Read fresh handle facts in one native call for ordinary paths.  The
+    # length-only query otherwise repeats the expensive path resolution on
+    # every directory-chain proof; long paths still grow the buffer below.
+    required = _INITIAL_FINAL_PATH_BUFFER - 1
     for _ in range(4):
         if required >= _MAX_PATH_BUFFER:
             raise _capability_unavailable()
