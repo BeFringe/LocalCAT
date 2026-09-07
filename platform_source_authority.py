@@ -7,11 +7,12 @@ handles are the authority.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import sys
 from threading import RLock
-from typing import final
+from typing import Iterator, final
 
 from platform_fs import compose_platform_file_backend
 from platform_fs_contracts import (
@@ -121,17 +122,11 @@ class RootedSourceFile:
 
     def _retained_is_current(self) -> bool:
         with self.__lock:
-            before = self.__file.snapshot()
-            content = self.__file.read_all()
-            facts = self.__file.content_facts()
-            after = self.__file.snapshot()
+            capture = self.__file.capture_content()
         return (
-            before == self.__snapshot
-            and facts.snapshot == self.__snapshot
-            and after == self.__snapshot
-            and content == self.__content
-            and facts.content_sha256 == self.__content_sha256
-            and hashlib.sha256(content).digest() == self.__content_sha256
+            capture.facts.snapshot == self.__snapshot
+            and capture.content == self.__content
+            and capture.facts.content_sha256 == self.__content_sha256
         )
 
     def _bound_file(self) -> BoundRegularFile:
@@ -161,6 +156,7 @@ class RootedSourceAuthority(OpaqueAuthority):
         "__backend",
         "__files",
         "__lock",
+        "__proof_window_files",
         "__root",
         "__root_path",
     )
@@ -182,6 +178,7 @@ class RootedSourceAuthority(OpaqueAuthority):
         self.__root = root
         self.__files: dict[PurePath, RootedSourceFile] = {}
         self.__lock = RLock()
+        self.__proof_window_files: set[PurePath] | None = None
 
     @property
     def root_path(self) -> Path:
@@ -191,7 +188,36 @@ class RootedSourceAuthority(OpaqueAuthority):
     def reprove(self) -> None:
         self._require_open()
         with self.__lock:
+            self._reprove_root()
+
+    def _reprove_root(self, *, force: bool = False) -> None:
+        """Reprove the root once per synchronous source-proof window."""
+
+        if force or self.__proof_window_files is None:
             self.__root.reprove()
+
+    @contextmanager
+    def proof_window(self) -> Iterator[None]:
+        """Reuse source proofs only within one synchronous composition operation."""
+
+        self._require_open()
+        with self.__lock:
+            if self.__proof_window_files is not None:
+                raise RuntimeError("source proof windows cannot be nested")
+            self._reprove_root(force=True)
+            self.__proof_window_files = set()
+            try:
+                yield
+                for relative in tuple(self.__proof_window_files):
+                    source = self.__files.get(relative)
+                    if source is None or not self._reprove_file_now(source):
+                        raise PlatformFileError(
+                            PlatformFileErrorCode.IDENTITY_STALE,
+                            retryable=True,
+                        )
+                self._reprove_root(force=True)
+            finally:
+                self.__proof_window_files = None
 
     def bind_path(self, path: Path) -> RootedSourceFile:
         """Bind an absolute locator below the retained root exactly once."""
@@ -207,37 +233,26 @@ class RootedSourceAuthority(OpaqueAuthority):
                         retryable=True,
                     )
                 return cached
-            self.__root.reprove()
+            self._reprove_root()
             bound = self.__backend.open_regular(self.__root, relative)
             try:
-                before = bound.snapshot()
-                content = bound.read_all()
-                facts = bound.content_facts()
-                after = bound.snapshot()
-                self.__root.reprove()
-                digest = hashlib.sha256(content).digest()
-                if (
-                    before != facts.snapshot
-                    or facts.snapshot != after
-                    or facts.content_sha256 != digest
-                ):
-                    raise PlatformFileError(
-                        PlatformFileErrorCode.IDENTITY_STALE,
-                        retryable=True,
-                    )
+                capture = bound.capture_content()
+                self._reprove_root()
                 source = RootedSourceFile(
                     owner=self,
                     path=self.__root_path.joinpath(*relative.parts),
                     relative=relative,
                     file=bound,
-                    snapshot=before,
-                    content=content,
-                    content_sha256=digest,
+                    snapshot=capture.facts.snapshot,
+                    content=capture.content,
+                    content_sha256=capture.facts.content_sha256,
                 )
             except BaseException:
                 bound.close()
                 raise
             self.__files[relative] = source
+            if self.__proof_window_files is not None:
+                self.__proof_window_files.add(relative)
             return source
 
     def _reprove_file(self, source: RootedSourceFile) -> bool:
@@ -245,31 +260,37 @@ class RootedSourceAuthority(OpaqueAuthority):
         if type(source) is not RootedSourceFile or not source._is_owned_by(self):
             raise PermissionError("source file belongs to another rooted authority")
         with self.__lock:
-            if not source._retained_is_current():
-                return False
-            self.__root.reprove()
-            rebound = self.__backend.open_regular(
-                self.__root,
-                source._relative_path(),
-            )
-            try:
-                before = rebound.snapshot()
-                content = rebound.read_all()
-                facts = rebound.content_facts()
-                after = rebound.snapshot()
-                self.__root.reprove()
-            finally:
-                rebound.close()
+            relative = source._relative_path()
+            if (
+                self.__proof_window_files is not None
+                and relative in self.__proof_window_files
+            ):
+                return True
+            current = self._reprove_file_now(source)
+            if current and self.__proof_window_files is not None:
+                self.__proof_window_files.add(relative)
+            return current
+
+    def _reprove_file_now(self, source: RootedSourceFile) -> bool:
+        if not source._retained_is_current():
+            return False
+        self._reprove_root()
+        rebound = self.__backend.open_regular(
+            self.__root,
+            source._relative_path(),
+        )
+        try:
+            capture = rebound.capture_content()
+            self._reprove_root()
+        finally:
+            rebound.close()
         captured_snapshot = source._captured_snapshot()
         captured_content = source._captured_content()
         captured_digest = source._captured_content_sha256()
         return (
-            before == captured_snapshot
-            and facts.snapshot == captured_snapshot
-            and after == captured_snapshot
-            and content == captured_content
-            and facts.content_sha256 == captured_digest
-            and hashlib.sha256(content).digest() == captured_digest
+            capture.facts.snapshot == captured_snapshot
+            and capture.content == captured_content
+            and capture.facts.content_sha256 == captured_digest
         )
 
     def _close_authority(self) -> None:
