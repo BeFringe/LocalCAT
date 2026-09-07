@@ -2815,7 +2815,9 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                 facts = source.content_facts()
             self.assertGreater(len(first_counts), 2)
             self.assertEqual(first_counts[-1], 0)
-            self.assertEqual(counts[-1], 0)
+            # The repeated exact read populated this live handle's content
+            # facts cache; hashing re-proves the handle instead of rereading.
+            self.assertEqual(counts, [])
             self.assertEqual(facts.snapshot.byte_count, len(self.payload))
             self.assertEqual(
                 facts.content_sha256,
@@ -2914,7 +2916,7 @@ class WindowsRootedRuntimeTests(unittest.TestCase):
                     native_proof.reset_mock()
                     facts = source.content_facts()
                     content_native_proofs = native_proof.call_count
-                self.assertEqual(reprove_calls, 4)
+                self.assertEqual(reprove_calls, 3)
                 self.assertEqual(facts.snapshot.byte_count, size)
                 self.assertEqual(
                     facts.content_sha256,

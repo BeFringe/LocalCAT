@@ -180,6 +180,24 @@ class BoundContentFacts(_LiveOnlyValue):
 
 
 @dataclass(frozen=True, slots=True)
+class BoundContentCapture(_LiveOnlyValue):
+    """Materialized bytes and facts from one exact live-handle capture."""
+
+    content: bytes
+    facts: BoundContentFacts
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not bytes:
+            raise TypeError("content must be exact bytes")
+        if type(self.facts) is not BoundContentFacts:
+            raise TypeError("facts must be exact BoundContentFacts")
+        if self.facts.snapshot.byte_count != len(self.content):
+            raise ValueError("content byte count contradicts captured facts")
+        if hashlib.sha256(self.content).digest() != self.facts.content_sha256:
+            raise ValueError("content digest contradicts captured facts")
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateContentFacts:
     byte_count: int
     content_sha256: bytes
@@ -933,6 +951,20 @@ class BoundRegularFile(OpaqueAuthority, ABC):
                 retryable=True,
             )
         return b"".join(chunks)
+
+    def capture_content(self) -> BoundContentCapture:
+        """Materialize one exact generation together with its live facts."""
+
+        self._require_open()
+        capture = self._capture_content()
+        if type(capture) is not BoundContentCapture:
+            raise TypeError(
+                "backend capture_content must return exact BoundContentCapture"
+            )
+        return capture
+
+    def _capture_content(self) -> BoundContentCapture:
+        return BoundContentCapture(self.read_all(), self.content_facts())
 
     def content_facts(self) -> BoundContentFacts:
         """Hash exact bytes without materializing the complete file in memory."""
