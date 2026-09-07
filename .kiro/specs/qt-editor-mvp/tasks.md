@@ -331,7 +331,7 @@
   - 排查全部 Qt 局部 QSS、palette、viewport、popup 和自绘颜色；包括分工管理、TMX 导出、资源包导入、新建资源、术语管理与浏览分组
   - 已打开窗口即时响应双向主题切换，文字和选择状态可读，不清除输入、选择或待发布预览
   - 导出完成或失败后移除过期忙碌提示；Resource/TMX 输出副产物修复分别由 owning Spec 和 ADR-027 约束，不在 Qt 删除文件
-  - _Requirements: 12.1–12.4, 12.6；用户追加协作分工管理主题反馈_
+  - _Requirements: 12.1–12.4, 12.6；用户追加主题遗漏与导出反馈_
   - _Boundary: Qt Presentation；输出协议依赖 Resource/TMX/平台维护任务_
 
 - [x] 15. 消除 SOURCE 装配中的重复 TM 冷开
@@ -346,6 +346,12 @@
   - 启动慢与偶发 CHILD_FAILED 分开验收
   - _Scope: 用户追加 Windows SOURCE 启动性能维护_
   - _Boundary: Source Integration；Core/平台拥有内部证明设计_
+
+- [x] 17. Windows 空首页先显示并后台预加载资源
+  - 用户明确批准首页先显示；加载、失败和重试状态清楚，正式资源就绪后交接编辑器
+  - 提前关闭不强杀资源操作，不显示假就绪状态；显式项目、sample、smoke 与 Mac 入口保持原流程
+  - _Scope: 用户明确追加首页先显示、后台预加载；不取代 Task 16_
+  - _Boundary: Windows SOURCE Startup Presentation and Owner Handoff_
 
 ## 维护实施记录
 
@@ -373,8 +379,10 @@
 - ResourcePackage 的 TMX handler 曾先物化私有临时 TMX 再复制进 carrier；改为携带同一已证明的不可变字节后，不再产生该 TMX 临时正文。此结论不扩展到 JSONL payload 临时文件。
 - Windows Resource/TMX 输出锁是平台迁移后新增行为，Mac 基线没有这些文件；锁的安全闲置回收归 ADR-027 与各 owning Spec，不归主题层。
 
-### Task 15–16：启动调查边界
+### Task 15–17：启动调查边界
 
 - MSIX 工具进程读取的资源注册表可能与 Explorer 启动的实际配置不同；必须记录入口上下文。`child_exit` 是进程存活时间，不是启动时间。
 - 空项目仍解析配置的全局 TM，当前也会检查非活动 TM；只启用小库不代表实际启动仅打开小库。
+- Core 的同进程当前索引复用已由 `tm-storage-retrieval-index` Task 8.8b/8.8c 单独修订；它不授权删除恢复流程中的目录、锁和权限证明。
 - 后台预加载只改善首屏响应。用户仍报告小 TM 配置完整启动超过五秒，Task 16 保持未完成；Mac 与 Windows 的差距不能笼统归因于 POSIX。
+- 阻塞式 Qt 测试需驱动真正事件循环；`QTest.qWait` 保留 GIL 可造成测试自身的后台线程饥饿。

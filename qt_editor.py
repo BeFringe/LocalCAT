@@ -719,6 +719,19 @@ def _compose_editor_controller(
             resolver=TMResourceResolver(),
             configs=repository.list_resources(),
         )
+        snapshot = runtime_host.snapshot()
+        try:
+            _startup_diagnostic({
+                "stage": "tm_resource_availability",
+                "status": (
+                    "complete"
+                    if len(snapshot.legacy_ports) + len(snapshot.canonical_ports)
+                    == len(snapshot.statuses)
+                    else "partial"
+                ),
+            })
+        except Exception:
+            pass
         startup_trace.finish("controller_resource_composition")
         controller = compose_project_enabled_editor_controller(
             repository,
@@ -798,6 +811,120 @@ def _compose_tmx_export_service(
         repository,
         chunk_controller=chunk_controller,
     )
+
+
+def _run_empty_home_startup(
+    repository: object,
+    source_authority: object,
+    qt_resources: object,
+    startup_trace: _StartupTrace,
+) -> int:
+    """Show the empty home before loading the global language resources."""
+
+    from typing import cast
+
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import QApplication
+
+    from capability_host import CapabilityHostComposition
+    from chunk_controller_adapter import ChunkControllerAdapter
+    from editor_controller import EditorController
+    from qt_editor_window import QtEditorWindow
+    from qt_resource_contracts import SourceQtResources
+    from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
+    from qt_startup_loader import QtStartupLoader
+    from qt_startup_window import QtStartupWindow
+    from tmx_application import TmxExportApplicationService
+
+    resources = cast(SourceQtResources, qt_resources)
+
+    QApplication.setApplicationName("LocalCAT")
+    QApplication.setApplicationDisplayName("LocalCAT")
+    QApplication.setOrganizationName("LocalCAT")
+    QApplication.setApplicationVersion(APPLICATION_VERSION)
+    app = cast(QApplication, QApplication.instance() or QApplication([sys.argv[0]]))
+    app.setDesktopFileName("localcat")
+    _stabilize_windows_tooltips(app)
+    logo_pixmap = resource_png_pixmap(resources.logo)
+    if logo_pixmap is None:
+        raise ValueError("source Qt logo is not a valid PNG")
+    app.setWindowIcon(QIcon(logo_pixmap))
+    home = QtStartupWindow()
+    home.show()
+    app.processEvents()
+    startup_trace.finish("home_first_events")
+    startup_trace.finish()
+    if home.closed:
+        return 0
+    # Keep the complete published graph and Qt bridges alive for app.exec().
+    owners: list[object] = []
+
+    def build() -> object:
+        trace = _StartupTrace("background_resource_preload")
+        try:
+            controller, capabilities = _compose_editor_controller(
+                repository, source_authority=source_authority
+            )
+            chunks = _compose_chunk_controller(controller, repository)
+            exports = _compose_tmx_export_service(controller, repository, chunks)
+        except Exception as error:
+            trace.finish(error=error)
+            raise
+        trace.finish()
+        return controller, capabilities, chunks, exports
+
+    def publish(result: object) -> None:
+        if home.closed:
+            return
+        controller, capabilities, chunks, exports = cast(
+            tuple[EditorController, CapabilityHostComposition,
+                  ChunkControllerAdapter, TmxExportApplicationService], result,
+        )
+        trace = _StartupTrace("ready_editor_window")
+        window = None
+        try:
+            window = QtEditorWindow(
+                controller,
+                chunk_controller=chunks,
+                speaker_avatar_catalog=SpeakerAvatarCatalog(resources.speaker_avatars),
+            )
+            window.tmx_export_coordinator = exports
+            window.setGeometry(home.geometry())
+            window.setWindowState(home.windowState())
+            validation_worker = _start_capability_validation(capabilities, window)
+            window.show()
+        except Exception as error:
+            if window is not None:
+                window.close()
+            trace.finish(error=error)
+            raise
+        owners.extend((controller, capabilities, chunks, exports, window, validation_worker))
+        # Show the ready editor before closing the home: otherwise Qt's
+        # lastWindowClosed could exit the event loop during this handoff.
+        home.close()
+        trace.finish("resources_ready")
+        app.processEvents()
+        trace.finish()
+
+    def failed(error: Exception) -> None:
+        if not home.closed:
+            _StartupTrace("background_preload_failed").finish(error=error)
+            home.set_loading_failed()
+
+    loader = QtStartupLoader(build, publish, failed, parent=home)
+
+    def retry() -> None:
+        if not loader.running:
+            home.set_loading()
+            loader.start()
+
+    home.retry_requested.connect(retry)
+    app.aboutToQuit.connect(loader.stop_publication)
+    loader.start()
+    try:
+        return app.exec()
+    finally:
+        loader.stop_publication()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -896,6 +1023,17 @@ def main(argv: list[str] | None = None) -> int:
             default_termbase_path=root / "terms.csv",
             backend=platform_backend,
         )
+        if (
+            sys.platform == "win32"
+            and args.project is None
+            and not args.sample
+            and not args.smoke_test
+            and args.bundle_smoke_marker is None
+        ):
+            startup_trace.finish("startup_home")
+            return _run_empty_home_startup(
+                repository, source_authority, qt_resources, startup_trace
+            )
         startup_trace.finish("editor_composition")
         controller, capability_composition = _compose_editor_controller(
             repository,
