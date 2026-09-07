@@ -448,16 +448,7 @@ def _gate_d_binding(
         != execution.contract_path
     ):
         raise AssertionError("composition must retain real rooted Gate D execution")
-    return cast(Any, host_module)._CoreGateDBinding.capture(
-        module_anchors=getattr(
-            execution,
-            "_RealGateDExecution__module_anchors",
-        ),
-        contract_anchor=getattr(
-            execution,
-            "_RealGateDExecution__contract_anchor",
-        ),
-    )
+    return execution._capture_binding()
 
 
 def _composition(
@@ -552,6 +543,191 @@ def _query_effective_recall(snapshot: object) -> CandidateRecallMetadata:
 
 
 class CapabilityHostGateDTests(unittest.TestCase):
+    def test_composition_defers_only_gate_d_exclusive_code_anchors(self) -> None:
+        authority = current_source_authority()
+        declaration_modules: list[str] = []
+        source_declarations = cast(Any, host_module)._source_declarations
+
+        def record_declarations(
+            content: bytes,
+            *,
+            path: Path,
+            named_defaults: dict[str, object],
+        ) -> object:
+            declaration_modules.append(path.stem)
+            return source_declarations(
+                content,
+                path=path,
+                named_defaults=named_defaults,
+            )
+
+        with patch.object(
+            host_module,
+            "_source_declarations",
+            side_effect=record_declarations,
+        ), authority.proof_window():
+            graph = cast(Any, host_module)._SourceAnchorGraph.capture(authority)
+
+        pending_type = cast(Any, host_module)._PendingModuleSourceCodeAnchor
+        complete_type = cast(Any, host_module)._ModuleSourceCodeAnchor
+        pending = tuple(
+            anchor.module_name
+            for anchor in graph.gate_d_module_anchors
+            if type(anchor) is pending_type
+        )
+        complete = tuple(
+            anchor.module_name
+            for anchor in graph.gate_d_module_anchors
+            if type(anchor) is complete_type
+        )
+
+        self.assertEqual(
+            pending,
+            (
+                "tm_benchmark",
+                "tm_benchmark_latency",
+                "tm_benchmark_oracle",
+                "tm_benchmark_platform_io",
+                "tm_benchmark_process",
+                "tm_benchmark_query_process",
+                "tm_benchmark_gate",
+            ),
+        )
+        self.assertEqual(complete, ("tm_retrieval_capability",))
+        self.assertEqual(len(declaration_modules), 10)
+        self.assertTrue(set(pending).isdisjoint(declaration_modules))
+        self.assertIn("tm_retrieval_capability", declaration_modules)
+        self.assertTrue(
+            all(anchor.source.is_current() for anchor in graph.gate_d_module_anchors)
+        )
+
+    def test_gate_d_worker_materializes_once_and_reuses_only_process_local_anchors(
+        self,
+    ) -> None:
+        composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
+            evaluated_at_utc=_EVALUATED_AT,
+        )
+        owner = cast(Any, composition).retrieval_gate_d_owner
+        restore = cast(Any, owner)._RetrievalGateDOwner__restore
+        execution = getattr(restore, "__self__", None)
+        self.assertIs(
+            type(execution), cast(Any, host_module)._RealGateDExecution
+        )
+        self.assertIsNone(
+            getattr(execution, "_RealGateDExecution__module_anchors")
+        )
+
+        pending_type = cast(Any, host_module)._PendingModuleSourceCodeAnchor
+        original_materialize = pending_type.materialize
+        materialized_on: list[int | None] = []
+        errors: list[BaseException] = []
+
+        def recorded_materialize(seed: object) -> object:
+            materialized_on.append(current_thread().ident)
+            return original_materialize(seed)
+
+        def capture_on_worker() -> None:
+            try:
+                execution._capture_binding()
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(pending_type, "materialize", recorded_materialize):
+            worker = Thread(target=capture_on_worker)
+            worker.start()
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(materialized_on), 7)
+            self.assertTrue(
+                all(identity == worker.ident for identity in materialized_on)
+            )
+            cached = getattr(
+                execution, "_RealGateDExecution__module_anchors"
+            )
+            self.assertIs(type(cached), tuple)
+            execution._capture_binding()
+            self.assertEqual(len(materialized_on), 7)
+            self.assertIs(
+                getattr(execution, "_RealGateDExecution__module_anchors"),
+                cached,
+            )
+
+    def test_gate_d_terminal_source_reproof_failure_does_not_cache(self) -> None:
+        composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
+            evaluated_at_utc=_EVALUATED_AT,
+        )
+        owner = cast(Any, composition).retrieval_gate_d_owner
+        restore = cast(Any, owner)._RetrievalGateDOwner__restore
+        execution = getattr(restore, "__self__", None)
+        authority = getattr(
+            execution, "_RealGateDExecution__source_authority"
+        )
+        authority_type = type(authority)
+        original_window = authority_type.proof_window
+
+        @contextmanager
+        def fail_after_terminal(instance: Any) -> Iterator[None]:
+            with original_window(instance):
+                yield
+            raise RuntimeError("fixture terminal source drift")
+
+        with patch.object(
+            authority_type,
+            "proof_window",
+            fail_after_terminal,
+        ), self.assertRaises(
+            cast(Any, host_module)._GateDOperationalError
+        ) as raised:
+            execution.run(
+                contract_path=execution.contract_path,
+                work_root=Path("unused-work-root"),
+                evidence_path=Path("unused-evidence"),
+                publication_owner_identity=object(),
+                publication_graph_nonce=object(),
+            )
+        self.assertEqual(
+            raised.exception.error_code,
+            "GATE_D.IMPLEMENTATION_CHANGED",
+        )
+        self.assertIsNone(
+            getattr(execution, "_RealGateDExecution__module_anchors")
+        )
+
+    def test_invalid_deferred_source_fails_closed_without_caching(self) -> None:
+        composition = cast(Any, host_module).compose_capability_host(
+            source_authority=current_source_authority(),
+            evaluated_at_utc=_EVALUATED_AT,
+        )
+        owner = cast(Any, composition).retrieval_gate_d_owner
+        restore = cast(Any, owner)._RetrievalGateDOwner__restore
+        execution = getattr(restore, "__self__", None)
+        complete_type = cast(Any, host_module)._ModuleSourceCodeAnchor
+
+        with patch.object(
+            complete_type,
+            "capture_from_tracked",
+            side_effect=TypeError("invalid source-derived dataclass"),
+        ), self.assertRaises(
+            cast(Any, host_module)._GateDOperationalError
+        ) as raised:
+            execution.run(
+                contract_path=execution.contract_path,
+                work_root=Path("unused-work-root"),
+                evidence_path=Path("unused-evidence"),
+                publication_owner_identity=object(),
+                publication_graph_nonce=object(),
+            )
+        self.assertEqual(
+            raised.exception.error_code,
+            "GATE_D.IMPLEMENTATION_CHANGED",
+        )
+        self.assertIsNone(
+            getattr(execution, "_RealGateDExecution__module_anchors")
+        )
+
     def test_ordinary_host_import_does_not_load_offline_gate_d_owner(
         self,
     ) -> None:
