@@ -2490,53 +2490,9 @@ def _rehydrate_completed_portable_authority(
             == active.database
         )
 
-        def pair_matches_attestation(
-            name: str,
-            expected: PortableContentFileProof,
-        ) -> bool:
-            opened: BoundRegularFile | None = None
-            matched = False
-            close_failed = False
-            try:
-                entry = root.inspect_entry(name)
-                if (
-                    entry is not None
-                    and entry.identity.kind == "regular"
-                    and entry.identity.link_count == 1
-                    and entry.reparse_free
-                ):
-                    opened = platform.open_regular(root, PurePath(name))
-                    facts = opened.content_facts()
-                    if (
-                        facts.snapshot == entry
-                        and root.inspect_entry(name) == facts.snapshot
-                    ):
-                        observed_proof = port.portable_content_proof(facts)
-                        final_facts = opened.content_facts()
-                        matched = (
-                            final_facts == facts
-                            and root.inspect_entry(name)
-                            == final_facts.snapshot
-                            and observed_proof == expected
-                        )
-            except (PlatformFileError, OSError):
-                matched = False
-            finally:
-                active_exception = sys.exception()
-                if opened is not None:
-                    try:
-                        opened.close()
-                    except (PlatformFileError, OSError):
-                        if active_exception is None:
-                            close_failed = True
-            return matched and not close_failed
-
-        for name, expected in (
-            (identity.snapshot_manifest_path.name, active.manifest),
-            (identity.configured_jsonl_path.name, active.source),
-        ):
-            if not pair_matches_attestation(name, expected):
-                reuse_semantic_facts = False
+        # Completed-generation index facts describe the canonical DB only.
+        # SourceBindingMonitor owns later configured-pair divergence, as on
+        # POSIX; the immutable publication attestations are still checked below.
 
         if (
             active.manifest != sealed.manifest
@@ -16811,30 +16767,26 @@ def _rebind_portable_attestation_for_health(
     lease: _SQLiteGenerationView,
     active: PortableActiveContentAttestation,
 ) -> PortableActiveContentAttestation | None:
-    """Bind portable semantic facts to the current rooted three-file set.
+    """Bind portable semantic facts to the current rooted canonical database.
 
     Portable attestations deliberately persist only byte count and SHA-256.
     A health call may therefore reuse their semantic facts only after fresh
-    platform-rooted handles prove the current database, manifest, and source
-    bytes.  File identities are live facts for this capture window only; they
+    platform-rooted handles prove the current database bytes. File identities
+    are live facts for this capture window only; they
     are never compared with or written into the durable attestation.
 
     A stable byte difference is an ordinary cache miss (for example, a legal
     canonical append) and falls back to the full SQLite validator.  A rooted
     authority failure or retained-handle race on the canonical database
-    invalidates the attestation.  The configured manifest and source remain
-    observable inputs, so any failure to prove that optional pair is only a
-    cache miss; ``SourceBindingMonitor`` owns its divergence classification.
+    invalidates the attestation. The configured manifest and source remain
+    observable inputs owned by ``SourceBindingMonitor``; their divergence
+    does not invalidate index facts for an unchanged canonical database.
     """
 
     identity = lease.stage.resource_identity
     root_path = identity.configured_jsonl_path.parent
-    expected = (
-        (identity.canonical_sidecar_path, active.database),
-        (identity.snapshot_manifest_path, active.manifest),
-        (identity.configured_jsonl_path, active.source),
-    )
-    if any(path.parent != root_path for path, _proof in expected):
+    database_path = identity.canonical_sidecar_path
+    if database_path.parent != root_path:
         raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
     try:
         backend = importlib.import_module(
@@ -16845,52 +16797,30 @@ def _rebind_portable_attestation_for_health(
             "STORE.ACTIVE_ATTESTATION_INVALID"
         ) from error
 
-    captures: list[tuple[str, OpaqueAuthority]] = []
+    database_capture = None
     reuse_semantic_facts = True
     try:
-        database_path, database_proof = expected[0]
         try:
             database_capture = _capture_platform_content_file(
                 backend,
                 root_path,
                 PurePath(database_path.name),
             )
-            captures.append(("database", database_capture))
             database_capture.reprove()
         except (ContentAttestationError, PlatformFileError, OSError) as error:
             raise SQLiteStoreSchemaError(
                 "STORE.ACTIVE_ATTESTATION_INVALID"
             ) from error
-        if database_capture.persisted_proof() != database_proof:
+        if database_capture.persisted_proof() != active.database:
             reuse_semantic_facts = False
-
-        for path, proof in expected[1:]:
-            if not reuse_semantic_facts:
-                break
-            try:
-                capture = _capture_platform_content_file(
-                    backend,
-                    root_path,
-                    PurePath(path.name),
-                )
-                captures.append(("pair", capture))
-                capture.reprove()
-            except (ContentAttestationError, PlatformFileError, OSError):
-                reuse_semantic_facts = False
-                break
-            if capture.persisted_proof() != proof:
-                reuse_semantic_facts = False
     finally:
         active_error = sys.exception()
         database_close_error: BaseException | None = None
-        for role, capture in reversed(captures):
+        if database_capture is not None:
             try:
-                capture.close()
+                database_capture.close()
             except (ContentAttestationError, PlatformFileError, OSError) as error:
-                if role == "database" and database_close_error is None:
-                    database_close_error = error
-                else:
-                    reuse_semantic_facts = False
+                database_close_error = error
         if active_error is None and database_close_error is not None:
             raise SQLiteStoreSchemaError(
                 "STORE.ACTIVE_ATTESTATION_INVALID"

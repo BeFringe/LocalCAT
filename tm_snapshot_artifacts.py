@@ -3162,7 +3162,11 @@ def _strict_pair_file_state(
             facts = bound.content_facts()
             after = bound.snapshot()
             root.reprove()
-            if before != facts.snapshot or facts.snapshot != after:
+            if (
+                before != facts.snapshot
+                or facts.snapshot != after
+                or facts.snapshot.identity.link_count != 1
+            ):
                 return ("unsafe", None, None)
             return (
                 "present",

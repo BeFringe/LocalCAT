@@ -464,6 +464,22 @@
   - _Amendment: WA-06_
   - _Depends: 5.8a, 5.9a, 8.8_
 
+- [x] 8.8b 对齐 canonical 索引复用与源文件分歧的职责边界
+  - hydration/health仅以完整复证的canonical DB内容决定历史active索引语义是否可复用；配置JSONL/manifest变化不单独触发未变DB全验，SourceBindingMonitor继续报告分歧。
+  - 保留publication三文件phase事实、DB rooted/live identity与完整内容证明、合法append后的完整索引验证，以及DB损坏/身份漂移的拒绝。
+  - 覆盖源对缺失/变更、DB变化、捕获/close失败和真实SourceBindingMonitor分歧；该修正不声称解决DB本身已变化时的启动重复全验。
+  - _Requirements: 2.13, 7.4, 7.5, 8.7_
+  - _Boundary: Migration Content Attestation / WA-06 owning amendment_
+  - _Depends: 8.8a_
+
+- [ ] 8.8c 复用当前进程内已完整验证的 canonical 索引事实
+  - 由Core coordinator私有保存exact view/generation绑定的当前DB验证结果，不改写历史active attestation；首次恢复与health全验后须经retained DB终端复证和close成功才可保存。
+  - 每次health仍完整证明当前DB活身份与SHA-256，保持meta/ledger/binding检查；DB变化重新全验，身份漂移拒绝，跨coordinator/view/generation/进程不得借用结果。
+  - RED/GREEN覆盖追加后冷开仅一次全验、连续health、相同大小篡改、同字节替换、合法写入、源对分歧、validator/终端/close失败、并发与过期query lease；Windows真实配置取证区分首页首帧与全部TM可用。
+  - _Requirements: 2.9, 2.10, 2.13, 7.4, 7.5, 8.7_
+  - _Boundary: ResourceStoreCoordinator / canonical health，现有发布与恢复协议不改_
+  - _Depends: 8.8b_
+
 - [x] 8.9 刷新 oracle、双路径性能与 Gate D 发布证据
   - 先在固定 5k oracle 重算 threshold 集与真实 top-10 完备性，再在真实 100k 上分别执行 FTS5_TRIGRAM 与 GRAM_FALLBACK 的迁移、query child 和 portable evidence bundle
   - 不改变 scorer、threshold、top-k、candidate budget、corpus/cohort/seed/digest、硬门或迁移阶段口径；失败路径不得被成功路径掩盖
