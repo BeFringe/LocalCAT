@@ -31,6 +31,17 @@ SHORTCUT_SCRIPT: Final = Path("packaging/windows/source_shortcut.ps1")
 GUARDIAN_SOURCE_FILENAME: Final = "windows_source_guardian.py"
 SOURCE_BOOTSTRAP_FILENAME: Final = "qt_editor.py"
 WINDOWS_ICON_FILENAME: Final = "LocalCAT-logo-silver.ico"
+_APPMODEL_ERROR_NO_PACKAGE: Final = 15700
+_ERROR_INSUFFICIENT_BUFFER: Final = 122
+_FILE_READ_ATTRIBUTES: Final = 0x0080
+_FILE_SHARE_READ: Final = 0x00000001
+_FILE_SHARE_WRITE: Final = 0x00000002
+_FILE_SHARE_DELETE: Final = 0x00000004
+_OPEN_EXISTING: Final = 3
+_FILE_FLAG_BACKUP_SEMANTICS: Final = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT: Final = 0x00200000
+_INVALID_HANDLE_VALUE: Final = ctypes.c_void_p(-1).value
+
 
 @final
 @dataclass(frozen=True, slots=True)
@@ -66,6 +77,105 @@ def _default_shortcut_path() -> Path:
         / "Programs"
         / SHORTCUT_FILENAME
     ).resolve()
+
+
+def _is_package_redirected_path(path: Path) -> bool:
+    """Return whether one resolved path is inside an AppData package LocalCache."""
+
+    parts = tuple(part.casefold() for part in path.parts)
+    return any(
+        parts[index : index + 3] == ("appdata", "local", "packages")
+        and parts[index + 4] == "localcache"
+        for index in range(max(0, len(parts) - 4))
+    )
+
+
+def _current_process_has_package_identity() -> bool:
+    """Return the process package identity; unexpected API results fail closed."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    function = kernel32.GetCurrentPackageFullName
+    function.argtypes = (
+        ctypes.POINTER(wintypes.UINT),
+        wintypes.LPWSTR,
+    )
+    function.restype = wintypes.LONG
+    length = wintypes.UINT()
+    result = int(function(ctypes.byref(length), None))
+    if result == _APPMODEL_ERROR_NO_PACKAGE:
+        return False
+    if result != _ERROR_INSUFFICIENT_BUFFER or length.value < 2:
+        raise RuntimeError("Windows source launcher package identity is unavailable")
+    package_name = ctypes.create_unicode_buffer(length.value)
+    result = int(function(ctypes.byref(length), package_name))
+    if result != 0 or not package_name.value:
+        raise RuntimeError("Windows source launcher package identity is unavailable")
+    return True
+
+
+def _normalized_native_path(value: str | Path) -> str:
+    path = str(value)
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _native_final_path(path: Path) -> Path:
+    """Resolve the physical Win32 name through a live handle."""
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    get_final_path.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_file(
+        str(path),
+        _FILE_READ_ATTRIBUTES,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        raise RuntimeError("Windows source launcher path proof failed")
+    try:
+        capacity = 32768
+        buffer = ctypes.create_unicode_buffer(capacity)
+        length = int(get_final_path(handle, buffer, capacity, 0))
+        if length == 0 or length >= capacity:
+            raise RuntimeError("Windows source launcher path proof failed")
+        return Path(buffer.value)
+    finally:
+        close_handle(handle)
+
+
+def _require_native_path_match(path: Path, *, label: str) -> None:
+    expected = path.resolve()
+    actual = _native_final_path(expected)
+    if _normalized_native_path(actual) != _normalized_native_path(expected):
+        raise RuntimeError(f"{label} is package-redirected")
 
 
 def _require_absolute_regular_file(path: Path, *, label: str) -> Path:
@@ -254,9 +364,17 @@ def _install_guardian_assets(source_root: Path) -> tuple[Path, Path]:
     if not _icon_is_extractable(icon_source):
         raise ValueError("Windows LocalCAT icon is invalid")
     target_directory = (_local_application_directory() / "Launcher").resolve()
+    if _is_package_redirected_path(target_directory):
+        raise RuntimeError(
+            "Windows source launcher installation requires an unpackaged process"
+        )
     target_directory.mkdir(parents=True, exist_ok=True)
     if not target_directory.is_dir() or target_directory.is_symlink():
         raise ValueError("Windows source guardian directory is unavailable")
+    _require_native_path_match(
+        target_directory,
+        label="Windows source guardian directory",
+    )
     targets = (
         target_directory / GUARDIAN_SOURCE_FILENAME,
         target_directory / WINDOWS_ICON_FILENAME,
@@ -267,6 +385,14 @@ def _install_guardian_assets(source_root: Path) -> tuple[Path, Path]:
         )
         try:
             shutil.copyfile(source, temporary)
+            if _is_package_redirected_path(temporary.resolve()):
+                raise RuntimeError(
+                    "Windows source launcher installation requires an unpackaged process"
+                )
+            _require_native_path_match(
+                temporary,
+                label="Windows source guardian candidate",
+            )
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
@@ -292,6 +418,15 @@ def _install_windows_source_launcher(
 ) -> WindowsSourceShortcutReport:
     if os.name != "nt":
         raise RuntimeError("Windows source launcher installation requires Windows")
+    if _current_process_has_package_identity():
+        raise RuntimeError(
+            "Windows source launcher installation requires an unpackaged process"
+        )
+    application_directory = _local_application_directory()
+    if _is_package_redirected_path(application_directory):
+        raise RuntimeError(
+            "Windows source launcher installation requires an unpackaged process"
+        )
     runtime = _current_venv_pythonw()
     _runtime_dependency_paths()
     checkout = source_root.expanduser().resolve()
@@ -307,14 +442,26 @@ def _install_windows_source_launcher(
     )
     if destination.suffix.casefold() != ".lnk" or destination.is_symlink():
         raise ValueError("Windows launcher target must be one .lnk path")
+    if _is_package_redirected_path(destination):
+        raise RuntimeError(
+            "Windows source launcher target is package-redirected"
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.parent.is_symlink():
         raise ValueError("Windows launcher parent is unavailable")
+    _require_native_path_match(
+        destination.parent,
+        label="Windows source launcher parent",
+    )
     cwd = (
-        _local_application_directory()
+        application_directory
         if working_directory is None
         else working_directory.expanduser().resolve()
     )
+    if _is_package_redirected_path(cwd):
+        raise RuntimeError(
+            "Windows source launcher working directory is package-redirected"
+        )
     cwd.mkdir(parents=True, exist_ok=True)
     if not cwd.is_dir() or cwd.is_symlink():
         raise ValueError("Windows launcher working directory is unavailable")
@@ -343,7 +490,15 @@ def _install_windows_source_launcher(
             IconLocation=icon_location,
             Description=SHORTCUT_DESCRIPTION,
         )
+        _require_native_path_match(
+            temporary,
+            label="Windows source launcher candidate",
+        )
         report = inspect_windows_source_shortcut(temporary)
+        if _is_package_redirected_path(report.shortcut):
+            raise RuntimeError(
+                "Windows source launcher target is package-redirected"
+            )
         expected = (
             report.target_path == runtime
             and report.arguments == arguments
