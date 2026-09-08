@@ -192,9 +192,10 @@ class Feature5UICapabilityFailureMatrixTests(unittest.TestCase):
                         foreign.assert_not_called()
                     else:
                         binding = cast(
-                            Any,
-                            owner,
-                        )._RetrievalGateCValidationOwner__validation_binding
+                            Any, owner
+                        )._RetrievalGateCValidationOwner__execution._capture_binding()[
+                            0
+                        ]
                         with patch.object(
                             type(binding),
                             "recompute",

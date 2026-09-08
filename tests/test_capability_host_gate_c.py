@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import capability_host as host_module
 import importlib.util
 import inspect
 import shutil
@@ -8,13 +9,13 @@ import sys
 import tm_retrieval_validation as retrieval_validation_module
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
 from types import MethodType
-from typing import Any, cast
+from typing import Any, Iterator, cast
 from unittest.mock import patch
 
 from capability_host import CapabilityHostComposition, compose_capability_host
@@ -197,6 +198,163 @@ class CapabilityHostGateCPublicBoundaryTests(unittest.TestCase):
 
 
 class CapabilityHostGateCCompositionTests(unittest.TestCase):
+    def test_composition_defers_gate_c_exclusive_code_anchors(self) -> None:
+        authority = current_source_authority()
+        declaration_modules: list[str] = []
+        source_declarations = cast(Any, host_module)._source_declarations
+
+        def record_declarations(
+            content: bytes,
+            *,
+            path: Path,
+            named_defaults: dict[str, object],
+        ) -> object:
+            declaration_modules.append(path.stem)
+            return source_declarations(
+                content,
+                path=path,
+                named_defaults=named_defaults,
+            )
+
+        with patch.object(
+            host_module,
+            "_source_declarations",
+            side_effect=record_declarations,
+        ), authority.proof_window():
+            graph = cast(Any, host_module)._SourceAnchorGraph.capture(authority)
+
+        pending_type = cast(Any, host_module)._PendingModuleSourceCodeAnchor
+        complete_type = cast(Any, host_module)._ModuleSourceCodeAnchor
+        seeds = (
+            graph.retrieval_validation_module_anchor,
+            *graph.retrieval_runtime_module_anchors,
+        )
+        self.assertEqual(declaration_modules, ["tm_retrieval_capability"])
+        self.assertEqual(
+            tuple(
+                seed.module_name
+                for seed in seeds
+                if type(seed) is complete_type
+            ),
+            ("tm_retrieval_capability",),
+        )
+        self.assertEqual(
+            tuple(
+                seed.module_name
+                for seed in seeds
+                if type(seed) is pending_type
+            ),
+            (
+                "tm_retrieval_validation",
+                "tm_candidate_index",
+                "tm_candidate_store_contracts",
+                "tm_contracts",
+                "tm_gate_a",
+                "tm_retrieval",
+                "tm_similarity",
+                "tm_sqlite_candidate_projection",
+                "tm_sqlite_store",
+            ),
+        )
+        self.assertTrue(all(seed.source.is_current() for seed in seeds))
+
+    def test_gate_c_worker_materializes_once_and_reproves_cached_binding(
+        self,
+    ) -> None:
+        composition = _composition()
+        owner = cast(Any, _gate_c_owner(composition))
+        execution = owner._RetrievalGateCValidationOwner__execution
+        self.assertIsNone(
+            getattr(execution, "_RealGateCExecution__validation_binding")
+        )
+        pending_type = cast(Any, host_module)._PendingModuleSourceCodeAnchor
+        original_materialize = pending_type.materialize
+        materialized_on: list[int | None] = []
+        errors: list[BaseException] = []
+
+        def recorded_materialize(seed: object) -> object:
+            materialized_on.append(current_thread().ident)
+            return original_materialize(seed)
+
+        def capture_on_worker() -> None:
+            try:
+                execution._capture_binding()
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(pending_type, "materialize", recorded_materialize):
+            worker = Thread(target=capture_on_worker)
+            worker.start()
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(materialized_on), 9)
+            self.assertTrue(
+                all(identity == worker.ident for identity in materialized_on)
+            )
+            cached = getattr(
+                execution, "_RealGateCExecution__validation_binding"
+            )
+            self.assertIsNotNone(cached)
+            execution._capture_binding()
+            self.assertEqual(len(materialized_on), 9)
+            self.assertIs(
+                getattr(execution, "_RealGateCExecution__validation_binding"),
+                cached,
+            )
+
+    def test_gate_c_terminal_source_reproof_failure_does_not_cache(self) -> None:
+        composition = _composition()
+        owner = cast(Any, _gate_c_owner(composition))
+        execution = owner._RetrievalGateCValidationOwner__execution
+        authority = getattr(execution, "_RealGateCExecution__source_authority")
+        authority_type = type(authority)
+        original_window = authority_type.proof_window
+
+        @contextmanager
+        def fail_after_terminal(instance: Any) -> Iterator[None]:
+            with original_window(instance):
+                yield
+            raise RuntimeError("fixture terminal source drift")
+
+        with patch.object(authority_type, "proof_window", fail_after_terminal):
+            returned = owner.validate_gate_c(
+                generated_at_utc=_GENERATED_AT,
+                valid_until_utc=_VALID_UNTIL,
+                evaluated_at_utc=_EVALUATED_AT,
+            )
+
+        self.assertIs(returned, composition.host.retrieval_snapshot())
+        self.assertEqual(returned.generation, 0)
+        self.assertIsNone(
+            getattr(execution, "_RealGateCExecution__validation_binding")
+        )
+
+    def test_gate_c_runtime_binding_type_error_fails_closed_without_cache(
+        self,
+    ) -> None:
+        composition = _composition()
+        owner = cast(Any, _gate_c_owner(composition))
+        execution = owner._RetrievalGateCValidationOwner__execution
+        before = composition.host.retrieval_snapshot()
+
+        with patch.object(
+            host_module,
+            "_loaded_module_binding",
+            side_effect=TypeError("invalid source-derived runtime binding"),
+        ):
+            returned = owner.validate_gate_c(
+                generated_at_utc=_GENERATED_AT,
+                valid_until_utc=_VALID_UNTIL,
+                evaluated_at_utc=_EVALUATED_AT,
+            )
+
+        self.assertIs(returned, before)
+        self.assertIs(composition.host.retrieval_snapshot(), before)
+        self.assertIsNone(
+            getattr(execution, "_RealGateCExecution__validation_binding")
+        )
+
     def _assert_notification_failure_is_atomic(
         self,
         *,
@@ -211,6 +369,12 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
         old_publisher = host_private._CapabilityHost__retrieval_publisher
         old_service = host_private._CapabilityHost__retrieval_service
         old_manifest = host_private._CapabilityHost__retrieval_base_manifest
+        old_checkout_identity = (
+            host_private._CapabilityHost__retrieval_checkout_identity
+        )
+        old_validation_binding = (
+            host_private._CapabilityHost__retrieval_validation_binding
+        )
         notification = host.retrieval_generation_notifications()
         notification_type = cast(Any, type(notification))
         original_publish = cast(
@@ -253,6 +417,14 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
         self.assertIs(
             host_private._CapabilityHost__retrieval_base_manifest,
             old_manifest,
+        )
+        self.assertIs(
+            host_private._CapabilityHost__retrieval_checkout_identity,
+            old_checkout_identity,
+        )
+        self.assertIs(
+            host_private._CapabilityHost__retrieval_validation_binding,
+            old_validation_binding,
         )
         self.assertEqual(notification.current(), old_handoff.generation)
 
@@ -650,8 +822,9 @@ def recompute_retrieval_validation(
         owner = _gate_c_owner(composition)
         old = composition.host.retrieval_snapshot()
         private_owner = cast(Any, owner)
-        checkout = (
-            private_owner._RetrievalGateCValidationOwner__checkout_identity
+        _binding, checkout = (
+            private_owner._RetrievalGateCValidationOwner__execution
+            ._capture_binding()
         )
         root_identity = checkout.root
         original_path = root_identity.path
@@ -801,9 +974,10 @@ def recompute_retrieval_validation(
                 old = host.retrieval_snapshot()
                 observer = cast(Any, host).retrieval_generation_notifications()
                 binding = cast(
-                    Any,
-                    owner,
-                )._RetrievalGateCValidationOwner__validation_binding
+                    Any, owner
+                )._RetrievalGateCValidationOwner__execution._capture_binding()[
+                    0
+                ]
 
                 if failure_target == "recompute":
                     contexts = (
@@ -865,9 +1039,10 @@ def recompute_retrieval_validation(
                         host,
                     ).retrieval_generation_notifications()
                     binding = cast(
-                        Any,
-                        owner,
-                    )._RetrievalGateCValidationOwner__validation_binding
+                        Any, owner
+                    )._RetrievalGateCValidationOwner__execution._capture_binding()[
+                        0
+                    ]
                     error = error_type(
                         f"{failure_target} programmer error"
                     )

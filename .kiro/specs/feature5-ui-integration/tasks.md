@@ -112,6 +112,7 @@
   - 不得把批准 manifest 刷入 sentinel default publisher；重算、构造或刷新失败时保持当前较低能力
   - Gate C 成功最多独立开放 CONTEXT；fuzzy-core 只满足 correctness 前提，FUZZY 必须继续关闭直至本次 intended path 的 Gate D 通过
   - 成功换入后递增 capability generation，使下一次查询使用新 snapshot，旧在途查询继续完成
+  - source 启动窗口只绑定 Gate C-only 模块的活句柄、exact bytes 与 digest；首次 validation worker 在 fresh proof window 内物化 AST/code、runtime binding、validation binding 与 checkout identity，terminal reproof 成功后才可进程内复用；后续每次 validation 仍完整复验 source/runtime identity。与 Gate D 共享的 `tm_retrieval_capability` 只保留一个完整 anchor，不重复物化
   - 完成时，paired/foreign/expired manifest、atomic swap 与 refresh isolation tests 全部通过
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.7_
   - _Boundary: CapabilityHost Gate C_
