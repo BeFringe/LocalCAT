@@ -530,7 +530,7 @@ QT_QPA_PLATFORM=offscreen python qt_editor.py --smoke-test
 - 深浅主题只保留设置对话框根 QSS 这一所有者，直接消费 `colorSchemeChanged` 携带的新 `ColorScheme`，并在后续 `ApplicationPaletteChange/PaletteChange/ThemeChange` 合并复核。浅色 QSS 对称覆盖 resource scroll、具名 viewport、content、group 与 table，避免 Windows 发出 Light 信号但应用 palette 尚为旧深色时露出黑色组间/底部背景；切换时先移除旧根 QSS，再统一 repolish 子树。
 - Lookup/Update 成功后只用稳定 `resource_id` 在当前 table cell 内原位同步三个 checkbox 与术语菜单，不清表；Active 跨分组时冻结 resource content 绘制，重建两表并以确定列宽同步计算 row/table/group 高度后再一次开放绘制。清表前移除旧 checkbox object name，避免 DeferredDelete 窗口内命中同名隐藏控件。
 - “仅显示未确认”在 checkbox 自身的内容矩形内保留 4px 左侧 padding，而非只把整个控件向右移动，确保 Windows 原生 `SE_CheckBoxIndicator` 的描边完整落在控件绘制边界内。
-- 回归测试证明构造不进入 fresh lifecycle resolver；三列状态变更的 resolver、TM reopen 与无关 termbase reread 均为零，legacy backend/canonical store identity 保持且 generation 只递增一次；同时覆盖 issued-report 复用、旧深色 palette 下的浅色资源背景、真实 scheme 信号、稳定行对象/行高与 indicator 几何。
+- 验证应覆盖设置构造与三列状态变更不触发重复资源解析、TM 重开或无关术语表重读，且资源对象身份保持、generation 仅递增一次；同时检查已发布建议的复用、旧深色 palette 下的浅色资源背景、真实 scheme 信号、稳定行对象与行高，以及 indicator 几何。
 
 ## 任务治理例外
 
