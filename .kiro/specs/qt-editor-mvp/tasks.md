@@ -335,10 +335,10 @@
   - _Boundary: Qt Presentation；输出协议依赖 Resource/TMX/平台维护任务_
 
 - [x] 15. 消除 SOURCE 装配中的重复 TM 冷开
-  - 同一次启动的 Controller 兼容层使用已装配资源，不重复加载同一库；保持查询、确认写回和错误资源拒绝
+  - 同一次 SOURCE 启动不得重复打开同一 TM；保持查询、确认写回和错误资源拒绝语义
   - 本项只记录装配去重，不代表首次加载或整体启动时延已达标
   - _Scope: 用户追加 SOURCE 启动性能维护；不是 Requirement 13 的设置响应验收_
-  - _Boundary: TM Runtime / Controller Compatibility Composition_
+  - _Boundary: SOURCE Resource Assembly；TM runtime 内部由 owning Spec 约束_
 
 - [ ] 16. 继续定位并缩减 Windows 完整启动时延
   - 以真实 Start Menu 入口和实际资源配置测量资源完全就绪，不以空首页出现或隔离小库计时代替
@@ -349,7 +349,7 @@
 
 - [x] 17. Windows 空首页先显示并后台预加载资源
   - 用户明确批准首页先显示；加载、失败和重试状态清楚，正式资源就绪后交接编辑器
-  - 提前关闭不强杀资源操作，不显示假就绪状态；显式项目、sample、smoke 与 Mac 入口保持原流程
+  - 提前关闭须安全收尾资源操作，不显示假就绪状态；异步流程仅适用于 Windows 空项目入口，显式项目与非 Windows 入口保持既有资源就绪顺序
   - _Scope: 用户明确追加首页先显示、后台预加载；不取代 Task 16_
   - _Boundary: Windows SOURCE Startup Presentation and Owner Handoff_
 
@@ -381,8 +381,6 @@
 
 ### Task 15–17：启动调查边界
 
-- MSIX 工具进程读取的资源注册表可能与 Explorer 启动的实际配置不同；必须记录入口上下文。`child_exit` 是进程存活时间，不是启动时间。
-- 空项目仍解析配置的全局 TM，当前也会检查非活动 TM；只启用小库不代表实际启动仅打开小库。
-- Core 的同进程当前索引复用已由 `tm-storage-retrieval-index` Task 8.8b/8.8c 单独修订；它不授权删除恢复流程中的目录、锁和权限证明。
-- 后台预加载只改善首屏响应。用户仍报告小 TM 配置完整启动超过五秒，Task 16 保持未完成；Mac 与 Windows 的差距不能笼统归因于 POSIX。
-- 阻塞式 Qt 测试需驱动真正事件循环；`QTest.qWait` 保留 GIL 可造成测试自身的后台线程饥饿。
+- Explorer / Start Menu 与 MSIX 工具进程可能读取不同资源注册表；比较启动结果必须记录入口与配置上下文。`child_exit` 表示进程存活时间，不能用作资源就绪时间。
+- 完整启动以实际入口、实际注册表和资源就绪状态为测量边界。空首页出现或仅启用小 TM 均不能替代该口径；未启用资源也可能参与启动检查。
+- 后台资源就绪测试需驱动真实 Qt 事件循环并让工作线程获得调度；单纯等待墙钟时间可能把测试调度延迟误判为启动失败。
