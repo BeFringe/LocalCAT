@@ -931,7 +931,7 @@ class _ModuleSourceCodeAnchor:
 
 @dataclass(frozen=True, slots=True)
 class _PendingModuleSourceCodeAnchor:
-    """Rooted Gate D source whose AST work is deferred to its worker."""
+    """Rooted module source whose AST work is deferred to its worker."""
 
     module_name: str
     source: _TrackedFileAnchor
@@ -1741,8 +1741,10 @@ class _SourceAnchorGraph:
 
     source_authority: RootedSourceAuthority
     retrieval_approved_roots_anchor: _TrackedFileAnchor
-    retrieval_validation_module_anchor: _ModuleSourceCodeAnchor
-    retrieval_runtime_module_bindings: tuple[_RuntimeModuleCodeBinding, ...]
+    retrieval_validation_module_anchor: _PendingModuleSourceCodeAnchor
+    retrieval_runtime_module_anchors: tuple[
+        _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
+    ]
     gate_d_contract_anchor: _TrackedFileAnchor
     gate_d_module_anchors: tuple[
         _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
@@ -1764,7 +1766,7 @@ class _SourceAnchorGraph:
             source_authority,
         )
         build_module_names = _retrieval_build_modules(retrieval_roots)
-        validation_anchor = _ModuleSourceCodeAnchor.capture(
+        validation_anchor = _PendingModuleSourceCodeAnchor.capture(
             module_name=_RETRIEVAL_VALIDATION_MODULE_NAME,
             path=root / f"{_RETRIEVAL_VALIDATION_MODULE_NAME}.py",
             source_authority=source_authority,
@@ -1775,27 +1777,35 @@ class _SourceAnchorGraph:
         build_anchors = tuple(
             validation_anchor
             if module_name == _RETRIEVAL_VALIDATION_MODULE_NAME
-            else _ModuleSourceCodeAnchor.capture(
-                module_name=module_name,
-                path=root / f"{module_name}.py",
-                source_authority=source_authority,
-                named_defaults=(
-                    {
-                        "_DEFAULT_APPROVED_ROOTS": (
-                            root
-                            / "tests"
-                            / "fixtures"
-                            / "feature5_gate_a_v1.json"
-                        )
-                    }
-                    if module_name == "tm_gate_a"
-                    else None
-                ),
+            else (
+                _ModuleSourceCodeAnchor.capture(
+                    module_name=module_name,
+                    path=root / f"{module_name}.py",
+                    source_authority=source_authority,
+                )
+                if module_name == "tm_retrieval_capability"
+                else _PendingModuleSourceCodeAnchor.capture(
+                    module_name=module_name,
+                    path=root / f"{module_name}.py",
+                    source_authority=source_authority,
+                    named_defaults=(
+                        {
+                            "_DEFAULT_APPROVED_ROOTS": (
+                                root
+                                / "tests"
+                                / "fixtures"
+                                / "feature5_gate_a_v1.json"
+                            )
+                        }
+                        if module_name == "tm_gate_a"
+                        else None
+                    ),
+                )
             )
             for module_name in build_module_names
         )
-        runtime_bindings = tuple(
-            _loaded_module_binding(anchor)
+        runtime_anchors = tuple(
+            anchor
             for anchor in build_anchors
             if anchor.module_name != _RETRIEVAL_VALIDATION_MODULE_NAME
         )
@@ -1839,7 +1849,7 @@ class _SourceAnchorGraph:
             source_authority=source_authority,
             retrieval_approved_roots_anchor=retrieval_roots,
             retrieval_validation_module_anchor=validation_anchor,
-            retrieval_runtime_module_bindings=runtime_bindings,
+            retrieval_runtime_module_anchors=runtime_anchors,
             gate_d_contract_anchor=gate_d_contract,
             gate_d_module_anchors=gate_d_anchors,
             matcher_factory_binding=matcher_binding,
@@ -2206,7 +2216,11 @@ class _RetrievalCheckoutIdentity:
 
 
 def _load_retrieval_validation_binding(
-    source_graph: _SourceAnchorGraph,
+    *,
+    validator_anchor: _ModuleSourceCodeAnchor,
+    approved_roots_anchor: _TrackedFileAnchor,
+    core_graphs: tuple[_RuntimeModuleCodeBinding, ...],
+    source_authority: RootedSourceAuthority,
 ) -> tuple[_CoreRetrievalValidationBinding, _RetrievalCheckoutIdentity]:
     """Late-bind validator objects under injected tracked-source anchors."""
 
@@ -2218,15 +2232,98 @@ def _load_retrieval_validation_binding(
     binding = _CoreRetrievalValidationBinding.capture(
         function,
         release_type,
-        validator_anchor=source_graph.retrieval_validation_module_anchor,
-        approved_roots_anchor=source_graph.retrieval_approved_roots_anchor,
-        core_graphs=source_graph.retrieval_runtime_module_bindings,
-        source_authority=source_graph.source_authority,
+        validator_anchor=validator_anchor,
+        approved_roots_anchor=approved_roots_anchor,
+        core_graphs=core_graphs,
+        source_authority=source_authority,
     )
     return binding, _RetrievalCheckoutIdentity.capture(
         binding,
-        source_graph.source_authority,
+        source_authority,
     )
+
+
+@final
+class _RealGateCExecution:
+    """Materialize the pinned Gate C graph on its validation worker."""
+
+    __slots__ = (
+        "__approved_roots_anchor",
+        "__checkout_identity",
+        "__materialize_lock",
+        "__module_anchor_seeds",
+        "__module_anchors",
+        "__source_authority",
+        "__validation_binding",
+        "__validation_module_seed",
+    )
+
+    def __init__(
+        self,
+        *,
+        validation_module_anchor: _PendingModuleSourceCodeAnchor,
+        module_anchors: tuple[
+            _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
+        ],
+        approved_roots_anchor: _TrackedFileAnchor,
+        source_authority: RootedSourceAuthority,
+    ) -> None:
+        if type(validation_module_anchor) is not _PendingModuleSourceCodeAnchor:
+            raise TypeError("Gate C execution requires pending validation source")
+        if type(module_anchors) is not tuple or any(
+            type(anchor) not in {
+                _ModuleSourceCodeAnchor,
+                _PendingModuleSourceCodeAnchor,
+            }
+            for anchor in module_anchors
+        ):
+            raise TypeError("Gate C execution requires module source anchors")
+        if type(approved_roots_anchor) is not _TrackedFileAnchor:
+            raise TypeError("Gate C execution requires approved roots source")
+        if type(source_authority) is not RootedSourceAuthority:
+            raise TypeError("Gate C execution requires rooted source authority")
+        self.__validation_module_seed = validation_module_anchor
+        self.__module_anchor_seeds = module_anchors
+        self.__approved_roots_anchor = approved_roots_anchor
+        self.__source_authority = source_authority
+        self.__materialize_lock = Lock()
+        self.__module_anchors: tuple[_ModuleSourceCodeAnchor, ...] | None = None
+        self.__validation_binding: _CoreRetrievalValidationBinding | None = None
+        self.__checkout_identity: _RetrievalCheckoutIdentity | None = None
+
+    def _capture_binding(
+        self,
+    ) -> tuple[_CoreRetrievalValidationBinding, _RetrievalCheckoutIdentity]:
+        """Reprove every reuse; publish a first materialization after terminal."""
+
+        with self.__materialize_lock:
+            with self.__source_authority.proof_window():
+                binding = self.__validation_binding
+                checkout = self.__checkout_identity
+                anchors = self.__module_anchors
+                if binding is None or checkout is None or anchors is None:
+                    validation_anchor = self.__validation_module_seed.materialize()
+                    anchors = tuple(
+                        seed.materialize()
+                        if type(seed) is _PendingModuleSourceCodeAnchor
+                        else cast(_ModuleSourceCodeAnchor, seed)
+                        for seed in self.__module_anchor_seeds
+                    )
+                    core_graphs = tuple(
+                        _loaded_module_binding(anchor) for anchor in anchors
+                    )
+                    binding, checkout = _load_retrieval_validation_binding(
+                        validator_anchor=validation_anchor,
+                        approved_roots_anchor=self.__approved_roots_anchor,
+                        core_graphs=core_graphs,
+                        source_authority=self.__source_authority,
+                    )
+                if not binding.is_current() or not checkout.is_current():
+                    raise RuntimeError("Gate C implementation changed")
+            self.__module_anchors = anchors
+            self.__validation_binding = binding
+            self.__checkout_identity = checkout
+            return binding, checkout
 
 
 @dataclass(frozen=True, slots=True)
@@ -3280,6 +3377,7 @@ class CapabilityHost:
         "__retrieval_checkout_identity",
         "__retrieval_base_manifest",
         "__retrieval_lifecycle_lock",
+        "__retrieval_gate_c_owner_minted",
         "__retrieval_publisher",
         "__retrieval_service",
         "__retrieval_handoff",
@@ -3316,6 +3414,7 @@ class CapabilityHost:
             self.__matcher_owner_identity,
         )
         self.__retrieval_owner_identity = object()
+        self.__retrieval_gate_c_owner_minted = False
         self.__retrieval_checkout_identity: (
             _RetrievalCheckoutIdentity | None
         ) = None
@@ -3537,8 +3636,7 @@ class CapabilityHost:
         self,
         composition_mint_identity: object,
         *,
-        checkout_identity: _RetrievalCheckoutIdentity,
-        validation_binding: _CoreRetrievalValidationBinding,
+        execution: _RealGateCExecution,
     ) -> _RetrievalGateCValidationOwner:
         """Mint the Gate C owner only for the application composition root."""
 
@@ -3546,26 +3644,18 @@ class CapabilityHost:
             raise PermissionError(
                 "Gate C owner mint requires application composition"
             )
-        if (
-            type(checkout_identity) is not _RetrievalCheckoutIdentity
-            or type(validation_binding) is not _CoreRetrievalValidationBinding
-            or not checkout_identity.is_current()
-        ):
-            raise RuntimeError("Gate C owner requires current Core bindings")
+        if type(execution) is not _RealGateCExecution:
+            raise RuntimeError("Gate C owner requires rooted source execution")
         with self.__lock:
-            if (
-                self.__retrieval_checkout_identity is not None
-                or self.__retrieval_validation_binding is not None
-            ):
+            if self.__retrieval_gate_c_owner_minted:
                 raise RuntimeError("Gate C owner has already been minted")
-            self.__retrieval_checkout_identity = checkout_identity
-            self.__retrieval_validation_binding = validation_binding
-        return _RetrievalGateCValidationOwner(
-            host=self,
-            owner_identity=self.__retrieval_owner_identity,
-            checkout_identity=checkout_identity,
-            validation_binding=validation_binding,
-        )
+            owner = _RetrievalGateCValidationOwner(
+                host=self,
+                owner_identity=self.__retrieval_owner_identity,
+                execution=execution,
+            )
+            self.__retrieval_gate_c_owner_minted = True
+            return owner
 
     def _composition_gate_d_owner(
         self,
@@ -3686,13 +3776,6 @@ class CapabilityHost:
 
         if owner_identity is not self.__retrieval_owner_identity:
             raise PermissionError("Gate C replacement requires composition owner")
-        if (
-            checkout_identity is not self.__retrieval_checkout_identity
-            or validation_binding is not self.__retrieval_validation_binding
-        ):
-            raise PermissionError(
-                "Gate C replacement requires the loaded Core binding"
-            )
         if type(publisher) is not RetrievalCapabilityPublisher:
             raise TypeError("Gate C publisher must be the Core publisher")
         if type(service) is not TMRetrievalService:
@@ -3711,6 +3794,17 @@ class CapabilityHost:
 
         with self.__retrieval_lifecycle_lock:
             with self.__lock:
+                installing_first_binding = (
+                    self.__retrieval_checkout_identity is None
+                    and self.__retrieval_validation_binding is None
+                )
+                if not installing_first_binding and (
+                    checkout_identity is not self.__retrieval_checkout_identity
+                    or validation_binding is not self.__retrieval_validation_binding
+                ):
+                    raise PermissionError(
+                        "Gate C replacement requires the loaded Core binding"
+                    )
                 if (
                     not checkout_identity.is_current()
                     or not validation_binding.is_current()
@@ -3734,6 +3828,8 @@ class CapabilityHost:
                 old_publisher = self.__retrieval_publisher
                 old_service = self.__retrieval_service
                 old_base_manifest = self.__retrieval_base_manifest
+                old_checkout_identity = self.__retrieval_checkout_identity
+                old_validation_binding = self.__retrieval_validation_binding
                 old_handoff = self.__retrieval_handoff
                 old_operation_display = self.__retrieval_operation_display
                 old_status = self.__status
@@ -3742,6 +3838,9 @@ class CapabilityHost:
                     ._precommit_snapshot_locked()
                 )
                 try:
+                    if installing_first_binding:
+                        self.__retrieval_checkout_identity = checkout_identity
+                        self.__retrieval_validation_binding = validation_binding
                     self.__retrieval_publisher = publisher
                     self.__retrieval_service = service
                     self.__retrieval_base_manifest = base_manifest
@@ -3757,6 +3856,8 @@ class CapabilityHost:
                     self.__retrieval_publisher = old_publisher
                     self.__retrieval_service = old_service
                     self.__retrieval_base_manifest = old_base_manifest
+                    self.__retrieval_checkout_identity = old_checkout_identity
+                    self.__retrieval_validation_binding = old_validation_binding
                     self.__retrieval_handoff = old_handoff
                     self.__retrieval_operation_display = old_operation_display
                     self.__status = old_status
@@ -4030,6 +4131,7 @@ class _RetrievalGateCValidationOwner:
 
     __slots__ = (
         "__checkout_identity",
+        "__execution",
         "__host",
         "__owner_identity",
         "__validation_binding",
@@ -4041,20 +4143,17 @@ class _RetrievalGateCValidationOwner:
         *,
         host: CapabilityHost,
         owner_identity: object,
-        checkout_identity: _RetrievalCheckoutIdentity,
-        validation_binding: _CoreRetrievalValidationBinding,
+        execution: _RealGateCExecution,
     ) -> None:
         if type(host) is not CapabilityHost:
             raise TypeError("Gate C owner requires CapabilityHost")
-        if (
-            type(checkout_identity) is not _RetrievalCheckoutIdentity
-            or type(validation_binding) is not _CoreRetrievalValidationBinding
-        ):
-            raise PermissionError("Gate C owner requires Core bindings")
+        if type(execution) is not _RealGateCExecution:
+            raise PermissionError("Gate C owner requires rooted source execution")
         self.__host = host
         self.__owner_identity = owner_identity
-        self.__checkout_identity = checkout_identity
-        self.__validation_binding = validation_binding
+        self.__execution = execution
+        self.__checkout_identity: _RetrievalCheckoutIdentity | None = None
+        self.__validation_binding: _CoreRetrievalValidationBinding | None = None
         self.__validation_lock = Lock()
 
     def validate_gate_c(
@@ -4068,14 +4167,24 @@ class _RetrievalGateCValidationOwner:
 
         with self.__validation_lock:
             current = self.__host.retrieval_snapshot()
-            if (
-                not self.__checkout_identity.is_current()
-                or not self.__validation_binding.is_current()
+            try:
+                validation_binding, checkout_identity = (
+                    self.__execution._capture_binding()
+                )
+            except (
+                ImportError,
+                OSError,
+                RuntimeError,
+                SyntaxError,
+                TypeError,
+                ValueError,
             ):
                 return current
+            self.__validation_binding = validation_binding
+            self.__checkout_identity = checkout_identity
             try:
-                release = self.__validation_binding.recompute(
-                    repository_root=self.__checkout_identity.root.path,
+                release = validation_binding.recompute(
+                    repository_root=checkout_identity.root.path,
                     generated_at_utc=generated_at_utc,
                     valid_until_utc=valid_until_utc,
                 )
@@ -4084,7 +4193,7 @@ class _RetrievalGateCValidationOwner:
             if release is None:
                 return current
             try:
-                graph = self.__validation_binding.compose_service(
+                graph = validation_binding.compose_service(
                     release,
                     evaluated_at_utc=evaluated_at_utc,
                 )
@@ -4094,15 +4203,15 @@ class _RetrievalGateCValidationOwner:
                 return current
             publisher, service, capability, base_manifest = graph
             if (
-                not self.__checkout_identity.is_current()
-                or not self.__validation_binding.is_current()
+                not checkout_identity.is_current()
+                or not validation_binding.is_current()
             ):
                 return current
             try:
                 return self.__host._install_gate_c_service(
                     owner_identity=self.__owner_identity,
-                    checkout_identity=self.__checkout_identity,
-                    validation_binding=self.__validation_binding,
+                    checkout_identity=checkout_identity,
+                    validation_binding=validation_binding,
                     publisher=publisher,
                     service=service,
                     capability=capability,
@@ -4550,8 +4659,15 @@ def compose_capability_host(
         raise TypeError("capability host requires RootedSourceAuthority")
     with source_authority.proof_window():
         source_graph = _SourceAnchorGraph.capture(source_authority)
-        retrieval_binding, retrieval_checkout = (
-            _load_retrieval_validation_binding(source_graph)
+        gate_c_execution = _RealGateCExecution(
+            validation_module_anchor=(
+                source_graph.retrieval_validation_module_anchor
+            ),
+            module_anchors=source_graph.retrieval_runtime_module_anchors,
+            approved_roots_anchor=(
+                source_graph.retrieval_approved_roots_anchor
+            ),
+            source_authority=source_graph.source_authority,
         )
         gate_d_execution = _RealGateDExecution(
             module_anchors=source_graph.gate_d_module_anchors,
@@ -4568,8 +4684,7 @@ def compose_capability_host(
             ),
             retrieval_gate_c_validation_owner=host._composition_gate_c_owner(
                 _COMPOSITION_MINT_IDENTITY,
-                checkout_identity=retrieval_checkout,
-                validation_binding=retrieval_binding,
+                execution=gate_c_execution,
             ),
             retrieval_gate_d_owner=host._composition_gate_d_owner(
                 _COMPOSITION_MINT_IDENTITY,

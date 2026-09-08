@@ -594,7 +594,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
             ),
         )
         self.assertEqual(complete, ("tm_retrieval_capability",))
-        self.assertEqual(len(declaration_modules), 10)
+        self.assertEqual(declaration_modules, ["tm_retrieval_capability"])
         self.assertTrue(set(pending).isdisjoint(declaration_modules))
         self.assertIn("tm_retrieval_capability", declaration_modules)
         self.assertTrue(
