@@ -190,6 +190,27 @@ cl.exe /nologo /W4 /WX /MT /O2 /Brepro /guard:cf /TC '<repository>\tools\probe_w
 
 退出成功只表示诊断结构有效。测试使用合成 fixture；查询结果仅描述观测时的状态。
 
+## E9 受控分配失败观测
+
+对当前已执行的真实封装 candidate，可分别运行 `control`、`path-alloc-null` 与 `inittab-alloc-null`：
+
+```powershell
+& '<candidate audit venv>\Scripts\python.exe' -B -m tools.trace_windows_frozen_e9_faults `
+  --diagnostic-build '<本轮 custom-runw 诊断目录>' `
+  --cdb '<Windows SDK>\Debuggers\x64\cdb.exe' `
+  --profile path-alloc-null
+```
+
+工具先核对当前 candidate、完整 dist 和锁定 Python DLL，再核对 allocation/owner 调用指令与 IAT。只在新 debuggee 的精确调用来源、参数及阶段同时匹配时，跳过一次 `malloc` 或 `realloc` 并令结果为 NULL；不跳过 `Py_SetPath` 或初始化函数，不改磁盘 DLL、runtime 或产品配置。正常对照只记录阶段，故障 profile 另在 E9 起点启用文件调用观测，避免调试断点拖慢先前的 bundle 逐文件复验。
+
+产物保存脚本、原始 CDB 输出、实际进程退出事件、输入前后摘要及故障模型。`OBSERVED_CONTROLLED_PATH` 只表示指定的受控分配失败路径已观测到，不是自然 OOM、所有初始化失败覆盖、文件访问闭包或 W3 PASS；无命中也不证明不可达。CDB 只属于验收工具，不是产品运行依赖。
+
+### Retained 初始化源码的失败边界
+
+`tools.trace_windows_frozen_retained_failures` 接受最终 dist、release、三个外锚及 CDB 参数；`--profile` 分别为 `control`、`clear-before-missing-path`、`compile-filename-allocation`、`body-allocation` 与 `install-allocation`。可加 `--polluted-cwd` 重放 traceback/encodings 发现诱饵。
+
+观察者绑定固定 PE/DLL 指令、E8 槽和实际执行上下文。清空前使用合法 borrowed NULL；三个分配故障在真实分配调用点模拟一次 NULL 返回，由 CPython 自身错误分支设置 MemoryError。编译项是文件名分配失败，不是语法失败。原始异常、撤销、未到 handoff 与自然退出必须吻合；完整 stderr 按 profile 核对，解析器与工具库存前后复验。无效 `.pyd` 仅为发现诱饵；这些受控样本不代表自然 OOM、全部 I/O 路径或完整 W3 验收。
+
 ## 历史 v1 terminal diagnostic replay
 
 以下仅用于在原 v1 输入及相应源码快照上重放旧 NO-GO；工具拒绝 v2 及当前 v3 lock。
