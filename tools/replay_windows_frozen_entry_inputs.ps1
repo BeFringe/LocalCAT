@@ -31,6 +31,9 @@ param(
     [string]$PyInstallerSource,
 
     [Parameter(Mandatory = $true)]
+    [string]$PackagingDependencies,
+
+    [Parameter(Mandatory = $true)]
     [string]$ProbeWorkRoot,
 
     [Parameter(Mandatory = $true)]
@@ -55,6 +58,7 @@ $ResolvedWindowsSdkRoot = (Resolve-Path -LiteralPath $WindowsSdkRoot).Path
 $ResolvedPythonRoot = (Resolve-Path -LiteralPath $PythonRoot).Path
 $ResolvedPyInstallerSdist = (Resolve-Path -LiteralPath $PyInstallerSdist).Path
 $ResolvedPyInstallerSource = (Resolve-Path -LiteralPath $PyInstallerSource).Path
+$ResolvedPackagingDependencies = (Resolve-Path -LiteralPath $PackagingDependencies).Path
 $EntryContract = Join-Path $RepositoryRoot 'packaging\windows\frozen-entry\candidate-contract.json'
 if ([string]::IsNullOrWhiteSpace($ExpectedLock)) {
     $ExpectedLock = Join-Path $RepositoryRoot 'packaging\windows\frozen-entry\candidate-input.lock.json'
@@ -214,6 +218,7 @@ try {
         --python-root $ResolvedPythonRoot `
         --pyinstaller-sdist $ResolvedPyInstallerSdist `
         --pyinstaller-source $ResolvedPyInstallerSource `
+        --packaging-dependencies $ResolvedPackagingDependencies `
         --toolchain-probe-runw $ResolvedToolchainProbeRunw `
         --probe-build-evidence $ProbeBuildEvidence `
         --entry-contract $EntryContract `

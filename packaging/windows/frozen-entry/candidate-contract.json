@@ -301,7 +301,201 @@
       "LOAD_LIBRARY_SEARCH_SYSTEM32"
     ],
     "pre_authority_external_calls": [
-      "LoadLibraryExW through localcat_native_closure_load_verified"
+      "LoadLibraryExW through localcat_native_closure_load_verified",
+      "crt-vcruntime-critical-section",
+      "crt-vcruntime-fls",
+      "crt-ucrt-fls2",
+      "crt-ucrt-process-termination",
+      "crt-ucrt-multibyte-casing",
+      "python-mimalloc-memory-kernelbase",
+      "python-mimalloc-memory-ntdll",
+      "python-mimalloc-memory-kernel32",
+      "python-mimalloc-random",
+      "python-mimalloc-stats"
+    ],
+    "application_system_calls": [
+      {
+        "id": "crt-vcruntime-critical-section",
+        "owner": "custom-entry-static-crt",
+        "phase": "E0.5",
+        "loader": "LoadLibraryExW",
+        "targets": [
+          "api-ms-win-core-synch-l1-2-0",
+          "kernel32"
+        ],
+        "flags": 2048,
+        "condition": "crt-initialization-fixed-name-probe",
+        "fallback": {
+          "error": 87,
+          "targets": [
+            "kernel32"
+          ],
+          "flags": 0,
+          "excluded_prefixes": [
+            "api-ms-"
+          ]
+        },
+        "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "crt-vcruntime-fls",
+        "owner": "custom-entry-static-crt",
+        "phase": "E0.5",
+        "loader": "LoadLibraryExW",
+        "targets": [
+          "api-ms-win-core-fibers-l1-1-1",
+          "kernel32"
+        ],
+        "flags": 2048,
+        "condition": "crt-initialization-fixed-name-probe",
+        "fallback": {
+          "error": 87,
+          "targets": [
+            "kernel32"
+          ],
+          "flags": 0,
+          "excluded_prefixes": [
+            "api-ms-"
+          ]
+        },
+        "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "crt-ucrt-fls2",
+        "owner": "custom-entry-static-crt",
+        "phase": "E0.5",
+        "loader": "LoadLibraryExW",
+        "targets": [
+          "api-ms-win-core-fibers-l1-1-2",
+          "kernelbase"
+        ],
+        "flags": 2048,
+        "condition": "crt-initialization-fixed-name-probe",
+        "fallback": {
+          "error": 87,
+          "targets": [
+            "kernelbase"
+          ],
+          "flags": 0,
+          "excluded_prefixes": [
+            "api-ms-",
+            "ext-ms-"
+          ]
+        },
+        "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "crt-ucrt-process-termination",
+        "owner": "custom-entry-static-crt",
+        "phase": "CRT_EXIT_INCLUDING_E1_FAILURE",
+        "loader": "LoadLibraryExW",
+        "targets": [
+          "api-ms-win-appmodel-runtime-l1-1-2"
+        ],
+        "flags": 2048,
+        "condition": "crt-termination-non-secure-and-empty-function-and-module-cache",
+        "fallback": null,
+        "requires": "POLICY_INDEPENDENT_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "crt-ucrt-multibyte-casing",
+        "owner": "custom-entry-static-crt",
+        "phase": "E0.5",
+        "loader": "LoadLibraryExW",
+        "targets": [
+          "api-ms-win-core-localization-l1-2-1",
+          "kernel32"
+        ],
+        "flags": 2048,
+        "condition": "crt-multibyte-initialization-non-utf8-acp-and-getcpinfo-success-and-empty-function-and-module-cache",
+        "module_selection": "first-available-module-next-candidate-on-load-failure-only",
+        "symbols": [
+          "LCMapStringEx",
+          "LocaleNameToLCID"
+        ],
+        "symbol_fallback": {
+          "LCMapStringEx": "static-LCMapStringW-with-LocaleNameToLCID-conversion",
+          "LocaleNameToLCID": "downlevel-conversion-no-loader",
+          "resolution": "same-candidate-list-and-module-cache-no-next-candidate-on-missing-symbol"
+        },
+        "fallback": {
+          "error": 87,
+          "targets": [
+            "kernel32"
+          ],
+          "flags": 0,
+          "excluded_prefixes": [
+            "api-ms-",
+            "ext-ms-"
+          ]
+        },
+        "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "python-mimalloc-memory-kernelbase",
+        "owner": "python314.dll",
+        "phase": "E6_DLL_INITIALIZATION",
+        "loader": "LoadLibraryA",
+        "targets": [
+          "kernelbase.dll"
+        ],
+        "flags": null,
+        "condition": "process-memory-init",
+        "fallback": null,
+        "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "python-mimalloc-memory-ntdll",
+        "owner": "python314.dll",
+        "phase": "E6_DLL_INITIALIZATION",
+        "loader": "LoadLibraryA",
+        "targets": [
+          "ntdll.dll"
+        ],
+        "flags": null,
+        "condition": "process-memory-init",
+        "fallback": null,
+        "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "python-mimalloc-memory-kernel32",
+        "owner": "python314.dll",
+        "phase": "E6_DLL_INITIALIZATION",
+        "loader": "LoadLibraryA",
+        "targets": [
+          "kernel32.dll"
+        ],
+        "flags": null,
+        "condition": "process-memory-init",
+        "fallback": null,
+        "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "python-mimalloc-random",
+        "owner": "python314.dll",
+        "phase": "AFTER_E1",
+        "loader": "LoadLibraryA",
+        "targets": [
+          "bcrypt.dll"
+        ],
+        "flags": null,
+        "condition": "os-random-request-and-empty-function-cache",
+        "fallback": null,
+        "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+      },
+      {
+        "id": "python-mimalloc-stats",
+        "owner": "python314.dll",
+        "phase": "AFTER_E1_INCLUDING_EARLY_EXIT",
+        "loader": "LoadLibraryA",
+        "targets": [
+          "psapi.dll"
+        ],
+        "flags": null,
+        "condition": "stats-or-verbose-and-empty-function-cache",
+        "fallback": null,
+        "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+      }
     ],
     "system_service_boundary": {
       "authority": "Windows OS",

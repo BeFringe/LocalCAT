@@ -21,6 +21,7 @@ from tools.prepare_windows_frozen_entry_inputs import (
     _toolchain_probe_fact,
     _validated_vs_instance,
     _validate_probe_build_evidence,
+    _validate_dynamic_loader,
     _venv_semantics,
     _verified_date,
     python_api_table_for_314,
@@ -418,9 +419,19 @@ static int _pyi_dylib_python_import_symbols(void) {
         self.assertEqual(
             loader["non_system_dispatcher"], "localcat_native_closure_load_verified"
         )
+        calls = loader["application_system_calls"]
+        self.assertEqual(len(calls), 10)
         self.assertEqual(loader["pre_authority_external_calls"], [
-            "LoadLibraryExW through localcat_native_closure_load_verified"
+            "LoadLibraryExW through localcat_native_closure_load_verified",
+            *[call["id"] for call in calls],
         ])
+        self.assertEqual([call["flags"] for call in calls[:3]], [0x800] * 3)
+        self.assertEqual([call["targets"][-1] for call in calls[:3]],
+                         ["kernel32", "kernel32", "kernelbase"])
+        self.assertEqual([call["targets"] for call in calls[5:]], [
+            ["kernelbase.dll"], ["ntdll.dll"], ["kernel32.dll"], ["bcrypt.dll"], ["psapi.dll"]])
+        self.assertEqual(calls[-1]["phase"], "AFTER_E1_INCLUDING_EARLY_EXIT")
+        self.assertEqual(calls[-2]["condition"], "os-random-request-and-empty-function-cache")
         target = loader["system_service_boundary"]
         self.assertEqual(target["authority"], "Windows OS")
         self.assertEqual(target["rng"], {
@@ -428,6 +439,100 @@ static int _pyi_dylib_python_import_symbols(void) {
             "hAlgorithm": 0, "flags": 2,
         })
         self.assertNotIn("members", target)
+
+    def test_crt_exit_call_does_not_assume_policy_success_or_authorize_fallback(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        contract, _ = _load_entry_contract(root / "packaging/windows/frozen-entry/candidate-contract.json")
+        calls = {item["id"]: item for item in contract["dynamic_loader"]["application_system_calls"]}
+        self.assertIn("crt-ucrt-process-termination", calls)
+        self.assertEqual(calls["crt-ucrt-process-termination"], {
+            "id": "crt-ucrt-process-termination", "owner": "custom-entry-static-crt",
+            "phase": "CRT_EXIT_INCLUDING_E1_FAILURE", "loader": "LoadLibraryExW",
+            "targets": ["api-ms-win-appmodel-runtime-l1-1-2"], "flags": 0x800,
+            "condition": "crt-termination-non-secure-and-empty-function-and-module-cache",
+            "fallback": None, "requires": "POLICY_INDEPENDENT_SYSTEM_RESOLUTION_PROOF",
+        })
+
+    def test_crt_multibyte_call_has_exact_pre_entry_resolution_and_symbol_fallback(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        contract, _ = _load_entry_contract(root / "packaging/windows/frozen-entry/candidate-contract.json")
+        calls = {item["id"]: item for item in contract["dynamic_loader"]["application_system_calls"]}
+        self.assertIn("crt-ucrt-multibyte-casing", calls)
+        self.assertEqual(calls["crt-ucrt-multibyte-casing"], {
+            "id": "crt-ucrt-multibyte-casing", "owner": "custom-entry-static-crt",
+            "phase": "E0.5", "loader": "LoadLibraryExW",
+            "targets": ["api-ms-win-core-localization-l1-2-1", "kernel32"], "flags": 0x800,
+            "condition": "crt-multibyte-initialization-non-utf8-acp-and-getcpinfo-success-and-empty-function-and-module-cache",
+            "module_selection": "first-available-module-next-candidate-on-load-failure-only",
+            "symbols": ["LCMapStringEx", "LocaleNameToLCID"],
+            "symbol_fallback": {
+                "LCMapStringEx": "static-LCMapStringW-with-LocaleNameToLCID-conversion",
+                "LocaleNameToLCID": "downlevel-conversion-no-loader",
+                "resolution": "same-candidate-list-and-module-cache-no-next-candidate-on-missing-symbol",
+            },
+            "fallback": {"error": 87, "targets": ["kernel32"], "flags": 0,
+                         "excluded_prefixes": ["api-ms-", "ext-ms-"]},
+            "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF",
+        })
+
+    def test_multibyte_contract_rejects_missing_or_widened_resolution_details(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        loader = json.loads((root / "packaging/windows/frozen-entry/candidate-contract.json").read_bytes())["dynamic_loader"]
+        self.assertIn("crt-ucrt-multibyte-casing", [item["id"] for item in loader["application_system_calls"]])
+        edits = [
+            lambda call: call.update(phase="AFTER_E1"),
+            lambda call: call.update(condition="always"),
+            lambda call: call.update(flags=0),
+            lambda call: call["targets"].append("api-ms-win-core-localization-obsolete-l1-2-0"),
+            lambda call: call["targets"].reverse(),
+            lambda call: call.pop("module_selection"),
+            lambda call: call.update(module_selection="next-candidate-on-missing-symbol"),
+            lambda call: call["symbols"].append("LoadLibraryW"),
+            lambda call: call["symbols"].remove("LocaleNameToLCID"),
+            lambda call: call["symbol_fallback"].update(LCMapStringEx="dynamic-LCMapStringW"),
+            lambda call: call["symbol_fallback"].update(LocaleNameToLCID="load-other-locale-provider"),
+            lambda call: call["symbol_fallback"].update(resolution="next-candidate-on-missing-symbol"),
+            lambda call: call["fallback"].update(error=0),
+            lambda call: call["fallback"]["targets"].append("api-ms-win-core-localization-l1-2-1"),
+            lambda call: call["fallback"].update(excluded_prefixes=["api-ms-"]),
+            lambda call: call.update(requires="E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"),
+        ]
+        for index, edit in enumerate(edits):
+            changed = json.loads(json.dumps(loader))
+            call = next(item for item in changed["application_system_calls"] if item["id"] == "crt-ucrt-multibyte-casing")
+            edit(call)
+            with self.subTest(index=index), self.assertRaises(CandidateInputError):
+                _validate_dynamic_loader(changed)
+
+    def test_system_call_contract_rejects_widened_targets_phases_flags_and_fallback(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        loader = json.loads((root / "packaging/windows/frozen-entry/candidate-contract.json").read_bytes())["dynamic_loader"]
+        _validate_dynamic_loader(loader)
+        edits = [
+            lambda item: item.pop("application_system_calls"),
+            lambda item: item["application_system_calls"].pop(),
+            lambda item: item["application_system_calls"].append(item["application_system_calls"][0]),
+            lambda item: item["pre_authority_external_calls"].append("unreviewed"),
+            lambda item: item["allowed_flags"].append("LOAD_LIBRARY_SEARCH_DEFAULT_DIRS"),
+            lambda item: item["application_system_calls"][0].update(flags=0),
+            lambda item: item["application_system_calls"][0]["targets"].append("plugin.dll"),
+            lambda item: item["application_system_calls"][0]["fallback"].update(error=0),
+            lambda item: item["application_system_calls"][0]["fallback"].update(excluded_prefixes=[]),
+            lambda item: item["application_system_calls"][0].update(requires="none"),
+            lambda item: item["application_system_calls"][-1].update(phase="E0.5"),
+            lambda item: item["application_system_calls"][-2].update(condition="always"),
+            lambda item: item["application_system_calls"][3].update(phase="AFTER_E1"),
+            lambda item: item["application_system_calls"][3].update(flags=0),
+            lambda item: item["application_system_calls"][3].update(fallback={"targets": ["kernel32"], "flags": 0}),
+            lambda item: item["application_system_calls"][3]["targets"].append("kernel.appcore.dll"),
+            lambda item: item["application_system_calls"][3].update(condition="always"),
+            lambda item: item["application_system_calls"][3].update(requires="E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"),
+        ]
+        for index, edit in enumerate(edits):
+            changed = json.loads(json.dumps(loader))
+            edit(changed)
+            with self.subTest(index=index), self.assertRaises(CandidateInputError):
+                _validate_dynamic_loader(changed)
 
     def test_historical_no_go_cannot_reject_new_system_provider_boundary(self) -> None:
         from tools.audit_windows_frozen_custom_entry import validate_legacy_target as producer_gate
@@ -466,6 +571,13 @@ static int _pyi_dylib_python_import_symbols(void) {
             re.search(r"(?<![A-Za-z])[A-Za-z]:[\\/]", json.dumps(record, ensure_ascii=False))
         )
         producer = record["evidence_producer"]
+        from tools.windows_frozen_packaging import APPLICATION_MANIFEST, BUILD_SOURCE_FILES, fact
+        packaging = producer["custom_packaging"]
+        self.assertEqual(set(packaging["source_files"]), set(BUILD_SOURCE_FILES))
+        for name in BUILD_SOURCE_FILES:
+            self.assertEqual(packaging["source_files"][name], fact((repository_root / name).read_bytes()))
+        self.assertEqual(packaging["application_manifest"], fact(APPLICATION_MANIFEST))
+        self.assertGreater(packaging["dependency_inventory"]["file_count"], 0)
         self.assertEqual(
             producer["preparer"]["sha256"],
             hashlib.sha256(
