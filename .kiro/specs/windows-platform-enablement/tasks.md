@@ -121,7 +121,7 @@
   - _Boundary: W3 Stock Entry NO-GO Gate_
   - _Depends: 1.2_
 
-- [ ] 1F. 规划并验证W3 custom in-process entry可行性
+- [x] 1F. 规划并验证W3 custom in-process entry可行性
 
 - [x] 1.5 重新批准W3 custom in-process entry计划
   - 固定同一进程真实entry、本机或CI受支持MSVC x64/Windows SDK的candidate选择与构建前candidate-input lock、PyInstaller source pin与patch owner/apply合同、expected PE/system allowlist、manifest parser/hash最小TCB、retained-handle→restricted load→actual-module reproof、native→Python handoff ABI、exact-source loader import order和升级维护边界
@@ -132,7 +132,7 @@
   - _Boundary: W3 Custom Entry Reapproval_
   - _Depends: 1.4_
 
-- [ ] 1.6 在W1 rooted contract冻结后完成custom entry最小W3 spike
+- [x] 1.6 在W1 rooted contract冻结后完成custom entry最小W3 spike
   - 按已批准的 `w3-e9-path-amendment.md` 接入早期路径隔离、interpreter source 与唯一兼容 ABI 增量；初始化后复证不得追认先前路径访问
   - 依 `w3-custom-entry-plan.md` §5.2 验证应用 dispatcher、系统 API 入口及其搜索策略，覆盖首次加载前的应用 DLL 重定向反例
   - 仅构建已批准完整Boot TCB、一个source-only critical module和一个fixture；在首次Python DLL/非KnownDLL load前闭合搜索、递归native closure与retained-handle proof，load后复核actual module identity并完成不可伪造handoff

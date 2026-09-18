@@ -49,6 +49,8 @@ Task 1.6 then realizes and tests the custom entry against the mandatory matrix.
 
 ## Task 1.6：应用 native 闭包与 OS 服务边界
 
+最小 custom-entry spike 的最终外锚、14 项组合裁决及重放索引见 [验收记录](spike-validation.md)。以下各工具保留自身的有限证据分类；单项成功不等于完整 frozen 产品发行通过。
+
 ### 完整五补丁的开发验证
 
 在锁定 MSVC x64/SDK 环境中运行：
