@@ -89,7 +89,7 @@ pre-authority 动态加载首版采用“**应用可达调用点闭包**”：cu
 
 - 锁定 CPython 在 E9 通过 `bcrypt!BCryptGenRandom(NULL, buffer, size, BCRYPT_USE_SYSTEM_PREFERRED_RNG)` 取得 hash 随机种子，flags 为 `2`，保持解释器正常随机化及错误处理。
 - candidate-contract/input v3 绑定上述调用合同。系统观测保存在独立诊断产物中；构建输入绑定声明的应用闭包与系统入口策略。
-- 系统入口与非系统 dispatcher 均须验证 E1 搜索策略及调用时序，覆盖 CWD/PATH、`.local`/SxS、同名 DLL 和 reparse/alias 重定向反例。
+- 系统入口与非系统 dispatcher 按各自阶段验证搜索策略及调用时序：§5.4 的 E0.5 CRT 探测使用 pre-entry system-resolution proof，CRT 退出探测使用不依赖 E1 成功的解析证明，其余要求 E1 策略的调用须证明策略已建立；均覆盖 CWD/PATH、`.local`/SxS、同名 DLL 和 reparse/alias 重定向反例。
 
 v1 terminal NO-GO 工具只重放旧合同，拒绝 v2/v3 输入。诊断、parser 单测或初始化 probe 均不能单独把下列 mandatory candidate 断言标成 PASS。
 
@@ -99,11 +99,31 @@ custom entry 的 E8 目标为 37 个函数和 `PyExc_RuntimeError` 数据导出�
 
 原生代码在易触发 fatal 的调用前先记录稳定阶段状态，再向可用的 stderr 和 `OutputDebugStringW` 尝试输出无正文标记。stderr、调试器或观察者均不是启动前置条件，输出不可用不得撤销有效 authority；可返回的真实失败仍通过错误诊断并非零退出。fatal/OOM 保持原生阶段记录与非零终止，在验收时由外部观察者取证；不承诺无人观察时的持久化日志。此修订须覆盖无 stderr 的真实 windowed entry 正常启动及失败路径。
 
+### 5.4 已批准的 CRT/mimalloc 系统调用增量
+
+E0.5 禁止的是未声明或可落入非授权路径的加载，不以“没有新增 module”代替调用点审计。锁定 CRT 在 E1 前的固定探测按下表进入精确目标合同；本表只声明可验证的调用边界，不预先授予解析成功或安全结论。
+
+| 应用调用根 | 固定目标与搜索条件 | 阶段与必须证明的边界 |
+|---|---|---|
+| VCRuntime critical-section/FLS 初始化 | `api-ms-win-core-synch-l1-2-0 → kernel32`；`api-ms-win-core-fibers-l1-1-1 → kernel32` | E0.5，首试 `LoadLibraryExW(..., 0x800)`；仅首试失败且错误为 87、名称非 `api-ms-` 时，真实系统 DLL 后备项可能使用 flags=0；须有 pre-entry system-resolution proof |
+| UCRT FLS2 初始化 | `api-ms-win-core-fibers-l1-1-2 → kernelbase` | 同上，回退还排除 `ext-ms-`；不得推广到共用 thunk 的全部名字或第三方 initializer |
+| UCRT multibyte 大小写表初始化 | `LCMapStringEx`、后备转换 `LocaleNameToLCID` 使用 `api-ms-win-core-localization-l1-2-1 → kernel32`，首试 `LoadLibraryExW(..., 0x800)` | E0.5；ANSI 代码页非 UTF-8、GetCPInfo 成功且对应函数／模块缓存为空时可触发。须有 pre-entry system-resolution proof，不能以 Python UTF-8 模式或本机 ACP=65001 排除；不要求用户修改区域设置 |
+| UCRT 进程终止策略查询 | `AppPolicyGetProcessTerminationMethod` 仅以 `LoadLibraryExW(..., 0x800)` 探测 `api-ms-win-appmodel-runtime-l1-1-2`，无后备目标或 flags=0 回退 | CRT 正常及失败退出，包含 E1 策略未建立时；进程非 secure 且函数与模块尚未缓存才加载。须独立证明系统目标解析，不以 E1 成功为前提 |
+| Python DLL 内 mimalloc memory 初始化 | `kernelbase.dll`、`ntdll.dll`、`kernel32.dll` 的 `LoadLibraryA` | E6 的 DLL CRT 初始化，必须已建立 E1 System32 策略并证明系统目标解析 |
+| mimalloc OS 随机源请求 | `bcrypt.dll` 的 `LoadLibraryA`，只在缓存函数指针为空时加载 | E1 后；CRT 的 weak-seed 重试是其中一条到达路径，不将该条件误写成所有随机源请求的前提；不改变解释器 hash RNG 合同 |
+| mimalloc 统计输出 | `psapi.dll` 的 `LoadLibraryA`，统计/verbose 开启且缓存为空 | E1 后，包含 E10 之前失败退出的清理支线；Python 隔离开关不屏蔽 mimalloc 环境选项 |
+
+所有目标、调用 API、阶段、条件和兼容回退逐项进入 `application_system_calls`；生成器和当前 candidate 消费者拒绝缺项、扩项或条件改变。非系统 dispatcher 及其 `0x900` 加载策略不变。仍须验证 API-set/KnownDLL/System32 解析以及 CWD/PATH、同名 DLL、`.local`/SxS、reparse/alias 反例；flags=0 回退不能仅凭名字或事后 inventory 放行。扩展导入、文件探测和 SHELL32 等未闭合的应用调用点不因这次增量自动获得授权。
+
+CRT 退出探测的加载或符号查询失败保留既有 `ExitProcess` 默认策略，不新增应用 fallback。正常完成后的观测不能排除它在 E10 前失败路径的可达性；必须另验 E1 API 失败、E9 可返回失败及各自退出时序。API-set 在本机解析到的 host 是系统解析证据，不另加为应用显式加载目标。
+
+UCRT multibyte 的候选循环仅在模块加载失败时前进；首个可用模块上符号缺失，不再继续遍历下一候选。LCMapStringEx 缺失转向静态导入的 LCMapStringW，并由 LocaleNameToLCID wrapper 转换 locale；该 wrapper 使用同一候选列表与模块缓存，符号仍缺失则使用 downlevel 转换，不引入额外 loader 目标。flags=0 兼容回退仅限前次 flags=0x800 失败且错误为87、目标名称非 `api-ms-`／`ext-ms-` 的真实 `kernel32` 候选；不向 localization API-set 开放 flags=0。本增量只补齐既有 CRT 分支的应用调用声明及验证，不扩大 Windows OS 信任范围。
+
 ## 6. Mandatory spike assertion matrix
 
 | ID | 刺激/观察 | 通过条件 |
 |---|---|---|
-| `W3.CUSTOM.PE_SYSTEM_ONLY` | 静态/delay import、MSVC CRT startup与启动module inventory | E0/E0.5仅出现allowlisted system/API-set identity；无`COMCTL32`歧义、第三方initializer或policy前dynamic load |
+| `W3.CUSTOM.PE_SYSTEM_ONLY` | 静态/delay import、MSVC CRT startup与启动module inventory | E0/E0.5仅出现allowlisted system/API-set identity；无`COMCTL32`歧义、第三方initializer、未声明或可落入非授权路径的policy前dynamic load |
 | `W3.CUSTOM.DLL_POLICY_FIRST` | CWD/PATH/application-dir放置同名Python/CRT probe DLL | 首次非system load前policy已生效，probe不执行 |
 | `W3.CUSTOM.BUNDLE_ROOTED` | bundle/ancestor junction、final reparse、ancestor swap | 全部在load前稳定fail closed，无path-only fallback |
 | `W3.CUSTOM.NATIVE_CLOSURE_PRELOAD` | 顶层及传递DLL替换、missing/extra、duplicate basename | 每个非system member在首次load前已有retained identity+digest proof |

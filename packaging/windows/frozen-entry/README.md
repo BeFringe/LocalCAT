@@ -21,6 +21,7 @@ $Replay = @{
     PythonRoot = '<pinned CPython 3.14.7 root>'
     PyInstallerSdist = '<inputs>\pyinstaller-6.22.2.tar.gz'
     PyInstallerSource = '<inputs>\pyinstaller-6.22.2'
+    PackagingDependencies = '<explicit build dependency site-packages>'
     ProbeWorkRoot = '<new empty parent>\stock-probe-source'
     SupportVerifiedOn = '2026-08-27'
     OutputPath = '<existing output parent>\candidate-input-replay.json'
@@ -48,12 +49,66 @@ Task 1.6 then realizes and tests the custom entry against the mandatory matrix.
 
 ## Task 1.6：应用 native 闭包与 OS 服务边界
 
+### 完整五补丁的开发验证
+
+在锁定 MSVC x64/SDK 环境中运行：
+
+```powershell
+& '<candidate audit venv>\Scripts\python.exe' -B -m tools.probe_windows_frozen_custom_runw `
+  --pristine-source '<pinned PyInstaller sdist source>' --run
+```
+
+该诊断从经过输入锁校验的 pristine bootloader 库存重放完整五补丁；原生模板仅用于逐字节核对，不在重放后覆盖源码。`applied-sources.json` 记录有序补丁和完整输入/结果库存，其摘要进入 pre-link manifest。生成头文件只替换 manifest 模板中声明的摘要占位。
+
+产物留在 `artifacts/windows/`；`--run` 分别执行捕获输出和标准句柄全 NULL 的同一 GUI PE。结果仍是诊断，不代替最终 PyInstaller 封装、E0～E11 全矩阵和双 clean final build。
+
+修改原生模板后，可运行 `tools/render_windows_frozen_native_patches.py` 生成 `apply_patch` 请求，经审阅后更新四份原生源码补丁；构建不会自动修补陈旧补丁。输入生成阶段同时要求 existing owner 在真实 pristine 库存中存在，new owner 尚不存在。
+
+### PyInstaller 封装组件验证
+
+同一命令增加 `--packaging-dependencies '<显式构建依赖 site-packages>'` 后，会在 Waf 构建后继续执行真实 `EXE → PKG → COLLECT`，并将 `--run` 指向封装后的 GUI EXE。锁定 sdist 须与 pristine 目录相邻，文件名来自 candidate lock；PyInstaller Python 包重新从摘要匹配的 sdist 提取，不从已安装的 PyInstaller 取包。
+
+封装子进程使用 `-I -S -B`、独占 cache/work/dist 及复制的构建依赖，不加入整个 site-packages 或仓库到搜索路径。构建依赖包括 `altgraph`、`packaging`、`pefile`（含 `ordlookup`/`peutils`）和 `pywin32-ctypes`，不会调用 Analysis 或收集 hooks。源码作为 DATA 收集，不产生 PYZ/字节码；空 CArchive 由 PyInstaller 正常写入。原生 DLL、源码与 fixture 在收集前后逐项比对原字节，最终目录拒绝额外条目。
+
+PyInstaller 会对任意输入 XML 强制补入 Common-Controls，因此 spec 的 EXE 子类在 `Target.__postinit__` 的缓存检查和 assemble 前设置准确 manifest。封装后重新检查真实 PE 的 manifest、static/delay imports、windowed subsystem、时间戳和 Security/Debug Directory，不在输出 PE 上事后补丁。此扩展点只对锁定 upstream 实现有效。
+
+candidate lock 的 `evidence_producer.custom_packaging` 绑定构建驱动/helper 源码、依赖文件库存摘要及 manifest/布局合同。输入生成器与重放脚本要求显式依赖目录；该目录只是读取来源，其绝对路径不进入 candidate 身份。缺少绑定的旧锁仍可供历史诊断读取，但不得进入此封装路径；当前工具/依赖在 Waf 前与候选比较，复制后的依赖和子进程驱动再与同一候选比较，不重新计算期望值放行变化。
+
+`packaging/inputs.json` 使用相对路径，记录实际包源码、依赖、驱动、spec 和 payload 摘要，并关联 candidate 与 packaging target 摘要；父进程将输入摘要传给子进程并复核返回结果与现场 dist。其分类为 **CANDIDATE_BOUND_PACKAGING_INPUTS_NOT_W3_APPROVAL**：构建输入绑定不等于 realized-build lock、完整 E0～E11 矩阵或 W3 批准。该组件跑通或两次字节相同均不能单独关闭 Task 1.6。
+
+### 从干净提交生成 post-build 绑定
+
+在锁定 vcvars 环境、无修改或未跟踪输入的独立工作树中运行：
+
+```powershell
+& '<candidate audit venv>\Scripts\python.exe' -B -m tools.build_windows_frozen_spike `
+  --expected-commit '<调用方选定的完整提交>' `
+  --expected-candidate-lock-sha256 '<已批准 lock 文件的 SHA-256>' `
+  --pristine-source '<pinned PyInstaller sdist source>' `
+  --runtime-root '<pinned CPython root>' `
+  --packaging-dependencies '<显式构建依赖 site-packages>' `
+  --vswhere '<Visual Studio Installer>\vswhere.exe' `
+  --output '<该工作树>\artifacts\windows\<新的构建目录>'
+```
+
+编排器在构建前后检查同一 clean HEAD，并把 `tools/` 与 `packaging/windows/frozen-entry/` 的实际原始字节与 Git archive 比较；被忽略的额外构建输入也不能绕过检查。它独立重放补丁、runtime/source/fixture 输入和生成头文件，再逐字节核对本轮实际构建目录，直接解析最终 PE 的 imports、manifest、Debug/Security Directory 与完整空 CArchive。旧 dirty 诊断不能事后升级为 clean build。
+
+仅净化外层 `INCLUDE`/`LIB` 不足以固定编译输入：Waf 的 MSVC 自动探测会重新加入 VS 辅助目录等搜索根。补丁关闭该重探测并显式设置锁定工具与目录；编排器同时核对 Waf 有效配置和实际编译／链接命令，避免只验证启动环境而遗漏真正的搜索路径。
+
+`release.json` 位于 dist 外，绑定 clean commit/source、candidate、pre-link、runtime manifest、applied source、最终 PE 与完整相对 dist 库存，不包含机器绝对路径、时间或诊断日志摘要。编排器输出的 `release_sha256` 必须由调用方在产物外保留；`verify_release_binding` 要求显式传入该摘要、commit 和 candidate，不能信任待检目录自己提供的 receipt。完整自洽地替换 PE 与清单仍应被原外锚拒绝。
+
+本单元分类为 **BUILD_BINDING_NOT_W3_ACCEPTANCE**。它提供 post-build 绑定，不将源码 API 正则投影变成 realized C API 证明，也不授予 E0～E11 或完整产品发行通过。构建前后核对针对受信构建主机上的输入漂移，不声称能防御已被控制的 OS 或编译器。
+
+### 系统入口边界
+
 v3 输入绑定应用系统 API 入口和非系统 dispatcher 合同。
 `BCryptGenRandom(NULL, flags=2)` 使用解释器正常的系统随机源。
 
 应用自有的 native entry、Python DLL/随包依赖、实际源码和 fixture 仍须完整证明。
 系统 API 入口的搜索策略仍受审；CWD/PATH、同名 DLL 或应用可控的重定向不获放行。
 准确边界与真实 custom entry 验收见 `w3-custom-entry-plan.md` §5.2。
+
+精确的应用系统加载目标另见该计划 §5.4 和 target 的 `application_system_calls`：包括 E0.5 CRT 固定探测、CRT 终止策略查询及 E1 后的 mimalloc 初始化/失败退出支线。CRT 终止策略查询包含 E1 未成功的失败返回，仅允许固定 AppModel API-set 和 `0x800`，没有后备目标或默认搜索回退；其系统解析证明不得依赖 E1 成功。生成器及当前 custom-entry 消费者都核对完整调用清单、阶段、flags 和有条件回退；重新计算 JSON 摘要不允许扩大目标。旧 v3 输入若缺少此清单，须由生成器重新 materialize，不能补默认值继续执行。该声明不替代系统目标解析或最终候选反例证据。
 
 以下可选工具记录系统文件诊断快照，独立于 candidate 输入。
 诊断专用 target 采用 `localcat.windows-system-provider-target.v1` 的显式 roots 格式：
