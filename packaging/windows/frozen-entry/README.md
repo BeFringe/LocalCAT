@@ -99,6 +99,31 @@ candidate lock 的 `evidence_producer.custom_packaging` 绑定构建驱动/helpe
 
 本单元分类为 **BUILD_BINDING_NOT_W3_ACCEPTANCE**。它提供 post-build 绑定，不将源码 API 正则投影变成 realized C API 证明，也不授予 E0～E11 或完整产品发行通过。构建前后核对针对受信构建主机上的输入漂移，不声称能防御已被控制的 OS 或编译器。
 
+### 最终 PE 的实际 API 绑定
+
+```powershell
+& '<candidate audit venv>\Scripts\python.exe' -B -m tools.trace_windows_frozen_api_binding `
+  --dist '<最终 dist>' --release '<dist 外的 release.json>' `
+  --expected-release-sha256 '<调用方保留的 release 摘要>' `
+  --expected-commit '<完整 clean commit>' --expected-candidate-digest '<candidate input 摘要>' `
+  --cdb '<Windows SDK>\Debuggers\x64\cdb.exe' --profile normal
+```
+
+对同一发行物再运行 `function-null` 和 `data-null`。观察者从最终 PE 的 `.pdata` 函数边界完整解码 binder 的调用、槽位和失败分支，并对照随包 Python DLL 的直接导出；正常路径逐项检查实际返回地址、写入与成功返回前的全部槽位。NULL profile 只改变新子进程中的一个解析返回值，验证它在初始化前拒绝。
+
+稳定绑定表记录 RVA；原始调试轨迹保留实际加载地址。外部 release 锚在观察前后核对完整 dist，C 签名仍由锁定 headers 和干净编译承接。结果分类为 `REALIZED_E8_BINDING_NOT_W3_GATE`，不替代其余阶段验证。仅精确记录已锚定零时间戳 EXE 的 CDB 时间戳诊断，不忽略其他模块或断点错误。
+
+### 实际封装入口的时序观测
+
+```powershell
+& '<candidate audit venv>\Scripts\python.exe' -B -m tools.trace_windows_frozen_entry `
+  --diagnostic-build '<本轮封装诊断目录>' --cdb '<Windows SDK>\Debuggers\x64\cdb.exe'
+```
+
+该观察者只启动指定的新样本；先核对当前 candidate、PE、Python DLL 与完整 dist 库存，再以模块限定的导出符号加偏移设置 CDB 断点。输出保存观察者、脚本和输入摘要、原始日志、marker 顺序及真实 debuggee 退出码。`--profile mimalloc-stats` 只在新子进程中设置统计选项，用于检查退出支线；两种 profile 均清除继承的 Python、Qt、mimalloc 和调试符号路径覆盖，不修改用户环境。
+
+结果分类始终是 `OBSERVER_NOT_CALL_CLOSURE_PROOF`。断点告警、缺少 Python DLL entry/完成/退出事件或非零退出不能报告完整成功轨迹；无命中不表示不可达，初始调试断点也不能证明更早的 static import 解析。实际代码根、搜索参数和仍待处理的合同缺口见 [入口调用点审查记录](entry-callsite-audit.md)。
+
 ### 系统入口边界
 
 v3 输入绑定应用系统 API 入口和非系统 dispatcher 合同。
