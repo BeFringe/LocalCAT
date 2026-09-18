@@ -119,6 +119,12 @@ candidate lock 的 `evidence_producer.custom_packaging` 绑定构建驱动/helpe
 
 输出记录每份捕获字节的摘要、观察器与解析器库存、原始轨迹和输入前后复验。结果为 `EXACT_SOURCE_EXECUTION_NOT_FULL_W3_GATE`：证明这些编译输入及代码对象进入执行，不声称覆盖全部语句、未执行分支、其他求值调用或路径访问闭包；保留句柄与交换攻击仍须独立验证。
 
+### 启动前 payload 与目录污染反例
+
+`tools/verify_windows_frozen_payload.py` 可从任意 CWD 调用，参数为 `--dist`、`--release`、`--expected-release-sha256`、`--expected-repository-commit` 和 `--expected-candidate-input-digest`。工具只修改每例新复制的样本，核对精确差异、真实退出及 marker，并复验原始发行物和观察器；证据包含独立重放快照。正常对照使用已有 System32 作为 checkout 外 CWD，污染目录只在独立证据目录创建。
+
+此矩阵覆盖启动前替换、缺失、额外源码／缓存／DLL 和固定导入诱饵；无重新签入的源码追加首先由长度检查拒绝，同长度变化另验摘要。`.pyd` 诱饵是无效 PE 的发现探针，不是 DllMain 执行探针；结果 `PRELAUNCH_PAYLOAD_EVIDENCE_NOT_FULL_W3_GATE` 不替代交换时序、完整 parser 或系统解析验证。
+
 ### 实际封装入口的时序观测
 
 ```powershell
