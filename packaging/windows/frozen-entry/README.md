@@ -46,7 +46,51 @@ bytes and the realized-build lock.
 internally consistent. W3 reapproval changes the Task 1.5 governance state;
 Task 1.6 then realizes and tests the custom entry against the mandatory matrix.
 
-## Task 1.6 terminal diagnostic replay
+## Task 1.6：应用 native 闭包与 OS 服务边界
+
+v3 输入绑定应用系统 API 入口和非系统 dispatcher 合同。
+`BCryptGenRandom(NULL, flags=2)` 使用解释器正常的系统随机源。
+
+应用自有的 native entry、Python DLL/随包依赖、实际源码和 fixture 仍须完整证明。
+系统 API 入口的搜索策略仍受审；CWD/PATH、同名 DLL 或应用可控的重定向不获放行。
+准确边界与真实 custom entry 验收见 `w3-custom-entry-plan.md` §5.2。
+
+以下可选工具记录系统文件诊断快照，独立于 candidate 输入。
+诊断专用 target 采用 `localcat.windows-system-provider-target.v1` 的显式 roots 格式：
+
+```powershell
+& '<candidate audit venv>\Scripts\python.exe' -B -m tools.windows_frozen_system_profile `
+  --target '<diagnostic work>\roots-target.json' `
+  --output '<existing output parent>\explicit-system-roots.json'
+```
+
+该命令只采集诊断声明的 roots；系统内部 loader flags 与应用 dispatcher flags 分别记录。
+
+### Provider 选择的只读诊断
+
+`tools/probe_windows_cng_selection.c` 先按冷启动实际请求查询 interface 6 的首个
+function（function/provider 为 NULL、flags 为 0），再查询该 function 的 provider
+解析与注册记录；失败或空结果不会回退到硬编码 RNG。
+同时记录初始化分支相关的进程查询响应；它不调用 RNG、不显式加载 provider，
+也不修改系统配置。在与 candidate 一致的 MSVC x64/SDK 构建环境中，
+从独立诊断工作目录运行（所有占位路径均须替换为绝对路径）：
+
+```powershell
+cl.exe /nologo /W4 /WX /MT /O2 /Brepro /guard:cf /TC '<repository>\tools\probe_windows_cng_selection.c' /Fe:cng-selection.exe /Fo:cng-selection.obj /link /Brepro /GUARD:CF
+& '<candidate audit venv>\Scripts\python.exe' -B '<repository>\tests\test_windows_cng_selection.py' --probe '<diagnostic work>\cng-selection.exe'
+```
+
+诊断输出使用 v3 schema，拒绝旧 mode-query 数据：首个查询的实际 class 是
+`0x56`，`query86_*` 字段保存其原始响应。仅解释当前 candidate 已观察的响应，
+不模拟其他负 NTSTATUS 的全部分支。fallback 的
+[`PROCESS_EXTENDED_BASIC_INFORMATION / IsSecureProcess`](https://learn.microsoft.com/en-us/windows/win32/procthread/isolated-user-mode--ium--processes)
+有公开定义，但首个私有查询仍是 candidate-bound 事实，不是通用稳定 API。
+
+退出成功只表示诊断结构有效。测试使用合成 fixture；查询结果仅描述观测时的状态。
+
+## 历史 v1 terminal diagnostic replay
+
+以下仅用于在原 v1 输入及相应源码快照上重放旧 NO-GO；工具拒绝 v2 及当前 v3 lock。
 
 The custom-entry producer stops before candidate construction when a hard
 assertion cannot satisfy the approved Task 1.5 contract. The diagnostic probe
