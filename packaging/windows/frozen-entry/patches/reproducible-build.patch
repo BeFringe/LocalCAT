@@ -1,0 +1,103 @@
+diff --git a/bootloader/wscript b/bootloader/wscript
+--- a/bootloader/wscript
++++ b/bootloader/wscript
+@@ -191,6 +191,14 @@
+         "executables are built with CFG enabled, which might cause issues with certain libraries.",
+         default=True,
+         dest='enable_cfg',
+     )
++    grp.add_option(
++        '--localcat-python-include', action='store', default=None,
++        help='Locked CPython headers directory supplied by the LocalCAT build owner.',
++    )
++    grp.add_option(
++        '--localcat-generated-include', action='store', default=None,
++        help='Candidate-specific generated manifest headers directory.',
++    )
+ 
+ 
+@@ -485,6 +493,7 @@
+     ctx.detect_arch()
+ 
+     # Set proper architecture and CPU for C compiler
+     ctx.set_arch_flags()
++    _localcat_configure(ctx)
+ 
+     # ** Other Tools **
+@@ -656,5 +665,5 @@
+     if ctx.env.DEST_OS == 'win32':
+         if ctx.env.CC_NAME == 'msvc':
+-            ctx.check_libs_msvc('user32 comctl32 kernel32 advapi32 gdi32', mandatory=True)
++            ctx.check_libs_msvc('user32 kernel32 advapi32 gdi32', mandatory=True)
+         else:
+             ctx.check_cc(lib='user32', mandatory=True)
+@@ -859,6 +868,60 @@
+     windowed('releasew', release_env)
+ 
+ 
++def _localcat_configure(ctx):
++    if ctx.env.DEST_OS != 'win32':
++        return
++    if (ctx.env.CC_NAME != 'msvc' or ctx.env.PYI_ARCH != '64bit'
++            or ctx.env.PYI_MACHINE != 'intel' or ctx.options.debug
++            or not ctx.options.enable_cfg):
++        ctx.fatal('LocalCAT frozen requires release MSVC x64 with CFG')
++    for option, key in (
++        ('localcat_python_include', 'LOCALCAT_PYTHON_INCLUDE'),
++        ('localcat_generated_include', 'LOCALCAT_GENERATED_INCLUDE'),
++    ):
++        value = getattr(ctx.options, option, None)
++        if not value or not os.path.isabs(value) or not os.path.isdir(value):
++            ctx.fatal('LocalCAT requires an explicit absolute include directory: ' + option)
++        setattr(ctx.env, key, value)
++
++
++def _localcat_build(ctx, exe_name, install_path):
++    if ctx.env.DEST_OS != 'win32':
++        return False
++    if (ctx.variant != 'releasew' or ctx.env.CC_NAME != 'msvc'
++            or ctx.env.PYI_ARCH != '64bit' or ctx.env.PYI_MACHINE != 'intel'):
++        ctx.fatal('LocalCAT frozen builds only the release MSVC x64 windowed entry')
++    if not ctx.env.LOCALCAT_PYTHON_INCLUDE or not ctx.env.LOCALCAT_GENERATED_INCLUDE:
++        ctx.fatal('LocalCAT build is missing configured input include directories')
++    # Exact build policy; do not inherit debug/dynamic-CRT flags from another variant.
++    ctx.env.CFLAGS = [
++        '/nologo', '/W4', '/WX', '/MT', '/O2', '/Brepro', '/guard:cf',
++        '/DUNICODE', '/D_UNICODE', '/D_CRT_SECURE_NO_WARNINGS',
++    ]
++    ctx.env.LINKFLAGS = [
++        '/Brepro', '/DYNAMICBASE', '/GUARD:CF', '/HIGHENTROPYVA', '/MACHINE:X64',
++        '/NXCOMPAT', '/OPT:ICF', '/OPT:REF', '/SUBSYSTEM:WINDOWS', '/WX',
++        '/INCREMENTAL:NO', '/MANIFEST:NO', '/NOCOFFGRPINFO', '/RELEASE', '/stack:2000000',
++    ]
++    ctx.env.DEFINES = [
++        'WIN32', 'WINDOWED', 'NDEBUG', 'Py_NO_LINK_LIB',
++        'NTDDI_VERSION=0x0A000000', '_WIN32_WINNT=0x0A00',
++    ]
++    ctx.env.MSVC_MANIFEST = False
++    # No stock archive/bootstrap, splash, exception dialog or console entry objects.
++    ctx.program(
++        source=['src/main.c'] + ['src/' + name + '.c' for name in (
++            'localcat_frozen_entry', 'localcat_frozen_bootstrap', 'localcat_manifest',
++            'localcat_native_closure', 'localcat_rooted_io', 'localcat_sha256',
++        )],
++        target=exe_name,
++        install_path=install_path,
++        use='USER32 KERNEL32 ADVAPI32 GDI32',
++        includes=['src', ctx.env.LOCALCAT_PYTHON_INCLUDE, ctx.env.LOCALCAT_GENERATED_INCLUDE],
++    )
++    return True
++
++
+ def build(ctx):
+     if not ctx.variant:
+         ctx.fatal('Call "python waf all" to compile all bootloaders.')
+@@ -874,5 +937,8 @@
+     if ctx.is_musl():
+         install_path += "-musl"
+ 
++    if _localcat_build(ctx, exe_name, install_path):
++        return
++
+     if not ctx.env.LIB_Z:
+         # If the operating system does not provide zlib, build our own. The configure phase defines whether or not zlib
