@@ -138,6 +138,10 @@ candidate lock 的 `evidence_producer.custom_packaging` 绑定构建驱动/helpe
 
 ### 系统入口边界
 
+`tools.trace_windows_frozen_loader_resolution` 接受最终 dist、release、三个外锚和 CDB；`--profile normal|mimalloc-stats|policy-false` 分别观察正常、统计退出和 E1 API 返回 FALSE 的调用方支线。每个固定应用 loader 调用与返回按线程、栈和调用点配对；返回 HMODULE 同时与调试器模块表及 PEB 的 FullDllName 关联。仅有 basename 的调试输出不能通过猜测补成 System32 路径。原始入参、flags、实际 host 和阶段关系均保留；A/W API 没有 flags 参数，不把寄存器残值解释成 flags。
+
+该结果是 `PAIRED_LOADER_HOST_OBSERVATION_NOT_E0_OR_CALL_CLOSURE_PROOF`：PEB/调试器路径是实际观察的加载器元数据，不是保留文件身份；初始断点晚于静态加载，不能代替 E0 外部解析证明、未到达分支分析或重定向反例。`policy-false` 仅在新子进程跳过一次 E1 调用并模拟 FALSE，不称真实 OS 故障。它仍要求真实调用方报错、CRT 退出探测与自然退出 1；产品加载策略不变。
+
 v3 输入绑定应用系统 API 入口和非系统 dispatcher 合同。
 `BCryptGenRandom(NULL, flags=2)` 使用解释器正常的系统随机源。
 
