@@ -130,7 +130,7 @@ class RunwPatchTests(unittest.TestCase):
         cls.files = cls.replayed.files
         tree = ast.parse(cls.files["bootloader/wscript"])
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
-                     and node.name in {"_localcat_build", "_localcat_configure", "build"}]
+                     and node.name in {"_localcat_build", "_localcat_configure", "_localcat_msvc_inputs", "build"}]
         cls.namespace = {"os": os, "variants": {"releasew": "runw", "release": "run"}}
         exec(compile(ast.Module(body=functions, type_ignores=[]), "wscript", "exec"), cls.namespace)
 
@@ -180,6 +180,31 @@ class RunwPatchTests(unittest.TestCase):
         self.assertNotIn("pyi_main(", body)
         self.assertNotIn("global_pyi_ctx", body)
         self.assertIn('#error "LocalCAT frozen builds require the windowed entry"', text)
+
+    def test_msvc_configuration_disables_rediscovery_and_drops_ambient_search_roots(self):
+        context = Context()
+        context.options = SimpleNamespace(clang=False, gcc=False)
+        context.environ = {"INCLUDE": "ambient", "LIB": "ambient", "LIBPATH": "ambient"}
+        with tempfile.TemporaryDirectory() as folder:
+            msvc, sdk = str(Path(folder) / "msvc"), str(Path(folder) / "sdk")
+            with mock.patch.dict(os.environ, {"VCToolsInstallDir": msvc, "WindowsSdkDir": sdk,
+                                               "WindowsSDKVersion": "10.0.26100.0\\",
+                                               "VisualStudioVersion": "17.0", "LIBPATH": "ambient"}), \
+                    mock.patch.object(os.path, "isdir", return_value=True):
+                self.namespace["_localcat_msvc_inputs"](context)
+                self.assertTrue(context.env.NO_MSVC_DETECT)
+                self.assertEqual(context.env.MSVC_COMPILER, "msvc")
+                self.assertEqual(context.env.INCLUDES, [])
+                self.assertEqual(context.env.LIBPATH, [])
+                self.assertEqual(len(context.env.PATH), 2)
+                self.assertEqual(len(context.environ["INCLUDE"].split(os.pathsep)), 6)
+                self.assertEqual(len(context.environ["LIB"].split(os.pathsep)), 3)
+                self.assertEqual(context.environ["LIBPATH"], "")
+                self.assertNotIn("LIBPATH", os.environ)
+                self.assertNotIn("ambient", repr(context.environ))
+        text = self.files["bootloader/wscript"].decode()
+        configure = text.split("def configure(ctx):", 1)[1].split("global is_cross", 1)[0]
+        self.assertLess(configure.index("_localcat_msvc_inputs(ctx)"), configure.index("ctx.load('msvc')"))
 
     def test_build_selects_only_explicit_native_sources_and_no_python_import_lib(self):
         context = Context()
