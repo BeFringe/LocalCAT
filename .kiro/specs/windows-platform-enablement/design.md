@@ -38,6 +38,7 @@
 - 扩大到 remote SMB、FAT/exFAT 或未经过完整反例矩阵的第三方文件系统。
 
 ### Allowed Dependencies
+- frozen 应用按 ADR-022 的 KnownDLL/System32 信任使用经审计的系统 API 入口与解析策略。
 - Python 3.14 stdlib：`ctypes`、`os`、`pathlib`、`sqlite3`、`hashlib`、`json`、`tempfile`；Windows backend 不新增 runtime package。
 - Windows desktop API：Kernel32/Advapi32 文档化函数；若反例迫使使用 `NtCreateFile`，必须返回 ADR 重新审批，不能在实现中临时切换。
 - PySide6/Qt 与现有 `requirements-ui.txt`；PyInstaller 是独立 build dependency，不进入 UI runtime requirements。
@@ -53,8 +54,8 @@
 
 ## Governance Impact
 - **Applicable Steering**: `product.md`、`tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md`、`release-governance.md`、`project-principles.md`、`repository-safety.md`。
-- **Applicable ADRs**: ADR-007、008、009、011、012、013、016、018、019，以及已采纳的ADR-020/W1、ADR-021/W2、ADR-022/W3、ADR-023补充决策、ADR-024 provider-agnostic token profile、ADR-025 documented publish分层与ADR-026 Parser无状态发布边界。
-- **ADR disposition**: **ADR-020～026 adopted；implementation按task graph授权**。ADR-023的LOCK-first、`PendingPublication`、MIC/security profile与动态native closure继续有效；ADR-024取代local/domain/Entra作为mandatory主体环境的要求，ADR-025取代runtime durability registry及硬断电硬件资格门，ADR-026取代ADR-020对Parser无条件外推journal/LKG的部分。ADR-022除registry输入外的native entry、Boot TCB、source/fixture authority、clean build与packaged E2E保持不变。
+- **Applicable ADRs**: ADR-007、008、009、011、012、013、016、018、019，以及已采纳的 ADR-020/W1、ADR-021/W2、ADR-022/W3、ADR-023 补充决策、ADR-024 provider-agnostic token profile、ADR-025 documented publish 分层、ADR-026 Parser 无状态发布与 ADR-027 输出锁收尾。
+- **ADR disposition**: **ADR-020～027 adopted；implementation 按 task graph 授权**。ADR-023 的 LOCK-first、`PendingPublication`、MIC/security profile 与动态 native closure 继续有效。ADR-024 取代 local/domain/Entra mandatory 主体环境，ADR-025 取代 runtime durability registry/硬断电资格门，ADR-026 收窄 Parser journal/LKG，ADR-027 收窄输出锁收尾；native entry、source/fixture authority、clean build 与 packaged E2E 保留。
 - **Scope amendment**: **Approved**；`windows-platform-enablement` 只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence；consumer business invariants 继续归相邻 owning Specs。`tmx-context-interchange` 是唯一 owning Spec，`ui-mvp` 只记录其 amendment 提交血缘；Qt avatar 仅作 Windows 功能回归。
 - **Steering sync**: Approved；Governance owner 同步 `spec-ownership.md`、`roadmap.md` 和长期技术边界；`structure.md` 等待真实 runtime/build 文件落地后再按实际结构更新。本 feature branch 不产生重复 Steering 提交。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
@@ -470,20 +471,21 @@ stateDiagram-v2
 - W3 custom in-process entry的toolchain、ABI、Boot TCB、PE/system allowlist、native→Python handoff和升级维护边界在source实现期间并行规划；父wrapper启动stock `runw.exe`不能保护child process entry，不属于候选方案。
 - Task 1.5的provisional draft见`w3-custom-entry-plan.md`：首选release-owned PyInstaller 6.22.2 `runw`下游patch，在同一GUI进程真实entry执行；native runtime manifest是pre-link input manifest的digest-bound派生物，compiled-in handoff只暴露one-shot opaque authority而不向Python泄露raw HANDLE。编译环境长期合同允许本机或CI上受支持且兼容的MSVC x64与Windows SDK；Task 1.5以构建前materialized的candidate-input lock批准toolchain、patch合同、目标API/closure与TCB边界，Task 1.6在W1冻结后实现完整patch并以applied source、resulting PE和realized closure生成绑定该输入digest的realized-build lock。
 - gate-quality native spike等待W1 rooted contract与Windows rooted handle invariants冻结后执行，并必须在任何frozen WA consumer merge和Task 7.1前全PASS。失败保持frozen lane NO-GO，但不撤销已经独立验证的source compatibility。
+- pre-E10 的 RNG 调用和系统 API 入口按 `w3-custom-entry-plan.md` §5.2 验证。
 - frozen lane分成pre-build与post-build两次汇合：1.6 PASS后先合并manifest/build必需的consumer roots与WA-07 3.6a，再生成manifest、handoff与发行候选；7.4验证同一dist后，WA-01/02/04/05/06与WA-07才运行packaged revalidation，最后由WA-08汇合Qt产品journey。source milestone、diagnostic onedir、最小spike与frozen release四者名称、证据和状态不得互相冒充。
 
 ## Frozen Distribution Design
 
 ### Bootstrap Trust Base
 - W3 governance可与W1并行，但实现必须等待正式 W1 语义；bootstrap不导入待验证的 `platform_fs_windows.py`，却必须满足 W1 的 rooted/reparse/live-identity/threat invariants。
-- `frozen_source_bootstrap` 是唯一项目级Python bootstrap authority，不是全部TCB。Boot TCB闭包至少包含release-owned/customized PyInstaller native bootloader/executable、Python DLL、pre-authority runtime hooks、bootstrap及其必要stdlib/`ctypes`/hash/manifest/import-loader代码、加载的native extension/DLL，以及明确allowlist的Windows system DLL；构建与release evidence逐项内容寻址。
-- native bootloader审计PE static imports/delay-load，保证process entry前只有获批KnownDLL/System32 trust；native entry后、首次加载Python DLL或任一非KnownDLL前即排除CWD/PATH并逐组件绑定bundle/native目录。bootloader必须递归枚举Boot TCB全部native static/delay-load依赖闭包，且owner manifest必须显式声明所有pre-authority hook/stdlib/ctypes extension代码内`LoadLibrary*`动态native roots；在任何成员可执行load前，对每个非系统DLL完成retained-handle rooted/reparse/live-identity/digest预证明并固定其依赖搜索，不得假设顶层`LoadLibraryExW` flags自动约束传递依赖。随后才以受限绝对路径加载，加载后把实际module path/identity与预证明handle复核，并把完整bundle/DLL attestation移交Python bootstrap；未声明动态load、闭包无法静态/受控解析或upstream bootloader不满足该时序时，最小spike失败并转向获批custom bootloader/launcher。
+- `frozen_source_bootstrap` 是唯一项目级 Python bootstrap authority，不是全部 TCB。应用 Boot TCB 至少包含 release-owned/customized native bootloader/executable、Python DLL、pre-authority runtime hooks、bootstrap 及必要 stdlib/`ctypes`/hash/manifest/import-loader 代码和随包 native extension/DLL，构建与 release evidence 逐项内容寻址。Windows system DLL/API-set allowlist 绑定应用系统入口与解析策略。
+- native bootloader 审计应用 PE static/delay imports，保证 process entry 前只有获批 KnownDLL/System32 trust；首次加载 Python DLL 或其他非系统 DLL 前排除 CWD/PATH 并逐组件绑定 bundle/native 目录。递归枚举应用及随包非系统 native static/delay 闭包，owner manifest 声明其 pre-authority 动态 roots 与系统 API 入口。在非系统成员首次可执行 load 前逐项 retained-handle rooted/reparse/live-identity/digest 预证明并固定依赖搜索，不能假设顶层 flags 自动约束传递依赖。受限绝对路径 load 后复核实际非系统 module 与预证明 handle，再移交 bundle/DLL attestation；未声明应用 load、未闭合应用依赖或时序不符使 spike 失败。
 - critical module 由bootstrap-owned `TrustedSourceLoader` 从 retained verified handle读取exact source bytes，校验digest后直接 `source_to_code`/compile并执行；critical module禁止`.pyc`、`__pycache__`和PYZ duplicate。`capability_host`验证loader attestation、source digest、`spec.origin`/`co_filename`和Gate closure，而不把metadata相等当作executed-byte proof。
 - build先生成排除resulting PE的canonical pre-link input manifest，并把其digest与bootstrap schema固定进executable-side TCB；链接/组装后再由post-build release manifest绑定executable hash、pre-link digest、derived runtime manifest与dist inventory，避免manifest/executable摘要自引用。runtime闭合后才mint不可序列化的 `TrustedSourceAuthority`。TCB不在runtime声称自证，其source/binary、生成输入与两阶段manifest关系由clean-build/release evidence绑定。
 
 ### Early Frozen Feasibility Spike
 - W3 获批后的第一个实现证据是最小 onedir/windowed spike，版本固定为 CPython 3.14.x + PyInstaller 6.22.x；只验证 bootstrap、一个外置 critical module 和一个 fixture。
-- spike 必须证明native entry在首次Python DLL/非KnownDLL load前闭合搜索策略，递归枚举native static/delay-load closure并逐个完成pre-load retained-handle/digest proof；pre-authority可达代码除唯一受审dispatcher外不得包含非system `LoadLibrary*`/`LdrLoadDll`/delay helper/native-extension import，声明、预加载、notification或事后inventory不能追认。bootstrap/critical source/fixture handles也必须在Python初始化和handoff前闭合；actual module按`GetModuleFileNameW`→受固定parent约束的rooted reopen→live FileId/final-path链复核。随后`TrustedSourceLoader`只从retained handle读取manifest匹配的exact `.py` bytes并直接编译执行，loader attestation/source digest与`__file__/spec.origin/co_filename`一致，无`.pyc`/`__pycache__`/PYZ duplicate；同时覆盖非repository CWD、未声明dynamic load、top-level/传递依赖的pre-entry与late DLL注入、reparse/swap/manifest tamper fail closed。
+- spike 必须证明 native entry 在首次 Python DLL/其他非系统 DLL load 前闭合搜索策略，递归枚举应用及随包非系统 static/delay 依赖并逐项完成 pre-load retained-handle/digest proof；应用 pre-authority 可达代码除唯一受审 dispatcher 外不得包含非系统 loader/native-extension import，声明、预加载、notification 或事后 inventory 不能追认。bootstrap/critical source/fixture handles 在 Python 初始化和 handoff 前闭合，实际非系统 module 依受固定 parent 约束的 rooted reopen 与 live FileId/final-path 链复核。`TrustedSourceLoader` 从 retained handle 读取 exact `.py` bytes 并直接编译，attestation/digest 与 metadata 一致，无 bytecode/PYZ duplicate；覆盖非 repository CWD、未声明应用 load、顶层/传递 DLL 注入及 reparse/swap/manifest tamper。
 - 任何断言失败立即返回 W3 重新设计；不得把该可行性风险拖到完整 UI/TM 打包后处理。
 
 ### Build Flow
