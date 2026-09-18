@@ -10,6 +10,51 @@
     "machine": "AMD64"
   },
   "evidence_producer": {
+    "custom_packaging": {
+      "schema": "localcat.windows-frozen-packaging-target.v1",
+      "source_files": {
+        "tools/windows_frozen_packaging.py": {
+          "bytes": 15521,
+          "sha256": "b99f5a2b20e67411f2d42a506d824d5012cd2f788e52e64cfe553460d913ee3d"
+        },
+        "tools/probe_windows_frozen_custom_runw.py": {
+          "bytes": 25550,
+          "sha256": "21fec2b5e06ddb9d5a254a8599026f2e7ebf549dc507b251f42620258770b476"
+        },
+        "tools/windows_frozen_manifest.py": {
+          "bytes": 7939,
+          "sha256": "c25df9357da19d4bb97b32595271c763eda119a98bbca3afe37f1800216e2923"
+        },
+        "tools/windows_frozen_patch_series.py": {
+          "bytes": 10305,
+          "sha256": "c44c1f0263ffaaf2c8361eb6bfd3b364a5e500800210dfdc5295ae8583f976eb"
+        },
+        "tools/audit_w3_stock_bootloader.py": {
+          "bytes": 33114,
+          "sha256": "0afa0b8a9716e208d28adbc24b0d09eda815f5abc5877fd29220da28a27a5731"
+        },
+        "tools/prepare_windows_frozen_entry_inputs.py": {
+          "bytes": 51989,
+          "sha256": "03a70e24b2b7d7bcda1cfe9e664cc2c822e05bd0194604cee57ed44b1c027662"
+        }
+      },
+      "dependency_inventory": {
+        "algorithm": "localcat.packaging-file-inventory.v1",
+        "file_count": 96,
+        "bytes": 989080,
+        "sha256": "9367f50622128bf9104906a1956d115ae9c27db231474944757c83134d21546c"
+      },
+      "application_manifest": {
+        "bytes": 553,
+        "sha256": "bf4fa226bb5697a40594141050ec1f8e2aca0678c52fd090303c2740e8a3f081"
+      },
+      "source_date_epoch": 0,
+      "layout": "onedir-windowed-retained-source",
+      "carchive": {
+        "entries": [],
+        "options": []
+      }
+    },
     "python": {
       "role": "candidate input producer Python",
       "name": "python.exe",
@@ -31,14 +76,14 @@
     "preparer": {
       "role": "candidate input producer",
       "name": "prepare_windows_frozen_entry_inputs.py",
-      "bytes": 47976,
-      "sha256": "4aa982e0663522359f4aa61d1b467f49e977774000500333e5a16607a357e565"
+      "bytes": 51989,
+      "sha256": "03a70e24b2b7d7bcda1cfe9e664cc2c822e05bd0194604cee57ed44b1c027662"
     },
     "replay_wrapper": {
       "role": "candidate input replay wrapper",
       "name": "replay_windows_frozen_entry_inputs.ps1",
-      "bytes": 10460,
-      "sha256": "81a730725f26c0244c74b3019bc65246b9bbd02df7352f970a09242e322e41fa"
+      "bytes": 10687,
+      "sha256": "f07b946a785ebb92fc7b09ed13597e37d14f6ede239fe9e50a3bd26a242513fe"
     },
     "stock_audit_helper": {
       "role": "stock audit helper",
@@ -1161,8 +1206,8 @@
     "contract_file": {
       "role": "frozen-entry target contract",
       "name": "candidate-contract.json",
-      "bytes": 10744,
-      "sha256": "07e2f0aa6114b604b08eb282953cac50815094af1ed03597c0ec56628ee21d80"
+      "bytes": 16543,
+      "sha256": "8e1fdaada9592be7ffea3f94732124a0a339e33d237bae7465029d0d378631f5"
     },
     "runtime_abi": {
       "module": "_localcat_frozen_bootstrap",
@@ -1495,7 +1540,201 @@
         "LOAD_LIBRARY_SEARCH_SYSTEM32"
       ],
       "pre_authority_external_calls": [
-        "LoadLibraryExW through localcat_native_closure_load_verified"
+        "LoadLibraryExW through localcat_native_closure_load_verified",
+        "crt-vcruntime-critical-section",
+        "crt-vcruntime-fls",
+        "crt-ucrt-fls2",
+        "crt-ucrt-process-termination",
+        "crt-ucrt-multibyte-casing",
+        "python-mimalloc-memory-kernelbase",
+        "python-mimalloc-memory-ntdll",
+        "python-mimalloc-memory-kernel32",
+        "python-mimalloc-random",
+        "python-mimalloc-stats"
+      ],
+      "application_system_calls": [
+        {
+          "id": "crt-vcruntime-critical-section",
+          "owner": "custom-entry-static-crt",
+          "phase": "E0.5",
+          "loader": "LoadLibraryExW",
+          "targets": [
+            "api-ms-win-core-synch-l1-2-0",
+            "kernel32"
+          ],
+          "flags": 2048,
+          "condition": "crt-initialization-fixed-name-probe",
+          "fallback": {
+            "error": 87,
+            "targets": [
+              "kernel32"
+            ],
+            "flags": 0,
+            "excluded_prefixes": [
+              "api-ms-"
+            ]
+          },
+          "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "crt-vcruntime-fls",
+          "owner": "custom-entry-static-crt",
+          "phase": "E0.5",
+          "loader": "LoadLibraryExW",
+          "targets": [
+            "api-ms-win-core-fibers-l1-1-1",
+            "kernel32"
+          ],
+          "flags": 2048,
+          "condition": "crt-initialization-fixed-name-probe",
+          "fallback": {
+            "error": 87,
+            "targets": [
+              "kernel32"
+            ],
+            "flags": 0,
+            "excluded_prefixes": [
+              "api-ms-"
+            ]
+          },
+          "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "crt-ucrt-fls2",
+          "owner": "custom-entry-static-crt",
+          "phase": "E0.5",
+          "loader": "LoadLibraryExW",
+          "targets": [
+            "api-ms-win-core-fibers-l1-1-2",
+            "kernelbase"
+          ],
+          "flags": 2048,
+          "condition": "crt-initialization-fixed-name-probe",
+          "fallback": {
+            "error": 87,
+            "targets": [
+              "kernelbase"
+            ],
+            "flags": 0,
+            "excluded_prefixes": [
+              "api-ms-",
+              "ext-ms-"
+            ]
+          },
+          "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "crt-ucrt-process-termination",
+          "owner": "custom-entry-static-crt",
+          "phase": "CRT_EXIT_INCLUDING_E1_FAILURE",
+          "loader": "LoadLibraryExW",
+          "targets": [
+            "api-ms-win-appmodel-runtime-l1-1-2"
+          ],
+          "flags": 2048,
+          "condition": "crt-termination-non-secure-and-empty-function-and-module-cache",
+          "fallback": null,
+          "requires": "POLICY_INDEPENDENT_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "crt-ucrt-multibyte-casing",
+          "owner": "custom-entry-static-crt",
+          "phase": "E0.5",
+          "loader": "LoadLibraryExW",
+          "targets": [
+            "api-ms-win-core-localization-l1-2-1",
+            "kernel32"
+          ],
+          "flags": 2048,
+          "condition": "crt-multibyte-initialization-non-utf8-acp-and-getcpinfo-success-and-empty-function-and-module-cache",
+          "module_selection": "first-available-module-next-candidate-on-load-failure-only",
+          "symbols": [
+            "LCMapStringEx",
+            "LocaleNameToLCID"
+          ],
+          "symbol_fallback": {
+            "LCMapStringEx": "static-LCMapStringW-with-LocaleNameToLCID-conversion",
+            "LocaleNameToLCID": "downlevel-conversion-no-loader",
+            "resolution": "same-candidate-list-and-module-cache-no-next-candidate-on-missing-symbol"
+          },
+          "fallback": {
+            "error": 87,
+            "targets": [
+              "kernel32"
+            ],
+            "flags": 0,
+            "excluded_prefixes": [
+              "api-ms-",
+              "ext-ms-"
+            ]
+          },
+          "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "python-mimalloc-memory-kernelbase",
+          "owner": "python314.dll",
+          "phase": "E6_DLL_INITIALIZATION",
+          "loader": "LoadLibraryA",
+          "targets": [
+            "kernelbase.dll"
+          ],
+          "flags": null,
+          "condition": "process-memory-init",
+          "fallback": null,
+          "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "python-mimalloc-memory-ntdll",
+          "owner": "python314.dll",
+          "phase": "E6_DLL_INITIALIZATION",
+          "loader": "LoadLibraryA",
+          "targets": [
+            "ntdll.dll"
+          ],
+          "flags": null,
+          "condition": "process-memory-init",
+          "fallback": null,
+          "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "python-mimalloc-memory-kernel32",
+          "owner": "python314.dll",
+          "phase": "E6_DLL_INITIALIZATION",
+          "loader": "LoadLibraryA",
+          "targets": [
+            "kernel32.dll"
+          ],
+          "flags": null,
+          "condition": "process-memory-init",
+          "fallback": null,
+          "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "python-mimalloc-random",
+          "owner": "python314.dll",
+          "phase": "AFTER_E1",
+          "loader": "LoadLibraryA",
+          "targets": [
+            "bcrypt.dll"
+          ],
+          "flags": null,
+          "condition": "os-random-request-and-empty-function-cache",
+          "fallback": null,
+          "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+        },
+        {
+          "id": "python-mimalloc-stats",
+          "owner": "python314.dll",
+          "phase": "AFTER_E1_INCLUDING_EARLY_EXIT",
+          "loader": "LoadLibraryA",
+          "targets": [
+            "psapi.dll"
+          ],
+          "flags": null,
+          "condition": "stats-or-verbose-and-empty-function-cache",
+          "fallback": null,
+          "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF"
+        }
       ],
       "system_service_boundary": {
         "authority": "Windows OS",
@@ -1572,6 +1811,6 @@
       "detail": "the selected MSVC stock rebuild has the approved compiler-generated import delta"
     }
   ],
-  "candidate_input_digest": "8d38a1bdb33449524dbea9f1ffd741850590283b7e762e00531f3146f7f06ef1",
+  "candidate_input_digest": "22df2bb748f1cadac1daf4410c06be5be18bf3e1b2395259e15e9d97160a1e84",
   "status": "MATERIALIZED"
 }

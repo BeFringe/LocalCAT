@@ -1,8 +1,8 @@
 diff --git a/bootloader/wscript b/bootloader/wscript
+index 08b0009..eeb7a0e 100644
 --- a/bootloader/wscript
 +++ b/bootloader/wscript
-@@ -191,6 +191,14 @@
-         "executables are built with CFG enabled, which might cause issues with certain libraries.",
+@@ -192,6 +192,14 @@ def options(ctx):
          default=True,
          dest='enable_cfg',
      )
@@ -16,25 +16,84 @@ diff --git a/bootloader/wscript b/bootloader/wscript
 +    )
  
  
-@@ -485,6 +493,7 @@
-     ctx.detect_arch()
+ def check_sizeof_pointer(ctx):
+@@ -443,8 +451,14 @@ def configure(ctx):
+ 
+     # ** C compiler **
+ 
+-    # Allow to use Clang if preferred.
+-    if ctx.options.clang:
++    # LocalCAT's build owner authenticates these exact compiler/SDK roots.
++    # Do not let Waf run another vcvars discovery and append ambient inputs.
++    if sys.platform == 'win32':
++        _localcat_msvc_inputs(ctx)
++        ctx.load('msvc')
++        ctx.env.COMPILER_CC = 'msvc'
++    # Allow to use Clang if preferred on other hosts.
++    elif ctx.options.clang:
+         ctx.load('clang')
+     # Allow to use gcc if preferred.
+     elif ctx.options.gcc:
+@@ -486,6 +500,7 @@ def configure(ctx):
  
      # Set proper architecture and CPU for C compiler
      ctx.set_arch_flags()
 +    _localcat_configure(ctx)
  
      # ** Other Tools **
-@@ -656,5 +665,5 @@
+ 
+@@ -655,7 +670,7 @@ def configure(ctx):
+ 
      if ctx.env.DEST_OS == 'win32':
          if ctx.env.CC_NAME == 'msvc':
 -            ctx.check_libs_msvc('user32 comctl32 kernel32 advapi32 gdi32', mandatory=True)
 +            ctx.check_libs_msvc('user32 kernel32 advapi32 gdi32', mandatory=True)
          else:
              ctx.check_cc(lib='user32', mandatory=True)
-@@ -859,6 +868,60 @@
+             ctx.check_cc(lib='comctl32', mandatory=True)
+@@ -859,6 +874,99 @@ def windowed(name, baseenv):
      windowed('releasew', release_env)
  
  
++def _localcat_msvc_inputs(ctx):
++    if ctx.options.clang or ctx.options.gcc:
++        ctx.fatal('LocalCAT requires the locked MSVC toolchain')
++    required = ('VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'VisualStudioVersion')
++    values = {name: os.environ.get(name) for name in required}
++    if any(not value for value in values.values()):
++        ctx.fatal('LocalCAT requires the build-owner vcvars environment')
++    msvc = values['VCToolsInstallDir']
++    sdk = values['WindowsSdkDir']
++    version = values['WindowsSDKVersion'].rstrip('\\/')
++    includes = [os.path.join(msvc, 'include')] + [
++        os.path.join(sdk, 'Include', version, name)
++        for name in ('ucrt', 'um', 'shared', 'winrt', 'cppwinrt')
++    ]
++    libraries = [os.path.join(msvc, 'lib', 'x64')] + [
++        os.path.join(sdk, 'Lib', version, name, 'x64') for name in ('ucrt', 'um')
++    ]
++    tools = [os.path.join(msvc, 'bin', 'Hostx64', 'x64'), os.path.join(sdk, 'bin', version, 'x64')]
++    if any(not os.path.isabs(path) or not os.path.isdir(path) for path in includes + libraries + tools):
++        ctx.fatal('LocalCAT compiler/SDK search root is missing or not absolute')
++    ctx.env.NO_MSVC_DETECT = True
++    ctx.env.MSVC_COMPILER = 'msvc'
++    ctx.env.MSVC_VERSION = float(values['VisualStudioVersion'])
++    ctx.env.DEST_CPU = 'amd64'
++    ctx.env.PATH = tools
++    ctx.env.INCLUDES = []
++    ctx.env.LIBPATH = []
++    for name in ('CC', 'CXX', 'LINK_CC', 'LINK_CXX', 'AR', 'MT', 'WINRC',
++                 'CFLAGS', 'CXXFLAGS', 'CPPFLAGS', 'LINKFLAGS', 'LDFLAGS', 'ARFLAGS', 'RCFLAGS',
++                 'CL', '_CL_', 'LINK', '_LINK_'):
++        ctx.environ.pop(name, None)
++        os.environ.pop(name, None)
++    ctx.environ['INCLUDE'] = os.pathsep.join(includes)
++    ctx.environ['LIB'] = os.pathsep.join(libraries)
++    ctx.environ['LIBPATH'] = ''
++    # Waf link_add_flags consumes process LIBPATH separately from ctx.environ.
++    os.environ.pop('LIBPATH', None)
++
++
 +def _localcat_configure(ctx):
 +    if ctx.env.DEST_OS != 'win32':
 +        return
@@ -92,7 +151,7 @@ diff --git a/bootloader/wscript b/bootloader/wscript
  def build(ctx):
      if not ctx.variant:
          ctx.fatal('Call "python waf all" to compile all bootloaders.')
-@@ -874,5 +937,8 @@
+@@ -874,6 +982,9 @@ def build(ctx):
      if ctx.is_musl():
          install_path += "-musl"
  
@@ -101,3 +160,4 @@ diff --git a/bootloader/wscript b/bootloader/wscript
 +
      if not ctx.env.LIB_Z:
          # If the operating system does not provide zlib, build our own. The configure phase defines whether or not zlib
+         # is mandatory for the given platform.

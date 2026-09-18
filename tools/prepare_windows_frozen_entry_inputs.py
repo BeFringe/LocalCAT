@@ -34,6 +34,7 @@ from tools.audit_w3_stock_bootloader import (
     audit_sources,
     sha256_file,
 )
+from tools.windows_frozen_packaging import PackagingInputError, candidate_packaging_fact
 SCHEMA_ID = "localcat.windows-frozen-entry-candidate-input.v3"
 DIRECTORY_DIGEST_ALGORITHM = "localcat.directory-input-sha256.v1"
 EXPECTED_PYTHON_VERSION = "3.14.7"
@@ -396,7 +397,7 @@ def _venv_semantics(configuration: Path) -> dict[str, Any]:
 
 
 def _evidence_producer_fact(
-    *, python_root: Path, vswhere: Path
+    *, python_root: Path, vswhere: Path, packaging_dependencies: Path
 ) -> dict[str, Any]:
     try:
         import pefile
@@ -419,6 +420,7 @@ def _evidence_producer_fact(
     if len(metadata_candidates) != 1:
         raise CandidateInputError("pefile distribution metadata is absent or ambiguous")
     return {
+        "custom_packaging": candidate_packaging_fact(Path(__file__).resolve().parents[1], packaging_dependencies),
         "python": _file_fact(Path(sys.executable), "candidate input producer Python"),
         "python_version": platform.python_version(),
         "base_runtime": _directory_input_fact(
@@ -579,18 +581,79 @@ def _validate_entry_contract_shape(contract: dict[str, Any]) -> None:
         {"purpose", "import_table_sha256", "added_symbols", "removed_symbols"},
         "pe_allowlist.compiler_probe",
     )
-    _require_exact_keys(
-        contract["dynamic_loader"],
-        {"non_system_dispatcher", "allowed_flags", "pre_authority_external_calls", "system_service_boundary"},
-        "dynamic_loader",
-    )
-    if _canonical_json(contract["dynamic_loader"]["system_service_boundary"]) != _canonical_json(SYSTEM_SERVICE_BOUNDARY):
-        raise CandidateInputError("system service boundary differs from the approved OS delegation")
+    _validate_dynamic_loader(contract["dynamic_loader"])
     _require_exact_keys(
         contract["boot_tcb"],
         {"native_roles", "python_roles", "external_roles"},
         "boot_tcb",
     )
+
+
+def _approved_system_loader_calls() -> list[dict[str, Any]]:
+    """Exact approved application call targets; not runtime resolution evidence."""
+    calls = []
+    for name, api_set, host, prefixes in (
+        ("crt-vcruntime-critical-section", "api-ms-win-core-synch-l1-2-0", "kernel32", ["api-ms-"]),
+        ("crt-vcruntime-fls", "api-ms-win-core-fibers-l1-1-1", "kernel32", ["api-ms-"]),
+        ("crt-ucrt-fls2", "api-ms-win-core-fibers-l1-1-2", "kernelbase", ["api-ms-", "ext-ms-"]),
+    ):
+        calls.append({
+            "id": name, "owner": "custom-entry-static-crt", "phase": "E0.5",
+            "loader": "LoadLibraryExW", "targets": [api_set, host], "flags": 0x800,
+            "condition": "crt-initialization-fixed-name-probe",
+            "fallback": {"error": 87, "targets": [host], "flags": 0, "excluded_prefixes": prefixes},
+            "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF",
+        })
+    calls.append({
+        "id": "crt-ucrt-process-termination", "owner": "custom-entry-static-crt",
+        "phase": "CRT_EXIT_INCLUDING_E1_FAILURE", "loader": "LoadLibraryExW",
+        "targets": ["api-ms-win-appmodel-runtime-l1-1-2"], "flags": 0x800,
+        "condition": "crt-termination-non-secure-and-empty-function-and-module-cache",
+        "fallback": None, "requires": "POLICY_INDEPENDENT_SYSTEM_RESOLUTION_PROOF",
+    })
+    calls.append({
+        "id": "crt-ucrt-multibyte-casing", "owner": "custom-entry-static-crt",
+        "phase": "E0.5", "loader": "LoadLibraryExW",
+        "targets": ["api-ms-win-core-localization-l1-2-1", "kernel32"], "flags": 0x800,
+        "condition": "crt-multibyte-initialization-non-utf8-acp-and-getcpinfo-success-and-empty-function-and-module-cache",
+        "module_selection": "first-available-module-next-candidate-on-load-failure-only",
+        "symbols": ["LCMapStringEx", "LocaleNameToLCID"],
+        "symbol_fallback": {
+            "LCMapStringEx": "static-LCMapStringW-with-LocaleNameToLCID-conversion",
+            "LocaleNameToLCID": "downlevel-conversion-no-loader",
+            "resolution": "same-candidate-list-and-module-cache-no-next-candidate-on-missing-symbol",
+        },
+        "fallback": {"error": 87, "targets": ["kernel32"], "flags": 0,
+                     "excluded_prefixes": ["api-ms-", "ext-ms-"]},
+        "requires": "PRE_ENTRY_SYSTEM_RESOLUTION_PROOF",
+    })
+    for name, target, phase, condition in (
+        ("python-mimalloc-memory-kernelbase", "kernelbase.dll", "E6_DLL_INITIALIZATION", "process-memory-init"),
+        ("python-mimalloc-memory-ntdll", "ntdll.dll", "E6_DLL_INITIALIZATION", "process-memory-init"),
+        ("python-mimalloc-memory-kernel32", "kernel32.dll", "E6_DLL_INITIALIZATION", "process-memory-init"),
+        ("python-mimalloc-random", "bcrypt.dll", "AFTER_E1", "os-random-request-and-empty-function-cache"),
+        ("python-mimalloc-stats", "psapi.dll", "AFTER_E1_INCLUDING_EARLY_EXIT", "stats-or-verbose-and-empty-function-cache"),
+    ):
+        calls.append({
+            "id": name, "owner": "python314.dll", "phase": phase, "loader": "LoadLibraryA",
+            "targets": [target], "flags": None, "condition": condition, "fallback": None,
+            "requires": "E1_SYSTEM32_AND_SYSTEM_RESOLUTION_PROOF",
+        })
+    return calls
+
+
+def _validate_dynamic_loader(loader: Any) -> None:
+    calls = _approved_system_loader_calls()
+    expected = {
+        "non_system_dispatcher": "localcat_native_closure_load_verified",
+        "allowed_flags": ["LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR", "LOAD_LIBRARY_SEARCH_SYSTEM32"],
+        "pre_authority_external_calls": [
+            "LoadLibraryExW through localcat_native_closure_load_verified", *[item["id"] for item in calls]],
+        "application_system_calls": calls,
+        "system_service_boundary": SYSTEM_SERVICE_BOUNDARY,
+    }
+    if _canonical_json(loader) != _canonical_json(expected):
+        raise CandidateInputError("dynamic loader differs from the approved exact application system-call boundary")
 
 
 def _load_entry_contract(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1083,7 +1146,7 @@ def build_candidate_input(args: argparse.Namespace) -> dict[str, Any]:
         },
         "target_platform": target_platform,
         "evidence_producer": _evidence_producer_fact(
-            python_root=python_root, vswhere=args.vswhere
+            python_root=python_root, vswhere=args.vswhere, packaging_dependencies=args.packaging_dependencies
         ),
         "toolchain": {
             "visual_studio": {
@@ -1189,6 +1252,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--python-root", type=Path, required=True)
     parser.add_argument("--pyinstaller-sdist", type=Path, required=True)
     parser.add_argument("--pyinstaller-source", type=Path, required=True)
+    parser.add_argument("--packaging-dependencies", type=Path, required=True)
     parser.add_argument("--toolchain-probe-runw", type=Path, required=True)
     parser.add_argument("--probe-build-evidence", type=Path, required=True)
     parser.add_argument("--entry-contract", type=Path, required=True)
@@ -1203,6 +1267,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         record = build_candidate_input(args)
     except (
         CandidateInputError,
+        PackagingInputError,
         KeyError,
         TypeError,
         OSError,
