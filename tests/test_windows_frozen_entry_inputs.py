@@ -28,6 +28,19 @@ from tools.prepare_windows_frozen_entry_inputs import (
 
 
 class WindowsFrozenEntryInputTests(unittest.TestCase):
+    def test_patch_owner_inventory_requires_real_pristine_existing_files(self) -> None:
+        from tools.prepare_windows_frozen_entry_inputs import _validate_patch_owner_inventory
+        policy = {"owned_existing_files": ["bootloader/main.c"],
+                  "owned_new_files": ["bootloader/native.c"]}
+        _validate_patch_owner_inventory(policy, {"bootloader/main.c"})
+        for names in (set(), {"bootloader/main.c", "bootloader/native.c"}):
+            with self.subTest(names=names), self.assertRaises(CandidateInputError):
+                _validate_patch_owner_inventory(policy, names)
+        with self.assertRaises(CandidateInputError):
+            _validate_patch_owner_inventory(
+                {**policy, "owned_existing_files": ["bootloader/main.c", "bootloader/main.c"]},
+                {"bootloader/main.c"})
+
     def test_custom_api_target_removes_stock_only_functions_explicitly(self) -> None:
         from tools.prepare_windows_frozen_entry_inputs import _target_python_functions
         policy = {
