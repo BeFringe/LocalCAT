@@ -113,6 +113,12 @@ candidate lock 的 `evidence_producer.custom_packaging` 绑定构建驱动/helpe
 
 稳定绑定表记录 RVA；原始调试轨迹保留实际加载地址。外部 release 锚在观察前后核对完整 dist，C 签名仍由锁定 headers 和干净编译承接。结果分类为 `REALIZED_E8_BINDING_NOT_W3_GATE`，不替代其余阶段验证。仅精确记录已锚定零时间戳 EXE 的 CDB 时间戳诊断，不忽略其他模块或断点错误。
 
+### 源码编译输入与执行对象
+
+`tools.trace_windows_frozen_source_execution` 使用与 API 观察者相同的 `--dist`、`--release`、三个外锚和 `--cdb` 参数，并增加 `--prelink '<同一构建的 prelink.json>'`。它核对已绑定的 Python DLL 调用点，捕获解释器启动源码、bootstrap 与 critical module 真正传入编译器的完整字节及结尾 NUL，再关联返回的代码对象与实际 `PyEval_EvalCode` 入口。
+
+输出记录每份捕获字节的摘要、观察器与解析器库存、原始轨迹和输入前后复验。结果为 `EXACT_SOURCE_EXECUTION_NOT_FULL_W3_GATE`：证明这些编译输入及代码对象进入执行，不声称覆盖全部语句、未执行分支、其他求值调用或路径访问闭包；保留句柄与交换攻击仍须独立验证。
+
 ### 实际封装入口的时序观测
 
 ```powershell
