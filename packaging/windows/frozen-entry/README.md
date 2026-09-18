@@ -119,6 +119,12 @@ candidate lock 的 `evidence_producer.custom_packaging` 绑定构建驱动/helpe
 
 输出记录每份捕获字节的摘要、观察器与解析器库存、原始轨迹和输入前后复验。结果为 `EXACT_SOURCE_EXECUTION_NOT_FULL_W3_GATE`：证明这些编译输入及代码对象进入执行，不声称覆盖全部语句、未执行分支、其他求值调用或路径访问闭包；保留句柄与交换攻击仍须独立验证。
 
+### Spike 内的 authority 使用反例
+
+retained bootstrap 在 native 首次 take 后检查重复 take、构造／派生／属性伪造、复制与序列化协议、真实异线程 read/reproof/close，以及 close 后保存的方法与 loader 引用。线程身份必须不同于 owner 且与创建返回值一致；等待有上限，worker 异常不能丢弃。仅全部断言完成后才公布 `_handoff_selftest` 的完成状态与结构化事实。
+
+这些是最小 spike 的验收代码，不是完整产品启动前置条件。fake authority 单测只验证断言自身；真实行为须随更新后的 manifest 和 PE 重新构建执行。该子集明确不覆盖提前 take、真实跨解释器对象调用或跨进程 pickle 重放，不能单独关闭 `HANDOFF_ONE_SHOT`。
+
 ### 启动前 payload 与目录污染反例
 
 `tools/verify_windows_frozen_payload.py` 可从任意 CWD 调用，参数为 `--dist`、`--release`、`--expected-release-sha256`、`--expected-repository-commit` 和 `--expected-candidate-input-digest`。工具只修改每例新复制的样本，核对精确差异、真实退出及 marker，并复验原始发行物和观察器；证据包含独立重放快照。正常对照使用已有 System32 作为 checkout 外 CWD，污染目录只在独立证据目录创建。
