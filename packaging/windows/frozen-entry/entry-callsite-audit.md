@@ -32,6 +32,12 @@ mimalloc 通过 Win32 环境 API 读取选项，早于 Python 的 `use_environme
 
 剩余源码分支还包括文件状态探测的 API-set loader、`os.startfile` 的 SHELL32 loader，以及扩展导入前的 `python3.dll` 探测和 PYD 加载。后者使用的 `0x1100` 不等于自定义 dispatcher 的 `0x900`；必须结合实际 retained importlib/source 闭包证明 E10 前不可达，不能只看初始化选项或导入表。
 
+## E9 分配失败：fatal 与可返回错误须分别观察
+
+锁定 DLL 的 `Py_SetPath` 调用默认 raw 字符串复制；首个空 prefix 的 `malloc` 返回 NULL 后，原有代码继续其他复制并进入 `path_out_of_memory → _Py_FatalErrorFunc`。真实封装 candidate 的单次分配故障观测产生 `PATH_CONFIGURATION_BEGIN`、`Py_SetPath: out of memory` 及实际 fatal 终止，不会回到 LocalCAT 的普通初始化失败分支。不能用“初始化 API 返回 −1”的替身代答这一条。
+
+`Py_InitializeFromInitConfig → PyImport_ExtendInittab` 中，默认 raw `realloc` 返回 NULL 则沿真实错误分支产生 NO_MEMORY、返回 −1，由 LocalCAT 输出 `INITIALIZATION_FAILED` 并退出 1。观测器用锁定 DLL 摘要、调用指令、栈中 owner 返回地址、参数和单次条件限制注入；两条路径都不修改发行文件。它们是受控 allocation 失败，不是自然耗尽或 allocator 自身故障，也没有覆盖后续 interpreter/core、清空路径、retained source 执行及 `_install` 失败。可重放工具为 `trace_windows_frozen_e9_faults`；正常对照不启用逐文件断点，文件调用轨迹及无命中不单独形成路径闭包证明。
+
 ## 证据使用与合同缺口
 
 可用 `trace_windows_frozen_entry` 对同一封装诊断目录重放 normal/stats profile。观察点偏移先绑定 exact Python DLL 摘要；实际执行仍需由当前原始日志、输入摘要与静态源/二进制关系共同复核。首版未限定模块的延迟断点产生告警；该轮汇总不能充当完整轨迹，新版明确拒绝此类结果。
