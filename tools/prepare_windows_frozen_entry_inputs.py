@@ -755,6 +755,14 @@ def _validate_probe_build_evidence(
         raise CandidateInputError("probe build evidence result mismatch")
 
 
+def _validate_patch_owner_inventory(policy: dict[str, Any], pristine_names: set[str]) -> None:
+    existing, new = policy["owned_existing_files"], policy["owned_new_files"]
+    all_names = [*existing, *new]
+    if (not existing or not new or len({name.casefold() for name in all_names}) != len(all_names)
+            or not set(existing) <= pristine_names or set(new) & pristine_names):
+        raise CandidateInputError("patch owner inventory differs from the actual pristine source")
+
+
 def _target_python_functions(base_symbols: list[str], policy: dict[str, Any]) -> list[str]:
     removed = policy["removed_base_functions"]
     additional = policy["additional_functions"]
@@ -947,6 +955,10 @@ def build_candidate_input(args: argparse.Namespace) -> dict[str, Any]:
         archive_audit = audit_sdist_sources(sdist)
     except AuditInputError as exc:
         raise CandidateInputError(str(exc)) from exc
+    _validate_patch_owner_inventory(entry_contract["patch"], {
+        path.relative_to(pyinstaller_source).as_posix()
+        for path in (pyinstaller_source / "bootloader").rglob("*") if path.is_file()
+    })
     api_table = python_api_table_for_314(
         pyinstaller_source / "bootloader/src/pyi_dylib_python.c"
     )

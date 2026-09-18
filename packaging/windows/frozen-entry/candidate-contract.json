@@ -26,9 +26,6 @@
       "bootloader/src/pyi_pyconfig_pep741.c",
       "bootloader/src/pyi_python.c",
       "bootloader/src/pyi_utils_win32_low_level.c",
-      "bootloader/src/pyi_utils_win32_low_level.h",
-      "bootloader/src/pyi_win32_utils.c",
-      "bootloader/src/pyi_win32_utils.h",
       "bootloader/wscript"
     ],
     "owned_new_files": [

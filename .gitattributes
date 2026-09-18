@@ -24,6 +24,9 @@
 *.qss text eol=lf
 *.ui text eol=lf
 
+# Unified diff context includes a required space on empty context lines.
+packaging/windows/frozen-entry/patches/*.patch text eol=lf whitespace=-blank-at-eol
+
 *.bat text eol=crlf
 *.cmd text eol=crlf
 

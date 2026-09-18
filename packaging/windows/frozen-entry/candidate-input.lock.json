@@ -31,8 +31,8 @@
     "preparer": {
       "role": "candidate input producer",
       "name": "prepare_windows_frozen_entry_inputs.py",
-      "bytes": 47277,
-      "sha256": "776d0de13decc098ea00cf0344032d579a398ff93dcc88410e5c87e75a202df6"
+      "bytes": 47976,
+      "sha256": "4aa982e0663522359f4aa61d1b467f49e977774000500333e5a16607a357e565"
     },
     "replay_wrapper": {
       "role": "candidate input replay wrapper",
@@ -1161,8 +1161,8 @@
     "contract_file": {
       "role": "frozen-entry target contract",
       "name": "candidate-contract.json",
-      "bytes": 10880,
-      "sha256": "4a8f5175f0c02c7835bbfe67defbcfafaf1b7353a3373a1aad6ad07f0670f382"
+      "bytes": 10744,
+      "sha256": "07e2f0aa6114b604b08eb282953cac50815094af1ed03597c0ec56628ee21d80"
     },
     "runtime_abi": {
       "module": "_localcat_frozen_bootstrap",
@@ -1190,9 +1190,6 @@
         "bootloader/src/pyi_pyconfig_pep741.c",
         "bootloader/src/pyi_python.c",
         "bootloader/src/pyi_utils_win32_low_level.c",
-        "bootloader/src/pyi_utils_win32_low_level.h",
-        "bootloader/src/pyi_win32_utils.c",
-        "bootloader/src/pyi_win32_utils.h",
         "bootloader/wscript"
       ],
       "owned_new_files": [
@@ -1575,6 +1572,6 @@
       "detail": "the selected MSVC stock rebuild has the approved compiler-generated import delta"
     }
   ],
-  "candidate_input_digest": "e5900306d1d2703b24b425e2ecfcf7b42c10886af455fc47b5df4e8bccc85ac9",
+  "candidate_input_digest": "8d38a1bdb33449524dbea9f1ffd741850590283b7e762e00531f3146f7f06ef1",
   "status": "MATERIALIZED"
 }
