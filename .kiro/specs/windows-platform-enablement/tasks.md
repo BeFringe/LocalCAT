@@ -133,6 +133,8 @@
   - _Depends: 1.4_
 
 - [ ] 1.6 在W1 rooted contract冻结后完成custom entry最小W3 spike
+  - 按已批准的 `w3-e9-path-amendment.md` 接入早期路径隔离、interpreter source 与唯一兼容 ABI 增量；初始化后复证不得追认先前路径访问
+  - 依 `w3-custom-entry-plan.md` §5.2 验证应用 dispatcher、系统 API 入口及其搜索策略，覆盖首次加载前的应用 DLL 重定向反例
   - 仅构建已批准完整Boot TCB、一个source-only critical module和一个fixture；在首次Python DLL/非KnownDLL load前闭合搜索、递归native closure与retained-handle proof，load后复核actual module identity并完成不可伪造handoff
   - `TrustedSourceLoader`只从retained verified handle读取manifest匹配的exact bytes并直接编译执行，attestation/digest与metadata一致且无`.pyc`/`__pycache__`/PYZ duplicate；覆盖未声明dynamic load、顶层/传递DLL注入、非仓库CWD、reparse/swap/manifest/source tamper
   - 生成applied patch/source digest、resulting PE、realized Python C API绑定表、实际native dependency inventory与PE/system allowlist并写入candidate-input digest绑定的realized-build lock；任一结果偏离1.5合同即回到W3
