@@ -1,0 +1,792 @@
+diff --git a/bootloader/src/localcat_frozen_bootstrap.c b/bootloader/src/localcat_frozen_bootstrap.c
+new file mode 100644
+--- /dev/null
++++ b/bootloader/src/localcat_frozen_bootstrap.c
+@@ -0,0 +1,738 @@
++#include "localcat_frozen_bootstrap.h"
++#include "localcat_sha256.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++
++/* Only functions already approved in the candidate's exact C API table. */
++struct localcat_python_api {
++    PyObject *(*PyBool_FromLong)(long);
++    PyObject *(*PyBytes_FromStringAndSize)(const char *, Py_ssize_t);
++    void (*PyErr_SetString)(PyObject *, const char *);
++    int (*PyInitConfig_AddModule)(PyInitConfig *, const char *, PyObject *(*)(void));
++    PyInitConfig *(*PyInitConfig_Create)(void);
++    void (*PyInitConfig_Free)(PyInitConfig *);
++    int (*PyInitConfig_SetInt)(PyInitConfig *, const char *, int64_t);
++    int (*PyInitConfig_SetStr)(PyInitConfig *, const char *, const char *);
++    int (*PyInitConfig_SetStrList)(PyInitConfig *, const char *, size_t, char *const *);
++    int (*Py_InitializeFromInitConfig)(PyInitConfig *);
++    /* Pinned stable-ABI export; absent from modern CPython public headers. */
++    void (*Py_SetPath)(const wchar_t *);
++    PyObject *(*PyLong_FromLong)(long);
++    PyObject *(*PyLong_FromUnsignedLongLong)(unsigned long long);
++    int (*PyModule_AddObjectRef)(PyObject *, const char *, PyObject *);
++    PyObject *(*PyModule_Create2)(PyModuleDef *, int);
++    void (*PyObject_Free)(void *);
++    PyThreadState *(*PyThreadState_Get)(void);
++    PyInterpreterState *(*PyThreadState_GetInterpreter)(PyThreadState *);
++    unsigned long (*PyThread_get_thread_ident)(void);
++    PyObject *(*PyTuple_New)(Py_ssize_t);
++    int (*PyTuple_SetItem)(PyObject *, Py_ssize_t, PyObject *);
++    PyObject *(*PyType_FromSpec)(PyType_Spec *);
++    PyObject *(*PyType_GenericNew)(PyTypeObject *, PyObject *, PyObject *);
++    const char *(*PyUnicode_AsUTF8)(PyObject *);
++    int (*Py_IsInitialized)(void);
++    void (*Py_DecRef)(PyObject *);
++    PyObject *(*Py_CompileStringExFlags)(const char *, const char *, int, PyCompilerFlags *, int);
++    PyObject *(*PyEval_EvalCode)(PyObject *, PyObject *, PyObject *);
++    PyObject *(*PyModule_GetDict)(PyObject *);
++    PyObject *(*PyUnicode_FromString)(const char *);
++    int (*PyObject_SetAttrString)(PyObject *, const char *, PyObject *);
++    PyObject *(*PyObject_GetAttrString)(PyObject *, const char *);
++    PyObject *(*PyObject_Str)(PyObject *);
++    PyObject *(*PyObject_CallFunctionObjArgs)(PyObject *, ...);
++    PyObject *(*PySys_GetObject)(const char *);
++    PyObject *(*PyImport_ImportModule)(const char *);
++    void (*PyErr_Clear)(void);
++    PyObject **runtime_error;
++};
++static struct localcat_python_api api;
++static struct localcat_bundle_authority *bundle;
++static struct localcat_bootstrap_facts facts;
++static PyInterpreterState *owner_interpreter;
++static unsigned long owner_thread;
++static DWORD producer_thread;
++static unsigned char configured, registered, armed, taken, closed;
++static PyObject *authority_type;
++static PyObject *issued_object;
++static unsigned char bootstrap_executed;
++static unsigned char initialization_attempted;
++static unsigned char interpreter_path_cleared;
++static const char *last_diagnostic;
++
++const char *localcat_bootstrap_last_diagnostic(void) { return last_diagnostic; }
++
++typedef struct { PyObject_HEAD unsigned char minted; } localcat_authority_object;
++
++static PyObject *localcat_error(const char *message)
++{
++    last_diagnostic = message;
++    api.PyErr_SetString(*api.runtime_error, message);
++    return NULL;
++}
++
++static int localcat_owner(void)
++{
++    return armed && !closed && bundle != NULL &&
++        api.PyThread_get_thread_ident() == owner_thread &&
++        api.PyThreadState_GetInterpreter(api.PyThreadState_Get()) == owner_interpreter;
++}
++
++static int localcat_valid_object(PyObject *self)
++{
++    if (!localcat_owner() || !taken || self != issued_object ||
++        !((localcat_authority_object *)self)->minted || bundle->state != 2U) {
++        localcat_error("FROZEN_ENTRY.AUTHORITY_UNAVAILABLE");
++        return 0;
++    }
++    return 1;
++}
++
++void localcat_bootstrap_abort(void)
++{
++    closed = 1U;
++    armed = 0U;
++    if (bundle != NULL) {
++        localcat_bundle_authority_close(bundle);
++        free(bundle);
++        bundle = NULL;
++    }
++}
++
++static PyObject *localcat_forbid_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
++{
++    (void)type; (void)args; (void)kwargs;
++    return localcat_error("FROZEN_ENTRY.AUTHORITY_NOT_CONSTRUCTIBLE");
++}
++
++static PyObject *localcat_forbid_copy(PyObject *self, PyObject *unused)
++{
++    (void)self; (void)unused;
++    return localcat_error("FROZEN_ENTRY.AUTHORITY_NOT_SERIALIZABLE");
++}
++
++static void localcat_authority_dealloc(PyObject *self)
++{
++    PyTypeObject *type = Py_TYPE(self);
++    if (self == issued_object) {
++        localcat_bootstrap_abort();
++        issued_object = NULL;
++    }
++    api.PyObject_Free(self);
++    api.Py_DecRef((PyObject *)type);
++}
++
++static struct localcat_retained_entry *localcat_entry(PyObject *self, PyObject *argument)
++{
++    const char *id;
++    size_t length;
++    struct localcat_retained_entry *entry;
++    if (!localcat_valid_object(self)) { return NULL; }
++    id = api.PyUnicode_AsUTF8(argument);
++    if (id == NULL) { return NULL; }
++    length = strlen(id);
++    /* IDs are canonical ASCII; compare Unicode length as well so embedded NUL
++     * cannot alias an authorized entry. Exact pinned CPython headers supply this
++     * layout accessor without importing any additional C API symbol. */
++    if (length == 0U || length > 63U || (size_t)PyUnicode_GET_LENGTH(argument) != length) {
++        localcat_error("FROZEN_ENTRY.ENTRY_ID_INVALID"); return NULL;
++    }
++    entry = localcat_bundle_authority_find(bundle, id);
++    if (entry == NULL) { localcat_error("FROZEN_ENTRY.ENTRY_UNKNOWN"); }
++    return entry;
++}
++
++static PyObject *localcat_read_verified(PyObject *self, PyObject *argument)
++{
++    struct localcat_retained_entry *entry = localcat_entry(self, argument);
++    unsigned char *bytes;
++    size_t count;
++    const char *diagnostic = NULL;
++    PyObject *result;
++    if (entry == NULL) { return NULL; }
++    if (localcat_retained_entry_read_verified(entry, &bytes, &count, &diagnostic) != 0) {
++        return localcat_error(diagnostic);
++    }
++    result = api.PyBytes_FromStringAndSize((const char *)bytes, (Py_ssize_t)count);
++    free(bytes);
++    return result;
++}
++
++static PyObject *localcat_module_reproof(PyObject *self, PyObject *argument)
++{
++    struct localcat_retained_entry *entry = localcat_entry(self, argument);
++    PyObject *values[10] = {0}, *result;
++    unsigned int index;
++    unsigned char *bytes;
++    size_t count;
++    const char *diagnostic = NULL;
++    if (entry == NULL) { return NULL; }
++    if (localcat_retained_entry_read_verified(entry, &bytes, &count, &diagnostic) != 0) {
++        return localcat_error(diagnostic);
++    }
++    free(bytes);
++    if (entry->manifest_entry->role == LOCALCAT_ROLE_NATIVE &&
++        (entry->loaded_module == NULL || !entry->actual_module_reproved ||
++         localcat_native_closure_load_verified(entry, &diagnostic) == NULL)) {
++        return localcat_error(diagnostic ? diagnostic : "FROZEN_ENTRY.NATIVE_REPROOF_MISSING");
++    }
++    values[0] = api.PyBool_FromLong(entry->actual_module_reproved != 0);
++    values[1] = api.PyLong_FromLong((long)entry->manifest_entry->role);
++    values[2] = api.PyLong_FromUnsignedLongLong(entry->manifest_entry->byte_count);
++    values[3] = api.PyBytes_FromStringAndSize((const char *)entry->manifest_entry->digest, 32);
++    values[4] = api.PyLong_FromUnsignedLongLong(entry->identity.volume_serial);
++    values[5] = api.PyBytes_FromStringAndSize((const char *)entry->identity.file_id, 16);
++    values[6] = api.PyBytes_FromStringAndSize((const char *)facts.build_id, 32);
++    values[7] = api.PyBytes_FromStringAndSize((const char *)facts.candidate_digest, 32);
++    values[8] = api.PyBytes_FromStringAndSize((const char *)facts.prelink_digest, 32);
++    values[9] = api.PyBytes_FromStringAndSize((const char *)facts.trace_digest, 32);
++    for (index = 0; index < 10U; ++index) {
++        if (values[index] == NULL) {
++            unsigned int other;
++            for (other = 0; other < 10U; ++other) { if (values[other]) { api.Py_DecRef(values[other]); } }
++            return NULL;
++        }
++    }
++    result = api.PyTuple_New(10);
++    if (result == NULL) { for (index = 0; index < 10U; ++index) { api.Py_DecRef(values[index]); } return NULL; }
++    for (index = 0; index < 10U; ++index) {
++        /* New tuple, exact in-range index. SetItem steals each new reference. */
++        if (api.PyTuple_SetItem(result, index, values[index]) != 0) {
++            unsigned int remaining;
++            for (remaining = index + 1U; remaining < 10U; ++remaining) { api.Py_DecRef(values[remaining]); }
++            api.Py_DecRef(result); return NULL;
++        }
++    }
++    return result;
++}
++
++static PyObject *localcat_close(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    if (!localcat_valid_object(self)) { return NULL; }
++    localcat_bootstrap_abort();
++    return api.PyBool_FromLong(1);
++}
++
++static PyMethodDef authority_methods[] = {
++    {"read_verified", localcat_read_verified, METH_O, NULL},
++    {"module_reproof", localcat_module_reproof, METH_O, NULL},
++    {"close", localcat_close, METH_NOARGS, NULL},
++    {"__reduce__", localcat_forbid_copy, METH_NOARGS, NULL},
++    {"__reduce_ex__", localcat_forbid_copy, METH_O, NULL},
++    {"__copy__", localcat_forbid_copy, METH_NOARGS, NULL},
++    {"__deepcopy__", localcat_forbid_copy, METH_O, NULL},
++    {NULL, NULL, 0, NULL}
++};
++static PyType_Slot authority_slots[] = {
++    {Py_tp_new, NULL},
++    {Py_tp_dealloc, NULL},
++    {Py_tp_methods, authority_methods},
++    {0, NULL}
++};
++static PyType_Spec authority_spec = {
++    "_localcat_frozen_bootstrap.FrozenBootstrapAuthority",
++    sizeof(localcat_authority_object), 0,
++    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE, authority_slots
++};
++
++static PyObject *localcat_take(PyObject *module, PyObject *unused)
++{
++    PyObject *object;
++    struct localcat_sha256_context trace;
++    (void)module; (void)unused;
++    if (!localcat_owner() || taken || authority_type == NULL || bundle->state != 1U) {
++        return localcat_error("FROZEN_ENTRY.HANDOFF_UNAVAILABLE");
++    }
++    object = api.PyType_GenericNew((PyTypeObject *)authority_type, NULL, NULL);
++    if (object == NULL) { return NULL; }
++    ((localcat_authority_object *)object)->minted = 1U;
++    issued_object = object;
++    taken = 1U;
++    bundle->state = 2U;
++    localcat_sha256_init(&trace);
++    localcat_sha256_update(&trace, facts.trace_digest, sizeof(facts.trace_digest));
++    localcat_sha256_update(&trace, "E10.HANDOFF_TAKEN", sizeof("E10.HANDOFF_TAKEN"));
++    localcat_sha256_final(&trace, facts.trace_digest);
++    return object;
++}
++static PyMethodDef module_methods[] = {
++    {"take_attestation", localcat_take, METH_NOARGS, NULL},
++    {NULL, NULL, 0, NULL}
++};
++static void localcat_module_free(void *module)
++{
++    (void)module;
++    if (authority_type != NULL) { api.Py_DecRef(authority_type); authority_type = NULL; }
++    localcat_bootstrap_abort();
++}
++static PyModuleDef module_definition = {
++    PyModuleDef_HEAD_INIT, "_localcat_frozen_bootstrap", NULL, -1,
++    module_methods, NULL, NULL, NULL, localcat_module_free
++};
++static PyObject *localcat_builtin_init(void)
++{
++    PyObject *module;
++    newfunc constructor = localcat_forbid_new;
++    destructor deallocator = localcat_authority_dealloc;
++    if (!localcat_owner() || GetCurrentThreadId() != producer_thread || authority_type != NULL || closed) {
++        return localcat_error("FROZEN_ENTRY.HANDOFF_MODULE_UNAVAILABLE");
++    }
++    module = api.PyModule_Create2(&module_definition, PYTHON_API_VERSION);
++    if (module == NULL) { return NULL; }
++    /* CPython's public slot ABI uses void *, while the functions retain their
++     * exact declared signatures. Windows AMD64 uses equally-sized addresses. */
++    memcpy(&authority_slots[0].pfunc, &constructor, sizeof(constructor));
++    memcpy(&authority_slots[1].pfunc, &deallocator, sizeof(deallocator));
++    authority_type = api.PyType_FromSpec(&authority_spec);
++    if (authority_type == NULL || api.PyModule_AddObjectRef(module, "FrozenBootstrapAuthority", authority_type) != 0) {
++        api.Py_DecRef(module); return NULL;
++    }
++    return module;
++}
++
++int localcat_bootstrap_bind(HMODULE python, const char **diagnostic)
++{
++#define BIND(name) do { FARPROC address = GetProcAddress(python, #name); \
++    if (address == NULL) { *diagnostic = "FROZEN_ENTRY.CAPI_MISSING"; return -1; } \
++    memcpy(&api.name, &address, sizeof(address)); } while (0)
++    FARPROC data;
++    if (python == NULL || configured || api.runtime_error != NULL) { *diagnostic = "FROZEN_ENTRY.CAPI_STATE"; return -1; }
++    BIND(PyBool_FromLong); BIND(PyBytes_FromStringAndSize); BIND(PyErr_SetString);
++    BIND(PyInitConfig_AddModule); BIND(PyLong_FromLong); BIND(PyLong_FromUnsignedLongLong);
++    BIND(PyInitConfig_Create); BIND(PyInitConfig_Free); BIND(PyInitConfig_SetInt);
++    BIND(PyInitConfig_SetStr); BIND(PyInitConfig_SetStrList); BIND(Py_InitializeFromInitConfig);
++    BIND(PyModule_AddObjectRef); BIND(PyModule_Create2); BIND(PyObject_Free);
++    BIND(PyThreadState_Get); BIND(PyThreadState_GetInterpreter); BIND(PyThread_get_thread_ident);
++    BIND(PyTuple_New); BIND(PyTuple_SetItem); BIND(PyType_FromSpec); BIND(PyType_GenericNew);
++    BIND(PyUnicode_AsUTF8); BIND(Py_DecRef); BIND(Py_IsInitialized);
++    BIND(Py_CompileStringExFlags); BIND(PyEval_EvalCode); BIND(PyModule_GetDict);
++    BIND(PyUnicode_FromString); BIND(PyObject_SetAttrString); BIND(PyObject_GetAttrString);
++    BIND(PyObject_CallFunctionObjArgs); BIND(PySys_GetObject);
++    BIND(PyImport_ImportModule); BIND(PyErr_Clear);
++    BIND(PyObject_Str);
++    BIND(Py_SetPath);
++    data = GetProcAddress(python, "PyExc_RuntimeError");
++    if (data == NULL) { *diagnostic = "FROZEN_ENTRY.CAPI_MISSING"; return -1; }
++    memcpy(&api.runtime_error, &data, sizeof(data));
++    return 0;
++#undef BIND
++}
++
++int localcat_bootstrap_configure(struct localcat_bundle_authority *authority,
++    const struct localcat_bootstrap_facts *input, const char **diagnostic)
++{
++    if (configured || closed || api.runtime_error == NULL || authority == NULL || input == NULL ||
++        input->abi_version != LOCALCAT_BOOTSTRAP_ABI_VERSION || input->struct_size != sizeof(*input) ||
++        authority->state != 1U || !authority->all_entries_proved || authority->entry_count == 0U) {
++        *diagnostic = "FROZEN_ENTRY.HANDOFF_CONFIG_INVALID"; return -1;
++    }
++    bundle = authority; facts = *input; configured = 1U;
++    producer_thread = GetCurrentThreadId();
++    return 0;
++}
++
++int localcat_bootstrap_register(PyInitConfig *config, const char **diagnostic)
++{
++    if (!configured || registered || closed || config == NULL || GetCurrentThreadId() != producer_thread ||
++        api.PyInitConfig_AddModule(config, "_localcat_frozen_bootstrap", localcat_builtin_init) != 0) {
++        *diagnostic = "FROZEN_ENTRY.HANDOFF_REGISTER_FAILED"; return -1;
++    }
++    registered = 1U; return 0;
++}
++
++/* Before any external Python body can replace sys values, inspect the actual
++ * interpreter result using only the approved C API. No opaque PyInitConfig
++ * layout access, configuration getter extension or Python eval is needed. */
++static int localcat_isolation_reprove(const char **diagnostic)
++{
++    static const struct { const char *name; const char *value; } expected[] = {
++        {"isolated", "1"}, {"ignore_environment", "1"}, {"no_user_site", "1"},
++        {"no_site", "1"}, {"safe_path", "True"}, {"dont_write_bytecode", "1"}
++    };
++    PyObject *flags = api.PySys_GetObject("flags");
++    PyObject *path = api.PySys_GetObject("path");
++    PyObject *builtins = NULL, *list_type = NULL, *value = NULL, *rendered = NULL;
++    const char *text;
++    unsigned int index;
++    int result = -1;
++    *diagnostic = "FROZEN_ENTRY.ISOLATION_MISMATCH";
++    if (flags == NULL || path == NULL) goto done;
++    builtins = api.PyImport_ImportModule("builtins");
++    if (builtins == NULL) goto done;
++    list_type = api.PyObject_GetAttrString(builtins,"list");
++    if (list_type == NULL || Py_TYPE(path) != (PyTypeObject *)list_type) goto done;
++    rendered = api.PyObject_Str(path);
++    if (rendered == NULL) goto done;
++    text = api.PyUnicode_AsUTF8(rendered);
++    if (text == NULL || strcmp(text,"[]") != 0) goto done;
++    api.Py_DecRef(rendered); rendered = NULL;
++    for (index = 0; index < sizeof(expected) / sizeof(expected[0]); ++index) {
++        value = api.PyObject_GetAttrString(flags,expected[index].name);
++        if (value == NULL) goto done;
++        rendered = api.PyObject_Str(value);
++        if (rendered == NULL) goto done;
++        text = api.PyUnicode_AsUTF8(rendered);
++        if (text == NULL || strcmp(text,expected[index].value) != 0) goto done;
++        api.Py_DecRef(rendered); rendered = NULL;
++        api.Py_DecRef(value); value = NULL;
++    }
++    result = 0;
++done:
++    if (rendered != NULL) api.Py_DecRef(rendered);
++    if (value != NULL) api.Py_DecRef(value);
++    if (list_type != NULL) api.Py_DecRef(list_type);
++    if (builtins != NULL) api.Py_DecRef(builtins);
++    if (result != 0) { api.PyErr_Clear(); localcat_bootstrap_abort(); }
++    return result;
++}
++
++int localcat_bootstrap_initialize(const char **diagnostic)
++{
++    static const struct { const char *name; int64_t value; } settings[] = {
++        {"isolated",1}, {"use_environment",0}, {"site_import",0}, {"write_bytecode",0},
++        {"safe_path",1}, {"parse_argv",0}, {"user_site_directory",0}, {"module_search_paths_set",1},
++        {"faulthandler",0}, {"tracemalloc",0}, {"perf_profiling",0}
++    };
++    PyInitConfig *config = NULL;
++    unsigned int index;
++    char executable[131072];
++    *diagnostic = "FROZEN_ENTRY.INITIALIZATION_STATE";
++    if (!configured || registered || armed || taken || closed || initialization_attempted ||
++        bundle == NULL || GetCurrentThreadId() != producer_thread || api.Py_IsInitialized()) return -1;
++    initialization_attempted = 1U;
++    if (localcat_initialization_environment_check(diagnostic) != 0 ||
++        localcat_bundle_authority_recheck_inventory(bundle,diagnostic) != 0) goto failed;
++    *diagnostic = "FROZEN_ENTRY.INITIALIZATION_PATH_INVALID";
++    if (bundle->root_final_path[0] == 0 || wcschr(bundle->root_final_path,L';') != NULL ||
++        WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,bundle->executable_final_path,-1,
++                            executable,sizeof(executable),NULL,NULL) <= 0) goto failed;
++    *diagnostic = "FROZEN_ENTRY.INITIALIZATION_CONFIG_FAILED";
++    config = api.PyInitConfig_Create();
++    if (config == NULL) goto failed;
++    for (index = 0; index < sizeof(settings) / sizeof(settings[0]); ++index) {
++        if (api.PyInitConfig_SetInt(config,settings[index].name,settings[index].value) != 0) goto failed;
++    }
++    if (api.PyInitConfig_SetStr(config,"stdio_encoding","utf-8") != 0 ||
++        api.PyInitConfig_SetStr(config,"program_name",executable) != 0 ||
++        api.PyInitConfig_SetStr(config,"executable",executable) != 0 ||
++        api.PyInitConfig_SetStrList(config,"module_search_paths",0,NULL) != 0 ||
++        api.PyInitConfig_SetStrList(config,"xoptions",0,NULL) != 0 ||
++        api.PyInitConfig_SetStrList(config,"warnoptions",0,NULL) != 0) goto failed;
++    if (localcat_bootstrap_register(config,diagnostic) != 0 ||
++        localcat_bootstrap_register_sources(config,diagnostic) != 0) goto failed;
++    /* This void compatibility call can terminate in CPython on allocation
++     * failure. Record native state first; observers are optional. */
++    if (localcat_stage_marker("FROZEN_ENTRY.PATH_CONFIGURATION_BEGIN") != 0) {
++        *diagnostic = "FROZEN_ENTRY.STAGE_MARKER_INVALID"; goto failed;
++    }
++    api.Py_SetPath(bundle->root_final_path);
++    *diagnostic = "FROZEN_ENTRY.INITIALIZATION_FAILED";
++    if (api.Py_InitializeFromInitConfig(config) != 0) goto failed;
++    if (!interpreter_path_cleared) {
++        *diagnostic = "FROZEN_ENTRY.INTERPRETER_PATH_NOT_CLEARED"; goto failed;
++    }
++    api.PyInitConfig_Free(config);
++    return localcat_isolation_reprove(diagnostic);
++failed:
++    last_diagnostic = *diagnostic;
++    localcat_bootstrap_abort();
++    if (config != NULL) api.PyInitConfig_Free(config);
++    return -1;
++}
++
++int localcat_bootstrap_seal_trace(const unsigned char digest[32], const char **diagnostic)
++{
++    static unsigned char sealed;
++    if (digest == NULL || sealed || !localcat_owner() || taken ||
++        GetCurrentThreadId() != producer_thread || bundle->state != 1U) {
++        *diagnostic = "FROZEN_ENTRY.TRACE_SEAL_UNAVAILABLE";
++        return -1;
++    }
++    memcpy(facts.trace_digest, digest, sizeof(facts.trace_digest));
++    sealed = 1U;
++    return 0;
++}
++
++int localcat_bootstrap_arm(const char **diagnostic)
++{
++    unsigned int index;
++    *diagnostic = "FROZEN_ENTRY.HANDOFF_ARM_INVALID";
++    if (!configured || !registered || armed || taken || closed || bundle == NULL ||
++        GetCurrentThreadId() != producer_thread || bundle->state != 1U || !bundle->all_entries_proved ||
++        !api.Py_IsInitialized()) {
++        *diagnostic = "FROZEN_ENTRY.HANDOFF_ARM_INVALID"; return -1;
++    }
++    if (initialization_attempted && localcat_isolation_reprove(diagnostic) != 0) return -1;
++    for (index = 0; index < bundle->entry_count; ++index) {
++        struct localcat_retained_entry *entry = &bundle->entries[index];
++        if (!entry->digest_proved || localcat_retained_entry_reprove(entry, diagnostic) != 0) {
++            localcat_bootstrap_abort(); return -1;
++        }
++        if (entry->manifest_entry->role == LOCALCAT_ROLE_NATIVE &&
++            (entry->loaded_module == NULL || !entry->actual_module_reproved ||
++             localcat_native_closure_load_verified(entry, diagnostic) == NULL)) {
++            *diagnostic = "FROZEN_ENTRY.HANDOFF_NATIVE_UNPROVED";
++            localcat_bootstrap_abort(); return -1;
++        }
++    }
++    if (localcat_bundle_authority_recheck_inventory(bundle,diagnostic) != 0) {
++        localcat_bootstrap_abort(); return -1;
++    }
++    owner_thread = api.PyThread_get_thread_ident();
++    owner_interpreter = api.PyThreadState_GetInterpreter(api.PyThreadState_Get());
++    bundle->owner_thread = owner_thread;
++    bundle->owner_interpreter = owner_interpreter;
++    armed = 1U; return 0;
++}
++
++/* Interpreter support uses no PathFinder/FileFinder. These approved-input
++ * stdlib sources are still read and compiled from their retained handles; only
++ * their native init adapters are builtins. No bytecode or added file is executed. */
++static const char *support_ids[] = {
++    "encoding-package", "encoding-aliases", "encoding-utf8", "encoding-win", "importlib-external"
++};
++static PyModuleDef support_definitions[] = {
++    {PyModuleDef_HEAD_INIT, "encodings", NULL, -1, NULL, NULL, NULL, NULL, NULL},
++    {PyModuleDef_HEAD_INIT, "encodings.aliases", NULL, -1, NULL, NULL, NULL, NULL, NULL},
++    {PyModuleDef_HEAD_INIT, "encodings.utf_8", NULL, -1, NULL, NULL, NULL, NULL, NULL},
++    {PyModuleDef_HEAD_INIT, "encodings._win_cp_codecs", NULL, -1, NULL, NULL, NULL, NULL, NULL},
++    {PyModuleDef_HEAD_INIT, "_frozen_importlib_external", NULL, -1, NULL, NULL, NULL, NULL, NULL}
++};
++static unsigned char sources_registered, support_started[5];
++
++static int localcat_clear_interpreter_path(void)
++{
++    PyObject *path = api.PySys_GetObject("path");
++    PyObject *builtins = NULL, *list_type = NULL, *clear = NULL, *cleared = NULL, *rendered = NULL;
++    const char *text;
++    int result = -1;
++    if (path == NULL || interpreter_path_cleared) goto done;
++    builtins = api.PyImport_ImportModule("builtins");
++    if (builtins == NULL) goto done;
++    list_type = api.PyObject_GetAttrString(builtins,"list");
++    if (list_type == NULL || Py_TYPE(path) != (PyTypeObject *)list_type) goto done;
++    clear = api.PyObject_GetAttrString(path,"clear");
++    if (clear == NULL) goto done;
++    cleared = api.PyObject_CallFunctionObjArgs(clear,NULL);
++    if (cleared == NULL) goto done;
++    rendered = api.PyObject_Str(path);
++    if (rendered == NULL) goto done;
++    text = api.PyUnicode_AsUTF8(rendered);
++    if (text == NULL || strcmp(text,"[]") != 0) goto done;
++    interpreter_path_cleared = 1U;
++    result = 0;
++done:
++    if (rendered) api.Py_DecRef(rendered);
++    if (cleared) api.Py_DecRef(cleared);
++    if (clear) api.Py_DecRef(clear);
++    if (list_type) api.Py_DecRef(list_type);
++    if (builtins) api.Py_DecRef(builtins);
++    return result;
++}
++
++static PyObject *localcat_support_init(unsigned int index)
++{
++    struct localcat_retained_entry *entry;
++    PyObject *module = NULL, *name = NULL, *package = NULL, *path = NULL, *origin = NULL;
++    PyObject *setter = NULL, *inserted = NULL, *code = NULL, *evaluated = NULL;
++    PyObject *modules, *globals;
++    unsigned char *bytes = NULL;
++    size_t count;
++    const char *diagnostic = NULL;
++    unsigned int native_index;
++    char filename[128], source_path[1025];
++    if (!sources_registered || !configured || closed || armed || taken || bundle == NULL ||
++        GetCurrentThreadId() != producer_thread || index >= 5U || support_started[index] ||
++        bundle->state != 1U || !bundle->all_entries_proved) {
++        localcat_error("FROZEN_ENTRY.INTERPRETER_SOURCE_STATE");
++        localcat_bootstrap_abort(); return NULL;
++    }
++    support_started[index] = 1U;
++    /* The external adapter is entered by frozen core before installing any
++     * external finder. Clear the actual list before reading/evaluating source. */
++    if ((index == 4U && localcat_clear_interpreter_path() != 0) ||
++        (index != 4U && !interpreter_path_cleared)) {
++        localcat_error("FROZEN_ENTRY.INTERPRETER_PATH_CLEAR_FAILED");
++        localcat_bootstrap_abort(); return NULL;
++    }
++    for (native_index = 0; native_index < bundle->entry_count; ++native_index) {
++        struct localcat_retained_entry *native = &bundle->entries[native_index];
++        if (native->manifest_entry->role == LOCALCAT_ROLE_NATIVE &&
++            (native->loaded_module == NULL || !native->actual_module_reproved ||
++             localcat_native_closure_load_verified(native, &diagnostic) == NULL)) {
++            localcat_error(diagnostic ? diagnostic : "FROZEN_ENTRY.INTERPRETER_NATIVE_UNPROVED");
++            localcat_bootstrap_abort(); return NULL;
++        }
++    }
++    entry = localcat_bundle_authority_find(bundle, support_ids[index]);
++    if (entry == NULL || entry->manifest_entry->role != LOCALCAT_ROLE_INTERPRETER ||
++        localcat_retained_entry_read_verified(entry, &bytes, &count, &diagnostic) != 0) {
++        localcat_error(diagnostic ? diagnostic : "FROZEN_ENTRY.INTERPRETER_SOURCE_MISSING");
++        localcat_bootstrap_abort();
++        return NULL;
++    }
++    module = api.PyModule_Create2(&support_definitions[index], PYTHON_API_VERSION);
++    name = api.PyUnicode_FromString(support_definitions[index].m_name);
++    package = api.PyUnicode_FromString(index == 4U ? "" : "encodings");
++    if (entry->manifest_entry->path_length >= sizeof(source_path) ||
++        sprintf_s(filename,sizeof(filename),"<localcat-retained:%s>",support_ids[index]) <= 0) goto failed;
++    for (native_index = 0; native_index < entry->manifest_entry->path_length; ++native_index) {
++        unsigned char ch = entry->manifest_entry->path[native_index];
++        source_path[native_index] = ch == '\\' ? '/' : (char)ch;
++    }
++    source_path[native_index] = 0;
++    origin = api.PyUnicode_FromString(source_path);
++    if (module == NULL || name == NULL || package == NULL || origin == NULL ||
++        api.PyObject_SetAttrString(module,"__package__",package) != 0 ||
++        api.PyObject_SetAttrString(module,"__file__",origin) != 0) { goto failed; }
++    if (index == 0U) {
++        path = api.PyTuple_New(0);
++        if (path == NULL || api.PyObject_SetAttrString(module,"__path__",path) != 0) { goto failed; }
++    }
++    /* Publish the initialized module shell for the package's relative import.
++     * Only the E9 native producer can reach this path; no Python authority is
++     * handed out before E10. A failed init is terminal, never a path fallback. */
++    modules = api.PySys_GetObject("modules");
++    if (modules == NULL) { goto failed; }
++    setter = api.PyObject_GetAttrString(modules,"__setitem__");
++    if (setter == NULL) { goto failed; }
++    inserted = api.PyObject_CallFunctionObjArgs(setter,name,module,NULL);
++    if (inserted == NULL) { goto failed; }
++    code = api.Py_CompileStringExFlags((const char *)bytes,filename,
++                                     Py_file_input,NULL,-1);
++    free(bytes); bytes = NULL;
++    if (code == NULL) { goto failed; }
++    globals = api.PyModule_GetDict(module);
++    if (globals == NULL) { goto failed; }
++    evaluated = api.PyEval_EvalCode(code,globals,globals);
++    if (evaluated == NULL) { goto failed; }
++    api.Py_DecRef(name); api.Py_DecRef(package); api.Py_DecRef(origin); if (path) { api.Py_DecRef(path); }
++    api.Py_DecRef(setter); api.Py_DecRef(inserted); api.Py_DecRef(code); api.Py_DecRef(evaluated);
++    return module;
++failed:
++    last_diagnostic = "FROZEN_ENTRY.INTERPRETER_SOURCE_EXECUTION_FAILED";
++    free(bytes);
++    if (module) { api.Py_DecRef(module); }
++    if (name) { api.Py_DecRef(name); }
++    if (package) { api.Py_DecRef(package); }
++    if (origin) { api.Py_DecRef(origin); }
++    if (path) { api.Py_DecRef(path); }
++    if (setter) { api.Py_DecRef(setter); }
++    if (inserted) { api.Py_DecRef(inserted); }
++    if (code) { api.Py_DecRef(code); }
++    if (evaluated) { api.Py_DecRef(evaluated); }
++    /* A shell can remain in sys.modules after an interrupted package import;
++     * revoke native state as well, so no retry can mint authority from it. */
++    localcat_bootstrap_abort();
++    return NULL;
++}
++static PyObject *localcat_encodings(void) { return localcat_support_init(0); }
++static PyObject *localcat_aliases(void) { return localcat_support_init(1); }
++static PyObject *localcat_utf8(void) { return localcat_support_init(2); }
++static PyObject *localcat_win_codecs(void) { return localcat_support_init(3); }
++static PyObject *localcat_importlib_external(void) { return localcat_support_init(4); }
++
++int localcat_bootstrap_register_sources(PyInitConfig *config, const char **diagnostic)
++{
++    unsigned int index;
++    PyObject *(*initializers[5])(void) = {
++        localcat_encodings, localcat_aliases, localcat_utf8, localcat_win_codecs, localcat_importlib_external
++    };
++    if (!configured || !registered || closed || sources_registered || config == NULL ||
++        GetCurrentThreadId() != producer_thread) {
++        *diagnostic = "FROZEN_ENTRY.INTERPRETER_REGISTER_STATE"; return -1;
++    }
++    for (index = 0; index < 5U; ++index) {
++        struct localcat_retained_entry *entry = localcat_bundle_authority_find(bundle,support_ids[index]);
++        if (entry == NULL || entry->manifest_entry->role != LOCALCAT_ROLE_INTERPRETER) {
++            *diagnostic = "FROZEN_ENTRY.INTERPRETER_SOURCE_MISSING"; return -1;
++        }
++    }
++    sources_registered = 1U;
++    for (index = 0; index < 5U; ++index) {
++        if (api.PyInitConfig_AddModule(config,support_definitions[index].m_name,initializers[index]) != 0) {
++            *diagnostic = "FROZEN_ENTRY.INTERPRETER_REGISTER_FAILED";
++            localcat_bootstrap_abort(); return -1;
++        }
++    }
++    return 0;
++}
++
++static PyModuleDef bootstrap_definition = {
++    PyModuleDef_HEAD_INIT,"localcat_spike_bootstrap",NULL,-1,NULL,NULL,NULL,NULL,NULL
++};
++
++int localcat_bootstrap_execute(const char **diagnostic)
++{
++    struct localcat_retained_entry *entry;
++    unsigned char *bytes = NULL;
++    size_t count;
++    unsigned int index;
++    char filename[1025];
++    PyObject *code = NULL, *module = NULL, *native = NULL, *authority = NULL, *builtins = NULL;
++    PyObject *name = NULL, *origin = NULL, *setter = NULL, *inserted = NULL, *evaluated = NULL;
++    PyObject *modules, *globals, *builtin_globals;
++    int result = -1;
++    *diagnostic = "FROZEN_ENTRY.BOOTSTRAP_EXECUTION_UNAVAILABLE";
++    if (!localcat_owner() || bootstrap_executed || taken ||
++        GetCurrentThreadId() != producer_thread || bundle->state != 1U) { return -1; }
++    bootstrap_executed = 1U;
++    /* E10 completes in native code before any bootstrap source instruction. */
++    native = api.PyImport_ImportModule("_localcat_frozen_bootstrap");
++    if (native == NULL) { goto cleanup; }
++    authority = localcat_take(native,NULL);
++    if (authority == NULL) { goto cleanup; }
++    entry = localcat_bundle_authority_find(bundle,"bootstrap");
++    if (entry == NULL || entry->manifest_entry->role != LOCALCAT_ROLE_BOOTSTRAP ||
++        localcat_retained_entry_read_verified(entry,&bytes,&count,diagnostic) != 0) {
++        goto cleanup;
++    }
++    if (entry->manifest_entry->path_length >= sizeof(filename)) { goto cleanup; }
++    for (index = 0; index < entry->manifest_entry->path_length; ++index) {
++        unsigned char ch = entry->manifest_entry->path[index];
++        filename[index] = ch == '\\' ? '/' : (char)ch;
++    }
++    filename[index] = 0;
++    *diagnostic = "FROZEN_ENTRY.BOOTSTRAP_COMPILE_FAILED";
++    code = api.Py_CompileStringExFlags((const char *)bytes,filename,Py_file_input,NULL,-1);
++    free(bytes); bytes = NULL;
++    if (code == NULL) {
++        goto cleanup;
++    }
++    *diagnostic = "FROZEN_ENTRY.BOOTSTRAP_EXECUTION_FAILED";
++    module = api.PyModule_Create2(&bootstrap_definition,PYTHON_API_VERSION);
++    builtins = api.PyImport_ImportModule("builtins");
++    builtin_globals = builtins == NULL ? NULL : api.PyModule_GetDict(builtins);
++    name = api.PyUnicode_FromString(bootstrap_definition.m_name);
++    origin = api.PyUnicode_FromString(filename);
++    if (module == NULL || builtin_globals == NULL || name == NULL || origin == NULL ||
++        api.PyModule_AddObjectRef(module,"_authority",authority) != 0 ||
++        api.PyModule_AddObjectRef(module,"__builtins__",builtin_globals) != 0 ||
++        api.PyObject_SetAttrString(module,"__file__",origin) != 0) { goto cleanup; }
++    modules = api.PySys_GetObject("modules");
++    if (modules == NULL) { goto cleanup; }
++    setter = api.PyObject_GetAttrString(modules,"__setitem__");
++    if (setter == NULL) { goto cleanup; }
++    inserted = api.PyObject_CallFunctionObjArgs(setter,name,module,NULL);
++    if (inserted == NULL) { goto cleanup; }
++    globals = api.PyModule_GetDict(module);
++    if (globals == NULL) { goto cleanup; }
++    evaluated = api.PyEval_EvalCode(code,globals,globals);
++    /* Successful bootstrap may already have closed and freed bundle. */
++    if (evaluated != NULL) { result = 0; }
++cleanup:
++    free(bytes);
++    if (result != 0) { api.PyErr_Clear(); localcat_bootstrap_abort(); }
++    if (code) { api.Py_DecRef(code); }
++    if (module) { api.Py_DecRef(module); }
++    if (native) { api.Py_DecRef(native); }
++    if (authority) { api.Py_DecRef(authority); }
++    if (builtins) { api.Py_DecRef(builtins); }
++    if (name) { api.Py_DecRef(name); }
++    if (origin) { api.Py_DecRef(origin); }
++    if (setter) { api.Py_DecRef(setter); }
++    if (inserted) { api.Py_DecRef(inserted); }
++    if (evaluated) { api.Py_DecRef(evaluated); }
++    return result;
++}
+diff --git a/bootloader/src/localcat_frozen_bootstrap.h b/bootloader/src/localcat_frozen_bootstrap.h
+new file mode 100644
+--- /dev/null
++++ b/bootloader/src/localcat_frozen_bootstrap.h
+@@ -0,0 +1,44 @@
++#ifndef LOCALCAT_FROZEN_BOOTSTRAP_H
++#define LOCALCAT_FROZEN_BOOTSTRAP_H
++
++/* This translation unit uses the exact pinned CPython types, not PyInstaller's
++ * opaque compatibility typedefs. Never implicitly import python314.dll. */
++#ifndef Py_NO_LINK_LIB
++#define Py_NO_LINK_LIB 1
++#endif
++#include <Python.h>
++#include "localcat_rooted_io.h"
++
++#define LOCALCAT_BOOTSTRAP_ABI_VERSION 1U
++struct localcat_bootstrap_facts {
++    uint32_t abi_version;
++    uint32_t struct_size;
++    unsigned char build_id[32];
++    unsigned char candidate_digest[32];
++    unsigned char prelink_digest[32];
++    unsigned char trace_digest[32];
++};
++
++int localcat_bootstrap_bind(HMODULE python, const char **diagnostic);
++/* Successful configure transfers the heap authority's cleanup ownership.
++ * This is a native-only producer API; it does not yet permit Python take. */
++int localcat_bootstrap_configure(struct localcat_bundle_authority *authority,
++    const struct localcat_bootstrap_facts *facts, const char **diagnostic);
++int localcat_bootstrap_register(PyInitConfig *config, const char **diagnostic);
++/* Native producer registration of the retained interpreter-start source set. */
++int localcat_bootstrap_register_sources(PyInitConfig *config, const char **diagnostic);
++/* E9 composition after caller's E4/E7 proofs: owns the isolated configuration.
++ * Does not itself claim an E0/E4 system closure or constitute the PE entry. */
++int localcat_bootstrap_initialize(const char **diagnostic);
++/* Called by the native entry only after E9. Revalidates all E7 native results. */
++int localcat_bootstrap_arm(const char **diagnostic);
++/* Native entry seals its actual E1-E9/arm trace once, before E10 take. */
++int localcat_bootstrap_seal_trace(const unsigned char digest[32], const char **diagnostic);
++/* E11: execute the retained bootstrap once, only after native arm succeeds. */
++int localcat_bootstrap_execute(const char **diagnostic);
++/* Stable native marker only; never Python exception text or source contents. */
++const char *localcat_bootstrap_last_diagnostic(void);
++/* Idempotent native failure cleanup; never re-arms the producer. */
++void localcat_bootstrap_abort(void);
++
++#endif
