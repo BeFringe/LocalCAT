@@ -20,12 +20,12 @@
 | E1 | `wWinMain`第一段LocalCAT patch代码 | 调用`SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`；不得先解析CWD、`PATH`、application data目录或加载非system DLL |
 | E2 | 定位EXE与onedir root | 逐组件打开并保留root/intermediate handles；执行W1 rooted、reparse、volume、final path和live FileId不变量 |
 | E3 | 读取pre-link input/native runtime manifest | 从retained handle读取固定格式runtime manifest；校验embedded input-manifest/schema/root digest，拒绝extra、duplicate basename和未声明dynamic root |
-| E4 | 预证明native closure并关闭dynamic call surface | 对Python DLL及其递归static/delay依赖逐项retained open、digest和identity；同时静态审计custom entry、CRT、每个非system binary及初始化前可达代码中的`LoadLibrary*`/`LdrLoadDll`/delay-load/extension-import callsite。除受审dispatcher及批准System32调用外不得存在初始化前可达dynamic loader；`DllMain`也在此约束内，声明或预加载本身不能代替该证明 |
+| E4 | 预证明应用 native closure 并约束 dynamic call surface | 对 Python DLL 及其递归非系统 static/delay 依赖逐项 retained open、digest 和 identity；静态审计 custom entry、CRT、每个非系统 binary 及初始化前可达代码中的 `LoadLibrary*`/`LdrLoadDll`/delay-load/extension-import callsite（含 `DllMain`）。只允许受审 dispatcher 与获批系统 API 入口，系统入口边界见 §5.2 |
 | E5 | 预证明source/fixture closure | 在Python初始化前逐组件rooted open并保留bootstrap、解释器启动所需exact-byte代码、一个critical `.py`和一个fixture的handle，记录identity/digest；同时拒绝同名PYZ/`.pyc`/`__pycache__`、extra source及manifest dependency cycle |
 | E6 | 受限加载 | 每个非system DLL只能由E4受审dispatcher使用已证明绝对路径和`LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`加载；不把多个`AddDllDirectory`目录的未规定顺序作为authority |
 | E7 | actual-module reproof | `GetModuleFileNameW(HMODULE)`取得实际pathname，在仍由no-write/no-delete root/source handles固定的同一parent下rooted reopen，再比较live FileId/final path与E4 retained handle；basename唯一性已由E3固定。任何`DllMain`后才发现的不一致仍判失败，不倒推出pre-load PASS |
 | E8 | 绑定Python C API | `python314.dll`不作为PE静态import；以`GetProcAddress`绑定获批的exact symbol table并固定built-in init function；任何缺失/额外symbol均在此停止 |
-| E9 | 初始化isolated Python并注册built-in | CPython 3.14固定使用PEP 741 `PyInitConfig_Create`的isolated defaults，通过`PyInitConfig_AddModule("_localcat_frozen_bootstrap", ...)`注册built-in，设置显式manifest-bound module paths后调用`Py_InitializeFromInitConfig`；配置结果必须保持`use_environment=0`、`user_site_directory=0`、`site_import=0`、`safe_path=1`、`parse_argv=0`且不含checkout/CWD，注册或初始化失败均停止；该阶段不得到达E4未批准的native loader callsite |
+| E9 | 初始化isolated Python并注册built-in | CPython 3.14 保持 PEP 741 isolated 配置与 compiled-in handoff；按已批准的 `w3-e9-path-amendment.md`，仅新增兼容 ABI `Py_SetPath` 与 exact-byte `_bootstrap_external.py` interpreter entry，关闭 getpath 探测并在外部导入器安装前清空实际搜索路径。真实 EXE 来自 retained authority，launcher 环境覆盖在 Python DLL 加载前拒绝；配置、源码或安装失败均终止并撤销 authority，不得到达 E4 未批准的 native loader callsite |
 | E10 | 建立不可伪造handoff | import已在E9通过init config注册的compiled-in `_localcat_frozen_bootstrap`，mint并take一个one-shot opaque extension authority；其内容绑定E4/E5/E7证明且不向Python返回raw HANDLE |
 | E11 | 执行可信bootstrap与source-only module | bootstrap从E5 native retained handle读取并直接编译；随后`TrustedSourceLoader`以同一authority执行critical `.py`和读取fixture，逐次复核live identity/digest并保持duplicate拒绝 |
 
@@ -45,7 +45,7 @@ build采用无自引用的两阶段manifest。第一阶段canonical **pre-link i
 - `_localcat_frozen_bootstrap` built-in module与最小Python C API symbol table；
 - exact-byte bootstrap、其解释器启动所需PyInstaller bootstrap/stdlib集合，以及这些代码的动态native roots；
 - 一个source-only critical module、一个fixture和对应manifest entries；
-- 版本化Windows system DLL/API-set allowlist与E0 external resolution evidence。
+- 应用所用 Windows system DLL/API-set 入口 allowlist 与 E0 external resolution evidence。
 
 `ctypes`不进入最小bootstrap路径；若实际PyInstaller/Python启动在authority建立前需要它或其他extension，必须显式加入TCB和dynamic-root closure，而不是依赖运行时偶然导入。
 
@@ -79,9 +79,25 @@ candidate-input lock只收录构建前已materialize的输入与获批目标合�
 
 ### 5.1 PE/system allowlist boundary
 
-proposed custom `runw.exe`自身E0 expected static import只允许`KERNEL32.DLL`、`ADVAPI32.DLL`、`GDI32.DLL`、`USER32.DLL`；`COMCTL32.DLL`必须消除。1.5从获批source/link合同固定exact name/symbol allowlist，并从锁定Python DLL及其非system依赖递归生成runtime expected allowlist。1.6从resulting PE生成realized static/delay/manifest inventory，逐项证明API-set解析到获批System32/KnownDLL host；compiler产生任何额外import、delay import或manifest dependency均回到W3，而不是扩张通配allowlist。当前host的KnownDLLs观察仅是scout输入，不替代目标profile上的external resolution proof。
+custom `runw.exe`自身E0 expected static import只允许`KERNEL32.DLL`与`USER32.DLL`，后者仅保留`MessageBoxA`错误诊断；精确symbol集合由`candidate-contract.json`相对锁定stock表的显式增减派生。移除stock路径不再使用的imports；`KERNEL32!OutputDebugStringW`仅用于下述可选阶段观测。锁定Python DLL及其非system依赖递归生成runtime expected allowlist。1.6从resulting PE生成realized static/delay/manifest inventory，逐项证明API-set解析到获批System32/KnownDLL host；compiler产生任何额外import、delay import或manifest dependency均回到W3，而不是扩张通配allowlist。当前host的KnownDLLs观察仅是scout输入，不替代目标profile上的external resolution proof。
 
-pre-authority动态加载首版采用“**可达调用点闭包**”而非OS级全局拦截：custom dispatcher是唯一获准的非system loader callsite；CRT、Python DLL `DllMain`、CPython初始化到E10之间的可达源码/反汇编与startup trace必须证明不会调用其他`LoadLibrary*`/`LdrLoadDll`/delay helper或native extension import。无法证明的binary/callsite直接NO-GO；E7 post-load inventory或loader notification不能追认。完整Task 7若Qt/PySide6/SQLite引入新的pre-authority callsite，须扩展同一闭包并重回W3。
+pre-authority 动态加载首版采用“**应用可达调用点闭包**”：custom dispatcher 是唯一获准的非系统 loader callsite；CRT、Python DLL `DllMain`、CPython 初始化到 E10 之间的可达源码/反汇编与 startup trace 必须证明应用代码不会到达 dispatcher 及获批系统 API 入口以外的 loader 或 native extension import。无法证明的应用 binary/callsite 直接 NO-GO，E7 inventory 或 notification 不能追认。Task 7 若 Qt/PySide6/SQLite 引入新的应用 pre-authority callsite，须扩展同一闭包并重回 W3。
+
+### 5.2 初始化 RNG 与系统 API 入口
+
+沿用 ADR-022 决策 5 的 KnownDLL/System32 信任与 ADR-023 决策 6 的非系统 native closure：应用声明并审计系统 API 入口和解析策略，系统服务实现由 Windows 提供。
+
+- 锁定 CPython 在 E9 通过 `bcrypt!BCryptGenRandom(NULL, buffer, size, BCRYPT_USE_SYSTEM_PREFERRED_RNG)` 取得 hash 随机种子，flags 为 `2`，保持解释器正常随机化及错误处理。
+- candidate-contract/input v3 绑定上述调用合同。系统观测保存在独立诊断产物中；构建输入绑定声明的应用闭包与系统入口策略。
+- 系统入口与非系统 dispatcher 均须验证 E1 搜索策略及调用时序，覆盖 CWD/PATH、`.local`/SxS、同名 DLL 和 reparse/alias 重定向反例。
+
+v1 terminal NO-GO 工具只重放旧合同，拒绝 v2/v3 输入。诊断、parser 单测或初始化 probe 均不能单独把下列 mandatory candidate 断言标成 PASS。
+
+### 5.3 最小绑定表与 windowed 阶段观测
+
+custom entry 的 E8 目标为 37 个函数和 `PyExc_RuntimeError` 数据导出。目标合同显式列出从 stock PEP-741 表移除的函数及 custom 增量，不再将整个 stock 启动表并入目标；签名仍来自锁定源码声明和显式增量表。缺失、额外绑定或签名差异均拒绝，不能通过解析未使用函数凑齐旧表。
+
+原生代码在易触发 fatal 的调用前先记录稳定阶段状态，再向可用的 stderr 和 `OutputDebugStringW` 尝试输出无正文标记。stderr、调试器或观察者均不是启动前置条件，输出不可用不得撤销有效 authority；可返回的真实失败仍通过错误诊断并非零退出。fatal/OOM 保持原生阶段记录与非零终止，在验收时由外部观察者取证；不承诺无人观察时的持久化日志。此修订须覆盖无 stderr 的真实 windowed entry 正常启动及失败路径。
 
 ## 6. Mandatory spike assertion matrix
 
@@ -91,7 +107,7 @@ pre-authority动态加载首版采用“**可达调用点闭包**”而非OS级�
 | `W3.CUSTOM.DLL_POLICY_FIRST` | CWD/PATH/application-dir放置同名Python/CRT probe DLL | 首次非system load前policy已生效，probe不执行 |
 | `W3.CUSTOM.BUNDLE_ROOTED` | bundle/ancestor junction、final reparse、ancestor swap | 全部在load前稳定fail closed，无path-only fallback |
 | `W3.CUSTOM.NATIVE_CLOSURE_PRELOAD` | 顶层及传递DLL替换、missing/extra、duplicate basename | 每个非system member在首次load前已有retained identity+digest proof |
-| `W3.CUSTOM.DYNAMIC_ROOTS_DECLARED` | pre-authority hook/extension新增未声明`LoadLibrary*` root | build或startup失败；不得在post-load inventory中追认 |
+| `W3.CUSTOM.DYNAMIC_ROOTS_DECLARED` | pre-authority hook/extension 新增未声明应用 native root；应用可控的系统入口路径重定向 | build 或首次相关调用前失败；应用调用点与系统入口解析策略事前闭合，不得由 post-load inventory 追认 |
 | `W3.CUSTOM.ACTUAL_MODULE_REPROOF` | proof后到load间swap与loaded-module path/FileId复核 | 实际module逐项等于pre-load retained identity；不一致失败 |
 | `W3.CUSTOM.HANDOFF_ONE_SHOT` | 缺失、重复take、错误线程/解释器、伪造对象、跨进程/序列化重放、close后复用 | 只有同进程compiled-in producer的单次opaque authority可用，状态严格`CREATED→TAKEN→CLOSED` |
 | `W3.CUSTOM.MANIFEST_EXACT` | manifest digest、offset/count/overlap/overflow、非法UTF-8/路径、duplicate entry/basename、dependency cycle、unknown flag、extra/trailing bytes tamper | parser、embedded pre-link root绑定及post-build release binding全部fail closed |
@@ -106,7 +122,7 @@ pre-authority动态加载首版采用“**可达调用点闭包**”而非OS级�
 
 ## 7. 维护与升级边界
 
-- PyInstaller、CPython minor/patch ABI、compiler/SDK、bootloader patch、PE imports、Python C API表、manifest schema、system allowlist、pre-authority module/dynamic roots任一变化，都重建TCB并至少重跑1.6矩阵。
+- PyInstaller、CPython minor/patch ABI、compiler/SDK、bootloader patch、应用 PE imports、Python C API 表、manifest schema、应用系统调用 allowlist 或 pre-authority module/dynamic roots 变化，都重建应用 TCB 并至少重跑 1.6 矩阵。
 - 只变Windows PowerShell 5.1 Build/Revision不改变W3 TCB；它是evidence orchestrator事实，由`CLEAN_WINDOWS_V2`记录而不阻断。PowerShell edition/major/minor/architecture、system-host选择或行为profile变化仍阻断证据lane。
 - Task 1.6只裁决最小机制可行性；完整Qt/PySide6/SQLite/native closure、owner roots、resources和全业务E2E仍归Task 7～10，不得由最小spike冒充。
 - upstream若接受等价实现，仍须按新source/digest重跑；不得仅因“已upstream”降低release-owned review和attack matrix。

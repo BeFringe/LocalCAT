@@ -733,10 +733,22 @@ def loader_iat_and_callsites(
     return loader_imports, matching_lines, process.stdout
 
 
+def validate_legacy_target(candidate_lock: dict[str, Any]) -> None:
+    """This historical probe cannot decide a revised system-provider contract."""
+    if (
+        candidate_lock.get("schema") != "localcat.windows-frozen-entry-candidate-input.v1"
+        or any(key in candidate_lock.get("entry_contract", {}).get("dynamic_loader", {})
+               for key in ("system_provider_target", "system_service_boundary"))
+    ):
+        raise SystemExit("historical NO-GO replay requires the original v1 target; use the custom-entry matrix for revised targets")
+
+
 def main() -> int:
     arguments = parse_arguments()
     repository_root = validated_directory(arguments.repository_root, "repository root")
     candidate_lock_path = validated_file(arguments.candidate_lock, "candidate lock")
+    candidate_lock = load_json_object(candidate_lock_path, "candidate lock")
+    validate_legacy_target(candidate_lock)
     pyinstaller_source = validated_directory(arguments.pyinstaller_source, "PyInstaller source")
     cpython_root = validated_directory(arguments.cpython_root, "CPython root")
     vcvarsall = validated_file(arguments.vcvarsall, "vcvarsall")
@@ -751,7 +763,6 @@ def main() -> int:
     source = validated_file(repository_root / "tools" / "probe_windows_python314_preauthority.c", "probe source")
     python_dll = validated_file(cpython_root / "python314.dll", "python DLL")
     runtime_dll = validated_file(cpython_root / "vcruntime140.dll", "VCRUNTIME")
-    candidate_lock = load_json_object(candidate_lock_path, "candidate lock")
     matrix_contract, matrix_ids = validate_matrix_contract(arguments.matrix_contract)
     if candidate_lock.get("status") != "MATERIALIZED":
         raise SystemExit("candidate input is not materialized")
