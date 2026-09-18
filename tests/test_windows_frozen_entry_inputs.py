@@ -28,6 +28,116 @@ from tools.prepare_windows_frozen_entry_inputs import (
 
 
 class WindowsFrozenEntryInputTests(unittest.TestCase):
+    def test_custom_api_target_removes_stock_only_functions_explicitly(self) -> None:
+        from tools.prepare_windows_frozen_entry_inputs import _target_python_functions
+        policy = {
+            "removed_base_functions": ["Py_Finalize"],
+            "additional_functions": ["Py_SetPath"],
+            "function_signatures": {"Py_SetPath": "void (*)(const wchar_t *)"},
+        }
+        self.assertEqual(
+            _target_python_functions(["Py_IsInitialized", "Py_Finalize"], policy),
+            ["Py_IsInitialized", "Py_SetPath"],
+        )
+        for removed in (["missing"], ["Py_Finalize", "Py_Finalize"]):
+            with self.subTest(removed=removed), self.assertRaises(CandidateInputError):
+                _target_python_functions(["Py_IsInitialized", "Py_Finalize"],
+                                         {**policy, "removed_base_functions": removed})
+        with self.assertRaises(CandidateInputError):
+            _target_python_functions(["Py_IsInitialized", "Py_Finalize"],
+                                     {**policy, "removed_base_functions": ["Py_SetPath"]})
+
+    def test_e9_path_contract_has_only_approved_compatibility_abi_and_sources(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        contract, _ = _load_entry_contract(root / "packaging/windows/frozen-entry/candidate-contract.json")
+        api = contract["python_c_api"]
+        self.assertIn("Py_SetPath", api["additional_functions"])
+        self.assertEqual(api["function_signatures"]["Py_SetPath"], "void (*)(const wchar_t *)")
+        self.assertNotIn("PyList_SetSlice", api["additional_functions"])
+        self.assertEqual(contract["interpreter_sources"], [
+            {"id": "encoding-package", "module": "encodings", "path": "Lib/encodings/__init__.py"},
+            {"id": "encoding-aliases", "module": "encodings.aliases", "path": "Lib/encodings/aliases.py"},
+            {"id": "encoding-utf8", "module": "encodings.utf_8", "path": "Lib/encodings/utf_8.py"},
+            {"id": "encoding-win", "module": "encodings._win_cp_codecs", "path": "Lib/encodings/_win_cp_codecs.py"},
+            {"id": "importlib-external", "module": "_frozen_importlib_external", "path": "Lib/importlib/_bootstrap_external.py"},
+        ])
+
+    def test_repository_custom_api_is_exact_minimal_entry_table(self) -> None:
+        from tools.prepare_windows_frozen_entry_inputs import _target_python_functions
+        root = Path(__file__).resolve().parents[1] / "packaging/windows/frozen-entry"
+        contract, _ = _load_entry_contract(root / "candidate-contract.json")
+        record = json.loads((root / "candidate-input.lock.json").read_text(encoding="utf-8"))
+        expected = set("""
+            PyBool_FromLong PyBytes_FromStringAndSize PyErr_Clear PyErr_SetString
+            PyEval_EvalCode PyImport_ImportModule PyInitConfig_AddModule
+            PyInitConfig_Create PyInitConfig_Free PyInitConfig_SetInt
+            PyInitConfig_SetStr PyInitConfig_SetStrList PyLong_FromLong
+            PyLong_FromUnsignedLongLong PyModule_AddObjectRef PyModule_Create2
+            PyModule_GetDict PyObject_CallFunctionObjArgs PyObject_Free
+            PyObject_GetAttrString PyObject_SetAttrString PyObject_Str
+            PySys_GetObject PyThreadState_Get PyThreadState_GetInterpreter
+            PyThread_get_thread_ident PyTuple_New PyTuple_SetItem PyType_FromSpec
+            PyType_GenericNew PyUnicode_AsUTF8 PyUnicode_FromString
+            Py_CompileStringExFlags Py_DecRef Py_InitializeFromInitConfig
+            Py_IsInitialized Py_SetPath
+        """.split())
+        target = _target_python_functions(
+            record["runtime"]["pyinstaller"]["python_314_api"]["symbols"],
+            contract["python_c_api"],
+        )
+        self.assertEqual(set(target), expected)
+        self.assertEqual(len(target), 37)
+        actual = record["entry_contract"]["python_c_api"]
+        self.assertEqual(actual["function_symbols"], target)
+        self.assertEqual(actual["data_symbols"], ["PyExc_RuntimeError"])
+        self.assertEqual(actual["symbol_count"], 38)
+        imports = {item["dll"]: item["symbols"]
+                   for item in record["entry_contract"]["expected_pe"]["imports"]}
+        self.assertEqual(set(imports), {"KERNEL32.DLL", "USER32.DLL"})
+        self.assertEqual(imports["USER32.DLL"], ["MessageBoxA"])
+        self.assertIn("OutputDebugStringW", imports["KERNEL32.DLL"])
+
+    def test_interpreter_input_fact_binds_exact_bytes_and_rejects_missing(self) -> None:
+        from tools import prepare_windows_frozen_entry_inputs as producer
+        root = Path(__file__).resolve().parents[1]
+        contract = json.loads((root / "packaging/windows/frozen-entry/candidate-contract.json").read_text())
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            for index, member in enumerate(contract["interpreter_sources"]):
+                source = runtime / member["path"]
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(b"# fixture " + str(index).encode() + b"\r\n")
+            facts = producer._interpreter_source_facts(runtime, contract["interpreter_sources"])
+            self.assertEqual(len(facts), 5)
+            for member, fact in zip(contract["interpreter_sources"], facts):
+                data = (runtime / member["path"]).read_bytes()
+                self.assertEqual(fact, {**member, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+            source.write_bytes(b"changed source\n")
+            changed = producer._interpreter_source_facts(runtime, contract["interpreter_sources"])
+            self.assertNotEqual(facts[-1]["sha256"], changed[-1]["sha256"])
+            source.unlink()
+            with self.assertRaisesRegex(CandidateInputError, "missing"):
+                producer._interpreter_source_facts(runtime, contract["interpreter_sources"])
+
+    def test_interpreter_source_declaration_cannot_drift(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        original = json.loads((root / "packaging/windows/frozen-entry/candidate-contract.json").read_text())
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "contract.json"
+            for mutation in ("missing", "extra", "duplicate", "path", "module", "id", "unknown"):
+                changed = json.loads(json.dumps(original))
+                members = changed["interpreter_sources"]
+                if mutation == "missing": members.pop()
+                elif mutation == "extra": members.append({"id": "other", "module": "other", "path": "Lib/other.py"})
+                elif mutation == "duplicate": members[-1] = members[0]
+                elif mutation == "path": members[-1]["path"] = "../external.py"
+                elif mutation == "module": members[-1]["module"] = "importlib._bootstrap_external"
+                elif mutation == "id": members[-1]["id"] = "other"
+                else: members[-1]["fallback"] = "frozen"
+                path.write_text(json.dumps(changed))
+                with self.subTest(mutation=mutation), self.assertRaises(CandidateInputError):
+                    _load_entry_contract(path)
+
     def test_directory_digest_is_ordered_and_path_sensitive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -283,8 +393,43 @@ static int _pyi_dylib_python_import_symbols(void) {
         )
         self.assertEqual(
             contract["pe_allowlist"]["expected_dll_names"],
-            ["ADVAPI32.DLL", "GDI32.DLL", "KERNEL32.DLL", "USER32.DLL"],
+            ["KERNEL32.DLL", "USER32.DLL"],
         )
+
+    def test_os_service_is_separate_from_non_system_dispatcher(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        contract, _ = _load_entry_contract(
+            root / "packaging/windows/frozen-entry/candidate-contract.json"
+        )
+        loader = contract["dynamic_loader"]
+        self.assertEqual(
+            loader["non_system_dispatcher"], "localcat_native_closure_load_verified"
+        )
+        self.assertEqual(loader["pre_authority_external_calls"], [
+            "LoadLibraryExW through localcat_native_closure_load_verified"
+        ])
+        target = loader["system_service_boundary"]
+        self.assertEqual(target["authority"], "Windows OS")
+        self.assertEqual(target["rng"], {
+            "dll": "bcrypt.dll", "symbol": "BCryptGenRandom",
+            "hAlgorithm": 0, "flags": 2,
+        })
+        self.assertNotIn("members", target)
+
+    def test_historical_no_go_cannot_reject_new_system_provider_boundary(self) -> None:
+        from tools.audit_windows_frozen_custom_entry import validate_legacy_target as producer_gate
+        from tools.validate_windows_frozen_custom_entry_no_go import validate_legacy_target as reviewer_gate
+        old = {"schema": "localcat.windows-frozen-entry-candidate-input.v1"}
+        revised = {"schema": "localcat.windows-frozen-entry-candidate-input.v2"}
+        os_boundary = {"schema": "localcat.windows-frozen-entry-candidate-input.v3"}
+        disguised = {**old, "entry_contract": {"dynamic_loader": {"system_provider_target": {}}}}
+        disguised_os = {**old, "entry_contract": {"dynamic_loader": {"system_service_boundary": {}}}}
+        for gate in (producer_gate, reviewer_gate):
+            gate(old)
+            for invalid in (revised, os_boundary, disguised, disguised_os):
+                with self.subTest(gate=gate.__module__, invalid=invalid):
+                    with self.assertRaisesRegex(SystemExit, "historical NO-GO"):
+                        gate(invalid)
 
     def test_repository_candidate_lock_is_self_consistent_and_portable(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
@@ -314,6 +459,21 @@ static int _pyi_dylib_python_import_symbols(void) {
                 (repository_root / "tools/prepare_windows_frozen_entry_inputs.py").read_bytes()
             ).hexdigest(),
         )
+        self.assertNotIn("system_profile_collector", producer)
+        contract, contract_fact = _load_entry_contract(repository_root /
+            "packaging/windows/frozen-entry/candidate-contract.json"
+        )
+        self.assertEqual(record["entry_contract"]["contract_file"], contract_fact)
+        self.assertEqual(record["entry_contract"]["dynamic_loader"], contract["dynamic_loader"])
+        self.assertEqual(record["entry_contract"]["interpreter_sources"], contract["interpreter_sources"])
+        self.assertEqual(record["entry_contract"]["python_c_api"]["additional_function_signatures"]["Py_SetPath"],
+                         "void (*)(const wchar_t *)")
+        self.assertEqual([{key: fact[key] for key in ("id", "module", "path")}
+                          for fact in record["runtime"]["cpython"]["interpreter_sources"]], contract["interpreter_sources"])
+        for fact in record["runtime"]["cpython"]["interpreter_sources"]:
+            self.assertGreater(fact["bytes"], 0)
+            self.assertRegex(fact["sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn("system_provider_profile", record["entry_contract"])
         self.assertEqual(
             producer["replay_wrapper"]["sha256"],
             hashlib.sha256(

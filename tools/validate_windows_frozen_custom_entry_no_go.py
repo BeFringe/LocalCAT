@@ -93,6 +93,15 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(message)
 
 
+def validate_legacy_target(candidate_lock: dict[str, Any]) -> None:
+    require(
+        candidate_lock.get("schema") == "localcat.windows-frozen-entry-candidate-input.v1"
+        and not any(key in candidate_lock.get("entry_contract", {}).get("dynamic_loader", {})
+                    for key in ("system_provider_target", "system_service_boundary")),
+        "historical NO-GO evidence cannot validate a revised system-provider target",
+    )
+
+
 def digest_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -939,6 +948,7 @@ def main() -> int:
 
     evidence = load_object(evidence_path, "evidence")
     candidate_lock = load_object(candidate_lock_path, "candidate lock")
+    validate_legacy_target(candidate_lock)
     matrix_contract = load_object(matrix_path, "matrix contract")
     schema = load_object(schema_path, "schema")
     validate_schema_language(schema)

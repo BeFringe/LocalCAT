@@ -1,5 +1,5 @@
 {
-  "schema": "localcat.windows-frozen-entry-candidate-input.v1",
+  "schema": "localcat.windows-frozen-entry-candidate-input.v3",
   "profile": "windows-x64-frozen-custom-entry-candidate",
   "support": {
     "verified_on": "2026-08-27",
@@ -31,8 +31,8 @@
     "preparer": {
       "role": "candidate input producer",
       "name": "prepare_windows_frozen_entry_inputs.py",
-      "bytes": 44273,
-      "sha256": "0701b5edc62f434a4a5b3cf603261630e7484cb831361117a2b2d2e750ea0f0e"
+      "bytes": 47277,
+      "sha256": "776d0de13decc098ea00cf0344032d579a398ff93dcc88410e5c87e75a202df6"
     },
     "replay_wrapper": {
       "role": "candidate input replay wrapper",
@@ -43,8 +43,8 @@
     "stock_audit_helper": {
       "role": "stock audit helper",
       "name": "audit_w3_stock_bootloader.py",
-      "bytes": 33916,
-      "sha256": "f7a4db1c7986c1225a876c33b7182b3f41b5d56460360d518d3c28e1b76033e2"
+      "bytes": 33114,
+      "sha256": "0afa0b8a9716e208d28adbc24b0d09eda815f5abc5877fd29220da28a27a5731"
     },
     "probe_evidence_recorder": {
       "role": "probe build evidence recorder",
@@ -1017,7 +1017,44 @@
           "VERSION.DLL",
           "WS2_32.DLL"
         ]
-      }
+      },
+      "interpreter_sources": [
+        {
+          "id": "encoding-package",
+          "module": "encodings",
+          "path": "Lib/encodings/__init__.py",
+          "bytes": 6127,
+          "sha256": "dbf9022ec9b4d68d4f3f76c9cda44b008c3942df7f927189daba810321bcfddd"
+        },
+        {
+          "id": "encoding-aliases",
+          "module": "encodings.aliases",
+          "path": "Lib/encodings/aliases.py",
+          "bytes": 16823,
+          "sha256": "da008f5eb1b85548dcc319cd906b27286502dd1bd7b997fa902d6fe8593384e6"
+        },
+        {
+          "id": "encoding-utf8",
+          "module": "encodings.utf_8",
+          "path": "Lib/encodings/utf_8.py",
+          "bytes": 1047,
+          "sha256": "9c54c7db8ce0722ca4ddb5f45d4e170357e37991afb3fcdc091721bf6c09257e"
+        },
+        {
+          "id": "encoding-win",
+          "module": "encodings._win_cp_codecs",
+          "path": "Lib/encodings/_win_cp_codecs.py",
+          "bytes": 1265,
+          "sha256": "344faac7c9b1702d987233c500f5793f1d2729b7722578ceb344747078883b8e"
+        },
+        {
+          "id": "importlib-external",
+          "module": "_frozen_importlib_external",
+          "path": "Lib/importlib/_bootstrap_external.py",
+          "bytes": 59247,
+          "sha256": "3562b2fe92d20c72c29d21614c354703989974cb9cd867b57c56d2f0484c0dd9"
+        }
+      ]
     },
     "pyinstaller": {
       "version": "6.22.2",
@@ -1124,8 +1161,8 @@
     "contract_file": {
       "role": "frozen-entry target contract",
       "name": "candidate-contract.json",
-      "bytes": 7613,
-      "sha256": "280af2a0c190b5938157621384caaabaf32d1bb0bdc1cd51d6051a857d6f8964"
+      "bytes": 10880,
+      "sha256": "4a8f5175f0c02c7835bbfe67defbcfafaf1b7353a3373a1aad6ad07f0670f382"
     },
     "runtime_abi": {
       "module": "_localcat_frozen_bootstrap",
@@ -1218,6 +1255,7 @@
         "/GUARD:CF",
         "/HIGHENTROPYVA",
         "/MACHINE:X64",
+        "/NOCOFFGRPINFO",
         "/NXCOMPAT",
         "/OPT:ICF",
         "/OPT:REF",
@@ -1228,52 +1266,54 @@
       "security_directory": "absent"
     },
     "python_c_api": {
-      "base": "pinned PyInstaller CPython 3.14 PEP-741 binding path",
+      "base": "Explicit subset of PyInstaller 6.22.2 CPython 3.14 PEP-741 bindings plus custom entry functions",
       "base_signature_authority": "bootloader/src/pyi_dylib_python.h in the pinned PyInstaller source aggregate",
-      "function_symbols": [
-        "Py_DecRef",
-        "Py_DecodeLocale",
-        "Py_Finalize",
-        "Py_IsInitialized",
-        "Py_PreInitialize",
-        "PyInitConfig_Create",
-        "PyInitConfig_Free",
-        "PyInitConfig_SetInt",
-        "PyInitConfig_SetStr",
-        "PyInitConfig_SetStrList",
-        "PyInitConfig_GetError",
-        "Py_InitializeFromInitConfig",
-        "PyErr_Clear",
+      "removed_base_functions": [
         "PyErr_Fetch",
         "PyErr_NormalizeException",
         "PyErr_Occurred",
         "PyErr_Print",
         "PyErr_Restore",
-        "PyEval_EvalCode",
         "PyImport_AddModule",
         "PyImport_ExecCodeModule",
-        "PyImport_ImportModule",
+        "PyInitConfig_GetError",
         "PyList_Append",
         "PyMarshal_ReadObjectFromString",
         "PyMem_RawFree",
-        "PyModule_GetDict",
         "PyObject_CallFunction",
+        "PyPreConfig_InitIsolatedConfig",
+        "PyRun_SimpleStringFlags",
+        "PyStatus_Exception",
+        "PySys_SetObject",
+        "PyUnicode_Decode",
+        "PyUnicode_DecodeFSDefault",
+        "PyUnicode_FromFormat",
+        "PyUnicode_Join",
+        "PyUnicode_Replace",
+        "Py_DecodeLocale",
+        "Py_Finalize",
+        "Py_PreInitialize"
+      ],
+      "function_symbols": [
+        "Py_DecRef",
+        "Py_IsInitialized",
+        "PyInitConfig_Create",
+        "PyInitConfig_Free",
+        "PyInitConfig_SetInt",
+        "PyInitConfig_SetStr",
+        "PyInitConfig_SetStrList",
+        "Py_InitializeFromInitConfig",
+        "PyErr_Clear",
+        "PyEval_EvalCode",
+        "PyImport_ImportModule",
+        "PyModule_GetDict",
         "PyObject_CallFunctionObjArgs",
         "PyObject_GetAttrString",
         "PyObject_SetAttrString",
         "PyObject_Str",
-        "PyPreConfig_InitIsolatedConfig",
-        "PyRun_SimpleStringFlags",
-        "PyStatus_Exception",
         "PySys_GetObject",
-        "PySys_SetObject",
         "PyUnicode_AsUTF8",
-        "PyUnicode_Decode",
-        "PyUnicode_DecodeFSDefault",
-        "PyUnicode_FromFormat",
         "PyUnicode_FromString",
-        "PyUnicode_Join",
-        "PyUnicode_Replace",
         "PyBool_FromLong",
         "PyBytes_FromStringAndSize",
         "PyErr_SetString",
@@ -1282,7 +1322,6 @@
         "PyLong_FromUnsignedLongLong",
         "PyModule_AddObjectRef",
         "PyModule_Create2",
-        "PyObject_CallNoArgs",
         "PyObject_Free",
         "PyThreadState_Get",
         "PyThreadState_GetInterpreter",
@@ -1292,7 +1331,7 @@
         "PyType_FromSpec",
         "PyType_GenericNew",
         "Py_CompileStringExFlags",
-        "Py_IncRef"
+        "Py_SetPath"
       ],
       "additional_function_signatures": {
         "PyBool_FromLong": "PyObject *(*)(long)",
@@ -1303,7 +1342,6 @@
         "PyLong_FromUnsignedLongLong": "PyObject *(*)(unsigned long long)",
         "PyModule_AddObjectRef": "int (*)(PyObject *, const char *, PyObject *)",
         "PyModule_Create2": "PyObject *(*)(PyModuleDef *, int)",
-        "PyObject_CallNoArgs": "PyObject *(*)(PyObject *)",
         "PyObject_Free": "void (*)(void *)",
         "PyThreadState_Get": "PyThreadState *(*)(void)",
         "PyThreadState_GetInterpreter": "PyInterpreterState *(*)(PyThreadState *)",
@@ -1313,7 +1351,7 @@
         "PyType_FromSpec": "PyObject *(*)(PyType_Spec *)",
         "PyType_GenericNew": "PyObject *(*)(PyTypeObject *, PyObject *, PyObject *)",
         "Py_CompileStringExFlags": "PyObject *(*)(const char *, const char *, int, PyCompilerFlags *, int)",
-        "Py_IncRef": "void (*)(PyObject *)"
+        "Py_SetPath": "void (*)(const wchar_t *)"
       },
       "data_symbols": [
         "PyExc_RuntimeError"
@@ -1321,7 +1359,7 @@
       "data_export_types": {
         "PyExc_RuntimeError": "PyObject ** (address of exported PyObject * variable)"
       },
-      "symbol_count": 63,
+      "symbol_count": 38,
       "missing_exports": []
     },
     "expected_pe": {
@@ -1335,40 +1373,15 @@
       },
       "imports": [
         {
-          "dll": "ADVAPI32.DLL",
-          "symbols": [
-            "ConvertSidToStringSidW",
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-            "GetTokenInformation",
-            "OpenProcessToken"
-          ]
-        },
-        {
-          "dll": "GDI32.DLL",
-          "symbols": [
-            "CreateFontIndirectW",
-            "DeleteObject",
-            "SelectObject"
-          ]
-        },
-        {
           "dll": "KERNEL32.DLL",
           "symbols": [
             "CloseHandle",
             "CompareStringOrdinal",
-            "CompareStringW",
-            "CreateDirectoryW",
             "CreateFileW",
-            "CreateProcessW",
-            "CreateSymbolicLinkW",
-            "CreateToolhelp32Snapshot",
             "DeleteCriticalSection",
-            "DeleteFileW",
             "EncodePointer",
             "EnterCriticalSection",
             "ExitProcess",
-            "ExpandEnvironmentStringsW",
-            "FileTimeToSystemTime",
             "FindClose",
             "FindFirstFileExW",
             "FindFirstFileW",
@@ -1378,7 +1391,6 @@
             "FlsGetValue",
             "FlsSetValue",
             "FlushFileBuffers",
-            "FormatMessageW",
             "FreeEnvironmentStringsW",
             "FreeLibrary",
             "GetACP",
@@ -1387,22 +1399,17 @@
             "GetCommandLineW",
             "GetConsoleMode",
             "GetConsoleOutputCP",
-            "GetCurrentDirectoryW",
             "GetCurrentProcess",
             "GetCurrentProcessId",
             "GetCurrentThreadId",
             "GetDriveTypeW",
             "GetEnvironmentStringsW",
             "GetEnvironmentVariableW",
-            "GetExitCodeProcess",
-            "GetFileAttributesExW",
-            "GetFileAttributesW",
             "GetFileInformationByHandle",
             "GetFileInformationByHandleEx",
             "GetFileSizeEx",
             "GetFileType",
             "GetFinalPathNameByHandleW",
-            "GetFullPathNameW",
             "GetLastError",
             "GetModuleFileNameW",
             "GetModuleHandleExW",
@@ -1413,10 +1420,7 @@
             "GetStartupInfoW",
             "GetStdHandle",
             "GetStringTypeW",
-            "GetSystemDirectoryW",
             "GetSystemTimeAsFileTime",
-            "GetTempPathW",
-            "GetTimeZoneInformation",
             "GetVolumeInformationByHandleW",
             "HeapAlloc",
             "HeapFree",
@@ -1428,41 +1432,24 @@
             "IsDebuggerPresent",
             "IsProcessorFeaturePresent",
             "IsValidCodePage",
-            "K32EnumProcessModules",
-            "K32GetModuleFileNameExW",
             "LCMapStringW",
             "LeaveCriticalSection",
             "LoadLibraryExW",
-            "LocalFree",
-            "MulDiv",
             "MultiByteToWideChar",
-            "OpenProcess",
-            "PeekNamedPipe",
-            "Process32FirstW",
-            "Process32NextW",
-            "QueryFullProcessImageNameW",
+            "OutputDebugStringW",
             "QueryPerformanceCounter",
-            "QueryPerformanceFrequency",
             "RaiseException",
-            "ReadConsoleW",
             "ReadFile",
-            "RemoveDirectoryW",
             "RtlCaptureContext",
             "RtlLookupFunctionEntry",
             "RtlPcToFileHeader",
             "RtlUnwindEx",
             "RtlVirtualUnwind",
-            "SetConsoleCtrlHandler",
             "SetDefaultDllDirectories",
-            "SetEndOfFile",
-            "SetEnvironmentVariableW",
-            "SetErrorMode",
             "SetFilePointerEx",
             "SetLastError",
             "SetStdHandle",
             "SetUnhandledExceptionFilter",
-            "Sleep",
-            "SystemTimeToTzSpecificLocalTime",
             "TerminateProcess",
             "TlsAlloc",
             "TlsFree",
@@ -1470,7 +1457,6 @@
             "TlsSetValue",
             "UnhandledExceptionFilter",
             "VirtualProtect",
-            "WaitForSingleObject",
             "WideCharToMultiByte",
             "WriteConsoleW",
             "WriteFile"
@@ -1479,38 +1465,7 @@
         {
           "dll": "USER32.DLL",
           "symbols": [
-            "CreateWindowExW",
-            "DefWindowProcW",
-            "DestroyIcon",
-            "DestroyWindow",
-            "DialogBoxIndirectParamW",
-            "DispatchMessageW",
-            "DrawTextW",
-            "EndDialog",
-            "GetClientRect",
-            "GetCursorPos",
-            "GetDC",
-            "GetDialogBaseUnits",
-            "GetMessageW",
-            "GetMonitorInfoW",
-            "GetSystemMetrics",
-            "GetWindowLongPtrW",
-            "InvalidateRect",
-            "MessageBoxA",
-            "MessageBoxW",
-            "MonitorFromPoint",
-            "MoveWindow",
-            "MsgWaitForMultipleObjects",
-            "PeekMessageW",
-            "PostMessageW",
-            "RegisterClassW",
-            "ReleaseDC",
-            "SendMessageW",
-            "SetWindowLongPtrW",
-            "ShowWindow",
-            "ShutdownBlockReasonCreate",
-            "SystemParametersInfoW",
-            "TranslateMessage"
+            "MessageBoxA"
           ]
         }
       ],
@@ -1533,7 +1488,7 @@
         "one retained-handle fixture"
       ],
       "external_roles": [
-        "versioned Windows system DLL and API-set resolution evidence"
+        "Windows OS services through audited application API and loader resolution policy"
       ]
     },
     "dynamic_loader": {
@@ -1544,8 +1499,44 @@
       ],
       "pre_authority_external_calls": [
         "LoadLibraryExW through localcat_native_closure_load_verified"
-      ]
-    }
+      ],
+      "system_service_boundary": {
+        "authority": "Windows OS",
+        "rng": {
+          "dll": "bcrypt.dll",
+          "symbol": "BCryptGenRandom",
+          "hAlgorithm": 0,
+          "flags": 2
+        }
+      }
+    },
+    "interpreter_sources": [
+      {
+        "id": "encoding-package",
+        "module": "encodings",
+        "path": "Lib/encodings/__init__.py"
+      },
+      {
+        "id": "encoding-aliases",
+        "module": "encodings.aliases",
+        "path": "Lib/encodings/aliases.py"
+      },
+      {
+        "id": "encoding-utf8",
+        "module": "encodings.utf_8",
+        "path": "Lib/encodings/utf_8.py"
+      },
+      {
+        "id": "encoding-win",
+        "module": "encodings._win_cp_codecs",
+        "path": "Lib/encodings/_win_cp_codecs.py"
+      },
+      {
+        "id": "importlib-external",
+        "module": "_frozen_importlib_external",
+        "path": "Lib/importlib/_bootstrap_external.py"
+      }
+    ]
   },
   "assertions": [
     {
@@ -1584,6 +1575,6 @@
       "detail": "the selected MSVC stock rebuild has the approved compiler-generated import delta"
     }
   ],
-  "candidate_input_digest": "06c37c4bf251700bdb16e5b4d288b3c8474e87d637ce7a290d9c33b1586e9619",
+  "candidate_input_digest": "e5900306d1d2703b24b425e2ecfcf7b42c10886af455fc47b5df4e8bccc85ac9",
   "status": "MATERIALIZED"
 }

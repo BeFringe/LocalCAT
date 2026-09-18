@@ -1,5 +1,5 @@
 {
-  "schema": "localcat.windows-frozen-entry-target-contract.v1",
+  "schema": "localcat.windows-frozen-entry-target-contract.v3",
   "runtime_abi": {
     "module": "_localcat_frozen_bootstrap",
     "protocol": "localcat.frozen-bootstrap-attestation.v1",
@@ -91,6 +91,7 @@
       "/GUARD:CF",
       "/HIGHENTROPYVA",
       "/MACHINE:X64",
+      "/NOCOFFGRPINFO",
       "/NXCOMPAT",
       "/OPT:ICF",
       "/OPT:REF",
@@ -101,8 +102,34 @@
     "security_directory": "absent"
   },
   "python_c_api": {
-    "base": "PyInstaller 6.22.2 CPython 3.14 PEP-741 binding path",
+    "base": "Explicit subset of PyInstaller 6.22.2 CPython 3.14 PEP-741 bindings plus custom entry functions",
     "base_signature_authority": "bootloader/src/pyi_dylib_python.h in the pinned PyInstaller source aggregate",
+    "removed_base_functions": [
+      "PyErr_Fetch",
+      "PyErr_NormalizeException",
+      "PyErr_Occurred",
+      "PyErr_Print",
+      "PyErr_Restore",
+      "PyImport_AddModule",
+      "PyImport_ExecCodeModule",
+      "PyInitConfig_GetError",
+      "PyList_Append",
+      "PyMarshal_ReadObjectFromString",
+      "PyMem_RawFree",
+      "PyObject_CallFunction",
+      "PyPreConfig_InitIsolatedConfig",
+      "PyRun_SimpleStringFlags",
+      "PyStatus_Exception",
+      "PySys_SetObject",
+      "PyUnicode_Decode",
+      "PyUnicode_DecodeFSDefault",
+      "PyUnicode_FromFormat",
+      "PyUnicode_Join",
+      "PyUnicode_Replace",
+      "Py_DecodeLocale",
+      "Py_Finalize",
+      "Py_PreInitialize"
+    ],
     "additional_functions": [
       "PyBool_FromLong",
       "PyBytes_FromStringAndSize",
@@ -112,7 +139,6 @@
       "PyLong_FromUnsignedLongLong",
       "PyModule_AddObjectRef",
       "PyModule_Create2",
-      "PyObject_CallNoArgs",
       "PyObject_Free",
       "PyThreadState_Get",
       "PyThreadState_GetInterpreter",
@@ -122,7 +148,7 @@
       "PyType_FromSpec",
       "PyType_GenericNew",
       "Py_CompileStringExFlags",
-      "Py_IncRef"
+      "Py_SetPath"
     ],
     "function_signatures": {
       "PyBool_FromLong": "PyObject *(*)(long)",
@@ -133,7 +159,6 @@
       "PyLong_FromUnsignedLongLong": "PyObject *(*)(unsigned long long)",
       "PyModule_AddObjectRef": "int (*)(PyObject *, const char *, PyObject *)",
       "PyModule_Create2": "PyObject *(*)(PyModuleDef *, int)",
-      "PyObject_CallNoArgs": "PyObject *(*)(PyObject *)",
       "PyObject_Free": "void (*)(void *)",
       "PyThreadState_Get": "PyThreadState *(*)(void)",
       "PyThreadState_GetInterpreter": "PyInterpreterState *(*)(PyThreadState *)",
@@ -143,7 +168,7 @@
       "PyType_FromSpec": "PyObject *(*)(PyType_Spec *)",
       "PyType_GenericNew": "PyObject *(*)(PyTypeObject *, PyObject *, PyObject *)",
       "Py_CompileStringExFlags": "PyObject *(*)(const char *, const char *, int, PyCompilerFlags *, int)",
-      "Py_IncRef": "void (*)(PyObject *)"
+      "Py_SetPath": "void (*)(const wchar_t *)"
     },
     "data_exports": [
       "PyExc_RuntimeError"
@@ -152,6 +177,13 @@
       "PyExc_RuntimeError": "PyObject ** (address of exported PyObject * variable)"
     }
   },
+  "interpreter_sources": [
+    {"id": "encoding-package", "module": "encodings", "path": "Lib/encodings/__init__.py"},
+    {"id": "encoding-aliases", "module": "encodings.aliases", "path": "Lib/encodings/aliases.py"},
+    {"id": "encoding-utf8", "module": "encodings.utf_8", "path": "Lib/encodings/utf_8.py"},
+    {"id": "encoding-win", "module": "encodings._win_cp_codecs", "path": "Lib/encodings/_win_cp_codecs.py"},
+    {"id": "importlib-external", "module": "_frozen_importlib_external", "path": "Lib/importlib/_bootstrap_external.py"}
+  ],
   "pe_allowlist": {
     "base_stock_runw_sha256": "87b0c589906a5d690c26c602bf2ee7e43b3eab55574bf72887a8ca07fbb2dba0",
     "compiler_probe": {
@@ -169,28 +201,94 @@
       "removed_symbols": {}
     },
     "expected_dll_names": [
-      "ADVAPI32.DLL",
-      "GDI32.DLL",
       "KERNEL32.DLL",
       "USER32.DLL"
     ],
     "remove_dlls": [
+      "ADVAPI32.DLL",
+      "GDI32.DLL",
       "COMCTL32.DLL"
     ],
     "remove_symbols": {
       "KERNEL32.DLL": [
-        "SetDllDirectoryW"
+        "CompareStringW",
+        "CreateDirectoryW",
+        "CreateProcessW",
+        "CreateSymbolicLinkW",
+        "CreateToolhelp32Snapshot",
+        "DeleteFileW",
+        "ExpandEnvironmentStringsW",
+        "FileTimeToSystemTime",
+        "FormatMessageW",
+        "GetCurrentDirectoryW",
+        "GetExitCodeProcess",
+        "GetFileAttributesExW",
+        "GetFullPathNameW",
+        "GetTempPathW",
+        "GetTimeZoneInformation",
+        "K32EnumProcessModules",
+        "K32GetModuleFileNameExW",
+        "LocalFree",
+        "MulDiv",
+        "OpenProcess",
+        "PeekNamedPipe",
+        "Process32FirstW",
+        "Process32NextW",
+        "QueryFullProcessImageNameW",
+        "QueryPerformanceFrequency",
+        "ReadConsoleW",
+        "RemoveDirectoryW",
+        "SetConsoleCtrlHandler",
+        "SetDllDirectoryW",
+        "SetEndOfFile",
+        "SetEnvironmentVariableW",
+        "SetErrorMode",
+        "Sleep",
+        "SystemTimeToTzSpecificLocalTime",
+        "WaitForSingleObject"
+      ],
+      "USER32.DLL": [
+        "CreateWindowExW",
+        "DefWindowProcW",
+        "DestroyIcon",
+        "DestroyWindow",
+        "DialogBoxIndirectParamW",
+        "DispatchMessageW",
+        "DrawTextW",
+        "EndDialog",
+        "GetClientRect",
+        "GetCursorPos",
+        "GetDC",
+        "GetDialogBaseUnits",
+        "GetMessageW",
+        "GetMonitorInfoW",
+        "GetSystemMetrics",
+        "GetWindowLongPtrW",
+        "InvalidateRect",
+        "MessageBoxW",
+        "MonitorFromPoint",
+        "MoveWindow",
+        "MsgWaitForMultipleObjects",
+        "PeekMessageW",
+        "PostMessageW",
+        "RegisterClassW",
+        "ReleaseDC",
+        "SendMessageW",
+        "SetWindowLongPtrW",
+        "ShowWindow",
+        "ShutdownBlockReasonCreate",
+        "SystemParametersInfoW",
+        "TranslateMessage"
       ]
     },
     "add_symbols": {
       "KERNEL32.DLL": [
         "CompareStringOrdinal",
-        "GetFileAttributesW",
         "GetFileInformationByHandleEx",
         "GetFinalPathNameByHandleW",
-        "GetSystemDirectoryW",
         "GetVolumeInformationByHandleW",
         "InitializeCriticalSectionAndSpinCount",
+        "OutputDebugStringW",
         "SetDefaultDllDirectories",
         "TlsAlloc",
         "TlsFree",
@@ -207,7 +305,16 @@
     ],
     "pre_authority_external_calls": [
       "LoadLibraryExW through localcat_native_closure_load_verified"
-    ]
+    ],
+    "system_service_boundary": {
+      "authority": "Windows OS",
+      "rng": {
+        "dll": "bcrypt.dll",
+        "symbol": "BCryptGenRandom",
+        "hAlgorithm": 0,
+        "flags": 2
+      }
+    }
   },
   "boot_tcb": {
     "native_roles": [
@@ -222,7 +329,7 @@
       "one retained-handle fixture"
     ],
     "external_roles": [
-      "versioned Windows system DLL and API-set resolution evidence"
+      "Windows OS services through audited application API and loader resolution policy"
     ]
   }
 }

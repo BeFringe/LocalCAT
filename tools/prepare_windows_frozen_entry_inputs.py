@@ -34,9 +34,7 @@ from tools.audit_w3_stock_bootloader import (
     audit_sources,
     sha256_file,
 )
-
-
-SCHEMA_ID = "localcat.windows-frozen-entry-candidate-input.v1"
+SCHEMA_ID = "localcat.windows-frozen-entry-candidate-input.v3"
 DIRECTORY_DIGEST_ALGORITHM = "localcat.directory-input-sha256.v1"
 EXPECTED_PYTHON_VERSION = "3.14.7"
 EXPECTED_MACHINE = 0x8664
@@ -44,13 +42,26 @@ SUPPORT_REFERENCE = (
     "https://learn.microsoft.com/en-us/visualstudio/releases/2022/"
     "release-history"
 )
-ENTRY_CONTRACT_SCHEMA = "localcat.windows-frozen-entry-target-contract.v1"
+ENTRY_CONTRACT_SCHEMA = "localcat.windows-frozen-entry-target-contract.v3"
+# Pin the interpreter's system API call; collect host observations separately.
+SYSTEM_SERVICE_BOUNDARY = {
+    "authority": "Windows OS",
+    "rng": {"dll": "bcrypt.dll", "symbol": "BCryptGenRandom",
+            "hAlgorithm": 0, "flags": 2},
+}
 PROBE_EVIDENCE_SCHEMA = "localcat.windows-frozen-entry-toolchain-probe-evidence.v1"
 PROBE_PREBUILD_EVIDENCE_SCHEMA = (
     "localcat.windows-frozen-entry-toolchain-probe-prebuild-evidence.v1"
 )
 PROBE_BUILD_ARGUMENTS = ["bootloader/waf", "all", "--target-arch=64bit", "-j1"]
 PROBE_CLEARED_ENVIRONMENT = ["CL", "INCLUDE", "LIB", "LIBPATH", "LINK", "_CL_", "_LINK_"]
+INTERPRETER_SOURCES = (
+    ("encoding-package", "encodings", "Lib/encodings/__init__.py"),
+    ("encoding-aliases", "encodings.aliases", "Lib/encodings/aliases.py"),
+    ("encoding-utf8", "encodings.utf_8", "Lib/encodings/utf_8.py"),
+    ("encoding-win", "encodings._win_cp_codecs", "Lib/encodings/_win_cp_codecs.py"),
+    ("importlib-external", "_frozen_importlib_external", "Lib/importlib/_bootstrap_external.py"),
+)
 
 _IMPORT_FUNCTION_RE = re.compile(r"(?m)^\s+_IMPORT_FUNCTION\((Py[A-Za-z0-9_]+)\)\s*(?:/\*.*\*/)?$")
 
@@ -469,6 +480,28 @@ def _require_exact_keys(value: Any, expected: set[str], role: str) -> dict[str, 
     return value
 
 
+def _validate_interpreter_sources(members: Any) -> None:
+    expected = [dict(zip(("id", "module", "path"), row)) for row in INTERPRETER_SOURCES]
+    if members != expected:
+        raise CandidateInputError("interpreter sources differ from the approved exact startup set")
+
+
+def _interpreter_source_facts(python_root: Path, members: Any) -> list[dict[str, Any]]:
+    """Materialize exact bytes, not runtime retained proof or a frozen fallback."""
+    _validate_interpreter_sources(members)
+    root = _require_directory(python_root, "CPython source root")
+    facts = []
+    for member in members:
+        source = _require_file(root / member["path"], "interpreter source " + member["id"])
+        if not source.is_relative_to(root):
+            raise CandidateInputError("interpreter source escapes the CPython input root")
+        data = source.read_bytes()
+        if not data:
+            raise CandidateInputError("empty interpreter source " + member["id"])
+        facts.append({**member, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+    return facts
+
+
 def _validate_entry_contract_shape(contract: dict[str, Any]) -> None:
     sections = {
         "runtime_abi",
@@ -478,8 +511,10 @@ def _validate_entry_contract_shape(contract: dict[str, Any]) -> None:
         "pe_allowlist",
         "dynamic_loader",
         "boot_tcb",
+        "interpreter_sources",
     }
     _require_exact_keys(contract, {"schema", *sections}, "entry contract")
+    _validate_interpreter_sources(contract["interpreter_sources"])
     _require_exact_keys(
         contract["runtime_abi"],
         {"module", "protocol", "authority_type", "state_machine"},
@@ -519,6 +554,7 @@ def _validate_entry_contract_shape(contract: dict[str, Any]) -> None:
         {
             "base",
             "base_signature_authority",
+            "removed_base_functions",
             "additional_functions",
             "function_signatures",
             "data_exports",
@@ -545,9 +581,11 @@ def _validate_entry_contract_shape(contract: dict[str, Any]) -> None:
     )
     _require_exact_keys(
         contract["dynamic_loader"],
-        {"non_system_dispatcher", "allowed_flags", "pre_authority_external_calls"},
+        {"non_system_dispatcher", "allowed_flags", "pre_authority_external_calls", "system_service_boundary"},
         "dynamic_loader",
     )
+    if _canonical_json(contract["dynamic_loader"]["system_service_boundary"]) != _canonical_json(SYSTEM_SERVICE_BOUNDARY):
+        raise CandidateInputError("system service boundary differs from the approved OS delegation")
     _require_exact_keys(
         contract["boot_tcb"],
         {"native_roles", "python_roles", "external_roles"},
@@ -715,6 +753,18 @@ def _validate_probe_build_evidence(
         or result["delay_imports"] != probe_fact["delay_imports"]
     ):
         raise CandidateInputError("probe build evidence result mismatch")
+
+
+def _target_python_functions(base_symbols: list[str], policy: dict[str, Any]) -> list[str]:
+    removed = policy["removed_base_functions"]
+    additional = policy["additional_functions"]
+    if len(removed) != len(set(removed)) or not set(removed) <= set(base_symbols):
+        raise CandidateInputError("custom Python API removes duplicate or absent base function")
+    if len(additional) != len(set(additional)) or set(removed) & set(additional):
+        raise CandidateInputError("custom Python API adds duplicate or removed function")
+    if set(policy["function_signatures"]) != set(additional):
+        raise CandidateInputError("custom Python function signature table is not exact")
+    return _ordered_unique([*(name for name in base_symbols if name not in removed), *additional])
 
 
 def _expected_entry_imports(
@@ -907,16 +957,13 @@ def build_candidate_input(args: argparse.Namespace) -> dict[str, Any]:
     exported = set(python_dll["exports"])
     missing_api = sorted(set(api_table["symbols"]) - exported)
     runtime_closure = _runtime_native_closure(python_root)
+    interpreter_sources = _interpreter_source_facts(python_root, entry_contract["interpreter_sources"])
     api_policy = entry_contract["python_c_api"]
     function_signatures = api_policy["function_signatures"]
     data_export_types = api_policy["data_export_types"]
-    if set(function_signatures) != set(api_policy["additional_functions"]):
-        raise CandidateInputError("custom Python function signature table is not exact")
     if set(data_export_types) != set(api_policy["data_exports"]):
         raise CandidateInputError("custom Python data export type table is not exact")
-    target_function_symbols = _ordered_unique(
-        [*api_table["symbols"], *api_policy["additional_functions"]]
-    )
+    target_function_symbols = _target_python_functions(api_table["symbols"], api_policy)
     target_data_symbols = list(api_policy["data_exports"])
     if len(target_data_symbols) != len(set(target_data_symbols)):
         raise CandidateInputError("duplicate data symbol in Python C API target")
@@ -1060,6 +1107,7 @@ def build_candidate_input(args: argparse.Namespace) -> dict[str, Any]:
                 "import_library": python_import_library,
                 "headers": python_headers,
                 "native_closure": runtime_closure,
+                "interpreter_sources": interpreter_sources,
             },
             "pyinstaller": {
                 "version": EXPECTED_PYINSTALLER_VERSION,
@@ -1079,8 +1127,9 @@ def build_candidate_input(args: argparse.Namespace) -> dict[str, Any]:
             "patch": entry_contract["patch"],
             "build": entry_contract["build"],
             "python_c_api": {
-                "base": "pinned PyInstaller CPython 3.14 PEP-741 binding path",
+                "base": api_policy["base"],
                 "base_signature_authority": api_policy["base_signature_authority"],
+                "removed_base_functions": api_policy["removed_base_functions"],
                 "function_symbols": target_function_symbols,
                 "additional_function_signatures": function_signatures,
                 "data_symbols": target_data_symbols,
@@ -1099,6 +1148,7 @@ def build_candidate_input(args: argparse.Namespace) -> dict[str, Any]:
             },
             "boot_tcb": entry_contract["boot_tcb"],
             "dynamic_loader": entry_contract["dynamic_loader"],
+            "interpreter_sources": entry_contract["interpreter_sources"],
         },
         "assertions": assertions,
     }
