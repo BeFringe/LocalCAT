@@ -1,5 +1,11 @@
 # Cross-Spec Amendment Dispatch and Integration Ledger
 
+## 当前交付解释（2026-09-20）
+
+source 已由 Task 6.6b 完成独立产品验收。下文 `SOURCE_MERGED_PASS` 是已交付 source 的事实；它不是 frozen 通过，也不因 frozen 仍未达到 `MERGED_PASS` 而变成 source 未完成。
+
+[ADR-028](../../steering/adr/adr-028.md) 部分取代原 W3 的完整 Boot TCB/native entry/source-only 前置；下方旧 W3 映射和 staged vocabulary 保留历史用途。WA-06 R3 source、R4 pre-build 与 WA-07/08 source 成果保留，不重签为 packaged 成果；新的 frozen 输入与消费合同在后续设计中映射，只修改实际受影响的 owner 边界。本轮不恢复旧 W3 实验，也不修改任何原始 evidence。
+
 ## Purpose and Authority
 
 本文件是 `windows-platform-enablement` 的派发/集成计划，不是相邻 Spec 的 authority 替代物。依据 `.kiro/steering/spec-ownership.md`，每个 amendment 必须修改 owning Spec 的 Requirements/Design/Tasks、独立获批并形成可追踪提交；Spec/合同是 owner，Agent、branch 与 worktree 都不是。单个执行者或 reviewer 可以覆盖多个 Spec，Windows 分支只记录请求、依赖、提交可达性与最终 evidence。表中 task ID 是拟追加到现有 task 后的 amendment ID，采用 `x.ya`，不重排或冒充原 checkbox。
@@ -70,11 +76,11 @@ ADR-020～026 promotion、Windows owning scope、WA-01～08 current R/D/T delta�
 | WA-03 | `R2` | `multi-document-project-workspace` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-04 | `R1` | `language-resource-portability` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-05 | `R1` | `tmx-context-interchange` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
-| WA-06 | `R4` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
-| WA-07 | `R1` | `feature5-ui-integration` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
-| WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ACKNOWLEDGED` | `ACKNOWLEDGED` |
+| WA-06 | `R4` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `FROZEN_PREBUILD_COMMITTED` |
+| WA-07 | `R1` | `feature5-ui-integration` | `ACKNOWLEDGED` | `FROZEN_PREBUILD_COMMITTED` |
+| WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 
-Superseded request history：WA-03 `R1`曾获acknowledgement，现由采用`WindowsDocumentedPublishV1`且移除运行时硬件registry/power-lab前置的`R2`完整取代；WA-06 `R1`曾因V1不能表达MIC authority由`R2`取代，继而由纳入ADR-024 provider-agnostic主体与ADR-025正常发布边界的`R3`取代。2026-09-19用户批准[修订请求](task7-prebuild-consumption-amendment.md)（提案提交`b48a291ce831d7b3c05e1363105fa84a4636e26a`），Core、平台和Feature5的Design/Tasks/ledger增量共同落盘，WA-06 current升为`R4`；Requirements语义不变，WA-07继续R1。WA-03 `R1`及WA-06 `R1`/`R2`/`R3`标记`SUPERSEDED`；R3 source evidence保留原始anchor与范围，不改签为R4 frozen PASS。R4尚无实现integration anchor或pre-build/runtime完成事实。
+Superseded request history：WA-03 `R1`曾获acknowledgement，现由采用`WindowsDocumentedPublishV1`且移除运行时硬件registry/power-lab前置的`R2`完整取代；WA-06 `R1`曾因V1不能表达MIC authority由`R2`取代，继而由纳入ADR-024 provider-agnostic主体与ADR-025正常发布边界的`R3`取代。2026-09-19用户批准[修订请求](task7-prebuild-consumption-amendment.md)（提案提交`b48a291ce831d7b3c05e1363105fa84a4636e26a`），Core、平台和Feature5的Design/Tasks/ledger增量共同落盘，WA-06 current升为`R4`；Requirements语义不变，WA-07继续R1。WA-03 `R1`及WA-06 `R1`/`R2`/`R3`标记`SUPERSEDED`；R3 source evidence保留原始anchor与范围，不改签为R4 frozen PASS。批准落盘时R4尚无实现integration anchor或pre-build/runtime完成事实；随后Core 9.6c/9.6d及Feature5 3.6a已独立验收并提交，当前pre-build事实见下表，runtime仍未验收。
 
 ## Amendment Dispatch Table
 
@@ -153,7 +159,9 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 | integration_anchor | 单一稳定commit；其tree包含该row已批准的amendment实现与所声明验收，较早实现提交由Git ancestry追溯；禁止记录工作树hash、patch-equivalent或随分支推进变化的tip |
 | disposition | 仅在终态记录`MERGED_PASS` / `BLOCKED` / `SUPERSEDED`，不得用 `SKIPPED` 放行 required row |
 
-### Current Integration Facts
+### Historical Source Integration Facts
+
+下表保留原source验收登记及其原始anchor。Task 7.0发现这些旧commit仍存在于保留历史，但均不是当前接受链的祖先；不能再把本表直接当作当前可达性证明。下方另列真实可达的集成锚，不修改旧evidence中的commit或摘要。
 
 | dispatch_id | revision | owning_spec | integration_anchor | current_status | disposition |
 |---|---|---|---|---|---|
@@ -163,8 +171,32 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 | WA-04 | `R1` | `language-resource-portability` | `7e28b2b62a0a1c99aff87a3b055463d169a6c9d3` | `SOURCE_MERGED_PASS` | — |
 | WA-05 | `R1` | `tmx-context-interchange` | `7e28b2b62a0a1c99aff87a3b055463d169a6c9d3` | `SOURCE_MERGED_PASS` | — |
 | WA-06 | `R3`（历史） | `tm-storage-retrieval-index` | `e7bab7a57283964e9424ea458b222f5b5f65a7fb` | `SOURCE_MERGED_PASS`（原始事实） | `SUPERSEDED` |
-| WA-06 | `R4` | `tm-storage-retrieval-index` | — | `ACKNOWLEDGED` | — |
 | WA-07 | `R1` | `feature5-ui-integration` | `76f9ea47c7962d2d6d3daaf3c18195dc6afc53e4` | `SOURCE_MERGED_PASS` | — |
 | WA-08 | `R1` | `qt-editor-json-mvp-increment` | `8f0a418a6e5fbbd7cfc302c75300a78fbad76680` | `SOURCE_MERGED_PASS` | — |
+
+### Current Integration Facts
+
+下表列出共享治理基线后的当前可达集成锚。提交整理保留实现、测试、批准合同及原验收范围；过程材料另存本地归档。当前定位不表示重新运行 source 验收，也不提升为 frozen PASS；历史表与原始 evidence 中的锚不改签。
+
+| dispatch_id | revision | owning_spec | integration_anchor | current_status | disposition |
+|---|---|---|---|---|---|
+| WA-01 | `R1` | `parser-subsystem-extraction` | `3960cdc0a746cc42b7637c09f0ed5f33c06677c9` | `SOURCE_MERGED_PASS` | — |
+| WA-02 | `R1` | `collaborative-job-chunks` | `f1a8cc514ac579ac485e3c730033221d0ab2ff9e` | `SOURCE_MERGED_PASS` | — |
+| WA-03 | `R2` | `multi-document-project-workspace` | `e2f0ce9d887606c49c57881353bbf0660f1543e7` | `SOURCE_MERGED_PASS` | — |
+| WA-04 | `R1` | `language-resource-portability` | `d5e6d642451be2280c2af191c110f4e971f4f33b` | `SOURCE_MERGED_PASS` | — |
+| WA-05 | `R1` | `tmx-context-interchange` | `d5e6d642451be2280c2af191c110f4e971f4f33b` | `SOURCE_MERGED_PASS` | — |
+| WA-06 | `R4` | `tm-storage-retrieval-index` | `f5d559b33dba0ac9265518c416adeb812f980a81` | `FROZEN_PREBUILD_COMMITTED` | — |
+| WA-07 | `R1` | `feature5-ui-integration` | `cf8ce140fb95f6c4648623ccd53884b01c60b99f` | `FROZEN_PREBUILD_COMMITTED` | — |
+| WA-08 | `R1` | `qt-editor-json-mvp-increment` | `dbd8d558f47c0d43a499ff1ed234ccceb15be295` | `SOURCE_MERGED_PASS` | — |
+
+WA-06原R3事实的当前可达tree为`db7e7ef0024d297264fbc7434b28ec7f77adf96c`，WA-07原source事实为`3d3fa8f74503eebd4e1ef433c2462d151c33e1fd`；前者继续只属`SUPERSEDED`历史，后者只作source追溯。原锚`e7bab7a57283964e9424ea458b222f5b5f65a7fb`及`76f9ea47c7962d2d6d3daaf3c18195dc6afc53e4`保持在历史表与原evidence中，均不改签为新revision/runtime结果。
+
+#### Task 7.0 pre-build 集成范围
+
+以上两个`FROZEN_PREBUILD_COMMITTED`锚只声明各自tree中已接受的consumer实现与owner验收：Core锚包含9.6c publication修复、9.6d worker消费及其fresh重验，独立 worker 与输入发布作为同一 Core 消费能力整合；Feature5锚包含3.6a、独立APPROVED与父代理VERIFIED。批准来源仍为各owner获批R/D/T、current request acknowledgement，以及R4的已批准[前置修订](task7-prebuild-consumption-amendment.md)。Core [9.6c验收](../tm-storage-retrieval-index/task96c-validation.md)、[9.6d验收](../tm-storage-retrieval-index/task96d-validation.md)与Feature5 [3.6a验收](../feature5-ui-integration/task36a-validation.md)保留其真实source/测试接缝、skip与非性能证据限制。
+
+本阶段的长期 owner 声明位于 [`packaging/windows/frozen_roots.json`](../../../packaging/windows/frozen_roots.json)，包含 owner 入口、Gate roots/benchmark inventory、动态 import/worker 映射和默认资源。它由平台 7.0 新增，验收见 [Task 7.0](task70-validation.md)，原运行过程另存本地归档。7.1 已实现旧 W3 清单生成，完整 producer 与正式 frozen admission 尚未完成；普通发行的替代接线按 ADR-028 重新设计。
+
+WA-01/02/03/04/05/08原source证据及历史锚保持不变，新声明不把这些source验收提升为frozen运行事实。WA-01 `5.12b`、WA-02 `1.4b/4.5b`、WA-04 `5.5a`、WA-05 `5.4a`、WA-06 `9.6b`、WA-07 `6.6b/7.4b/7.6b/9.2a`以及WA-08 `5.2b/5.3b/5.4b`全部仍pending；WA-03由同候选packaged Project journey消费复验。只有7.4/7.4a及WA-08 journey实际闭合后才能推进各自下一状态，当前没有`FROZEN_REVALIDATED_PASS`或terminal `MERGED_PASS`。
 
 `WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
