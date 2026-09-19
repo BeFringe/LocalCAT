@@ -66,6 +66,30 @@ static void check(const char *name, int expected_success)
     }
 }
 
+static void source_closure_fixture(unsigned int count)
+{
+    unsigned int i, used = 0, strings = 80 + count * 72;
+    memset(input, 0, sizeof(input));
+    memcpy(input, "LCFMV001", 8);
+    put32(8, 1); put32(12, 80); put32(16, count); put32(20, 72);
+    put32(24, 80); put32(28, strings); put32(36, strings);
+    memcpy(input + 48, localcat_embedded_runtime_root_digest, 32);
+    for (i = 0; i < count; ++i) {
+        char value[64];
+        unsigned int record = 80 + i * 72, length;
+        sprintf_s(value, sizeof(value), "p%u\\__init__.py", i);
+        length = (unsigned int)strlen(value);
+        put32(record, used); put32(record + 4, length);
+        memcpy(input + strings + used, value, length); used += length;
+        sprintf_s(value, sizeof(value), "package-%u", i);
+        length = (unsigned int)strlen(value);
+        put32(record + 8, used); put32(record + 12, length);
+        memcpy(input + strings + used, value, length); used += length;
+        put32(record + 16, LOCALCAT_ROLE_CRITICAL_SOURCE);
+    }
+    put32(40, used); input_size = strings + used;
+}
+
 static void append_terminal_entry(void)
 {
     unsigned int used = get32(40);
@@ -99,6 +123,19 @@ int main(void)
     fixture("x\\COM10.dll", "y\\LPT0.dll"); check("non-reserved numbered names", 1);
     fixture("x\\python314.dll", "y\\PYTHON314.DLL"); check("case-insensitive basename", 0);
     fixture("x\\python314.dll", "X\\PYTHON314.DLL"); check("case-insensitive path", 0);
+    fixture("x\\__init__.py", "y\\__init__.py");
+    put32(96, LOCALCAT_ROLE_CRITICAL_SOURCE); put32(168, LOCALCAT_ROLE_INTERPRETER);
+    check("distinct source package initializers", 1);
+    fixture("x\\__init__.py", "X\\__INIT__.PY");
+    put32(96, LOCALCAT_ROLE_CRITICAL_SOURCE); put32(168, LOCALCAT_ROLE_INTERPRETER);
+    check("source path collision", 0);
+    for (i = LOCALCAT_ROLE_NATIVE; i <= LOCALCAT_ROLE_FIXTURE; ++i) {
+        fixture("x\\probe.dll", "y\\PROBE.DLL"); put32(168, i);
+        check("native basename cross-role collision", 0);
+        fixture("x\\probe.dll", "y\\PROBE.DLL"); put32(96, i);
+        check("reverse native basename cross-role collision", 0);
+    }
+    source_closure_fixture(65); check("complete source closure above spike capacity", 1);
     fixture("x\\\xc3\xa4.dll", "y\\\xc3\x84.dll"); check("Unicode case-insensitive basename", 0);
     for (i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
         fixture(invalid[i], "y\\helper.dll"); check(invalid[i], 0);

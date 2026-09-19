@@ -66,8 +66,10 @@ The explicit test transport cannot produce non-test benchmark evidence.
         raise TypeError("test transport cannot produce final evidence")
     if getattr(sys, "frozen", False):
         if _test_frozen_transport is None:
-            raise OSError("frozen worker requires the platform E10 transport")
-        completed = _test_frozen_transport(command, request_json.encode("utf-8"), timeout_seconds)
+            from frozen_worker_transport import run_frozen_child
+            completed = run_frozen_child(command, request_json.encode("utf-8"), timeout_seconds)
+        else:
+            completed = _test_frozen_transport(command, request_json.encode("utf-8"), timeout_seconds)
         if type(completed) is not subprocess.CompletedProcess or type(completed.returncode) is not int:
             raise OSError("invalid frozen transport result")
         if type(completed.stdout) is not bytes or type(completed.stderr) is not bytes:

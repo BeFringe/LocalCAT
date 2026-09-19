@@ -255,6 +255,8 @@ int main(int argc, char **argv)
             "stale retained parent denies bytes");
         authority->directory_identities[authority->directory_count - 1U].file_id[0] ^= 1U;
         localcat_bundle_authority_close(authority);
+        check(source->final_path == NULL && native->final_path == NULL && authority->manifest_bytes == NULL,
+            "close releases allocated paths and manifest while entry slots remain safely revoked");
         check(localcat_retained_entry_read_verified(source, &bytes, &size, &diagnostic) != 0,
             "held entry reference fails after close");
         check(localcat_native_closure_load_verified(native, &diagnostic) == NULL,

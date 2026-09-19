@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Any
 
 from tools.audit_w3_stock_bootloader import audit_pe, audit_sources
 from tools.prepare_windows_frozen_entry_inputs import (
@@ -259,7 +260,7 @@ def run_probe(args):
     directory = Path(tempfile.mkdtemp(prefix="custom-runw-", dir=output_parent))
     producer_bytes = Path(__file__).read_bytes()
     print("CUSTOM_RUNW_DIAGNOSTIC=" + str(directory), flush=True)
-    report = {"schema": SCHEMA, "classification": "DIAGNOSTIC_ONLY_NOT_W3_GATE",
+    report: dict[str, Any] = {"schema": SCHEMA, "classification": "DIAGNOSTIC_ONLY_NOT_W3_GATE",
               "limitations": ["five-patch source replay is not the final release producer",
                               "captured-stream and explicit NULL-standard-handle GUI runs are controlled diagnostics, not a desktop launch journey",
                               "NULL-handle mode records process exit only; it does not observe native stage markers or attach a debugger",
@@ -308,7 +309,11 @@ def run_probe(args):
         files = replayed.files
         (directory / "applied-sources.json").write_bytes(replayed.provenance_bytes)
         report["applied_sources"] = byte_fact(replayed.provenance_bytes)
-        entries = runtime_entries(runtime, lock)
+        producer_inputs = getattr(args, "producer_inputs", None)
+        entries = producer_inputs.entries if producer_inputs is not None else runtime_entries(runtime, lock)
+        if producer_inputs is not None:
+            (directory / "producer-inputs.json").write_bytes(canonical(producer_inputs.provenance))
+            report.update(producer_inputs=byte_fact(canonical(producer_inputs.provenance)))
         prepared, header, source_facts = prepare_source_manifest(
             files, entries, lock["candidate_input_digest"],
             applied_sources_digest=replayed.applied_sources_digest)

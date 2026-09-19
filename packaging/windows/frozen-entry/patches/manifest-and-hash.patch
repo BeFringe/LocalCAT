@@ -2,7 +2,7 @@ diff --git a/bootloader/src/localcat_manifest.c b/bootloader/src/localcat_manife
 new file mode 100644
 --- /dev/null
 +++ b/bootloader/src/localcat_manifest.c
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,365 @@
 +#include "localcat_manifest.h"
 +
 +#include <limits.h>
@@ -327,7 +327,9 @@ new file mode 100644
 +        for (other = 0; other < index; ++other) {
 +            if (localcat_same_string(entry->id, entry->id_length, manifest->entries[other].id, manifest->entries[other].id_length) ||
 +                localcat_same_windows_name(entry->path, entry->path_length, manifest->entries[other].path, manifest->entries[other].path_length) ||
-+                localcat_same_basename(entry, &manifest->entries[other])) {
++                ((entry->role == LOCALCAT_ROLE_NATIVE ||
++                  manifest->entries[other].role == LOCALCAT_ROLE_NATIVE) &&
++                 localcat_same_basename(entry, &manifest->entries[other]))) {
 +                *diagnostic = "FROZEN_ENTRY.MANIFEST_DUPLICATE";
 +                return -1;
 +            }
@@ -377,7 +379,7 @@ new file mode 100644
 +#include <stddef.h>
 +#include <stdint.h>
 +
-+#define LOCALCAT_MANIFEST_MAX_ENTRIES 32U
++#define LOCALCAT_MANIFEST_MAX_ENTRIES 2048U
 +#define LOCALCAT_MANIFEST_HEADER_SIZE 80U
 +#define LOCALCAT_MANIFEST_ENTRY_SIZE 72U
 +
