@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from tests.benchmark_worker_test_support import worker_temporary_directory
 
 import tm_benchmark_query_process
 from tm_benchmark import (
@@ -547,13 +548,13 @@ class QueryProbeCodecTests(unittest.TestCase):
 
 class ArtifactVerificationTests(unittest.TestCase):
     def _migrated_root(self, path: BenchmarkExecutionPath) -> tuple[Path, TMBenchmarkProcessEvidence]:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, path)
             return root, evidence
 
     def test_accepts_real_migrated_root(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             snapshot = verify_canonical_artifact(
@@ -584,7 +585,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                 self.assertGreater(snapshot.sidecar_identity.inode, 0)
 
     def test_rejects_missing_sidecar_and_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             Path(evidence.fixture_path + ".sqlite3").unlink()
@@ -595,7 +596,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                     resource_id=evidence.resource_id,
                     expected_fixture_digest=evidence.fixture_digest,
                 )
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             Path(
@@ -610,7 +611,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                 )
 
     def test_rejects_symlink_sidecar(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
@@ -653,7 +654,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                 self.assertEqual(marker.read_bytes(), b"foreign")
 
     def test_rejects_multilink_sidecar(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
@@ -667,7 +668,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                 )
 
     def test_rejects_foreign_entry_and_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             (root / "planted.txt").write_text("foreign", encoding="utf-8")
@@ -678,7 +679,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                     resource_id=evidence.resource_id,
                     expected_fixture_digest=evidence.fixture_digest,
                 )
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             (root / "planted-dir").mkdir()
@@ -691,7 +692,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                 )
 
     def test_rejects_fixture_digest_drift_and_path_escape(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             with self.assertRaisesRegex(ValueError, "fixture digest"):
@@ -713,7 +714,7 @@ class ArtifactVerificationTests(unittest.TestCase):
                 )
 
     def test_pre_post_mutation_detected_as_snapshot_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             kwargs: dict[str, Any] = dict(
@@ -810,7 +811,7 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertEqual(ctx.exception.error_code, "QUERY.LATENCY_FAILED")
 
     def test_worker_rejects_request_fact_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             from tm_benchmark_query_process import _request_payload
@@ -832,7 +833,7 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertIn("QUERY.FACT_DRIFT", completed.stderr)
 
     def test_worker_rejects_path_mismatch_request_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FALLBACK)
             from tm_benchmark_query_process import (
@@ -878,7 +879,7 @@ class WorkerProtocolTests(unittest.TestCase):
 
 class ProbeIntegrationTests(unittest.TestCase):
     def test_fast_path_real_subprocess_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             result = run_query_process_probe(evidence, timeout_seconds=120.0)
@@ -938,7 +939,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             )
 
     def test_fallback_path_real_subprocess_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FALLBACK)
             result = run_query_process_probe(evidence, timeout_seconds=120.0)
@@ -953,7 +954,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             self.assertTrue(probe.processes_distinct)
 
     def test_each_probe_spawns_a_distinct_query_child(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             first = run_query_process_probe(evidence, timeout_seconds=120.0)
@@ -961,7 +962,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             self.assertNotEqual(first.query_child_pid, second.query_child_pid)
 
     def test_evidence_runner_refuses_test_mode_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             with self.assertRaises(QueryProcessError) as raised:
@@ -969,7 +970,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.TEST_MODE_MISMATCH")
 
     def test_artifact_mutation_before_spawn_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             fixture = Path(evidence.fixture_path)
@@ -980,7 +981,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.ARTIFACT_INVALID")
 
     def test_post_migration_append_rejected_against_baseline(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
@@ -992,7 +993,7 @@ class ProbeIntegrationTests(unittest.TestCase):
                 raised.exception.error_code,
                 "QUERY.ARTIFACT_BASELINE_DRIFT",
             )
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             manifest = Path(evidence.fixture_path + ".localcat-snapshot.json")
@@ -1005,7 +1006,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             )
 
     def test_post_migration_optional_family_mutation_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             journal = _activation_journal_path(root)
@@ -1020,7 +1021,7 @@ class ProbeIntegrationTests(unittest.TestCase):
     def test_post_migration_regular_replace_rejected_against_baseline(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
@@ -1032,7 +1033,7 @@ class ProbeIntegrationTests(unittest.TestCase):
                 raised.exception.error_code,
                 "QUERY.ARTIFACT_BASELINE_DRIFT",
             )
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
@@ -1042,7 +1043,7 @@ class ProbeIntegrationTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.ARTIFACT_INVALID")
 
     def test_symlink_artifact_fails_closed_before_spawn(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
@@ -1083,7 +1084,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
         return run_query_process_probe(evidence, timeout_seconds=120.0).probe
 
     def test_runner_rejects_timeout(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             with patch(
@@ -1095,7 +1096,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.CHILD_TIMEOUT")
 
     def test_runner_rejects_child_failure_and_stderr_noise(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             fake = subprocess.CompletedProcess(
@@ -1108,7 +1109,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
                 with self.assertRaises(QueryProcessError) as raised:
                     self._run(evidence)
             self.assertEqual(raised.exception.error_code, "QUERY.X")
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             noise = subprocess.CompletedProcess(
@@ -1231,7 +1232,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
     def test_runner_rejects_fake_child_process_evidence_digest_drift(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = self._evidence_consistent_probe(
@@ -1244,7 +1245,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             )
 
     def test_runner_rejects_fake_child_process_pair_digest_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = self._evidence_consistent_probe(
@@ -1257,7 +1258,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             )
 
     def test_runner_rejects_fake_child_query_protocol_digest_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = self._evidence_consistent_probe(
@@ -1270,7 +1271,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             )
 
     def test_runner_rejects_fake_child_generation_and_count_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = self._evidence_consistent_probe(
@@ -1281,7 +1282,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
                 self._run_fake(report, evidence).error_code,
                 "QUERY.FACT_DRIFT",
             )
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = self._evidence_consistent_probe(
@@ -1295,7 +1296,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             )
 
     def test_runner_rejects_fake_child_path_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = self._evidence_consistent_probe(
@@ -1312,7 +1313,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             )
 
     def test_runner_rejects_fake_child_artifact_proof_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             tampered = _artifact_snapshot(sidecar_digest=_digest("9"))
@@ -1329,7 +1330,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
     def test_runner_rejects_fake_child_artifact_baseline_digest_drift(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = self._evidence_consistent_probe(
@@ -1342,7 +1343,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             )
 
     def test_runner_rejects_same_pid_and_non_distinct_pid(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             fake = subprocess.CompletedProcess(
@@ -1355,7 +1356,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
                 with self.assertRaises(QueryProcessError) as raised:
                     self._run(evidence)
             self.assertEqual(raised.exception.error_code, "QUERY.CHILD_PID_INVALID")
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             fake = subprocess.CompletedProcess(
@@ -1370,7 +1371,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.CHILD_PID_NOT_DISTINCT")
 
     def test_runner_rejects_protocol_and_kind_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             envelope = json.loads(self._valid_response())
@@ -1387,7 +1388,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.RESPONSE_INVALID")
 
     def test_runner_detects_artifact_mutation_during_child_run(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             sidecar = Path(evidence.fixture_path + ".sqlite3")
@@ -1411,7 +1412,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.ARTIFACT_MUTATED")
 
     def test_runner_detects_optional_family_mutation_during_child_run(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             journal = _activation_journal_path(root)
@@ -1434,7 +1435,7 @@ class ParentRunnerFailureTests(unittest.TestCase):
             self.assertEqual(raised.exception.error_code, "QUERY.ARTIFACT_MUTATED")
 
     def test_runner_rejects_evidence_invalid_payload(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             report = _probe_report()
@@ -1463,7 +1464,7 @@ class NoBodyLeakageAndBoundaryTests(unittest.TestCase):
     def test_evidence_payloads_never_contain_query_source_or_target_bodies(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             fixture_bytes = Path(evidence.fixture_path).read_bytes()
@@ -1522,7 +1523,7 @@ class NoBodyLeakageAndBoundaryTests(unittest.TestCase):
 
 class ProcessOwnerCodecRegressionTests(unittest.TestCase):
     def test_process_evidence_payload_and_json_round_trip(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             payload = process_evidence_to_payload(evidence)
@@ -1535,7 +1536,7 @@ class ProcessOwnerCodecRegressionTests(unittest.TestCase):
             self.assertEqual(parsed["evidence_digest"], evidence.evidence_digest)
 
     def test_process_canonical_artifact_paths_are_deterministic(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = _migrate(root, _FTS5)
             fixture = Path(evidence.fixture_path)
