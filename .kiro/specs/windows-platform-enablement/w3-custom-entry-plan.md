@@ -60,6 +60,14 @@ ABI名为`localcat.frozen-bootstrap-attestation.v1`，由compiled-in module单�
 
 type名、指针cookie或Python对象identity都不是独立信任根；可信性来自E0～E10无未批准代码执行的顺序、compiled-in producer和native retained handles。bootstrap不得接受pickle/JSON/environment/argv传入的等价对象，也不得自行按pathname reopen。
 
+### 4.1 完整产品的worker消费与生命周期
+
+2026-09-19批准的WA-06 R4补齐Core 9.6c/9.6d及WA-07 3.6a消费，不改变opaque ABI与take次数。完整产品保持native read/reproof/close也在原owner thread/interpreter串行执行；平台内部调度向后台proof window交付受撤销约束的bytes/attestation。WA-07仅在Boot TCB闭合后注入Qt调度，平台和Core均不反向依赖Qt；headless worker在自己的初始线程履行owner合同。关闭/取消/异常/重入应撤销session并唤醒等待者，发布前必须fresh terminal reproof，不能永久信任启动缓存或排队旧证明。
+
+每个benchmark child必须独立经过同一候选的E0～E10与自己的one-shot handoff。E10后由固定trusted bootstrap将两个允许的内部模式映射到migration/query worker，默认模式进入产品；未知/重复/多余模式与任意`-m`拒绝。模式只选择工作，禁止参数、父进程对象、JSON或environment传入authority，选择worker前不导入Core、platform factory、Qt或SQLite。
+
+windowed request/result使用父进程创建、定向继承的pipes；E10后才接入Core严格codec。错误句柄、畸形/截断结果、非零退出与timeout遵守Core失败合同，fresh process/RSS范围不变；pipe不是authority，不回落venv或进程内worker。完整实现归平台7.2，Core pre-build tests不代替native/full runtime；本节不缩减§7维护触发器及Task 1.6完整mandatory重验。
+
 ## 5. Toolchain input profile
 
 选择MSVC x64静态bootloader路线，不使用MinGW/Cygwin。PyInstaller官方文档支持从sdist用Visual C++重建bootloader；MSVC路线可生成self-contained static executable，减少bootloader自身CRT DLL pre-entry闭包。
