@@ -557,9 +557,30 @@
 
 - [ ] 9.6b 在ADR-022 frozen harness重放Windows canonical TM发布验证
   - 在W3 custom spike全PASS后重放9.6a；frozen manifest不再包含硬件durability registry输入，CapabilityHost/SQLite/snapshot仍必须服从正常platform publish、trusted source closure且不访问checkout，其他ADR-022 strict frozen要求保持不变。
+  - 同一候选中验证9.6c/9.6d的Gate source/fixture/contract读取、两个独立fresh worker及发布前terminal reproof；完整100k双路径硬门、RSS/timeout与产品发布验证不得缩减或由pre-build单测代答。
   - _Amendment: WA-06_
   - _Delivery phase: frozen post-build_
-  - _Depends: 9.6a, ADR-022, ADR-023, ADR-024, ADR-025, windows-platform-enablement 7.4_
+  - _Depends: 9.6a, 9.6c, 9.6d, ADR-022, ADR-023, ADR-024, ADR-025, windows-platform-enablement 7.4_
+
+- [ ] 9.6c 实现Gate源码、fixture与benchmark输入的受信字节消费
+  - 为Gate A/C approved roots、JSON/TXT fixtures、源码摘要及Gate D contract/implementation fingerprint建立内部输入session；保留source公开Path入口，frozen消费只接受真实authority绑定的manifest-relative exact bytes，不允许pathname reopen、fixture复制或任意callback自报proof。
+  - 保留Core grammar/digest/Gate唯一所有权；同一epoch覆盖开始、执行、结果构造和terminal reproof，关闭/漂移/foreign authority/错id/旧session均fail closed。严格test seam不生成生产authority或frozen PASS。
+  - 完成时，受信输入正反测试、source Gate/benchmark消费回归及独立review闭合；实际native producer与同候选runtime分别归平台7.2与本Spec 9.6b。
+  - _Requirements: 8.5, 8.7, 9.9, 9.10, 9.12；Windows Compatibility Amendment WA-06 5_
+  - _Amendment: WA-06_
+  - _Boundary: Core Trusted Gate Input Consumption_
+  - _Delivery phase: frozen pre-build_
+  - _Depends: 9.6a, ADR-009, ADR-022, ADR-023, windows-platform-enablement 1.6_
+
+- [ ] 9.6d 实现migration/query fresh worker的source与frozen调用适配
+  - Core保留严格request/result codec、独立migration/query child、fresh PID、从启动到结束的RSS、timeout和失败语义；source保持Python模块入口，frozen只启动同候选EXE的固定worker模式，不传authority、不回落venv或进程内执行。
+  - 消费平台E10后建立的定向request/result pipes与child本进程authority；未知模式、错误句柄、畸形/截断结果、非零退出和超时均拒绝，不能依赖windowed console streams。
+  - 完成时，两worker的source兼容与launch/codec/错误/超时/RSS合同测试和独立review闭合；pre-build只能记录消费实现事实，真实frozen进程由9.6b验收。
+  - _Requirements: 8.3, 8.4, 8.5, 8.6, 8.7, 9.12；Windows Compatibility Amendment WA-06 5_
+  - _Amendment: WA-06_
+  - _Boundary: Core Fresh Benchmark Worker Consumption_
+  - _Delivery phase: frozen pre-build_
+  - _Depends: 9.6c_
 
 ## Implementation Notes
 

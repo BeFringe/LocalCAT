@@ -12,9 +12,9 @@ LocalCAT 面向个人译者提供完全本地的翻译记忆库。当前能力�
 - **范围外**：Qt 控件、菜单、快捷键、搜索导航和用户偏好持久化；机器翻译、语义向量、云端 TM、在线协作、账号与共享锁；项目文件解析和厂商 TMX 上下文映射。
 - **相邻期望**：Qt 产品通过既有编辑协调入口消费建议和文本匹配结果；旧 Excel 工作流继续只看到 `TM_HIT / TERMS_FOUND / NO_MATCH`；未来 Parser 或 TMX 互操作变更只能触发兼容复验，不改变本规格的用户可见语义。
 
-### Windows Compatibility Amendment WA-06（current R3）
+### Windows Compatibility Amendment WA-06（current R4）
 
-WA-06 `R3`依据ADR-024/025完整取代`R2`，`R1`与`R2`只保留在dispatch ledger历史，不得驱动实施或证据。
+WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿用下列Requirements语义，只补齐Design/Tasks中的frozen受信输入与fresh worker pre-build消费合同。`R1`～`R3`保留为dispatch ledger的`SUPERSEDED`历史；既有source evidence保持原始签署锚，不自动成为R4 frozen证据。
 
 1. Windows canonical TM 首次激活、generation 切换、snapshot publication、schema upgrade 与 recovery 必须消费 ADR-020/025 的 process lock、rooted authority与正常`PendingPublication`端口，并保持 SQLite authority、reservation、journal、LKG、generation 与业务 error envelope不变；已激活资源的显式import/rebuild必须在同一resource W1 owner内完成portable full replacement，pre-arm不改变canonical命名状态，post-arm只产生完整prior、完整new或recovery-only，且只有new `READY`清除divergence。实现仍服从`windows-platform-enablement`的前置platform capability与merge依赖。
 2. Windows 私有存储资格必须按 ADR-021经ADR-023/024接管后的`WindowsPrivateSecurityV2`使用provider-agnostic current process primary token事实：exact TokenUser owner、DACL、medium或high mandatory-integrity、`NO_WRITE_UP`、OS access行为与嵌套`WindowsPrivateProof`。local/domain/Entra等provider来源不是mandatory事实且不得进入persistent proof；proof的`security_profile_id`和authority descriptor digest仍绑定V2 canonical owner+DACL+MIC projection。它只替代POSIX物理表示谓词，Gate D/canonical owner envelope、content/phase/generation proof不得由此省略或重铸；V1/unknown profile不得兼容读取或自动迁移。

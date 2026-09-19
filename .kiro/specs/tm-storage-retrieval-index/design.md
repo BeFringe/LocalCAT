@@ -47,13 +47,25 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 - Core 可以读取中立 raw records，不得依赖 PySide6、xlwings、Controller、workspace state 或 Parser 实现。
 - Compatibility facade 可依赖新 Core ports；新 Core 不反向依赖旧 `TMEngine`。
 
-### Windows Compatibility Amendment WA-06（current R3）
+### Windows Compatibility Amendment WA-06（current R4）
 
-- **ADR mapping**：follow adopted ADR-020/021 as supplemented by ADR-023/024/025。WA-06 `R3`取代`R2`，其中V2 security profile保持、主体资格改为provider-agnostic current-primary-token事实，运行时硬件durability registry被`WindowsDocumentedPublishV1`取代。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
+- **ADR mapping**：follow adopted ADR-020/021 as supplemented by ADR-023/024/025。WA-06 `R3`取代`R2`时保持V2 security profile、采用provider-agnostic current-primary-token与`WindowsDocumentedPublishV1`；2026-09-19获批的`R4`继续保留这些语义，并按ADR-009/022/023补齐frozen输入与fresh worker消费。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
 - **Platform composition**：activation/snapshot/schema/attestation modules消费`ProcessFileLock`、`RootedFileSystem`、`ExistingFileDurability`、`BoundDirectoryAuthority.begin_publish()`产生的`PendingPublication`与`PrivateStorageProof`；不在Core复制`fcntl`/dirfd或裸Win32调用。未发布stage的POSIX实现保持file fsync与parent fsync；Windows实现通过同一retained synchronization handle完成`FlushFileBuffers`和exact content/live identity复证，并对parent/root执行live reproof，不把它表述为Windows directory fsync。任一同步或复证缺失/漂移都不得登记sealed registry，冷重开只能重建该stage或保持unavailable；canonical publication仍只走5.7a的`PendingPublication`协议。
 - **Private proof**：owner envelope嵌套`WindowsPrivateProof`，以`security_profile_id=WindowsPrivateSecurityV2`及descriptor digest绑定exact TokenUser owner+DACL+medium/high MIC projection；handle-bound label读取使用`LABEL_SECURITY_INFORMATION`而非完整SACL权限。资格来自实际current process primary token，standard/elevated正向及same-SID low/restricted负向分别验证；local/domain/Entra等provider origin不进入proof。FileId只作live observation，recreate/reuse与security profile/token变化进入re-attestation或fail-stop，不改store id/generation；V1/unknown profile不兼容读取。
 - **Publication/FTS5**：activation、snapshot与export在local fixed NTFS上按`WindowsDocumentedPublishV1`完成write-through/flush、handle-bound naming、retained exact readback；owner在`PendingPublication`存活时提交自身journal/receipt并复证业务state，再调用platform terminal reproof。不确定时platform返回`RECOVERY_REQUIRED`，owner在故障注入、two-process/process kill、app restart与正常OS reboot后只接受完整old、完整new或recovery-only；source/frozen均不加载硬件durability registry，frozen manifest只移除该输入而保留其他ADR-022 strict closure。FTS5/fallback create-query-reopen仍分别验收并服从Gate C/D与benchmark owner。
 - **Explicit replacement**：Windows显式import/rebuild从source rooted preflight取得同一resource-scoped reservation与caller-held root/lock，构建fresh portable stage并沿replacement activation envelope把prior `N`切换为candidate `N+1`；DB/manifest publication继续消费`PendingPublication`，只有terminal `READY`可以更新binding并清除divergence。replacement使用独立的版本化discriminator绑定prior store/generation、active attestation与backup proof、candidate store和next generation，并将私有namespace限制为current completed chain加至多一个pending replacement；不得放宽或重解释现有first-activation v3/generation-zero codec。schema upgrade保持其独立后续边界。
+
+#### R4：frozen pre-build受信输入与fresh worker
+
+本增量依据[已批准的Task 7前置修订](../windows-platform-enablement/task7-prebuild-consumption-amendment.md)。Core拥有Gate A/C approved roots grammar、fixture parsing、relative-id集合、digest算法、Gate D implementation fingerprint、benchmark contract及Gate判定；平台只提供source/frozen authority绑定的读取与复证能力，Feature5负责组合并验证消费它们的runtime ports。
+
+Core validation/benchmark边界使用内部受信输入session，以owner roots声明的规范bundle-relative id请求本次有效proof window内的exact bytes。生产session只能从组合根验证的真实authority建立；任意read callback、bytes字典、自报digest或test seam不能铸造Gate/publication authority。source route保留既有公开Path入口与行为，由组合入口建立source session；frozen route只消费`TrustedSourceAuthority`背后的manifest-bound retained reads。JSON/TXT、源码摘要、contract都经该session读取，禁止pathname reopen、临时复制fixture、checkout fallback或全局替换Path；业务临时资产继续使用既有rooted platform合同。
+
+source inventory、fingerprint与执行模块必须属于同一implementation epoch。Gate C/D的开始、执行、结果构造和发布前terminal reproof仍绑定同一epoch；关闭、身份/内容漂移、loader/code anchor不符或过期均fail closed，启动时缓存不能成为长期authority或为旧evidence重新盖章。native take/read/reproof/close仍由平台在原owner thread/interpreter串行执行；后台消费的bytes/attestation继续受session撤销与terminal reproof约束，Core不依赖Qt。
+
+Core继续拥有migration/query request/result codec、独立fresh child、RSS从启动到完成的口径、timeout及错误分类。source使用现有Python模块入口；frozen launch只选择同一候选EXE的两个固定worker模式。每个child独立经过W3 entry、Boot TCB与E10 handoff并取得自己的authority；参数只选工作模式，父进程不得传递authority或把自报release digest作为授权。平台trusted bootstrap在E10后固定映射至`tm_benchmark_process`或`tm_benchmark_query_process`，拒绝未知/重复/多余模式及任意`-m`。
+
+windowed child在E10后将父进程创建、定向继承的request/result pipes接到Core严格codec；pipe和模式不构成authority，不能依赖GUI控制台stream存在。错误句柄、畸形/截断结果、非零退出和超时按既有Core失败语义处理；禁止venv Python fallback或进程内worker替代。Task 9.6c/9.6d只交付pre-build消费实现与测试，真实同候选运行及100k双路径硬门仍归依赖平台7.4的9.6b。
 
 ### Revalidation Triggers
 

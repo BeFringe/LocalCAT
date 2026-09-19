@@ -472,7 +472,7 @@ stateDiagram-v2
 - Task 1.5的provisional draft见`w3-custom-entry-plan.md`：首选release-owned PyInstaller 6.22.2 `runw`下游patch，在同一GUI进程真实entry执行；native runtime manifest是pre-link input manifest的digest-bound派生物，compiled-in handoff只暴露one-shot opaque authority而不向Python泄露raw HANDLE。编译环境长期合同允许本机或CI上受支持且兼容的MSVC x64与Windows SDK；Task 1.5以构建前materialized的candidate-input lock批准toolchain、patch合同、目标API/closure与TCB边界，Task 1.6在W1冻结后实现完整patch并以applied source、resulting PE和realized closure生成绑定该输入digest的realized-build lock。
 - gate-quality native spike等待W1 rooted contract与Windows rooted handle invariants冻结后执行，并必须在任何frozen WA consumer merge和Task 7.1前全PASS。失败保持frozen lane NO-GO，但不撤销已经独立验证的source compatibility。
 - pre-E10 的 RNG 调用和系统 API 入口按 `w3-custom-entry-plan.md` §5.2 验证。
-- frozen lane分成pre-build与post-build两次汇合：1.6 PASS后先合并manifest/build必需的consumer roots与WA-07 3.6a，再生成manifest、handoff与发行候选；7.4验证同一dist后，WA-01/02/04/05/06与WA-07才运行packaged revalidation，最后由WA-08汇合Qt产品journey。source milestone、diagnostic onedir、最小spike与frozen release四者名称、证据和状态不得互相冒充。
+- frozen lane分成pre-build与post-build两次汇合：1.6 PASS后先完成WA-06 R4的Core 9.6c受信输入、9.6d fresh worker消费，再合并manifest/build必需的consumer roots与WA-07 3.6a；随后生成manifest、handoff与发行候选。7.4验证同一dist后，WA-01/02/04/05/06与WA-07才运行packaged revalidation，最后由WA-08汇合Qt产品journey。pre-build只记录消费实现；source milestone、diagnostic onedir、最小spike与frozen release四者名称、证据和状态不得互相冒充。
 
 ## Frozen Distribution Design
 
@@ -482,6 +482,16 @@ stateDiagram-v2
 - native bootloader 审计应用 PE static/delay imports，保证 process entry 前只有获批 KnownDLL/System32 trust；首次加载 Python DLL 或其他非系统 DLL 前排除 CWD/PATH 并逐组件绑定 bundle/native 目录。递归枚举应用及随包非系统 native static/delay 闭包，owner manifest 声明其 pre-authority 动态 roots 与系统 API 入口。在非系统成员首次可执行 load 前逐项 retained-handle rooted/reparse/live-identity/digest 预证明并固定依赖搜索，不能假设顶层 flags 自动约束传递依赖。受限绝对路径 load 后复核实际非系统 module 与预证明 handle，再移交 bundle/DLL attestation；未声明应用 load、未闭合应用依赖或时序不符使 spike 失败。
 - critical module 由bootstrap-owned `TrustedSourceLoader` 从 retained verified handle读取exact source bytes，校验digest后直接 `source_to_code`/compile并执行；critical module禁止`.pyc`、`__pycache__`和PYZ duplicate。`capability_host`验证loader attestation、source digest、`spec.origin`/`co_filename`和Gate closure，而不把metadata相等当作executed-byte proof。
 - build先生成排除resulting PE的canonical pre-link input manifest，并把其digest与bootstrap schema固定进executable-side TCB；链接/组装后再由post-build release manifest绑定executable hash、pre-link digest、derived runtime manifest与dist inventory，避免manifest/executable摘要自引用。runtime闭合后才mint不可序列化的 `TrustedSourceAuthority`。TCB不在runtime声称自证，其source/binary、生成输入与两阶段manifest关系由clean-build/release evidence绑定。
+
+### 受信输入、fresh worker与线程生命周期
+
+2026-09-19批准的[Task 7前置修订](task7-prebuild-consumption-amendment.md)将Core受信字节session及fresh worker消费列为WA-06 R4 pre-build任务。Core继续拥有roots grammar、fixture/contract parsing、digest/fingerprint、Gate判定与worker request/result codec；平台只提供manifest-bound retained reads、复证与固定启动模式，Feature5验证并组合consumer。source公开Path入口保留；frozen禁止pathname reopen、复制fixture、checkout fallback或调用方bytes/digest铸造authority。
+
+同一候选EXE中的每个child独立经过W3 native entry、Boot TCB、E10 handoff及本进程一次take。E10后固定trusted bootstrap只将两个内部模式映射到`tm_benchmark_process`、`tm_benchmark_query_process`，默认模式进入产品；未知/重复/多余选择与任意`-m`拒绝。工作模式参数、pipe或父进程自报digest均不提供authority；选择worker前不导入Core、platform factory、Qt或SQLite。E10后才将父进程创建、定向继承的request/result pipes接到Core严格codec，错误/缺失句柄、畸形/截断数据、非零退出和timeout服从Core失败合同。fresh PID、独立测量与启动至完成RSS范围不变，不回落venv或进程内执行。
+
+native take/read/reproof/close保留原owner thread/interpreter并串行执行。平台内部调度向后台Gate交付有效proof window内的bytes/attestation；WA-07在Boot TCB闭合后注入Qt调度，平台authority和Core不反向依赖Qt。headless worker在自己的初始线程执行owner合同。关闭先撤销新window，使未完成请求失败并唤醒等待者；取消、异常和重入不能遗留可发布session，也不能让主线程等待一个反向等待它的worker。开始、执行、结果构造和发布前fresh terminal reproof绑定同一implementation epoch；旧排队证明、缓存、内容/身份漂移、loader/code anchor错误与close后复用全部fail closed。
+
+以上producer在Task 7.2实现，pre-build consumer tests不得生成生产authority或frozen PASS。任何既有W3维护触发器命中都重建candidate inputs并至少重跑Task 1.6完整mandatory矩阵；full candidate仍须通过Task 7～10。
 
 ### Early Frozen Feasibility Spike
 - W3 获批后的第一个实现证据是最小 onedir/windowed spike，版本固定为 CPython 3.14.x + PyInstaller 6.22.x；只验证 bootstrap、一个外置 critical module 和一个 fixture。
