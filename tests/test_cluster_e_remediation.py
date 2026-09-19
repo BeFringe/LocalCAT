@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.benchmark_worker_test_support import worker_temporary_directory
+
 import contextlib
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -568,7 +570,7 @@ class ClusterERemediationTests(unittest.TestCase):
     def test_capability_completion_refreshes_window_at_gate_c_and_gate_d(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             source = _activate(
                 root,
@@ -693,7 +695,7 @@ class ClusterERemediationTests(unittest.TestCase):
             window.close()
 
     def test_capability_completion_ignores_destroyed_window(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             source = _activate(
                 root,
