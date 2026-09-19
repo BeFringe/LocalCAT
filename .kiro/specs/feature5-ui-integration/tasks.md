@@ -132,7 +132,7 @@
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.7_
   - _Boundary: CapabilityHost Gate D_
 
-- [ ] 3.6a 从 frozen bootstrap 消费受信 source authority
+- [x] 3.6a 从 frozen bootstrap 消费受信 source authority
   - native entry/Boot TCB必须在import platform factory、CapabilityHost或其他业务模块前闭合DLL/source policy并铸造`TrustedSourceAuthority`；Gate C/D build inventory、approved roots、原始`.py`与benchmark contract只经bundle authority/loader attestation定位，不信任cwd、任意`sys._MEIPASS`文件或现场复制源码。
   - 消费Core 9.6c/9.6d的共同受信输入session与fresh worker适配；在Boot TCB闭合后注入Qt调度，保留native owner-thread限制及后台proof window/terminal reproof，关闭、取消、等待和旧证明复用均fail closed。
   - 本任务只形成pre-build consumer实现与独立review checkpoint；实际producer归平台7.2，同候选runtime继续由6.6b/7.4b/7.6b/9.2a验收，不提前声明frozen PASS。
@@ -451,6 +451,7 @@
 
 ## Implementation Notes
 
+- 3.6a：frozen consumer 的 close 必须撤销实际 Core input owner，再于短锁外唤醒 Qt 等待者；Host/通知/owner 的成功引用通过 Core 登记的普通 slot plan 与 snapshot 一起提交。Matcher/Gate C 的最终安装另开同 owner fresh window，不能复用结束窗口；source publication 的 terminal/退出异常仍须完整恢复 prior。合法生产 source issuer/receipt 正控、故障回滚与 Qt queued-terminal/close 已独立验证，但平台 native producer 和同候选 packaged/100k 资格仍分别归 7.2 与 post-build owner 任务，见 task36a-validation.md。
 - Task 2.1：新增唯一 application-facing `TMMigrationService.activate_initial(Path, str) -> MigrationOutcome`；合法首次激活仍只经 Core-owned build、`StageSealer`、coordinator prepare/journal/publish 链，非法 source/resource/coordinator、non-READY 与 already-active 在 build 前稳定 fail-closed 且零修改。独立评审 APPROVED；parent fresh completion 覆盖 252 个 migration/activation/sealer 测试（1 个明确 opt-in skip），changed-file basedpyright 0，四个用户 WIP hash 不变。publication tail、rollback/recovery、并发与 tamper 仍分别留给 2.2～2.5。
 - Task 2.2：首次激活仅在 generation 0 durable publication、sealed source-binding canonical digest、正式 `SQLiteTMStore` health/revision/query-view 重开全部一致后返回成功；FTS5/fallback 均经默认 fail-closed `TMRetrievalService` 证明 canonical EXACT，同 source variants 保留而 context/fuzzy 继续关闭。独立评审两次拒绝并闭合 ledger 路径一致改绑反例与测试 connection 泄漏后 APPROVED；parent fresh completion 聚焦 4/4（强制 ResourceWarning 无告警）、相关 264/264、changed-file basedpyright 0，四个 WIP hash 不变。published-tail recovery 仍归 2.4。
 - Task 2.3：仅在 Core 证明从未发布或 PREPARED/DB_REPLACED/MANIFEST_PUBLISHED 已完整回滚、fresh coordinator 冷复证 legacy authority 后返回 preservation-backed `MigrationFailure`；普通 I/O 完整回滚稳定为 `MIGRATION.INITIAL_IO_FAILED` 且可重试。独立评审三轮拒绝并闭合 source/target basename 置换、builder residue、terminal/quarantine 篡改、primary-error masking；unpublished pair 采用 Darwin `renameatx_np(RENAME_EXCL)` / Linux `renameat2(RENAME_NOREPLACE)` 的 dirfd-relative exclusive quarantine，无普通 rename 回退。最终评审 APPROVED；parent fresh completion mutation-negative 19/19、相关 336/336（1 个明确 opt-in skip）、changed-file basedpyright 0，四个 WIP hash 不变；ambiguous 与 GENERATION_PUBLISHED 仍归 2.4。

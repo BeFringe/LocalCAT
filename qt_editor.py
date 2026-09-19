@@ -587,10 +587,10 @@ def _start_capability_validation(
     """Start validation and queue generation changes to one Qt receiver."""
 
     from datetime import datetime, timedelta, timezone
-    from threading import Thread
+    from threading import Event, Thread
 
     from capability_host import CapabilityHostComposition
-    from PySide6.QtCore import QObject, Qt, Signal
+    from PySide6.QtCore import QCoreApplication, QObject, Qt, Signal
 
     if type(composition) is not CapabilityHostComposition:
         raise TypeError(
@@ -599,6 +599,16 @@ def _start_capability_validation(
 
     class CapabilityCompletionBridge(QObject):
         changed = Signal()
+
+    cancelled = Event()
+
+    def cancel() -> None:
+        cancelled.set()
+        composition._close_frozen_inputs()
+
+    application = QCoreApplication.instance()
+    if application is not None:
+        application.aboutToQuit.connect(cancel)
 
     bridge: CapabilityCompletionBridge | None = None
     if on_capability_changed is not None:
@@ -620,20 +630,28 @@ def _start_capability_validation(
             callback,
             Qt.ConnectionType.QueuedConnection,
         )
+        receiver.destroyed.connect(cancel)
+        closing = getattr(receiver, "_capability_validation_closed", None)
+        if closing is not None:
+            closing.connect(cancel)
 
     generated_at_utc = datetime.now(timezone.utc).replace(microsecond=0)
     valid_until_utc = generated_at_utc + timedelta(days=1)
 
     def notify_capability_change() -> None:
-        if bridge is not None:
+        if bridge is not None and not cancelled.is_set():
             bridge.changed.emit()
 
-    def validate() -> None:
+    def validate_stages() -> None:
+        if cancelled.is_set():
+            return
         _ = composition.matcher_validation_owner.validate_text_v1(
             generated_at_utc=generated_at_utc,
             valid_until_utc=valid_until_utc,
             evaluated_at_utc=generated_at_utc,
         )
+        if cancelled.is_set():
+            return
         gate_c = composition.retrieval_gate_c_validation_owner
         if gate_c is None:
             return
@@ -645,6 +663,8 @@ def _start_capability_validation(
             valid_until_utc=valid_until_utc,
             evaluated_at_utc=generated_at_utc,
         )
+        if cancelled.is_set():
+            return
         current_generation = (
             composition.host.retrieval_operation_snapshot().generation
         )
@@ -664,7 +684,30 @@ def _start_capability_validation(
             raise
         notify_capability_change()
 
-    worker = Thread(
+    def validate() -> None:
+        try:
+            validate_stages()
+        except BaseException:
+            was_cancelled = cancelled.is_set()
+            cancel()
+            if not was_cancelled:
+                raise
+
+    class CapabilityValidationThread(Thread):
+        def cancel(self) -> None:
+            cancel()
+
+        def join(self, timeout: float | None = None) -> None:
+            source = composition._frozen_input_source
+            if source is not None and timeout != 0 and self.is_alive():
+                try:
+                    source.require_worker_wait_allowed()
+                except RuntimeError:
+                    cancel()
+                    raise
+            super().join(timeout)
+
+    worker = CapabilityValidationThread(
         target=validate,
         name="LocalCAT-capability-validation",
         daemon=True,
@@ -678,10 +721,17 @@ def _compose_editor_controller(
     repository: object,
     *,
     source_authority: object | None = None,
+    trusted_source_authority: object | None = None,
 ):
     """Build the one formal TM composition graph owned by this app run."""
 
-    if source_authority is None:
+    from typing import cast
+
+    if source_authority is not None and trusted_source_authority is not None:
+        raise TypeError("editor composition cannot mix source and frozen authorities")
+    if trusted_source_authority is None and getattr(sys, "frozen", False):
+        raise RuntimeError("frozen editor requires trusted source handoff")
+    if source_authority is None and trusted_source_authority is None:
         # Legacy in-process callers still use the production platform factory;
         # only main() owns the stricter bootstrap-before-business-import route.
         from platform_source_authority import compose_rooted_source_authority
@@ -692,7 +742,7 @@ def _compose_editor_controller(
 
     from datetime import datetime, timezone
 
-    from capability_host import compose_capability_host
+    from capability_host import compose_capability_host, compose_frozen_capability_host
     from editor_controller import compose_project_enabled_editor_controller
     from editor_tm_adapter import EditorTMAdapter
     from platform_source_authority import RootedSourceAuthority
@@ -701,19 +751,32 @@ def _compose_editor_controller(
 
     if type(repository) is not ResourceRepository:
         raise TypeError("editor composition requires ResourceRepository")
-    if type(source_authority) is not RootedSourceAuthority:
+    if trusted_source_authority is None and type(source_authority) is not RootedSourceAuthority:
         raise TypeError(
             "editor composition requires one rooted source authority"
         )
     startup_trace = _StartupTrace("capability_composition")
+    owner_scheduler = None
     try:
-        capability_composition = compose_capability_host(
-            source_authority=source_authority,
-            evaluated_at_utc=datetime.now(timezone.utc),
-            gate_d_attestation_root=(
-                repository.config_dir / "gate-d-qualification"
-            ),
-        )
+        if trusted_source_authority is None:
+            capability_composition = compose_capability_host(
+                source_authority=cast(RootedSourceAuthority, source_authority),
+                evaluated_at_utc=datetime.now(timezone.utc),
+                gate_d_attestation_root=repository.config_dir / "gate-d-qualification",
+            )
+        else:
+            # Only the platform's post-Boot-TCB entry supplies this argument.
+            # Qt is injected into the admitted high-level producer as a generic
+            # scheduling port; neither Core nor platform needs to import Qt.
+            from qt_owner_dispatch import create_owner_thread_dispatcher
+
+            owner_scheduler = create_owner_thread_dispatcher()
+            capability_composition = compose_frozen_capability_host(
+                trusted_source_authority=trusted_source_authority,
+                evaluated_at_utc=datetime.now(timezone.utc),
+                gate_d_attestation_root=repository.config_dir / "gate-d-qualification",
+                _owner_scheduler=owner_scheduler,
+            )
         startup_trace.finish("tm_runtime_resolution")
         runtime_host = TMRuntimeHost(
             resolver=TMResourceResolver(),
@@ -747,6 +810,8 @@ def _compose_editor_controller(
             ),
         )
     except Exception as exc:
+        if owner_scheduler is not None:
+            owner_scheduler.close()
         startup_trace.finish(error=exc)
         raise
     startup_trace.finish()
@@ -932,6 +997,11 @@ def _run_empty_home_startup(
 def main(argv: list[str] | None = None) -> int:
     launch_argv = tuple(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(launch_argv)
+    if getattr(sys, "frozen", False):
+        # This is the source launcher. Platform's post-TCB entry supplies the
+        # explicit trusted composition; a frozen flag never grants a fallback.
+        print(f"LocalCAT Qt editor could not start [{STARTUP_FAILURE_CODE}].", file=sys.stderr)
+        return 1
     if args.source_launch_smoke_marker is not None and not args.smoke_test:
         print(
             f"LocalCAT Qt editor could not start [{STARTUP_FAILURE_CODE}].",

@@ -11,6 +11,7 @@ No capability is inferred from booleans, store health, or display state.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager, nullcontext
 from dataclasses import (
     MISSING,
     dataclass,
@@ -32,7 +33,7 @@ import sys
 import tempfile
 import time
 from threading import Condition, Lock, RLock, Thread
-from types import CodeType, FunctionType, ModuleType
+from types import CodeType, FunctionType, MemberDescriptorType, ModuleType
 from typing import (
     Any,
     Callable,
@@ -41,8 +42,16 @@ from typing import (
     cast,
     final,
     runtime_checkable,
+    Iterator,
 )
 
+from capability_frozen_inputs import (
+    _FrozenCapabilitySource,
+    _FrozenSourceFile,
+    _OwnerWaitGuardLock,
+    _compose_frozen_capability_source,
+)
+from tm_gate_inputs import _GateInputSession
 from capability_gated_text_matcher import CapabilityGatedTextMatcherV1
 from editor_contracts import RetrievalDisplayState, TextMatcherDisplayState
 from matcher_validation import build_validated_matcher_v1
@@ -66,6 +75,8 @@ from tm_retrieval_capability import (
     RetrievalCapabilityPublisher,
     RetrievalCapabilitySnapshot,
     default_retrieval_capability_publisher,
+    _publication_reference_type,
+    _ReferenceAssignment,
 )
 
 
@@ -119,12 +130,34 @@ def _absolute_locator(value: object) -> Path | None:
         return None
 
 
+@contextmanager
+def _host_input_session(
+    authority: RootedSourceAuthority | _FrozenCapabilitySource,
+) -> Iterator[_GateInputSession | None]:
+    if type(authority) is _FrozenCapabilitySource:
+        with authority.input_session() as session:
+            yield session
+    else:
+        yield None
+
+
+def _anchor_frozen_source(anchor: _TrackedFileAnchor) -> _FrozenCapabilitySource | None:
+    source = anchor.source_file
+    return source.owner if type(source) is _FrozenSourceFile else None
+
+
+def _reference_assignment(target: object, name: str, prior: object, candidate: object) -> _ReferenceAssignment:
+    """Capture an ordinary registered slot before the Core memory boundary."""
+    descriptor = cast(MemberDescriptorType, vars(type(target))[name])
+    return descriptor, target, prior, candidate
+
+
 @dataclass(frozen=True, slots=True)
 class _PathIdentity:
     path: Path
     directory: bool
-    source_authority: RootedSourceAuthority
-    source_file: RootedSourceFile | None
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource
+    source_file: RootedSourceFile | _FrozenSourceFile | None
 
     @classmethod
     def capture(
@@ -132,9 +165,9 @@ class _PathIdentity:
         path: Path,
         *,
         directory: bool,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> _PathIdentity:
-        if type(source_authority) is not RootedSourceAuthority:
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
             raise TypeError("path identity requires rooted source authority")
         if type(path) is not type(Path()) or not path.is_absolute():
             raise TypeError("path identity locator must be an absolute Path")
@@ -169,15 +202,15 @@ class _TrackedFileAnchor:
     path: Path
     digest: str
     content: bytes
-    source_file: RootedSourceFile
+    source_file: RootedSourceFile | _FrozenSourceFile
 
     @classmethod
     def capture(
         cls,
         path: Path,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> _TrackedFileAnchor:
-        if type(source_authority) is not RootedSourceAuthority:
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
             raise TypeError("tracked source requires rooted source authority")
         source = source_authority.bind_path(path)
         return cls(
@@ -201,13 +234,16 @@ class _ApplicationCheckoutIdentity:
     root: _PathIdentity
     host_module: _PathIdentity
     matcher_factory_source: _PathIdentity
+    frozen_helper_graph: _RuntimeModuleCodeBinding | None = None
 
     @classmethod
     def capture(
         cls,
         factory_source: _PathIdentity,
         approved_roots: _PathIdentity,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        *,
+        frozen_helper_graph: _RuntimeModuleCodeBinding | None = None,
     ) -> _ApplicationCheckoutIdentity:
         host_path = _absolute_locator(__file__)
         if host_path is None:
@@ -237,14 +273,21 @@ class _ApplicationCheckoutIdentity:
                 source_authority=source_authority,
             ),
             matcher_factory_source=factory_source,
+            frozen_helper_graph=frozen_helper_graph,
         )
 
     def is_current(self) -> bool:
+        if self.frozen_helper_graph is not None and not self.frozen_helper_graph.is_current():
+            return False
         if (
             self.host_module.path.parent != self.root.path
             or self.matcher_factory_source.path.parent != self.root.path
         ):
             return False
+        if type(self.host_module.source_file) is _FrozenSourceFile:
+            module = sys.modules.get(__name__)
+            if type(module) is not ModuleType or not self.host_module.source_file.matches_module(module):
+                return False
         return (
             self.root.is_current()
             and self.host_module.is_current()
@@ -838,7 +881,7 @@ class _ModuleSourceCodeAnchor:
         *,
         module_name: str,
         path: Path,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
         named_defaults: dict[str, object] | None = None,
     ) -> _ModuleSourceCodeAnchor:
         source = _TrackedFileAnchor.capture(path, source_authority)
@@ -908,6 +951,15 @@ class _ModuleSourceCodeAnchor:
     def matches_module(self, module: ModuleType) -> bool:
         spec = module.__spec__
         loader = module.__loader__
+        if type(self.source.source_file) is _FrozenSourceFile:
+            return (
+                type(spec) is ModuleSpec
+                and module.__name__ == self.module_name
+                and module.__package__ == ""
+                and sys.modules.get(self.module_name) is module
+                and spec.name == self.module_name
+                and self.source.source_file.matches_module(module)
+            )
         if type(spec) is not ModuleSpec or type(loader) is not SourceFileLoader:
             return False
         module_path = _absolute_locator(getattr(module, "__file__", None))
@@ -943,7 +995,7 @@ class _PendingModuleSourceCodeAnchor:
         *,
         module_name: str,
         path: Path,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
         named_defaults: dict[str, object] | None = None,
     ) -> _PendingModuleSourceCodeAnchor:
         if type(module_name) is not str or not module_name:
@@ -1541,13 +1593,24 @@ class _CoreMatcherFactoryBinding:
     closure_snapshot: tuple[tuple[int, int, str, str], ...] | None
     source: _PathIdentity
     approved_roots: _PathIdentity
+    frozen_graph: _RuntimeModuleCodeBinding | None
+    frozen_helper_graph: _RuntimeModuleCodeBinding | None
 
     @classmethod
     def capture(
         cls,
         value: object,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        *,
+        frozen_helper_anchor: _ModuleSourceCodeAnchor | None = None,
     ) -> _CoreMatcherFactoryBinding:
+        helper_graph = None
+        if type(source_authority) is _FrozenCapabilitySource:
+            if frozen_helper_anchor is None:
+                raise RuntimeError("frozen matcher requires its executed input helper")
+            helper_graph = _loaded_module_binding(frozen_helper_anchor)
+            if not helper_graph.is_current():
+                raise RuntimeError("frozen input helper implementation changed")
         if type(value) is not FunctionType:
             raise RuntimeError("Core matcher factory must be a Python function")
         function = cast(FunctionType, value)
@@ -1611,9 +1674,23 @@ class _CoreMatcherFactoryBinding:
                 directory=False,
                 source_authority=source_authority,
             ),
+            frozen_graph=(
+                _RuntimeModuleCodeBinding.capture(
+                    module,
+                    _ModuleSourceCodeAnchor.capture(
+                        module_name=module.__name__, path=source_path,
+                        source_authority=source_authority,
+                        named_defaults={"_DEFAULT_APPROVED_ROOTS": approved_path},
+                    ),
+                )
+                if type(source_authority) is _FrozenCapabilitySource else None
+            ),
+            frozen_helper_graph=helper_graph,
         )
 
     def is_current(self) -> bool:
+        if self.frozen_helper_graph is not None and not self.frozen_helper_graph.is_current():
+            return False
         function = self.function
         source_path = _absolute_locator(function.__code__.co_filename)
         module_path = _absolute_locator(getattr(self.module, "__file__", None))
@@ -1650,6 +1727,7 @@ class _CoreMatcherFactoryBinding:
             and module_path == self.source.path
             and self.source.is_current()
             and self.approved_roots.is_current()
+            and (self.frozen_graph is None or self.frozen_graph.is_current())
         )
 
     def invoke(
@@ -1663,14 +1741,20 @@ class _CoreMatcherFactoryBinding:
     ) -> CapabilityGatedTextMatcherV1 | None:
         if not self.is_current():
             return None
-        result = self.function(
-            repository_root=repository_root,
-            approved_roots_path=self.approved_roots.path,
-            generated_at_utc=generated_at_utc,
-            valid_until_utc=valid_until_utc,
-            evaluated_at_utc=evaluated_at_utc,
-            include_full=include_full,
-        )
+        with _host_input_session(self.source.source_authority) as session:
+            parameters = {} if session is None else {
+                "_input_session": session,
+                "_approved_roots_id": self.approved_roots.path.relative_to(repository_root).as_posix(),
+            }
+            result = self.function(
+                repository_root=repository_root if session is None else None,
+                approved_roots_path=self.approved_roots.path if session is None else None,
+                generated_at_utc=generated_at_utc,
+                valid_until_utc=valid_until_utc,
+                evaluated_at_utc=evaluated_at_utc,
+                include_full=include_full,
+                **parameters,
+            )
         if not self.is_current():
             return None
         return result
@@ -1692,7 +1776,7 @@ class _CoreTypeBinding:
         value: type[object],
         *,
         host_name: str | None,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> _CoreTypeBinding:
         if type(value) is not type:
             raise RuntimeError("Core constructor binding must be a class")
@@ -1739,7 +1823,7 @@ class _CoreTypeBinding:
 class _SourceAnchorGraph:
     """Composition-time source graph retained under one rooted authority."""
 
-    source_authority: RootedSourceAuthority
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource
     retrieval_approved_roots_anchor: _TrackedFileAnchor
     retrieval_validation_module_anchor: _PendingModuleSourceCodeAnchor
     retrieval_runtime_module_anchors: tuple[
@@ -1755,12 +1839,24 @@ class _SourceAnchorGraph:
     @classmethod
     def capture(
         cls,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> _SourceAnchorGraph:
-        if type(source_authority) is not RootedSourceAuthority:
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
             raise TypeError("source graph requires RootedSourceAuthority")
         source_authority.reprove()
         root = source_authority.root_path
+        # This helper owns input/session/revocation decisions. Prove its exact
+        # executed code just like the Core consumers, independently of the
+        # helper's own matches_module result and before composing any owner.
+        frozen_helper_anchor = (
+            _ModuleSourceCodeAnchor.capture(
+                module_name="capability_frozen_inputs",
+                path=root / "capability_frozen_inputs.py",
+                source_authority=source_authority,
+            )
+            if type(source_authority) is _FrozenCapabilitySource else None
+        )
+        helper_anchors = () if frozen_helper_anchor is None else (frozen_helper_anchor,)
         retrieval_roots = _TrackedFileAnchor.capture(
             root / _RETRIEVAL_APPROVED_ROOTS_RELATIVE_PATH,
             source_authority,
@@ -1808,7 +1904,7 @@ class _SourceAnchorGraph:
             anchor
             for anchor in build_anchors
             if anchor.module_name != _RETRIEVAL_VALIDATION_MODULE_NAME
-        )
+        ) + helper_anchors
         build_anchors_by_name = {
             anchor.module_name: anchor for anchor in build_anchors
         }
@@ -1816,7 +1912,7 @@ class _SourceAnchorGraph:
             root / _GATE_D_CONTRACT_RELATIVE_PATH,
             source_authority,
         )
-        gate_d_anchors = tuple(
+        gate_d_anchors = helper_anchors + tuple(
             build_anchors_by_name[module_name]
             if module_name in build_anchors_by_name
             else _PendingModuleSourceCodeAnchor.capture(
@@ -1838,11 +1934,13 @@ class _SourceAnchorGraph:
         matcher_binding = _CoreMatcherFactoryBinding.capture(
             build_validated_matcher_v1,
             source_authority,
+            frozen_helper_anchor=frozen_helper_anchor,
         )
         application_identity = _ApplicationCheckoutIdentity.capture(
             matcher_binding.source,
             matcher_binding.approved_roots,
             source_authority,
+            frozen_helper_graph=matcher_binding.frozen_helper_graph,
         )
         source_authority.reprove()
         return cls(
@@ -1897,7 +1995,7 @@ class _CoreRetrievalValidationBinding:
         validator_anchor: _ModuleSourceCodeAnchor,
         approved_roots_anchor: _TrackedFileAnchor,
         core_graphs: tuple[_RuntimeModuleCodeBinding, ...],
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> _CoreRetrievalValidationBinding:
         if type(value) is not FunctionType:
             raise RuntimeError("Core Gate C recomputation must be a function")
@@ -2067,12 +2165,26 @@ class _CoreRetrievalValidationBinding:
     ) -> object | None:
         if not self.is_current():
             return None
-        value = self.function(
-            repository_root=repository_root,
-            approved_roots_path=self.approved_roots.path,
-            generated_at_utc=generated_at_utc,
-            valid_until_utc=valid_until_utc,
-        )
+        with _host_input_session(self.source.source_authority) as session:
+            if session is None:
+                value = self.function(
+                    repository_root=repository_root,
+                    approved_roots_path=self.approved_roots.path,
+                    generated_at_utc=generated_at_utc,
+                    valid_until_utc=valid_until_utc,
+                )
+            else:
+                # The recursive validator graph pins this Core-owned helper.
+                value = self.module._recompute_retrieval_validation_from_session(
+                    session,
+                    approved_roots_id=self.approved_roots.path.relative_to(repository_root).as_posix(),
+                    generated_at_utc=generated_at_utc,
+                    valid_until_utc=valid_until_utc,
+                )
+                session.terminal_reproof()
+                # A provisional result may exercise all Core computations but
+                # cannot enter the Host's existing evaluator/publisher path.
+                session._completed_owner()
         if not self.is_current() or type(value) is not self.release_type.value:
             return None
         return value
@@ -2147,7 +2259,7 @@ class _RetrievalCheckoutIdentity:
     def capture(
         cls,
         binding: _CoreRetrievalValidationBinding,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> _RetrievalCheckoutIdentity:
         host_path = _absolute_locator(__file__)
         if host_path is None:
@@ -2220,7 +2332,7 @@ def _load_retrieval_validation_binding(
     validator_anchor: _ModuleSourceCodeAnchor,
     approved_roots_anchor: _TrackedFileAnchor,
     core_graphs: tuple[_RuntimeModuleCodeBinding, ...],
-    source_authority: RootedSourceAuthority,
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
 ) -> tuple[_CoreRetrievalValidationBinding, _RetrievalCheckoutIdentity]:
     """Late-bind validator objects under injected tracked-source anchors."""
 
@@ -2266,7 +2378,7 @@ class _RealGateCExecution:
             _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
         ],
         approved_roots_anchor: _TrackedFileAnchor,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> None:
         if type(validation_module_anchor) is not _PendingModuleSourceCodeAnchor:
             raise TypeError("Gate C execution requires pending validation source")
@@ -2280,7 +2392,7 @@ class _RealGateCExecution:
             raise TypeError("Gate C execution requires module source anchors")
         if type(approved_roots_anchor) is not _TrackedFileAnchor:
             raise TypeError("Gate C execution requires approved roots source")
-        if type(source_authority) is not RootedSourceAuthority:
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
             raise TypeError("Gate C execution requires rooted source authority")
         self.__validation_module_seed = validation_module_anchor
         self.__module_anchor_seeds = module_anchors
@@ -2290,6 +2402,9 @@ class _RealGateCExecution:
         self.__module_anchors: tuple[_ModuleSourceCodeAnchor, ...] | None = None
         self.__validation_binding: _CoreRetrievalValidationBinding | None = None
         self.__checkout_identity: _RetrievalCheckoutIdentity | None = None
+
+    def _input_source(self) -> RootedSourceAuthority | _FrozenCapabilitySource:
+        return self.__source_authority
 
     def _capture_binding(
         self,
@@ -2372,6 +2487,19 @@ class _GateDExecutionPort(Protocol):
 _GATE_D_PUBLICATION_MINT = object()
 
 
+@contextmanager
+def _gate_d_input_session(anchor: _TrackedFileAnchor) -> Iterator[_GateInputSession | None]:
+    source = _anchor_frozen_source(anchor)
+    if source is None:
+        yield None
+        return
+    try:
+        with source.input_session() as session:
+            yield session
+    except (OSError, RuntimeError, TypeError) as error:
+        raise _GateDOperationalError("GATE_D.INPUT_AUTHORITY_UNAVAILABLE") from error
+
+
 def _gate_d_publication_bindings_are_canonical(
     *,
     gate_module: ModuleType,
@@ -2436,9 +2564,14 @@ class _CoreGateDBinding:
         module_anchors: tuple[_ModuleSourceCodeAnchor, ...],
         contract_anchor: _TrackedFileAnchor,
     ) -> _CoreGateDBinding:
+        expected_names = (
+            ("capability_frozen_inputs",) + _GATE_D_MODULE_NAMES
+            if _anchor_frozen_source(contract_anchor) is not None
+            else _GATE_D_MODULE_NAMES
+        )
         if (
             type(module_anchors) is not tuple
-            or len(module_anchors) != len(_GATE_D_MODULE_NAMES)
+            or len(module_anchors) != len(expected_names)
             or any(
                 type(anchor) is not _ModuleSourceCodeAnchor
                 for anchor in module_anchors
@@ -2446,6 +2579,8 @@ class _CoreGateDBinding:
             or type(contract_anchor) is not _TrackedFileAnchor
         ):
             raise TypeError("Gate D capture requires rooted source anchors")
+        if tuple(anchor.module_name for anchor in module_anchors) != expected_names:
+            raise TypeError("Gate D capture requires its complete ordered source graph")
         modules = tuple(
             importlib.import_module(anchor.module_name)
             for anchor in module_anchors
@@ -2580,11 +2715,17 @@ class _CoreGateDBinding:
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
         try:
-            run_result = self.run_function(
-                contract_path,
-                work_root,
-                evidence_path,
-            )
+            source = _anchor_frozen_source(self.contract_anchor)
+            if source is None:
+                run_result = self.run_function(contract_path, work_root, evidence_path)
+            else:
+                with _gate_d_input_session(self.contract_anchor) as session:
+                    assert session is not None
+                    run_result = self.gate_module._run_benchmark_gate_d_from_session(
+                        session, contract_path=None, work_root=work_root,
+                        evidence_path=evidence_path,
+                        _contract_input=session.input(_GATE_D_CONTRACT_RELATIVE_PATH.as_posix()),
+                    )
         except self.error_type as error:
             raise _GateDOperationalError(
                 cast(Any, error).error_code
@@ -2619,7 +2760,7 @@ class _CoreGateDBinding:
             or not self.is_current()
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
-        def prepare_core_result(publication: object) -> _GateDExecutionResult:
+        def prepare_core_result(publication: object) -> Any:
             if type(publication) is not self.publication_result_type:
                 raise _GateDOperationalError(
                     "GATE_D.IMPLEMENTATION_CHANGED"
@@ -2630,19 +2771,23 @@ class _CoreGateDBinding:
                 raise TypeError(
                     "Core Gate D publication returned invalid snapshot"
                 )
+            if session is not None:
+                return cast(Any, prepare_publication)(snapshot, _input_session=session)
             return prepare_publication(snapshot)
 
         try:
-            publication = self.publish_function(
-                base_manifest,
-                run_result,
-                publisher,
-                generated_at_utc=base_manifest.generated_at_utc,
-                valid_until_utc=base_manifest.valid_until_utc,
-                evaluated_at_utc=evaluated_at_utc,
-                prepare_publication=prepare_core_result,
-                _publication_bindings=self.publication_bindings,
-            )
+            with _gate_d_input_session(self.contract_anchor) as session:
+                publication = self.publish_function(
+                    base_manifest,
+                    run_result,
+                    publisher,
+                    generated_at_utc=base_manifest.generated_at_utc,
+                    valid_until_utc=base_manifest.valid_until_utc,
+                    evaluated_at_utc=evaluated_at_utc,
+                    prepare_publication=prepare_core_result,
+                    _publication_bindings=self.publication_bindings,
+                    **({} if session is None else {"_input_session": session}),
+                )
         except self.error_type as error:
             validated_error: Any = error
             raise _GateDOperationalError(
@@ -2667,13 +2812,18 @@ class _CoreGateDBinding:
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
         try:
-            self.persist_attestation_function(
-                contract_path=contract_path,
-                state_root=state_root,
-                base_manifest=base_manifest,
-                run_result=run_result,
-                issued_at_utc=issued_at_utc,
-            )
+            with _gate_d_input_session(self.contract_anchor) as session:
+                self.persist_attestation_function(
+                    contract_path=contract_path if session is None else None,
+                    state_root=state_root,
+                    base_manifest=base_manifest,
+                    run_result=run_result,
+                    issued_at_utc=issued_at_utc,
+                    **({} if session is None else {
+                        "_input_session": session,
+                        "_contract_input": session.input(_GATE_D_CONTRACT_RELATIVE_PATH.as_posix()),
+                    }),
+                )
         except self.error_type as error:
             validated_error: Any = error
             raise _GateDOperationalError(
@@ -2695,11 +2845,16 @@ class _CoreGateDBinding:
         ):
             raise _GateDOperationalError("GATE_D.IMPLEMENTATION_CHANGED")
         try:
-            run_result = self.restore_attestation_function(
-                contract_path=contract_path,
-                state_root=state_root,
-                base_manifest=base_manifest,
-            )
+            with _gate_d_input_session(self.contract_anchor) as session:
+                run_result = self.restore_attestation_function(
+                    contract_path=contract_path if session is None else None,
+                    state_root=state_root,
+                    base_manifest=base_manifest,
+                    **({} if session is None else {
+                        "_input_session": session,
+                        "_contract_input": session.input(_GATE_D_CONTRACT_RELATIVE_PATH.as_posix()),
+                    }),
+                )
         except self.error_type as error:
             validated_error: Any = error
             raise _GateDOperationalError(
@@ -2834,7 +2989,7 @@ class _RealGateDExecution:
             _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
         ],
         contract_anchor: _TrackedFileAnchor,
-        source_authority: RootedSourceAuthority,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     ) -> None:
         if type(module_anchors) is not tuple or any(
             type(anchor) not in {
@@ -2846,7 +3001,7 @@ class _RealGateDExecution:
             raise TypeError("Gate D execution requires module source anchors")
         if type(contract_anchor) is not _TrackedFileAnchor:
             raise TypeError("Gate D execution requires a contract source anchor")
-        if type(source_authority) is not RootedSourceAuthority:
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
             raise TypeError("Gate D execution requires rooted source authority")
         self.__module_anchor_seeds = module_anchors
         self.__module_anchors: tuple[_ModuleSourceCodeAnchor, ...] | None = None
@@ -2857,6 +3012,19 @@ class _RealGateDExecution:
     @property
     def contract_path(self) -> Path:
         return self.__contract_anchor.path
+
+    def input_operation(self):
+        source = _anchor_frozen_source(self.__contract_anchor)
+        return nullcontext() if source is None else source.operation()
+
+    def require_worker_wait_allowed(self) -> None:
+        source = _anchor_frozen_source(self.__contract_anchor)
+        if source is not None:
+            source.require_worker_wait_allowed()
+
+    def condition_lock(self) -> Lock | _OwnerWaitGuardLock:
+        source = _anchor_frozen_source(self.__contract_anchor)
+        return Lock() if source is None else _OwnerWaitGuardLock(source)
 
     def _capture_binding(self) -> _CoreGateDBinding:
         """Materialize pending Gate D anchors under a fresh proof window."""
@@ -3147,13 +3315,16 @@ class _CoreRetrievalQueryPort:
 
 
 @final
-class _MatcherGenerationNotifications:
+class _MatcherGenerationNotifications(metaclass=_publication_reference_type):
     """Condition-backed observer with no public publication operation."""
 
-    __slots__ = ("__condition", "__generation", "__owner_identity")
+    __slots__ = ("__condition", "__generation", "__owner_identity", "__guarded_lock")
 
-    def __init__(self, lock: RLock, owner_identity: object) -> None:
-        self.__condition = Condition(lock)
+    def __init__(self, lock: RLock | _OwnerWaitGuardLock, owner_identity: object) -> None:
+        # threading supports the complete RLock protocol implemented by the
+        # frozen wait guard; typeshed lists only the built-in lock classes.
+        self.__condition = Condition(cast(Any, lock))
+        self.__guarded_lock = lock if type(lock) is _OwnerWaitGuardLock else None
         self.__generation = 0
         self.__owner_identity = owner_identity
 
@@ -3178,6 +3349,8 @@ class _MatcherGenerationNotifications:
                 )
         else:
             numeric_timeout = None
+        if timeout != 0 and self.__guarded_lock is not None:
+            self.__guarded_lock.require_worker_wait_allowed()
         with self.__condition:
             changed = self.__condition.wait_for(
                 lambda: self.__generation > after_generation,
@@ -3228,13 +3401,14 @@ class _MatcherGenerationNotifications:
 
 
 @final
-class _RetrievalGenerationNotifications:
+class _RetrievalGenerationNotifications(metaclass=_publication_reference_type):
     """Condition-backed retrieval observer with no mutation surface."""
 
-    __slots__ = ("__condition", "__generation", "__owner_identity")
+    __slots__ = ("__condition", "__generation", "__owner_identity", "__guarded_lock")
 
-    def __init__(self, lock: RLock, owner_identity: object) -> None:
-        self.__condition = Condition(lock)
+    def __init__(self, lock: RLock | _OwnerWaitGuardLock, owner_identity: object) -> None:
+        self.__condition = Condition(cast(Any, lock))
+        self.__guarded_lock = lock if type(lock) is _OwnerWaitGuardLock else None
         self.__generation = 0
         self.__owner_identity = owner_identity
 
@@ -3259,6 +3433,8 @@ class _RetrievalGenerationNotifications:
                 )
         else:
             numeric_timeout = None
+        if timeout != 0 and self.__guarded_lock is not None:
+            self.__guarded_lock.require_worker_wait_allowed()
         with self.__condition:
             changed = self.__condition.wait_for(
                 lambda: self.__generation > after_generation,
@@ -3357,7 +3533,7 @@ def _clone_retrieval_display(
 
 
 @final
-class CapabilityHost:
+class CapabilityHost(metaclass=_publication_reference_type):
     """Hold immutable process handoffs for independent matcher/retrieval gates.
 
     Validation mutation is isolated behind composition-owner objects; the
@@ -3405,8 +3581,8 @@ class CapabilityHost:
             display=matcher_display,
         )
 
-        self.__lock = RLock()
-        self.__retrieval_lifecycle_lock = Lock()
+        self.__lock: RLock | _OwnerWaitGuardLock = RLock()
+        self.__retrieval_lifecycle_lock: Lock | _OwnerWaitGuardLock = Lock()
         self.__matcher_handoff = matcher
         self.__matcher_owner_identity = object()
         self.__matcher_notifications = _MatcherGenerationNotifications(
@@ -3438,6 +3614,16 @@ class CapabilityHost:
             matcher=matcher.display,
             retrieval=retrieval.display,
         )
+
+    def _bind_frozen_input_waits(self, mint: object, source: _FrozenCapabilitySource) -> None:
+        if mint is not _COMPOSITION_MINT_IDENTITY or type(source) is not _FrozenCapabilitySource:
+            raise PermissionError("input wait guards require frozen composition")
+        if self.__matcher_handoff.generation or self.__retrieval_handoff.generation or self.__retrieval_gate_c_owner_minted:
+            raise RuntimeError("input wait guards must precede owner handoff")
+        self.__lock = _OwnerWaitGuardLock(source)
+        self.__retrieval_lifecycle_lock = _OwnerWaitGuardLock(source)
+        self.__matcher_notifications = _MatcherGenerationNotifications(self.__lock, self.__matcher_owner_identity)
+        self.__retrieval_notifications = _RetrievalGenerationNotifications(self.__lock, self.__retrieval_owner_identity)
 
     def matcher_snapshot(self) -> MatcherHandoffSnapshot:
         """Capture one immutable matcher handoff reference."""
@@ -3683,6 +3869,7 @@ class CapabilityHost:
         owner_identity: object,
         matcher: CapabilityGatedTextMatcherV1 | None,
         capability: TextMatcherCapability | None,
+        _input_session: _GateInputSession | None = None,
     ) -> MatcherHandoffSnapshot:
         """Atomically replace the handoff after Core validation."""
 
@@ -3752,6 +3939,18 @@ class CapabilityHost:
                 self.__matcher_notifications._publish_prevalidated_locked(
                     generation
                 )
+                if _input_session is not None:
+                    assignments = (
+                        _reference_assignment(self, "_CapabilityHost__matcher_handoff", old_handoff, handoff),
+                        _reference_assignment(self, "_CapabilityHost__status", old_status, status),
+                        _reference_assignment(self.__matcher_notifications, "_MatcherGenerationNotifications__generation", old_notification_generation, generation),
+                    )
+                    self.__matcher_handoff = old_handoff
+                    self.__status = old_status
+                    self.__matcher_notifications._restore_precommit_locked(old_notification_generation)
+                    plan = _input_session._prepare_reference_publication(assignments, handoff)
+                    _input_session._prepare_publication()
+                    return _input_session._commit_publication(plan)
             except BaseException:
                 self.__matcher_handoff = old_handoff
                 self.__status = old_status
@@ -3771,6 +3970,7 @@ class CapabilityHost:
         service: TMRetrievalService,
         capability: RetrievalCapabilitySnapshot,
         base_manifest: RetrievalCapabilityManifest,
+        _input_session: _GateInputSession | None = None,
     ) -> RetrievalHandoffSnapshot:
         """Atomically replace the full retrieval graph after Gate C."""
 
@@ -3852,6 +4052,30 @@ class CapabilityHost:
                     self.__retrieval_notifications._publish_prevalidated_locked(
                         generation
                     )
+                    if _input_session is not None:
+                        assignments = (
+                            _reference_assignment(self, "_CapabilityHost__retrieval_checkout_identity", old_checkout_identity, self.__retrieval_checkout_identity),
+                            _reference_assignment(self, "_CapabilityHost__retrieval_validation_binding", old_validation_binding, self.__retrieval_validation_binding),
+                            _reference_assignment(self, "_CapabilityHost__retrieval_publisher", old_publisher, publisher),
+                            _reference_assignment(self, "_CapabilityHost__retrieval_service", old_service, service),
+                            _reference_assignment(self, "_CapabilityHost__retrieval_base_manifest", old_base_manifest, base_manifest),
+                            _reference_assignment(self, "_CapabilityHost__retrieval_handoff", old_handoff, handoff),
+                            _reference_assignment(self, "_CapabilityHost__retrieval_operation_display", old_operation_display, self.__retrieval_operation_display),
+                            _reference_assignment(self, "_CapabilityHost__status", old_status, status),
+                            _reference_assignment(self.__retrieval_notifications, "_RetrievalGenerationNotifications__generation", old_notification_generation, generation),
+                        )
+                        self.__retrieval_publisher = old_publisher
+                        self.__retrieval_service = old_service
+                        self.__retrieval_base_manifest = old_base_manifest
+                        self.__retrieval_checkout_identity = old_checkout_identity
+                        self.__retrieval_validation_binding = old_validation_binding
+                        self.__retrieval_handoff = old_handoff
+                        self.__retrieval_operation_display = old_operation_display
+                        self.__status = old_status
+                        self.__retrieval_notifications._restore_precommit_locked(old_notification_generation)
+                        plan = _input_session._prepare_reference_publication(assignments, handoff)
+                        _input_session._prepare_publication()
+                        return _input_session._commit_publication(plan)
                 except BaseException:
                     self.__retrieval_publisher = old_publisher
                     self.__retrieval_service = old_service
@@ -3906,6 +4130,8 @@ class CapabilityHost:
         evaluated_at_utc: datetime,
         prepare_owner_success: Callable[[], None] | None = None,
         rollback_owner_success: Callable[[], None] | None = None,
+        owner_success_assignments: tuple[_ReferenceAssignment, ...] = (),
+        prepare_owner_notification: Callable[[], None] | None = None,
     ) -> RetrievalHandoffSnapshot | None:
         """Publish and install one still-current Gate D graph generation."""
 
@@ -3945,9 +4171,18 @@ class CapabilityHost:
                 )
                 prepared_handoff = graph.handoff
 
+                def restore_publication() -> None:
+                    self.__retrieval_handoff = old_handoff
+                    self.__retrieval_operation_display = old_operation_display
+                    self.__status = old_status
+                    self.__retrieval_notifications._restore_precommit_locked(old_notification_generation)
+                    if rollback_owner_success is not None:
+                        rollback_owner_success()
+
                 def prepare_publication(
                     capability: RetrievalCapabilitySnapshot,
-                ) -> _GateDExecutionResult:
+                    *, _input_session: _GateInputSession | None = None,
+                ) -> Any:
                     nonlocal prepared_handoff
                     if (
                         capability.context != graph.capability.context
@@ -3972,11 +4207,25 @@ class CapabilityHost:
                         handoff=handoff,
                         status=status,
                     )
+                    operation_display = _clone_retrieval_display(display)
+                    if _input_session is not None:
+                        try:
+                            self.__retrieval_notifications._publish_prevalidated_locked(generation)
+                        finally:
+                            self.__retrieval_notifications._restore_precommit_locked(old_notification_generation)
+                        if prepare_owner_notification is not None:
+                            prepare_owner_notification()
+                        assignments = (
+                            _reference_assignment(self, "_CapabilityHost__retrieval_handoff", old_handoff, handoff),
+                            _reference_assignment(self, "_CapabilityHost__retrieval_operation_display", old_operation_display, operation_display),
+                            _reference_assignment(self, "_CapabilityHost__status", old_status, status),
+                            _reference_assignment(self.__retrieval_notifications, "_RetrievalGenerationNotifications__generation", old_notification_generation, generation),
+                        ) + owner_success_assignments
+                        prepared_handoff = handoff
+                        return _input_session._prepare_reference_publication(assignments, prepared)
                     try:
                         self.__retrieval_handoff = handoff
-                        self.__retrieval_operation_display = (
-                            _clone_retrieval_display(display)
-                        )
+                        self.__retrieval_operation_display = operation_display
                         self.__status = status
                         self.__retrieval_notifications._publish_prevalidated_locked(
                             generation
@@ -3984,28 +4233,23 @@ class CapabilityHost:
                         if prepare_owner_success is not None:
                             prepare_owner_success()
                     except BaseException:
-                        self.__retrieval_handoff = old_handoff
-                        self.__retrieval_operation_display = (
-                            old_operation_display
-                        )
-                        self.__status = old_status
-                        self.__retrieval_notifications._restore_precommit_locked(
-                            old_notification_generation
-                        )
-                        if rollback_owner_success is not None:
-                            rollback_owner_success()
+                        restore_publication()
                         raise
                     prepared_handoff = handoff
                     return prepared
 
-                publication.publish(
-                    publication_owner_identity=owner_identity,
-                    publication_graph_nonce=graph.publication_nonce,
-                    base_manifest=graph.base_manifest,
-                    publisher=graph.publisher,
-                    evaluated_at_utc=evaluated_at_utc,
-                    prepare_publication=prepare_publication,
-                )
+                try:
+                    publication.publish(
+                        publication_owner_identity=owner_identity,
+                        publication_graph_nonce=graph.publication_nonce,
+                        base_manifest=graph.base_manifest,
+                        publisher=graph.publisher,
+                        evaluated_at_utc=evaluated_at_utc,
+                        prepare_publication=prepare_publication,
+                    )
+                except BaseException:
+                    restore_publication()
+                    raise
                 return prepared_handoff
 
 
@@ -4082,6 +4326,33 @@ class _MatcherValidationOwner:
         evaluated_at_utc: datetime,
         include_full: bool,
     ) -> MatcherHandoffSnapshot:
+        source = self.__factory_binding.source.source_authority
+        if type(source) is _FrozenCapabilitySource:
+            try:
+                with source.operation():
+                    return self.__validate_in_operation(
+                        generated_at_utc=generated_at_utc,
+                        valid_until_utc=valid_until_utc,
+                        evaluated_at_utc=evaluated_at_utc,
+                        include_full=include_full,
+                    )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return self.__host.matcher_snapshot()
+        return self.__validate_in_operation(
+            generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc,
+            evaluated_at_utc=evaluated_at_utc,
+            include_full=include_full,
+        )
+
+    def __validate_in_operation(
+        self,
+        *,
+        generated_at_utc: datetime,
+        valid_until_utc: datetime,
+        evaluated_at_utc: datetime,
+        include_full: bool,
+    ) -> MatcherHandoffSnapshot:
         if (
             not self.__checkout_identity.is_current()
             or not self.__factory_binding.is_current()
@@ -4097,29 +4368,30 @@ class _MatcherValidationOwner:
             )
         except (OSError, ValueError):
             return self.__publish_unavailable()
-        if (
-            matcher is None
-            or not self.__checkout_identity.is_current()
-            or not self.__factory_binding.is_current()
-        ):
-            return self.__publish_unavailable()
-        if type(matcher) is not CapabilityGatedTextMatcherV1:
-            raise TypeError(
-                "Core validated matcher factory returned an invalid type"
+        with _host_input_session(self.__factory_binding.source.source_authority) as session:
+            if (
+                matcher is None
+                or not self.__checkout_identity.is_current()
+                or not self.__factory_binding.is_current()
+            ):
+                return self.__host._install_core_matcher(
+                    owner_identity=self.__owner_identity, matcher=None,
+                    capability=None, _input_session=session,
+                )
+            if type(matcher) is not CapabilityGatedTextMatcherV1:
+                raise TypeError("Core validated matcher factory returned an invalid type")
+            capability = matcher.capability()
+            return self.__host._install_core_matcher(
+                owner_identity=self.__owner_identity, matcher=matcher,
+                capability=capability, _input_session=session,
             )
-        capability = matcher.capability()
-        return self.__host._install_core_matcher(
-            owner_identity=self.__owner_identity,
-            matcher=matcher,
-            capability=capability,
-        )
 
     def __publish_unavailable(self) -> MatcherHandoffSnapshot:
-        return self.__host._install_core_matcher(
-            owner_identity=self.__owner_identity,
-            matcher=None,
-            capability=None,
-        )
+        with _host_input_session(self.__factory_binding.source.source_authority) as session:
+            return self.__host._install_core_matcher(
+                owner_identity=self.__owner_identity,
+                matcher=None, capability=None, _input_session=session,
+            )
 
     def _is_bound_to(self, host: CapabilityHost) -> bool:
         return self.__host is host
@@ -4164,7 +4436,30 @@ class _RetrievalGateCValidationOwner:
         evaluated_at_utc: datetime,
     ) -> RetrievalHandoffSnapshot:
         """Recompute Gate C and swap only one fully validated Core graph."""
+        source = self.__execution._input_source()
+        if type(source) is _FrozenCapabilitySource:
+            try:
+                with source.operation():
+                    return self.__validate_in_operation(
+                        generated_at_utc=generated_at_utc,
+                        valid_until_utc=valid_until_utc,
+                        evaluated_at_utc=evaluated_at_utc,
+                    )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return self.__host.retrieval_snapshot()
+        return self.__validate_in_operation(
+            generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc,
+            evaluated_at_utc=evaluated_at_utc,
+        )
 
+    def __validate_in_operation(
+        self,
+        *,
+        generated_at_utc: datetime,
+        valid_until_utc: datetime,
+        evaluated_at_utc: datetime,
+    ) -> RetrievalHandoffSnapshot:
         with self.__validation_lock:
             current = self.__host.retrieval_snapshot()
             try:
@@ -4208,15 +4503,15 @@ class _RetrievalGateCValidationOwner:
             ):
                 return current
             try:
-                return self.__host._install_gate_c_service(
-                    owner_identity=self.__owner_identity,
-                    checkout_identity=checkout_identity,
-                    validation_binding=validation_binding,
-                    publisher=publisher,
-                    service=service,
-                    capability=capability,
-                    base_manifest=base_manifest,
-                )
+                with _host_input_session(self.__execution._input_source()) as session:
+                    return self.__host._install_gate_c_service(
+                        owner_identity=self.__owner_identity,
+                        checkout_identity=checkout_identity,
+                        validation_binding=validation_binding,
+                        publisher=publisher, service=service,
+                        capability=capability, base_manifest=base_manifest,
+                        _input_session=session,
+                    )
             except (OSError, RuntimeError, ValueError):
                 return current
 
@@ -4225,7 +4520,7 @@ class _RetrievalGateCValidationOwner:
 
 
 @final
-class _RetrievalGateDOwner:
+class _RetrievalGateDOwner(metaclass=_publication_reference_type):
     """Composition-private, process-local asynchronous Gate D owner."""
 
     __slots__ = (
@@ -4233,6 +4528,7 @@ class _RetrievalGateDOwner:
         "__condition",
         "__contract_path",
         "__execute",
+        "__execution",
         "__host",
         "__owner_identity",
         "__programmer_error",
@@ -4264,8 +4560,9 @@ class _RetrievalGateDOwner:
             raise TypeError("Gate D owner requires rooted source execution")
         self.__contract_path = execution.contract_path
         self.__execute = execution.run
+        self.__execution = execution
         self.__restore = execution.restore
-        self.__condition = Condition(Lock())
+        self.__condition = Condition(cast(Any, execution.condition_lock()))
         self.__status = GateDRunStatus(
             epoch=0,
             state=GateDRunState.IDLE,
@@ -4329,6 +4626,14 @@ class _RetrievalGateDOwner:
             return self.__status
 
     def restore_gate_d(
+        self,
+        *,
+        evaluated_at_utc: datetime,
+    ) -> GateDRunStatus:
+        with self.__execution.input_operation():
+            return self.__restore_gate_d(evaluated_at_utc=evaluated_at_utc)
+
+    def __restore_gate_d(
         self,
         *,
         evaluated_at_utc: datetime,
@@ -4409,6 +4714,8 @@ class _RetrievalGateDOwner:
         return self.status()
 
     def wait(self, timeout: float | None = None) -> GateDRunStatus:
+        if timeout != 0:
+            self.__execution.require_worker_wait_allowed()
         if timeout is not None:
             if type(timeout) not in (int, float):
                 raise TypeError("Gate D timeout must be numeric")
@@ -4431,6 +4738,22 @@ class _RetrievalGateDOwner:
         return status
 
     def __run(
+        self,
+        *,
+        epoch: int,
+        graph: _GateDGraphSnapshot,
+        evaluated_at_utc: datetime,
+    ) -> None:
+        try:
+            with self.__execution.input_operation():
+                self.__run_in_input_operation(epoch=epoch, graph=graph, evaluated_at_utc=evaluated_at_utc)
+        except (OSError, RuntimeError, TypeError):
+            self.__finish(GateDRunStatus(
+                epoch=epoch, state=GateDRunState.FAILED,
+                safe_code="GATE_D.INPUT_AUTHORITY_UNAVAILABLE",
+            ))
+
+    def __run_in_input_operation(
         self,
         *,
         epoch: int,
@@ -4585,6 +4908,11 @@ class _RetrievalGateDOwner:
                 evaluated_at_utc=evaluated_at_utc,
                 prepare_owner_success=prepare_owner_success,
                 rollback_owner_success=rollback_owner_success,
+                owner_success_assignments=(
+                    _reference_assignment(self, "_RetrievalGateDOwner__status", old_status, succeeded),
+                    _reference_assignment(self, "_RetrievalGateDOwner__programmer_error", old_programmer_error, None),
+                ),
+                prepare_owner_notification=self.__condition.notify_all,
             )
             if installed is None:
                 raise _GateDOperationalError("GATE_D.GATE_C_CHANGED")
@@ -4619,6 +4947,11 @@ class CapabilityHostComposition:
         RetrievalGateCValidationOwnerPort | None
     ) = None
     retrieval_gate_d_owner: RetrievalGateDOwnerPort | None = None
+    _frozen_input_source: _FrozenCapabilitySource | None = None
+
+    def _close_frozen_inputs(self) -> None:
+        if self._frozen_input_source is not None:
+            self._frozen_input_source.close()
 
     def __post_init__(self) -> None:
         if type(self.host) is not CapabilityHost:
@@ -4649,14 +4982,16 @@ class CapabilityHostComposition:
 
 def compose_capability_host(
     *,
-    source_authority: RootedSourceAuthority,
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
     evaluated_at_utc: datetime,
     gate_d_attestation_root: Path | None = None,
 ) -> CapabilityHostComposition:
     """Create the application-owned host and its private validation control."""
 
-    if type(source_authority) is not RootedSourceAuthority:
+    if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
         raise TypeError("capability host requires RootedSourceAuthority")
+    if getattr(sys, "frozen", False) and type(source_authority) is RootedSourceAuthority:
+        raise RuntimeError("frozen Host requires trusted source handoff")
     with source_authority.proof_window():
         source_graph = _SourceAnchorGraph.capture(source_authority)
         gate_c_execution = _RealGateCExecution(
@@ -4675,8 +5010,11 @@ def compose_capability_host(
             source_authority=source_graph.source_authority,
         )
         host = CapabilityHost(evaluated_at_utc=evaluated_at_utc)
+        if type(source_authority) is _FrozenCapabilitySource:
+            host._bind_frozen_input_waits(_COMPOSITION_MINT_IDENTITY, source_authority)
         return CapabilityHostComposition(
             host=host,
+            _frozen_input_source=source_authority if type(source_authority) is _FrozenCapabilitySource else None,
             matcher_validation_owner=host._composition_matcher_owner(
                 _COMPOSITION_MINT_IDENTITY,
                 checkout_identity=source_graph.application_checkout_identity,
@@ -4694,6 +5032,27 @@ def compose_capability_host(
         )
 
 
+def compose_frozen_capability_host(
+    *,
+    trusted_source_authority: object,
+    evaluated_at_utc: datetime,
+    gate_d_attestation_root: Path | None = None,
+    _owner_scheduler: object | None = None,
+) -> CapabilityHostComposition:
+    """Consume the post-Boot-TCB handoff; never fall back to source paths."""
+    source = _compose_frozen_capability_source(trusted_source_authority)
+    try:
+        if _owner_scheduler is not None:
+            source.install_owner_scheduler(_owner_scheduler)
+        return compose_capability_host(
+            source_authority=source, evaluated_at_utc=evaluated_at_utc,
+            gate_d_attestation_root=gate_d_attestation_root,
+        )
+    except BaseException:
+        source.close()
+        raise
+
+
 __all__ = [
     "CapabilityHostComposition",
     "CapabilityDisplaySnapshot",
@@ -4709,4 +5068,5 @@ __all__ = [
     "RetrievalHandoffSnapshot",
     "RetrievalQueryPort",
     "compose_capability_host",
+    "compose_frozen_capability_host",
 ]

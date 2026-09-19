@@ -869,6 +869,8 @@ class _ChunkSegmentSelectionSession:
 class QtEditorWindow(QMainWindow):
     """LocalCAT desktop shell; all domain operations go through EditorController."""
 
+    _capability_validation_closed = Signal()
+
     def __init__(
         self,
         controller: EditorController,
@@ -6288,6 +6290,7 @@ class QtEditorWindow(QMainWindow):
                 except RuntimeError:
                     pass
             event.accept()
+            self._capability_validation_closed.emit()
         else:
             event.ignore()
 
