@@ -55,6 +55,8 @@ static DWORD producer_thread;
 static unsigned char configured, registered, armed, taken, closed;
 static PyObject *authority_type;
 static PyObject *issued_object;
+static PyObject *registered_producer;
+static PyObject *producer_holder;
 static unsigned char bootstrap_executed;
 static unsigned char initialization_attempted;
 static unsigned char interpreter_path_cleared;
@@ -90,9 +92,23 @@ static int localcat_valid_object(PyObject *self)
 
 void localcat_bootstrap_abort(void)
 {
+    PyObject *holder;
     closed = 1U;
     armed = 0U;
+    registered_producer = NULL;
+    holder = producer_holder;
+    producer_holder = NULL;
+    if (holder != NULL) { api.Py_DecRef(holder); }
     if (bundle != NULL) {
+        /* Revocation is immediate, including final-reference release on a
+         * worker. Handle release stays with the initial native owner; the
+         * windowed entry's terminal abort drains a deferred close. Never
+         * dispatch cleanup through a possibly closed Python/Qt scheduler. */
+        if ((producer_thread != 0U && GetCurrentThreadId() != producer_thread) ||
+            (owner_interpreter != NULL && api.Py_IsInitialized() &&
+             api.PyThreadState_GetInterpreter(api.PyThreadState_Get()) != owner_interpreter)) {
+            return;
+        }
         localcat_bundle_authority_close(bundle);
         free(bundle);
         bundle = NULL;
@@ -214,9 +230,52 @@ static PyObject *localcat_close(PyObject *self, PyObject *unused)
     return api.PyBool_FromLong(1);
 }
 
+static PyModuleDef producer_holder_definition = {
+    PyModuleDef_HEAD_INIT, "_localcat_private_producer_holder", NULL, -1,
+    NULL, NULL, NULL, NULL, NULL
+};
+
+static PyObject *localcat_bind_producer(PyObject *self, PyObject *argument)
+{
+    struct localcat_retained_entry *entry;
+    unsigned char *bytes;
+    size_t count;
+    const char *diagnostic = NULL;
+    if (!localcat_valid_object(self)) { return NULL; }
+    if (!bootstrap_executed || registered_producer != NULL || producer_holder != NULL) {
+        return localcat_error("FROZEN_ENTRY.PRODUCER_BIND_STATE");
+    }
+    entry = localcat_bundle_authority_find(bundle, "catalog");
+    if (entry == NULL || entry->manifest_entry->role != LOCALCAT_ROLE_INTERPRETER ||
+        localcat_retained_entry_read_verified(entry, &bytes, &count, &diagnostic) != 0) {
+        return localcat_error(diagnostic ? diagnostic : "FROZEN_ENTRY.PRODUCER_CATALOG_MISSING");
+    }
+    free(bytes);
+    /* This private, unexported holder owns a strong reference. Pointer identity
+     * remains native state even if Python mutates a public module namespace. */
+    producer_holder = api.PyModule_Create2(&producer_holder_definition, PYTHON_API_VERSION);
+    if (producer_holder == NULL || api.PyModule_AddObjectRef(producer_holder, "producer", argument) != 0) {
+        if (producer_holder != NULL) { api.Py_DecRef(producer_holder); producer_holder = NULL; }
+        return NULL;
+    }
+    registered_producer = argument;
+    return api.PyBool_FromLong(1);
+}
+
+static PyObject *localcat_is_producer(PyObject *module, PyObject *argument)
+{
+    (void)module;
+    /* Memory-only admission may be queried from a worker in the same
+     * interpreter. It does not perform or replace an owner-thread proof. */
+    return api.PyBool_FromLong(armed && !closed && taken && bundle != NULL &&
+        bundle->state == 2U && registered_producer != NULL && argument == registered_producer &&
+        api.PyThreadState_GetInterpreter(api.PyThreadState_Get()) == owner_interpreter);
+}
+
 static PyMethodDef authority_methods[] = {
     {"read_verified", localcat_read_verified, METH_O, NULL},
     {"module_reproof", localcat_module_reproof, METH_O, NULL},
+    {"bind_producer", localcat_bind_producer, METH_O, NULL},
     {"close", localcat_close, METH_NOARGS, NULL},
     {"__reduce__", localcat_forbid_copy, METH_NOARGS, NULL},
     {"__reduce_ex__", localcat_forbid_copy, METH_O, NULL},
@@ -258,13 +317,16 @@ static PyObject *localcat_take(PyObject *module, PyObject *unused)
 }
 static PyMethodDef module_methods[] = {
     {"take_attestation", localcat_take, METH_NOARGS, NULL},
+    {"is_producer", localcat_is_producer, METH_O, NULL},
     {NULL, NULL, 0, NULL}
 };
 static void localcat_module_free(void *module)
 {
     (void)module;
-    if (authority_type != NULL) { api.Py_DecRef(authority_type); authority_type = NULL; }
     localcat_bootstrap_abort();
+    registered_producer = NULL;
+    if (producer_holder != NULL) { api.Py_DecRef(producer_holder); producer_holder = NULL; }
+    if (authority_type != NULL) { api.Py_DecRef(authority_type); authority_type = NULL; }
 }
 static PyModuleDef module_definition = {
     PyModuleDef_HEAD_INIT, "_localcat_frozen_bootstrap", NULL, -1,
@@ -663,15 +725,42 @@ static PyModuleDef bootstrap_definition = {
     PyModuleDef_HEAD_INIT,"localcat_spike_bootstrap",NULL,-1,NULL,NULL,NULL,NULL,NULL
 };
 
+static PyObject *localcat_entry_arguments(void)
+{
+    PyObject *arguments, *value;
+    int index, count = 0;
+    char encoded[131072];
+    if (localcat_bundle_authority_find(bundle, "catalog") != NULL) {
+        if (__argc < 1 || __argc > 3 || __wargv == NULL) {
+            return localcat_error("FROZEN_ENTRY.ARGUMENTS_REJECTED");
+        }
+        count = __argc - 1;
+    }
+    arguments = api.PyTuple_New(count);
+    if (arguments == NULL) { return NULL; }
+    for (index = 0; index < count; ++index) {
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, __wargv[index + 1], -1,
+                               encoded, sizeof(encoded), NULL, NULL) <= 0) {
+            api.Py_DecRef(arguments);
+            return localcat_error("FROZEN_ENTRY.ARGUMENTS_REJECTED");
+        }
+        value = api.PyUnicode_FromString(encoded);
+        if (value == NULL || api.PyTuple_SetItem(arguments, index, value) != 0) {
+            api.Py_DecRef(arguments); return NULL;
+        }
+    }
+    return arguments;
+}
+
 int localcat_bootstrap_execute(const char **diagnostic)
 {
     struct localcat_retained_entry *entry;
     unsigned char *bytes = NULL;
     size_t count;
     unsigned int index;
-    char filename[1025];
+    char filename[131072];
     PyObject *code = NULL, *module = NULL, *native = NULL, *authority = NULL, *builtins = NULL;
-    PyObject *name = NULL, *origin = NULL, *setter = NULL, *inserted = NULL, *evaluated = NULL;
+    PyObject *name = NULL, *origin = NULL, *setter = NULL, *inserted = NULL, *evaluated = NULL, *arguments = NULL;
     PyObject *modules, *globals, *builtin_globals;
     int result = -1;
     *diagnostic = "FROZEN_ENTRY.BOOTSTRAP_EXECUTION_UNAVAILABLE";
@@ -688,12 +777,17 @@ int localcat_bootstrap_execute(const char **diagnostic)
         localcat_retained_entry_read_verified(entry,&bytes,&count,diagnostic) != 0) {
         goto cleanup;
     }
-    if (entry->manifest_entry->path_length >= sizeof(filename)) { goto cleanup; }
-    for (index = 0; index < entry->manifest_entry->path_length; ++index) {
-        unsigned char ch = entry->manifest_entry->path[index];
-        filename[index] = ch == '\\' ? '/' : (char)ch;
+    if (localcat_bundle_authority_find(bundle, "catalog") != NULL) {
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, entry->final_path, -1,
+                               filename, sizeof(filename), NULL, NULL) <= 0) { goto cleanup; }
+    } else {
+        if (entry->manifest_entry->path_length >= sizeof(filename)) { goto cleanup; }
+        for (index = 0; index < entry->manifest_entry->path_length; ++index) {
+            unsigned char ch = entry->manifest_entry->path[index];
+            filename[index] = ch == '\\' ? '/' : (char)ch;
+        }
+        filename[index] = 0;
     }
-    filename[index] = 0;
     *diagnostic = "FROZEN_ENTRY.BOOTSTRAP_COMPILE_FAILED";
     code = api.Py_CompileStringExFlags((const char *)bytes,filename,Py_file_input,NULL,-1);
     free(bytes); bytes = NULL;
@@ -706,8 +800,10 @@ int localcat_bootstrap_execute(const char **diagnostic)
     builtin_globals = builtins == NULL ? NULL : api.PyModule_GetDict(builtins);
     name = api.PyUnicode_FromString(bootstrap_definition.m_name);
     origin = api.PyUnicode_FromString(filename);
-    if (module == NULL || builtin_globals == NULL || name == NULL || origin == NULL ||
+    arguments = localcat_entry_arguments();
+    if (module == NULL || builtin_globals == NULL || name == NULL || origin == NULL || arguments == NULL ||
         api.PyModule_AddObjectRef(module,"_authority",authority) != 0 ||
+        api.PyModule_AddObjectRef(module,"_entry_argv",arguments) != 0 ||
         api.PyModule_AddObjectRef(module,"__builtins__",builtin_globals) != 0 ||
         api.PyObject_SetAttrString(module,"__file__",origin) != 0) { goto cleanup; }
     modules = api.PySys_GetObject("modules");
@@ -734,5 +830,6 @@ cleanup:
     if (setter) { api.Py_DecRef(setter); }
     if (inserted) { api.Py_DecRef(inserted); }
     if (evaluated) { api.Py_DecRef(evaluated); }
+    if (arguments) { api.Py_DecRef(arguments); }
     return result;
 }

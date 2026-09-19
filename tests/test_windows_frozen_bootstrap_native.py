@@ -87,10 +87,14 @@ class WindowsFrozenBootstrapNativeTests(unittest.TestCase):
             self.run_command([str(exe), sys.base_prefix, str(script), 'normal'], work)
             script.write_text(DESTRUCTOR_ATTACKS, encoding="utf-8")
             self.run_command([str(exe), sys.base_prefix, str(script), 'normal'], work)
+            script.write_text(WORKER_DESTRUCTOR_ATTACKS, encoding="utf-8")
+            self.run_command([str(exe), sys.base_prefix, str(script), 'worker-destructor'], work)
 
     def run_command(self, command, cwd):
         result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if "background final reference:" in result.stdout:
+            print(result.stdout.strip())
 
 
 ATTACKS = r'''
@@ -107,6 +111,8 @@ def wrong_take():
 t = threading.Thread(target=wrong_take); t.start(); t.join(); assert not errors
 a = b.take_attestation()
 denied(b.take_attestation)
+assert b.is_producer(object()) is False
+denied(a.bind_producer, object())  # source/harness take is not the native bootstrap execution
 denied(type(a)); denied(object.__new__, type(a))
 denied(type, 'Forged', (type(a),), {})
 denied(setattr, a, 'forged', True)
@@ -133,6 +139,7 @@ try:
 finally: _interpreters.destroy(other)
 held = a.read_verified
 a.close()
+assert b.is_producer(object()) is False
 denied(a.close); denied(held, 'fixture'); denied(a.module_reproof, 'native-probe'); denied(b.take_attestation)
 '''
 
@@ -146,6 +153,20 @@ gc.collect()
 try: b.take_attestation()
 except RuntimeError: pass
 else: raise AssertionError('destructor allowed authority remint')
+'''
+
+WORKER_DESTRUCTOR_ATTACKS = r'''
+import _localcat_frozen_bootstrap as b
+import gc, threading
+holder = [b.take_attestation()]
+def release():
+    holder.clear()
+    gc.collect()
+t = threading.Thread(target=release); t.start(); t.join()
+try: b.take_attestation()
+except RuntimeError: pass
+else: raise AssertionError('worker destructor allowed authority remint')
+assert b.is_producer(object()) is False
 '''
 
 

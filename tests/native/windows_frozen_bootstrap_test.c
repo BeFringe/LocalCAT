@@ -31,6 +31,9 @@ int main(int argc, char **argv)
     long length;
     char *program;
     int result;
+    HANDLE retained[LOCALCAT_MANIFEST_MAX_ENTRIES + LOCALCAT_MAX_RETAINED_DIRECTORIES + 2U];
+    unsigned int retained_count = 0, index;
+    DWORD handle_flags;
 #define TEST(condition) do { if (!(condition)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, diagnostic ? diagnostic : #condition); return 1; } } while (0)
 #define RESOLVE(field, symbol) do { FARPROC value = GetProcAddress(python, symbol); TEST(value != NULL); memcpy(&py.field, &value, sizeof(value)); } while (0)
     TEST(argc == 4);
@@ -38,6 +41,10 @@ int main(int argc, char **argv)
     authority = (struct localcat_bundle_authority *)calloc(1, sizeof(*authority));
     TEST(authority != NULL);
     TEST(localcat_bundle_authority_prepare(authority, &diagnostic) == 0);
+    retained[retained_count++] = authority->executable_handle;
+    retained[retained_count++] = authority->manifest_handle;
+    for (index = 0; index < authority->entry_count; ++index) { retained[retained_count++] = authority->entries[index].handle; }
+    for (index = 0; index < authority->directory_count; ++index) { retained[retained_count++] = authority->directory_handles[index]; }
     TEST(swprintf_s(fixture_path, 32768, L"%ls\\_internal\\fixture.txt", authority->root_final_path) > 0);
     native = localcat_bundle_authority_find(authority, "native-probe");
     TEST(native != NULL && localcat_native_closure_load_verified(native, &diagnostic) != NULL);
@@ -101,6 +108,16 @@ int main(int argc, char **argv)
     TEST(result == 0);
     writable = CreateFileW(fixture_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL, OPEN_EXISTING, 0, NULL);
+    if (strcmp(argv[3], "worker-destructor") == 0) {
+        TEST(writable == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION);
+        for (index = 0; index < retained_count; ++index) { TEST(GetHandleInformation(retained[index], &handle_flags)); }
+        puts("background final reference: revoked with every native handle retained on owner");
+        localcat_bootstrap_abort(); localcat_bootstrap_abort();
+        for (index = 0; index < retained_count; ++index) { TEST(!GetHandleInformation(retained[index], &handle_flags)); }
+        writable = CreateFileW(fixture_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, 0, NULL);
+        puts("owner terminal abort: every retained handle released, repeated abort safe");
+    }
     TEST(writable != INVALID_HANDLE_VALUE);
     CloseHandle(writable);
     py.finalize();

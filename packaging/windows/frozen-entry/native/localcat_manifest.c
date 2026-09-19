@@ -322,7 +322,9 @@ localcat_manifest_parse(
         for (other = 0; other < index; ++other) {
             if (localcat_same_string(entry->id, entry->id_length, manifest->entries[other].id, manifest->entries[other].id_length) ||
                 localcat_same_windows_name(entry->path, entry->path_length, manifest->entries[other].path, manifest->entries[other].path_length) ||
-                localcat_same_basename(entry, &manifest->entries[other])) {
+                ((entry->role == LOCALCAT_ROLE_NATIVE ||
+                  manifest->entries[other].role == LOCALCAT_ROLE_NATIVE) &&
+                 localcat_same_basename(entry, &manifest->entries[other]))) {
                 *diagnostic = "FROZEN_ENTRY.MANIFEST_DUPLICATE";
                 return -1;
             }

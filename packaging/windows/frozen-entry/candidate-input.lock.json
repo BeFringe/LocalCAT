@@ -18,12 +18,12 @@
           "sha256": "b99f5a2b20e67411f2d42a506d824d5012cd2f788e52e64cfe553460d913ee3d"
         },
         "tools/probe_windows_frozen_custom_runw.py": {
-          "bytes": 25550,
-          "sha256": "21fec2b5e06ddb9d5a254a8599026f2e7ebf549dc507b251f42620258770b476"
+          "bytes": 25946,
+          "sha256": "1f9388ed4015afadde512e2b6f84b12739563f2e49ed3dab7957915ba1de5f81"
         },
         "tools/windows_frozen_manifest.py": {
-          "bytes": 7939,
-          "sha256": "c25df9357da19d4bb97b32595271c763eda119a98bbca3afe37f1800216e2923"
+          "bytes": 8046,
+          "sha256": "15d5b3c872c33cb6e1c4731edfb450ef3abf9c7c76fd5e0fdaaac0c2fe480b54"
         },
         "tools/windows_frozen_patch_series.py": {
           "bytes": 10305,
@@ -1206,8 +1206,8 @@
     "contract_file": {
       "role": "frozen-entry target contract",
       "name": "candidate-contract.json",
-      "bytes": 16543,
-      "sha256": "8e1fdaada9592be7ffea3f94732124a0a339e33d237bae7465029d0d378631f5"
+      "bytes": 16649,
+      "sha256": "e5f4ac5eea6107fd19892c4edf3c719e8f662a7e1ed8cf572ebf03710f732927"
     },
     "runtime_abi": {
       "module": "_localcat_frozen_bootstrap",
@@ -1521,13 +1521,13 @@
       "native_roles": [
         "customized runw and tracked LocalCAT native sources",
         "compiled-in manifest parser and SHA-256",
-        "python314.dll and its verified non-system native closure",
+        "manifest-bound CPython, Qt, Shiboken and coherent CRT native closure",
         "compiled-in _localcat_frozen_bootstrap module"
       ],
       "python_roles": [
-        "exact-byte bootstrap and interpreter-start support set",
-        "one source-only critical module",
-        "one retained-handle fixture"
+        "exact-byte bootstrap, source catalog and interpreter-start support set",
+        "complete retained source-only producer and declared project module closure",
+        "retained owner fixtures, contracts and declared product assets"
       ],
       "external_roles": [
         "Windows OS services through audited application API and loader resolution policy"
@@ -1811,6 +1811,6 @@
       "detail": "the selected MSVC stock rebuild has the approved compiler-generated import delta"
     }
   ],
-  "candidate_input_digest": "22df2bb748f1cadac1daf4410c06be5be18bf3e1b2395259e15e9d97160a1e84",
+  "candidate_input_digest": "87abe13a6c84551a78d8a71efa617cd547779fb024bf1c5c3a59541173deef99",
   "status": "MATERIALIZED"
 }

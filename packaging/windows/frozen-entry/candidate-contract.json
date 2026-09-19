@@ -511,13 +511,13 @@
     "native_roles": [
       "customized runw and tracked LocalCAT native sources",
       "compiled-in manifest parser and SHA-256",
-      "python314.dll and its verified non-system native closure",
+      "manifest-bound CPython, Qt, Shiboken and coherent CRT native closure",
       "compiled-in _localcat_frozen_bootstrap module"
     ],
     "python_roles": [
-      "exact-byte bootstrap and interpreter-start support set",
-      "one source-only critical module",
-      "one retained-handle fixture"
+      "exact-byte bootstrap, source catalog and interpreter-start support set",
+      "complete retained source-only producer and declared project module closure",
+      "retained owner fixtures, contracts and declared product assets"
     ],
     "external_roles": [
       "Windows OS services through audited application API and loader resolution policy"
