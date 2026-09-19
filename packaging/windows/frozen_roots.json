@@ -1,0 +1,120 @@
+{
+  "schema_version": "localcat-frozen-owner-roots-v1",
+  "scope": "prebuild-owner-declarations",
+  "collection_policy": {
+    "project_source_modules": "py",
+    "gate_inputs": "preserve-repository-relative-layout",
+    "recursive_closure_owner": "windows-platform-enablement 7.1",
+    "native_bootstrap_owner": "windows-platform-enablement 7.2"
+  },
+  "owners": [
+    {
+      "dispatch_id": "WA-01",
+      "revision": "R1",
+      "owning_spec": "parser-subsystem-extraction",
+      "reason": "Parser composition 是内建 codec 与 rooted source/writer 的唯一产品组合入口。",
+      "module_roots": ["parser_composition"],
+      "dynamic_imports": [
+        {
+          "source": "parser_termbase_codec.py",
+          "modules": ["openpyxl"],
+          "phase": "post-authority",
+          "reason": "XLSX preflight 后的条件导入；仍须收集既有 XLSX 产品依赖。"
+        }
+      ]
+    },
+    {
+      "dispatch_id": "WA-02",
+      "revision": "R1",
+      "owning_spec": "collaborative-job-chunks",
+      "reason": "Chunk Controller adapter 闭合独立 metadata 与 Workspace 的产品组合。",
+      "module_roots": ["chunk_controller_adapter"]
+    },
+    {
+      "dispatch_id": "WA-03",
+      "revision": "R2",
+      "owning_spec": "multi-document-project-workspace",
+      "reason": "显式 intake、carrier-neutral save 与 ProjectPackage 各保持原 owner。",
+      "module_roots": ["project_package", "project_save", "project_workspace_intake"]
+    },
+    {
+      "dispatch_id": "WA-04",
+      "revision": "R1",
+      "owning_spec": "language-resource-portability",
+      "reason": "资源导入/导出、repository 与设备本地 workspace 状态的产品入口。",
+      "module_roots": ["resource_importer", "resource_portability", "resource_repository", "workspace_state"],
+      "assets": [
+        {"path": "terms.csv", "kind": "data", "reason": "首次启动默认术语表。"},
+        {"path": "tm.jsonl", "kind": "data", "reason": "首次启动默认 legacy TM。"}
+      ]
+    },
+    {
+      "dispatch_id": "WA-05",
+      "revision": "R1",
+      "owning_spec": "tmx-context-interchange",
+      "reason": "TMX Application 与 export coordinator 保留 locale、scope、receipt 和 publication 语义。",
+      "module_roots": ["tmx_application", "tmx_export_coordinator"]
+    },
+    {
+      "dispatch_id": "WA-06",
+      "revision": "R4",
+      "owning_spec": "tm-storage-retrieval-index",
+      "reason": "Core 受信输入、Gate validator、benchmark 与两个 fresh worker 的消费入口。",
+      "module_roots": ["tm_benchmark_gate", "tm_benchmark_worker", "tm_gate_a", "tm_gate_inputs", "tm_retrieval_validation"],
+      "gate_input_roots": [
+        {"path": "benchmark_tm_contract.json", "kind": "contract", "reason": "Gate D 原 benchmark contract；不得换为历史 evidence。"},
+        {"path": "tests/fixtures/feature5_gate_a_v1.json", "kind": "gate-roots", "reason": "Core 拥有 components/matcher paths、fixtures 与 digest grammar。"},
+        {"path": "tests/fixtures/retrieval_gate_c_roots_v1.json", "kind": "gate-roots", "reason": "Core 拥有 retrieval artifact/build/fixture paths 与双路径合同。"}
+      ],
+      "source_inventory": {
+        "source": "tm_benchmark.py",
+        "symbol": "BENCHMARK_IMPLEMENTATION_SOURCE_PATHS",
+        "reason": "7.1 从 Core 的原 tuple 解析 Gate D fingerprint 输入，不维护手抄第二清单。"
+      },
+      "dynamic_imports": [
+        {"source": "tm_sqlite_store.py", "modules": ["tm_stage_sealer"], "phase": "post-authority", "reason": "Store 的既有 late-bound sealer 导入。"}
+      ],
+      "worker_dispatch": {
+        "source": "tm_benchmark_worker.py",
+        "symbol": "_WORKER_MODULES",
+        "selector": "--localcat-tm-worker",
+        "phase": "post-E10",
+        "reason": "只声明已提交 Core 的 migration/query 固定映射；同 EXE、独立 authority 与定向 pipes 由 7.2 实现。"
+      }
+    },
+    {
+      "dispatch_id": "WA-07",
+      "revision": "R1",
+      "owning_spec": "feature5-ui-integration",
+      "reason": "CapabilityHost 只消费受信输入；Qt 调度在完整 Boot TCB 后注入。",
+      "module_roots": ["capability_frozen_inputs", "capability_host", "qt_owner_dispatch"],
+      "dynamic_imports": [
+        {"source": "capability_host.py", "symbol": "_RETRIEVAL_VALIDATION_MODULE_NAME", "phase": "post-authority", "reason": "Gate C 的计算模块名。"},
+        {"source": "capability_host.py", "symbol": "_GATE_D_MODULE_NAMES", "phase": "post-authority", "reason": "Gate D 延迟导入闭集；从原 tuple 解析，不复制清单。"}
+      ]
+    },
+    {
+      "dispatch_id": "WA-08",
+      "revision": "R1",
+      "owning_spec": "qt-editor-json-mvp-increment",
+      "reason": "Qt 产品组合与资源展示入口；qt_editor.main 仍只允许 source 启动，frozen entry 归 7.2。",
+      "module_roots": ["qt_editor", "qt_editor_window", "qt_speaker_avatar"],
+      "assets": [
+        {"path": "LocalCAT-logo-silver.png", "kind": "asset", "reason": "既有 Qt logo/icon 字节输入。"}
+      ],
+      "runtime_import_roots": ["PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets", "shiboken6"],
+      "qt_plugin_roots": ["platforms/qwindows.dll"],
+      "speaker_avatar_catalog": {
+        "policy": "not-bundled",
+        "reason": "speaker_avatars 是被忽略的用户资源；本声明不收集任意本机目录，保留无匹配头像 fallback。"
+      }
+    }
+  ],
+  "platform": {
+    "owning_spec": "windows-platform-enablement",
+    "module_roots": ["platform_fs", "platform_source_authority"],
+    "dynamic_imports": [
+      {"source": "platform_fs.py", "modules": ["platform_fs_windows"], "phase": "post-authority", "reason": "Windows factory 的平台分流；不能在 Boot TCB 前导入。"}
+    ]
+  }
+}
