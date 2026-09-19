@@ -2406,8 +2406,10 @@ class GateDPublicationTests(unittest.TestCase):
         *,
         test_mode: bool = False,
     ) -> BenchmarkGateDRunResult:
+        from tests.gate_d_input_support import issue_source_bound_fixture_result
+
         artifact_bytes = benchmark_evidence_bundle_to_json(bundle).encode("utf-8")
-        return tm_benchmark_gate._issue_benchmark_gate_d_run_result(
+        return issue_source_bound_fixture_result(
             bundle=bundle,
             bundle_digest=bundle.bundle_digest,
             artifact_size=len(artifact_bytes),
@@ -2572,7 +2574,7 @@ class GateDPublicationTests(unittest.TestCase):
         concurrent: list[RetrievalCapabilitySnapshot] = []
         calls: list[None] = []
 
-        def observed_fingerprint() -> str:
+        def observed_fingerprint(_session: object) -> str:
             if concurrent:
                 raise AssertionError("fingerprint called more than twice")
             if not calls:
@@ -2585,7 +2587,7 @@ class GateDPublicationTests(unittest.TestCase):
 
         with mock.patch.object(
             tm_benchmark_gate,
-            "benchmark_implementation_fingerprint",
+            "_gate_d_input_fingerprint",
             side_effect=observed_fingerprint,
         ):
             with self.assertRaises(BenchmarkGateDError):
@@ -2746,11 +2748,10 @@ class GateDPublicationTests(unittest.TestCase):
         bundle = _combined_bundle()
         manifest = _base_capability_manifest()
         publisher = _capability_publisher()
-        run_result = self._run_result(bundle)
         for base, result, pub, code in (
-            (None, run_result, publisher, "GATE_D.MANIFEST_INVALID"),
+            (None, self._run_result(bundle), publisher, "GATE_D.MANIFEST_INVALID"),
             (manifest, None, publisher, "GATE_D.RUN_RESULT_INVALID"),
-            (manifest, run_result, None, "GATE_D.PUBLISHER_INVALID"),
+            (manifest, self._run_result(bundle), None, "GATE_D.PUBLISHER_INVALID"),
         ):
             with self.assertRaises(BenchmarkGateDError) as ctx:
                 publish_retrieval_capability_gate_d(
@@ -2765,7 +2766,7 @@ class GateDPublicationTests(unittest.TestCase):
         with self.assertRaises(BenchmarkGateDError) as ctx:
             publish_retrieval_capability_gate_d(
                 manifest,
-                run_result,
+                self._run_result(bundle),
                 publisher,
                 generated_at_utc=_VALID_UNTIL,
                 valid_until_utc=_GENERATED_AT,
@@ -2780,7 +2781,7 @@ class GateDPublicationTests(unittest.TestCase):
             with self.assertRaises(BenchmarkGateDError) as ctx:
                 publish_retrieval_capability_gate_d(
                     manifest,
-                    run_result,
+                    self._run_result(bundle),
                     publisher,
                     generated_at_utc=cast(str, generated),
                     valid_until_utc=cast(str, valid_until),
@@ -2813,7 +2814,7 @@ class GateDPublicationTests(unittest.TestCase):
         initial = publisher.snapshot()
         with mock.patch.object(
             tm_benchmark_gate,
-            "benchmark_implementation_fingerprint",
+            "_gate_d_input_fingerprint",
             return_value=_digest("0"),
         ):
             with self.assertRaises(BenchmarkGateDError) as ctx:
@@ -2832,7 +2833,7 @@ class GateDPublicationTests(unittest.TestCase):
         initial = publisher.snapshot()
         with mock.patch.object(
             tm_benchmark_gate,
-            "benchmark_implementation_fingerprint",
+            "_gate_d_input_fingerprint",
             side_effect=(bundle.implementation_fingerprint, _digest("0")),
         ):
             with self.assertRaises(BenchmarkGateDError) as ctx:

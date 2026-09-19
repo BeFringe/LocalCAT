@@ -10,6 +10,7 @@ from unittest.mock import patch
 import capability_host
 from tests.source_authority_support import current_source_authority
 import tm_benchmark_gate
+from tests.gate_d_input_support import issue_source_bound_fixture_result
 from capability_host import GateDRunState
 from tests.test_capability_host_gate_d import (
     _EVALUATED_AT,
@@ -29,7 +30,7 @@ class CapabilityHostGateDAttestationTests(unittest.TestCase):
         artifact = tm_benchmark_gate.benchmark_evidence_bundle_to_json(
             bundle
         ).encode("utf-8")
-        return tm_benchmark_gate._issue_benchmark_gate_d_run_result(
+        return issue_source_bound_fixture_result(
             bundle=bundle,
             bundle_digest=bundle.bundle_digest,
             artifact_size=len(artifact),
