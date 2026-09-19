@@ -1,6 +1,6 @@
 # 实施计划
 
-> **WA-06 Windows compatibility amendment（current R3）**：`R1`/`R2`只保留为已被取代的历史，以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
+> **WA-06 Windows compatibility amendment（current R4）**：R4继承R3的source合同并以9.6c/9.6d落实frozen pre-build消费；`R1`/`R2`只保留为已被取代的历史。以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
 
 - [x] 1. 冻结版本化基础契约与验证夹具
 
@@ -562,7 +562,7 @@
   - _Delivery phase: frozen post-build_
   - _Depends: 9.6a, 9.6c, 9.6d, ADR-022, ADR-023, ADR-024, ADR-025, windows-platform-enablement 7.4_
 
-- [ ] 9.6c 实现Gate源码、fixture与benchmark输入的受信字节消费
+- [x] 9.6c 实现Gate源码、fixture与benchmark输入的受信字节消费
   - 为Gate A/C approved roots、JSON/TXT fixtures、源码摘要及Gate D contract/implementation fingerprint建立内部输入session；保留source公开Path入口，frozen消费只接受真实authority绑定的manifest-relative exact bytes，不允许pathname reopen、fixture复制或任意callback自报proof。
   - 保留Core grammar/digest/Gate唯一所有权；同一epoch覆盖开始、执行、结果构造和terminal reproof，关闭/漂移/foreign authority/错id/旧session均fail closed。严格test seam不生成生产authority或frozen PASS。
   - 完成时，受信输入正反测试、source Gate/benchmark消费回归及独立review闭合；实际native producer与同候选runtime分别归平台7.2与本Spec 9.6b。
@@ -572,7 +572,7 @@
   - _Delivery phase: frozen pre-build_
   - _Depends: 9.6a, ADR-009, ADR-022, ADR-023, windows-platform-enablement 1.6_
 
-- [ ] 9.6d 实现migration/query fresh worker的source与frozen调用适配
+- [x] 9.6d 实现migration/query fresh worker的source与frozen调用适配
   - Core保留严格request/result codec、独立migration/query child、fresh PID、从启动到结束的RSS、timeout和失败语义；source保持Python模块入口，frozen只启动同候选EXE的固定worker模式，不传authority、不回落venv或进程内执行。
   - 消费平台E10后建立的定向request/result pipes与child本进程authority；未知模式、错误句柄、畸形/截断结果、非零退出和超时均拒绝，不能依赖windowed console streams。
   - 完成时，两worker的source兼容与launch/codec/错误/超时/RSS合同测试和独立review闭合；pre-build只能记录消费实现事实，真实frozen进程由9.6b验收。
@@ -583,6 +583,14 @@
   - _Depends: 9.6c_
 
 ## Implementation Notes
+
+- 2026-09-19 / Task 9.6c publication消费：terminal/窗口退出完成不等于引用提交完成；最终安装须与真实owner撤销共享短内存边界，native/Qt工作先于该边界结束。`MemberDescriptorType`也包含只读或数值C字段，下游引用holder须采用Core固定构造的普通slot协议；原观察锁必须覆盖整套引用安装与失败恢复，布局登记不授予Gate资格。
+
+- 2026-09-19 / Task 9.6c 集成修复：正式Matcher factory的private session路线须显式取消默认source roots locator；共同owner/window不替代CapabilityHost loader/code权威。Gate D/migration的relative contract引用必须属于当前window，persist/restore新窗口从同owner重新绑定；source外部域和冲突locator继续拒绝混用。test-frozen只用于provisional消费，实际native admission仍由平台7.2提供。
+
+- 2026-09-19 / Task 9.6d：结果构造与最终输入复证会产生新的真实RSS峰值；worker须在这些实质操作后采集OS自启动high-water，同步RSS字段与原strict digest，迁移elapsed仍保持原业务口径。source test-mode保留合法异值外部contract，生产child仍独立读取并比较committed contract；显式测试transport不能提升生产资格。
+
+- 2026-09-19 / Task 9.6c：`RootedSourceAuthority` 的 exact type 仍允许注入后端，故生产输入须由 Core 内部 source composition 建立；输入 owner 不替代 CapabilityHost 的 loader/code authority。Gate D receipt 绑定原 owner 与可撤销完成窗口，后续阶段须使用同 owner 的新窗口；source 专用终结器不能移用于 native 原线程关闭。公开 source locator 先词法绝对化，再执行 rooted/no-follow 读取。
 
 - 2026-07-29 / Task 1.1：冻结 `tm_contracts.py` 的记录、资源句柄、查询、结果、evidence、局部失败与严格 codec v1；运行时 `TMResourceHandle` 保持必需 `TMStore` 绑定且不进入持久 codec。独立复审通过；focused 15/15、全量 127/127、basedpyright 0 errors。
 - 2026-07-29 / Task 1.2：冻结 canonical 资源身份、确定性 sidecar、snapshot receipt/manifest/binding、阶段校验证据与 generation 闭合；sealed artifact 和单次 token 保持 registry 背书的模块私有运行期能力，公开协调器只暴露 `activate(SealedStage)`。独立复审通过；focused 27/27、全量 138/138、basedpyright 0 errors。

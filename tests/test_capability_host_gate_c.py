@@ -250,6 +250,7 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
                 "tm_candidate_store_contracts",
                 "tm_contracts",
                 "tm_gate_a",
+                "tm_gate_inputs",
                 "tm_retrieval",
                 "tm_similarity",
                 "tm_sqlite_candidate_projection",
@@ -288,7 +289,7 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
             worker.join(10)
             self.assertFalse(worker.is_alive())
             self.assertEqual(errors, [])
-            self.assertEqual(len(materialized_on), 9)
+            self.assertEqual(len(materialized_on), 10)
             self.assertTrue(
                 all(identity == worker.ident for identity in materialized_on)
             )
@@ -297,7 +298,7 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
             )
             self.assertIsNotNone(cached)
             execution._capture_binding()
-            self.assertEqual(len(materialized_on), 9)
+            self.assertEqual(len(materialized_on), 10)
             self.assertIs(
                 getattr(execution, "_RealGateCExecution__validation_binding"),
                 cached,
@@ -1107,6 +1108,7 @@ def recompute_retrieval_validation(
             "tm_candidate_store_contracts.py",
             "tm_contracts.py",
             "tm_gate_a.py",
+            "tm_gate_inputs.py",
             "tm_retrieval.py",
             "tm_retrieval_capability.py",
             "tm_retrieval_validation.py",

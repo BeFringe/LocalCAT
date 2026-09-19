@@ -15,6 +15,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 import tm_benchmark_gate
+from tests.gate_d_input_support import issue_source_bound_fixture_result
 from tests.test_tm_benchmark_gate import (
     _base_capability_manifest,
     _combined_bundle,
@@ -30,7 +31,7 @@ def _run_result() -> tm_benchmark_gate.BenchmarkGateDRunResult:
     artifact = tm_benchmark_gate.benchmark_evidence_bundle_to_json(bundle).encode(
         "utf-8"
     )
-    return tm_benchmark_gate._issue_benchmark_gate_d_run_result(
+    return issue_source_bound_fixture_result(
         bundle=bundle,
         bundle_digest=bundle.bundle_digest,
         artifact_size=len(artifact),
