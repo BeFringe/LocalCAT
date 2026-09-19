@@ -1,8 +1,7 @@
 """Closed exact-byte windows shared by Core validation consumers.
 
-Only the source adapter currently has production admission. The explicit frozen
-test adapter exercises the same consumer/lifetime code with test provenance;
-neither its Python type nor its scripted bytes attest a native producer.
+Source and native-issued frozen adapters share the consumer/lifetime code. The
+explicit frozen test adapter remains provisional and cannot attest a producer.
 """
 
 from __future__ import annotations
@@ -12,8 +11,8 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import sys
 from threading import get_ident
-from types import MemberDescriptorType
-from typing import Iterator, TypeVar, cast, final
+from types import BuiltinFunctionType, MemberDescriptorType, ModuleType
+from typing import Any, Iterator, TypeVar, cast, final
 from weakref import finalize
 
 from platform_source_authority import (
@@ -197,13 +196,57 @@ class _TestFrozenInputAdapter:
 
 
 @final
+class _FrozenInputAdapter:
+    """A native-admitted producer borrow, never a process authority owner."""
+
+    __slots__ = ("__authority", "__borrow", "__closed")
+
+    def __init__(self, authority: object, *, _key: object) -> None:
+        if _key is not _FACTORY_KEY:
+            raise TypeError("frozen adapter requires internal composition")
+        _require_native_frozen_producer(authority)
+        self.__authority = authority
+        self.__borrow = cast(Any, authority)._borrow_core_inputs()
+        self.__closed = False
+
+    def is_production(self) -> bool:
+        return True
+
+    def reprove(self) -> None:
+        if self.__closed:
+            raise RuntimeError("frozen input adapter is closed")
+        _require_native_frozen_producer(self.__authority)
+        self.__borrow.reprove()
+
+    @contextmanager
+    def proof_window(self) -> Iterator[None]:
+        self.reprove()
+        with self.__borrow.proof_window():
+            yield
+
+    def read_bytes(self, relative: str, domain: object | None) -> bytes:
+        if domain is not None:
+            raise ValueError("frozen inputs cannot use source domains")
+        self.reprove()
+        content = self.__borrow.read_bytes(relative)
+        if type(content) is not bytes:
+            raise TypeError("frozen retained read did not return exact bytes")
+        return content
+
+    def close(self) -> None:
+        if not self.__closed:
+            self.__closed = True
+            self.__borrow.close()
+
+
+@final
 class _GateInputOwner(metaclass=_publication_reference_type):
     """One closed adapter/epoch, with strictly sequential consumer windows."""
 
     __slots__ = ("__adapter", "__thread", "__native_closed", "__publication_lifetime", "__retained", "__epoch", "__window", "__window_started", "__weakref__")  # pyright: ignore[reportUninitializedInstanceVariable]
 
-    def __init__(self, adapter: _SourceInputAdapter | _TestFrozenInputAdapter, *, _key: object, retained: bool = False) -> None:
-        if _key is not _FACTORY_KEY or type(adapter) not in (_SourceInputAdapter, _TestFrozenInputAdapter):
+    def __init__(self, adapter: _SourceInputAdapter | _TestFrozenInputAdapter | _FrozenInputAdapter, *, _key: object, retained: bool = False) -> None:
+        if _key is not _FACTORY_KEY or type(adapter) not in (_SourceInputAdapter, _TestFrozenInputAdapter, _FrozenInputAdapter):
             raise TypeError("input owner requires a closed Core composition adapter")
         self.__adapter = adapter
         self.__thread = get_ident()
@@ -227,7 +270,9 @@ class _GateInputOwner(metaclass=_publication_reference_type):
 
     def _require_production(self) -> None:
         self._require_live()
-        if type(self.__adapter) is not _SourceInputAdapter or not self.__adapter.is_production():
+        if type(self.__adapter) not in (_SourceInputAdapter, _FrozenInputAdapter):
+            raise TypeError("production inputs require internal authority composition")
+        if not cast(_SourceInputAdapter | _FrozenInputAdapter, self.__adapter).is_production():
             raise TypeError("production inputs require internal authority composition")
 
     @property
@@ -235,6 +280,8 @@ class _GateInputOwner(metaclass=_publication_reference_type):
         self._require_live()
         if type(self.__adapter) is _TestFrozenInputAdapter:
             return "test-frozen"
+        if type(self.__adapter) is _FrozenInputAdapter:
+            return "frozen-production"
         return "source-production" if self.__adapter.is_production() else "source-borrowed"
 
     def _is_retained(self) -> bool:
@@ -581,13 +628,23 @@ def _compose_source_input_owner(root: Path) -> Iterator[_GateInputOwner]:
         owner.close()
 
 
-def _compose_frozen_input_owner(authority: object) -> _GateInputOwner:
-    """Unique production admission boundary awaiting real platform 7.2 proof.
+def _require_native_frozen_producer(authority: object) -> None:
+    """Only the actual builtin's native pointer registry can admit a producer."""
+    from importlib.machinery import BuiltinImporter
 
-    Do not admit by frozen boolean, Python private key/type, callback or digest.
-    Native/loader provenance and original-thread scheduling belong to 7.2.
-    """
-    raise RuntimeError("production frozen input admission is unavailable")
+    native = sys.modules.get("_localcat_frozen_bootstrap")
+    checker = getattr(native, "is_producer", None)
+    spec = getattr(native, "__spec__", None)
+    if (type(native) is not ModuleType or type(checker) is not BuiltinFunctionType
+            or checker.__self__ is not native or checker.__name__ != "is_producer"
+            or getattr(spec, "origin", None) != "built-in"
+            or getattr(spec, "loader", None) is not BuiltinImporter
+            or checker(authority) is not True):
+        raise RuntimeError("production frozen input admission is unavailable without the native E10 producer")
+
+
+def _compose_frozen_input_owner(authority: object) -> _GateInputOwner:
+    return _GateInputOwner(_FrozenInputAdapter(authority, _key=_FACTORY_KEY), _key=_FACTORY_KEY)
 
 
 @contextmanager

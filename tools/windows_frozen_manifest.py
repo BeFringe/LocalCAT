@@ -116,8 +116,8 @@ def _validate_entry(entry: SourceEntry) -> None:
 def prepare_manifest(entries, *, candidate_input_digest: str, applied_sources_digest: str) -> PreparedManifest:
     _digest(candidate_input_digest)
     _digest(applied_sources_digest)
-    if type(entries) not in {list, tuple} or not 1 <= len(entries) <= 32:
-        raise ManifestInputError("entry count must be in 1..32")
+    if type(entries) not in {list, tuple} or not 1 <= len(entries) <= 2048:
+        raise ManifestInputError("entry count must be in 1..2048")
     for entry in entries:
         _validate_entry(entry)
     entries = sorted(entries, key=lambda entry: entry.id)
@@ -126,7 +126,10 @@ def prepare_manifest(entries, *, candidate_input_digest: str, applied_sources_di
         raise ManifestInputError("duplicate id")
     for index, entry in enumerate(entries):
         for other in entries[:index]:
-            if _same_name(entry.path, other.path) or _same_name(entry.path.split("/")[-1], other.path.split("/")[-1]):
+            if _same_name(entry.path, other.path) or (
+                (entry.role == "native" or other.role == "native")
+                and _same_name(entry.path.split("/")[-1], other.path.split("/")[-1])
+            ):
                 raise ManifestInputError("duplicate Windows path or basename")
         if any(dependency not in ids for dependency in entry.dependencies):
             raise ManifestInputError("missing dependency")

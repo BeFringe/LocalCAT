@@ -11,7 +11,7 @@
   "tm_sqlite_candidate_projection.py",
   "tm_sqlite_store.py"
  ],
-  "build_digest": "797fee6f604e2f6e93fa35234423380f3a5846fe2795e70257432be4e9c68660",
+  "build_digest": "5310a16bb82d4c6a3936b441e764960ec7b25cc1113caeb90a05e356ec0500bd",
  "build_paths": [
   "tm_candidate_index.py",
   "tm_candidate_store_contracts.py",
