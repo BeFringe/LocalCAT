@@ -2,7 +2,7 @@ diff --git a/bootloader/src/localcat_rooted_io.c b/bootloader/src/localcat_roote
 new file mode 100644
 --- /dev/null
 +++ b/bootloader/src/localcat_rooted_io.c
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,900 @@
 +#ifdef _WIN32
 +
 +#include "localcat_rooted_io.h"
@@ -418,9 +418,14 @@ new file mode 100644
 +        entry->manifest_entry = manifest_entry;
 +        entry->handle = handle;
 +        entry->identity = identity;
-+        wcscpy_s(entry->final_path, 32768, final_path);
 +        /* Transfer cleanup ownership before any fallible content proof. */
 +        authority->entry_count++;
++        entry->final_path = (wchar_t *)malloc((wcslen(final_path) + 1U) * sizeof(wchar_t));
++        if (entry->final_path == NULL) {
++            *diagnostic = "FROZEN_ENTRY.ALLOCATION_FAILED";
++            return -1;
++        }
++        wcscpy_s(entry->final_path, wcslen(final_path) + 1U, final_path);
 +        if (localcat_retained_entry_read_verified(entry, &verified_bytes, &verified_size, diagnostic) != 0) {
 +            return -1;
 +        }
@@ -600,6 +605,8 @@ new file mode 100644
 +        }
 +        authority->entries[index].digest_proved = 0U;
 +        authority->entries[index].actual_module_reproved = 0U;
++        free(authority->entries[index].final_path);
++        authority->entries[index].final_path = NULL;
 +    }
 +    if (authority->manifest_handle != NULL) { CloseHandle(authority->manifest_handle); authority->manifest_handle = NULL; }
 +    if (authority->executable_handle != NULL) { CloseHandle(authority->executable_handle); authority->executable_handle = NULL; }
@@ -900,7 +907,7 @@ diff --git a/bootloader/src/localcat_rooted_io.h b/bootloader/src/localcat_roote
 new file mode 100644
 --- /dev/null
 +++ b/bootloader/src/localcat_rooted_io.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,82 @@
 +#ifndef LOCALCAT_ROOTED_IO_H
 +#define LOCALCAT_ROOTED_IO_H
 +
@@ -912,7 +919,7 @@ new file mode 100644
 +
 +#include "localcat_manifest.h"
 +
-+#define LOCALCAT_MAX_RETAINED_DIRECTORIES 64U
++#define LOCALCAT_MAX_RETAINED_DIRECTORIES 512U
 +
 +struct localcat_file_identity {
 +    uint64_t volume_serial;
@@ -924,7 +931,7 @@ new file mode 100644
 +    const struct localcat_manifest_entry *manifest_entry;
 +    HANDLE handle;
 +    struct localcat_file_identity identity;
-+    wchar_t final_path[32768];
++    wchar_t *final_path;
 +    HMODULE loaded_module;
 +    unsigned char actual_module_reproved;
 +    unsigned char digest_proved;
@@ -944,6 +951,8 @@ new file mode 100644
 +    struct localcat_file_identity manifest_identity;
 +    struct localcat_runtime_manifest manifest;
 +    unsigned char *manifest_bytes;
++    /* Compact stable slots keep previously issued entry pointers valid until
++     * the authority itself is freed. Only exact-sized path strings allocate. */
 +    struct localcat_retained_entry entries[LOCALCAT_MANIFEST_MAX_ENTRIES];
 +    unsigned int entry_count;
 +    unsigned long owner_thread;

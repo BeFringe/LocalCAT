@@ -413,9 +413,14 @@ localcat_open_manifest_entries(struct localcat_bundle_authority *authority, cons
         entry->manifest_entry = manifest_entry;
         entry->handle = handle;
         entry->identity = identity;
-        wcscpy_s(entry->final_path, 32768, final_path);
         /* Transfer cleanup ownership before any fallible content proof. */
         authority->entry_count++;
+        entry->final_path = (wchar_t *)malloc((wcslen(final_path) + 1U) * sizeof(wchar_t));
+        if (entry->final_path == NULL) {
+            *diagnostic = "FROZEN_ENTRY.ALLOCATION_FAILED";
+            return -1;
+        }
+        wcscpy_s(entry->final_path, wcslen(final_path) + 1U, final_path);
         if (localcat_retained_entry_read_verified(entry, &verified_bytes, &verified_size, diagnostic) != 0) {
             return -1;
         }
@@ -595,6 +600,8 @@ localcat_bundle_authority_close(struct localcat_bundle_authority *authority)
         }
         authority->entries[index].digest_proved = 0U;
         authority->entries[index].actual_module_reproved = 0U;
+        free(authority->entries[index].final_path);
+        authority->entries[index].final_path = NULL;
     }
     if (authority->manifest_handle != NULL) { CloseHandle(authority->manifest_handle); authority->manifest_handle = NULL; }
     if (authority->executable_handle != NULL) { CloseHandle(authority->executable_handle); authority->executable_handle = NULL; }

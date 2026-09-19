@@ -9,7 +9,7 @@
 
 #include "localcat_manifest.h"
 
-#define LOCALCAT_MAX_RETAINED_DIRECTORIES 64U
+#define LOCALCAT_MAX_RETAINED_DIRECTORIES 512U
 
 struct localcat_file_identity {
     uint64_t volume_serial;
@@ -21,7 +21,7 @@ struct localcat_retained_entry {
     const struct localcat_manifest_entry *manifest_entry;
     HANDLE handle;
     struct localcat_file_identity identity;
-    wchar_t final_path[32768];
+    wchar_t *final_path;
     HMODULE loaded_module;
     unsigned char actual_module_reproved;
     unsigned char digest_proved;
@@ -41,6 +41,8 @@ struct localcat_bundle_authority {
     struct localcat_file_identity manifest_identity;
     struct localcat_runtime_manifest manifest;
     unsigned char *manifest_bytes;
+    /* Compact stable slots keep previously issued entry pointers valid until
+     * the authority itself is freed. Only exact-sized path strings allocate. */
     struct localcat_retained_entry entries[LOCALCAT_MANIFEST_MAX_ENTRIES];
     unsigned int entry_count;
     unsigned long owner_thread;

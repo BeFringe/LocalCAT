@@ -112,7 +112,8 @@
   ],
   "platform": {
     "owning_spec": "windows-platform-enablement",
-    "module_roots": ["platform_fs", "platform_source_authority"],
+    "module_roots": ["platform_fs", "platform_source_authority", "frozen_source_bootstrap", "frozen_product_entry", "frozen_worker_transport"],
+    "runtime_import_roots": ["_localcat_frozen_bootstrap"],
     "dynamic_imports": [
       {"source": "platform_fs.py", "modules": ["platform_fs_windows"], "phase": "post-authority", "reason": "Windows factory 的平台分流；不能在 Boot TCB 前导入。"}
     ]
