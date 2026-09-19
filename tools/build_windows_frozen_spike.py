@@ -137,7 +137,7 @@ def verify_waf_inputs(directory, toolchain, projection, runtime):
         raise ReleaseBindingError("incomplete release compile/link evidence")
 
 
-def expected_inputs(pristine, runtime, lock):
+def expected_inputs(pristine, runtime, lock, *, producer_inputs=None):
     pristine = _no_reparse_ancestors(pristine)
     runtime = _no_reparse_ancestors(runtime)
     probe.directory_matches(pristine / "bootloader", lock["runtime"]["pyinstaller"]["build_driver"])
@@ -150,13 +150,15 @@ def expected_inputs(pristine, runtime, lock):
               for name in probe.MODULES for suffix in (".c", ".h")}
     replayed = probe.replay_native_sources(files, patches, contract, native)
     prepared, header, templates = probe.prepare_source_manifest(
-        replayed.files, probe.runtime_entries(runtime, lock), lock["candidate_input_digest"],
+        replayed.files, producer_inputs.entries if producer_inputs is not None else probe.runtime_entries(runtime, lock), lock["candidate_input_digest"],
         applied_sources_digest=replayed.applied_sources_digest)
     evidence = {"applied-sources.json": replayed.provenance_bytes,
                 "prelink.json": prepared.prelink_bytes,
                 "template-source-inventory.json": canonical(templates),
                 "generated/localcat_manifest.h": header.encode("utf-8"),
                 "inputs/candidate-input.lock.json": canonical(lock)}
+    if producer_inputs is not None:
+        evidence["producer-inputs.json"] = canonical(producer_inputs.provenance)
     sources = {"pyinstaller/" + name: content for name, content in replayed.files.items()}
     sources["pyinstaller/bootloader/src/localcat_manifest.h"] = header.encode("utf-8")
     return prepared, evidence, sources
@@ -208,7 +210,20 @@ def build_spike(args):
     output = _no_reparse_ancestors(args.output)
     if not output.is_relative_to(ROOT / "artifacts/windows") or output.exists():
         raise ReleaseBindingError("build output must be a new artifacts/windows directory")
-    prepared, evidence, sources = expected_inputs(args.pristine_source, args.runtime_root, lock)
+    producer_wheels = getattr(args, "producer_wheel_root", None)
+    producer_crt = getattr(args, "producer_crt_root", None)
+    if bool(producer_wheels) != bool(producer_crt):
+        raise ReleaseBindingError("complete producer requires both wheel and coherent CRT input roots")
+    def collect_producer():
+        if producer_wheels is None:
+            return None
+        if producer_crt is None:
+            raise ReleaseBindingError("coherent CRT input root is required")
+        from tools.windows_frozen_producer_inputs import collect_locked_producer_inputs
+        return collect_locked_producer_inputs(ROOT, args.runtime_root, producer_wheels, producer_crt)
+    producer_inputs = collect_producer()
+    prepared, evidence, sources = expected_inputs(args.pristine_source, args.runtime_root, lock,
+                                                 producer_inputs=producer_inputs)
     producer = _evidence_producer_fact(python_root=args.runtime_root, vswhere=args.vswhere,
                                      packaging_dependencies=args.packaging_dependencies)
     if producer != lock["evidence_producer"]:
@@ -218,7 +233,8 @@ def build_spike(args):
     output.mkdir(parents=True, exist_ok=False)
     probe_args = argparse.Namespace(pristine_source=args.pristine_source, runtime_root=args.runtime_root,
                                    candidate_input=LOCK, native_directory=probe.NATIVE, output_parent=output,
-                                   packaging_dependencies=args.packaging_dependencies, run=True)
+                                   packaging_dependencies=args.packaging_dependencies, run=producer_inputs is None,
+                                   producer_inputs=producer_inputs)
     with compile_environment(lock) as projection:
         directory, _ = probe.run_probe(probe_args)
         # Recheck the external tool/runtime snapshots; never accept report flags
@@ -228,7 +244,10 @@ def build_spike(args):
     if _evidence_producer_fact(python_root=args.runtime_root, vswhere=args.vswhere,
                               packaging_dependencies=args.packaging_dependencies) != producer:
         raise ReleaseBindingError("build producer changed during build")
-    repeated = expected_inputs(args.pristine_source, args.runtime_root, lock)
+    repeated_producer = collect_producer()
+    if repeated_producer != producer_inputs:
+        raise ReleaseBindingError("complete producer inputs changed during build")
+    repeated = expected_inputs(args.pristine_source, args.runtime_root, lock, producer_inputs=repeated_producer)
     if repeated != (prepared, evidence, sources) or clean_source_context(ROOT) != context:
         raise ReleaseBindingError("build inputs changed during build")
     verify_files(directory, sources)
@@ -264,6 +283,8 @@ def parser():
     result.add_argument("--packaging-dependencies", type=Path, required=True)
     result.add_argument("--vswhere", type=Path, required=True)
     result.add_argument("--output", type=Path, required=True)
+    result.add_argument("--producer-wheel-root", type=Path)
+    result.add_argument("--producer-crt-root", type=Path)
     return result
 
 

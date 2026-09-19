@@ -76,15 +76,32 @@ class FrozenManifestBuilderTests(unittest.TestCase):
         b = SourceEntry("b", "x/b.txt", "fixture", b"ok", ("a",))
         cases = [[], [a], [a, b], [b, b],
                  [SourceEntry("a", "x/a.py", "bootstrap", b"pass"),
-                  SourceEntry("b", "y/A.py", "bootstrap", b"pass")],
+                  SourceEntry("b", "X/A.py", "bootstrap", b"pass")],
                  [SourceEntry("a", "a.txt", "fixture", b"", ("a", "a"))],
-                 [SourceEntry(f"e{i}", f"e{i}.txt", "fixture", b"") for i in range(33)]]
+                 [SourceEntry(f"e{i}", f"e{i}.txt", "fixture", b"") for i in range(2049)]]
         for entries in cases:
             with self.subTest(entries=entries), self.assertRaises(ManifestInputError):
                 self.prepare(entries)
         for digest in ("short", "A" * 64, "z" * 64):
             with self.subTest(digest=digest), self.assertRaises(ManifestInputError):
                 self.prepare(candidate_input_digest=digest)
+
+    def test_complete_source_closure_keeps_distinct_package_initializers(self):
+        entries = [SourceEntry(f"package-{i}", f"_internal/packages/p{i}/__init__.py",
+                               "critical-source", b"value = 1\n") for i in range(65)]
+        prepared = self.prepare(entries)
+        self.assertEqual(struct.unpack_from("<I", prepared.runtime_bytes, 16)[0], 65)
+        self.assertEqual(len(json.loads(prepared.prelink_bytes)["entries"]), 65)
+
+    def test_native_basename_remains_exclusive_across_roles_and_case(self):
+        for other_role in ("native", "interpreter", "bootstrap", "critical-source", "fixture"):
+            for reverse in (False, True):
+                entries = [SourceEntry("native", "_internal/runtime/probe.dll", "native", b"MZ"),
+                           SourceEntry("other", "_internal/other/PROBE.DLL", other_role, b"pass")]
+                if reverse:
+                    entries.reverse()
+                with self.subTest(role=other_role, reverse=reverse), self.assertRaises(ManifestInputError):
+                    self.prepare(entries)
 
 
 if __name__ == "__main__":
