@@ -413,12 +413,12 @@
 - [ ] 7. 构建完整 frozen-source closure 与 Windows onedir/windowed发行物
 
 - [ ] 7.0 集成frozen pre-build消费合同与WA-07 trusted bootstrap实现
-  - 在1.6全PASS后，只集成生成manifest/build前必须存在的owner roots/hooks与WA-07 3.6a `TrustedSourceAuthority`消费实现；WA-01/02/04/05/06及WA-07其余packaged revalidation不得在发行候选生成前标为完成
+  - 在1.6全PASS后，集成生成manifest/build前必须存在的owner roots/hooks、WA-06 9.6c/9.6d受信输入与fresh worker消费、WA-07 3.6a `TrustedSourceAuthority`消费实现；WA-01/02/04/05/06及WA-07其余packaged revalidation不得在发行候选生成前标为完成
   - CapabilityHost只消费native entry移交的`TrustedSourceAuthority`，完整Boot TCB先于platform factory与业务import；source阶段结果与最小spike都不得代答full candidate runtime
   - 完成时ledger只追加`FROZEN_PREBUILD_COMMITTED`事实，所有owner row仍等待7.4a post-build revalidation，terminal `MERGED_PASS`继续禁止
   - _Requirements: 5.1, 10.1, 10.2, 10.3, 10.5, 10.6, 12.5_
   - _Boundary: Frozen Consumer Amendment Integration_
-  - _Depends: 1.6, 6.6b, feature5-ui-integration 3.6a_
+  - _Depends: 1.6, 6.6b, tm-storage-retrieval-index 9.6c, tm-storage-retrieval-index 9.6d, feature5-ui-integration 3.6a_
 
 - [ ] 7.1 生成deterministic frozen source/fixture/data manifest
   - 从approved owner roots解析Gate A/C/D、benchmark contract与dynamic import递归闭包，记录schema/commit/reason/relative path/kind/SHA-256和UTF-8排序
@@ -431,6 +431,7 @@
 - [ ] 7.2 实现native boot entry到CapabilityHost的可信handoff
   - release-owned native bootloader审计entry前PE imports/delay-load，在首次Python DLL/非KnownDLL load前固定搜索、拒绝CWD/PATH、绑定bundle/native目录，递归枚举native static/delay-load closure与manifest-declared dynamic native roots并对每个非系统DLL完成pre-load retained-handle/root/reparse/live-id/digest proof；未声明dynamic load fail closed，随后才加载、复核actual module identity并移交完整bundle/DLL attestation
   - `TrustedSourceLoader`从retained handle读取、摘要并直接编译exact `.py` bytes后mint不可序列化`TrustedSourceAuthority`；外置CapabilityHost验证loader attestation/source digest/origin/co_filename/Gate closure，不以metadata相等代答executed bytes；bundle authority不提供或消费durability profile registry
+  - E10后由固定trusted bootstrap只派发两个获批Core worker模式或默认产品启动；每个child独立完成同候选W3 entry和本进程authority，通过定向继承pipes消费严格codec，禁止任意`-m`、参数authority及venv/进程内fallback。native读/复证/关闭保持owner thread，闭合调度等待、取消、撤销与terminal reproof；按W3维护触发器重建inputs并至少重跑1.6完整mandatory矩阵
   - 完成时，bootstrap不导入待验证adapter但满足W1 invariants，Boot TCB/source/fixture handle-read、bytecode/PYZ、tamper/reparse/DLL injection/circular-trust tests全绿
   - _Requirements: 1.2, 10.1, 10.2, 10.3, 10.5, 10.6_
   - _Boundary: Native Boot and Frozen Trust Handoff_

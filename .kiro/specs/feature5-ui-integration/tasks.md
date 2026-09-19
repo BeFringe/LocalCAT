@@ -134,8 +134,10 @@
 
 - [ ] 3.6a 从 frozen bootstrap 消费受信 source authority
   - native entry/Boot TCB必须在import platform factory、CapabilityHost或其他业务模块前闭合DLL/source policy并铸造`TrustedSourceAuthority`；Gate C/D build inventory、approved roots、原始`.py`与benchmark contract只经bundle authority/loader attestation定位，不信任cwd、任意`sys._MEIPASS`文件或现场复制源码。
+  - 消费Core 9.6c/9.6d的共同受信输入session与fresh worker适配；在Boot TCB闭合后注入Qt调度，保留native owner-thread限制及后台proof window/terminal reproof，关闭、取消、等待和旧证明复用均fail closed。
+  - 本任务只形成pre-build consumer实现与独立review checkpoint；实际producer归平台7.2，同候选runtime继续由6.6b/7.4b/7.6b/9.2a验收，不提前声明frozen PASS。
   - _Amendment: WA-07_
-  - _Depends: 3.6, ADR-022, windows-platform-enablement 1.6_
+  - _Depends: 3.6, ADR-022, windows-platform-enablement 1.6, tm-storage-retrieval-index 9.6c, tm-storage-retrieval-index 9.6d_
 
 - [x] 3.7 将 declarative 资源解析为有序 runtime ports
   - 根据 Active/Lookup/Update 与显式资源顺序构造不可变 snapshot，不把 canonical lifecycle flag 复制进 registry
