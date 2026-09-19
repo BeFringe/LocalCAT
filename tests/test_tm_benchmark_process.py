@@ -14,6 +14,7 @@ import tempfile
 from typing import Any, Mapping
 import unittest
 from unittest.mock import patch
+from tests.benchmark_worker_test_support import worker_temporary_directory
 
 from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
 from tm_benchmark import (
@@ -525,7 +526,7 @@ class ProcessRunnerTests(unittest.TestCase):
         )
 
     def test_fast_path_real_subprocess_integration(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = self._run(_FTS5, run_root=root)
             self.assertNotEqual(evidence.child_pid, os.getpid())
@@ -612,7 +613,7 @@ class ProcessRunnerTests(unittest.TestCase):
                 )
 
     def test_run_root_must_be_closed_before_spawn(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             foreign = root / "foreign.txt"
             foreign.write_text("foreign", encoding="utf-8")
@@ -621,7 +622,7 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertEqual(foreign.read_text(encoding="utf-8"), "foreign")
 
     def test_provided_fixture_must_be_single_link_and_sole_entry(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             fixture = root / "fixture.jsonl"
             fixture.write_text('{"source":"x","target":"y"}\n', encoding="utf-8")
@@ -632,7 +633,7 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertEqual(extra.read_text(encoding="utf-8"), "foreign")
 
     def test_fallback_path_real_subprocess_integration(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             evidence = self._run(_FALLBACK, run_root=root)
             self.assertNotEqual(evidence.child_pid, os.getpid())
@@ -649,7 +650,7 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertEqual(evidence.record_count, 40)
 
     def test_each_run_spawns_a_distinct_child_process(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             first_root = root / "first"
             second_root = root / "second"
@@ -662,7 +663,7 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertNotEqual(second.child_pid, os.getpid())
 
     def test_fixture_is_pre_generated_before_child_and_never_charged(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             fixture_path = root / "fixture.jsonl"
             self.assertFalse(fixture_path.exists())
@@ -681,7 +682,7 @@ class ProcessRunnerTests(unittest.TestCase):
             self.assertEqual(len(expected_rows), 40)
 
     def test_provided_fixture_must_match_requested_corpus(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             foreign = root / "fixture.jsonl"
             foreign.write_text('{"source":"foreign","target":"x"}\n', encoding="utf-8")
@@ -689,7 +690,7 @@ class ProcessRunnerTests(unittest.TestCase):
                 self._run(_FTS5, run_root=root, fixture_path=foreign)
 
     def test_test_mode_requires_small_explicit_count(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             with self.assertRaisesRegex(ValueError, "test record count"):
                 run_process_migration_evidence(
@@ -716,7 +717,7 @@ class ProcessRunnerTests(unittest.TestCase):
             stdout="",
             stderr='{"error_code": "PROCESS.X"}\n',
         )
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             with patch(
                 "tm_benchmark_process.subprocess.run",
@@ -726,7 +727,7 @@ class ProcessRunnerTests(unittest.TestCase):
                     self._run(_FTS5, run_root=root)
             self.assertEqual(raised.exception.error_code, "PROCESS.X")
 
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             noise = subprocess.CompletedProcess(
                 args=[],
@@ -745,7 +746,7 @@ class ProcessRunnerTests(unittest.TestCase):
                 "PROCESS.CHILD_STDERR_NOISE",
             )
 
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             extra = subprocess.CompletedProcess(
                 args=[],
@@ -832,7 +833,7 @@ class WorkerProtocolTests(unittest.TestCase):
         self.assertIn("error_code", completed.stderr)
 
     def test_worker_rejects_duplicate_request_keys(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             request = self._request_json(
                 fixture_path=root / "fixture.jsonl",
@@ -848,7 +849,7 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(completed.stdout, "")
 
     def test_worker_rejects_unknown_request_key(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             request = self._request_json(
                 fixture_path=root / "fixture.jsonl",
@@ -862,7 +863,7 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(completed.stdout, "")
 
     def test_worker_rejects_caller_protocol_digest_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             request = self._request_json(
                 fixture_path=root / "fixture.jsonl",
@@ -876,7 +877,7 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertIn("PROTOCOL_DIGEST_MISMATCH", completed.stderr)
 
     def test_worker_rejects_missing_fixture_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             request = self._request_json(
                 fixture_path=root / "missing.jsonl",
@@ -888,7 +889,7 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(completed.stdout, "")
 
     def test_worker_maps_rooted_fixture_read_failure_to_stable_code(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             fixture = root / "fixture.jsonl"
             fixture.write_bytes(b"fixture")
@@ -918,7 +919,7 @@ class WorkerProtocolTests(unittest.TestCase):
             self.assertEqual(caught.exception.error_code, "PROCESS.FIXTURE_INVALID")
 
     def test_worker_rejects_run_root_that_is_not_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             fixture = root / "fixture.jsonl"
             fixture.write_text('{"source":"x","target":"y"}\n', encoding="utf-8")
@@ -987,6 +988,8 @@ class ModuleBoundaryTests(unittest.TestCase):
             "tm_benchmark",
             "tm_benchmark_latency",
             "tm_benchmark_platform_io",
+            "tm_benchmark_worker",
+            "tm_gate_inputs",
             "tm_candidate_index",
             "tm_contracts",
             "tm_migration",

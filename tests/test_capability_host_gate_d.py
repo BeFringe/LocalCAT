@@ -862,20 +862,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
             fts5_missing=0,
             fallback_missing=0,
         )
-        artifact_bytes = cast(
-            Any,
-            binding.gate_module,
-        ).benchmark_evidence_bundle_to_json(bundle).encode("utf-8")
-        run_result = cast(
-            Any,
-            binding.gate_module,
-        )._issue_benchmark_gate_d_run_result(
-            bundle=bundle,
-            bundle_digest=bundle.bundle_digest,
-            artifact_size=len(artifact_bytes),
-            artifact_digest=hashlib.sha256(artifact_bytes).hexdigest(),
-            test_mode=False,
-        )
+        run_result = benchmark_tests.GateDPublicationTests._run_result(bundle)
         publication = cast(Any, host_module)._CoreGateDPublication(
             _mint=cast(Any, host_module)._GATE_D_PUBLICATION_MINT,
             binding=binding,
@@ -1059,20 +1046,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
             fts5_missing=0,
             fallback_missing=0,
         )
-        artifact_bytes = cast(
-            Any,
-            binding.gate_module,
-        ).benchmark_evidence_bundle_to_json(bundle).encode("utf-8")
-        run_result = cast(
-            Any,
-            binding.gate_module,
-        )._issue_benchmark_gate_d_run_result(
-            bundle=bundle,
-            bundle_digest=bundle.bundle_digest,
-            artifact_size=len(artifact_bytes),
-            artifact_digest=hashlib.sha256(artifact_bytes).hexdigest(),
-            test_mode=False,
-        )
+        run_result = benchmark_tests.GateDPublicationTests._run_result(bundle)
         publication = cast(Any, host_module)._CoreGateDPublication(
             _mint=cast(Any, host_module)._GATE_D_PUBLICATION_MINT,
             binding=binding,
@@ -1255,20 +1229,6 @@ class CapabilityHostGateDTests(unittest.TestCase):
             fts5_missing=0,
             fallback_missing=0,
         )
-        artifact_bytes = cast(
-            Any,
-            binding.gate_module,
-        ).benchmark_evidence_bundle_to_json(bundle).encode("utf-8")
-        run_result = cast(
-            Any,
-            binding.gate_module,
-        )._issue_benchmark_gate_d_run_result(
-            bundle=bundle,
-            bundle_digest=bundle.bundle_digest,
-            artifact_size=len(artifact_bytes),
-            artifact_digest=hashlib.sha256(artifact_bytes).hexdigest(),
-            test_mode=False,
-        )
         owner = _gate_d_owner(composition)
 
         def authentic_execute(
@@ -1280,6 +1240,7 @@ class CapabilityHostGateDTests(unittest.TestCase):
             publication_graph_nonce: object,
         ) -> object:
             del contract_path, work_root, evidence_path
+            run_result = benchmark_tests.GateDPublicationTests._run_result(bundle)
             return cast(Any, host_module)._CoreGateDPublication(
                 _mint=cast(Any, host_module)._GATE_D_PUBLICATION_MINT,
                 binding=binding,

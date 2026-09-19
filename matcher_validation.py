@@ -38,6 +38,10 @@ from tm_gate_a import (
     require_string,
     unicode_transcript,
 )
+from tm_gate_inputs import (
+    _GateInputSession, _InputRoot, _InputFile,
+    _require_session, _require_production_session, _source_validation_inputs,
+)
 
 
 _MAX_EVIDENCE_TTL = timedelta(days=30)
@@ -67,8 +71,40 @@ def recompute_matcher_validation(
 ) -> MatcherValidationRelease:
     """Execute matcher cohorts and build one non-persisted evidence manifest."""
 
-    if not isinstance(repository_root, Path) or not repository_root.is_dir():
-        raise ValueError("repository_root must be an existing directory")
+    with _source_validation_inputs(repository_root, approved_roots_path) as (session, roots):
+        result = _recompute_matcher_validation_inputs(
+            session, roots, generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc, include_full=include_full,
+        )
+    return result
+
+
+def _recompute_matcher_validation_from_session(
+    session: _GateInputSession,
+    *,
+    generated_at_utc: datetime,
+    valid_until_utc: datetime,
+    include_full: bool,
+    approved_roots_id: str = "tests/fixtures/feature5_gate_a_v1.json",
+) -> MatcherValidationRelease:
+    session = _require_session(session)
+    return _recompute_matcher_validation_inputs(
+        session, session.input(approved_roots_id),
+        generated_at_utc=generated_at_utc, valid_until_utc=valid_until_utc,
+        include_full=include_full,
+    )
+
+
+def _recompute_matcher_validation_inputs(
+    repository_root: _GateInputSession,
+    approved_roots_path: _InputFile,
+    *,
+    generated_at_utc: datetime,
+    valid_until_utc: datetime,
+    include_full: bool,
+) -> MatcherValidationRelease:
+    _require_session(repository_root)
+    repository_root._require_bound_input(approved_roots_path)
     if not isinstance(include_full, bool):
         raise TypeError("include_full must be a boolean")
     generated = _require_utc(generated_at_utc, "generated_at_utc")
@@ -212,7 +248,7 @@ def recompute_matcher_validation(
 
 def _observe_full_cohort_digest(
     cohort_id: str,
-    repository_root: Path,
+    repository_root: _InputRoot,
 ) -> str:
     if cohort_id == "matcher-text-v1":
         fixture_paths = (
@@ -240,23 +276,43 @@ def _observe_full_cohort_digest(
 
 def build_validated_matcher_v1(
     *,
-    repository_root: Path,
-    approved_roots_path: Path = _DEFAULT_APPROVED_ROOTS,
+    repository_root: Path | None = None,
+    approved_roots_path: Path | None = _DEFAULT_APPROVED_ROOTS,
     generated_at_utc: datetime,
     valid_until_utc: datetime,
     evaluated_at_utc: datetime,
     include_full: bool,
+    _input_session: _GateInputSession | None = None,
+    _approved_roots_id: str = "tests/fixtures/feature5_gate_a_v1.json",
 ) -> CapabilityGatedTextMatcherV1:
     """Rerun evidence, then construct the only capability-gated matcher."""
 
     evaluated = _require_utc(evaluated_at_utc, "evaluated_at_utc")
-    release = recompute_matcher_validation(
-        repository_root=repository_root,
-        approved_roots_path=approved_roots_path,
-        generated_at_utc=generated_at_utc,
-        valid_until_utc=valid_until_utc,
-        include_full=include_full,
-    )
+    if _input_session is None:
+        if repository_root is None or approved_roots_path is None:
+            raise TypeError("source matcher validation requires repository_root")
+        if _approved_roots_id != "tests/fixtures/feature5_gate_a_v1.json":
+            raise ValueError("session roots id requires an input session")
+        release = recompute_matcher_validation(
+            repository_root=repository_root,
+            approved_roots_path=approved_roots_path,
+            generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc,
+            include_full=include_full,
+        )
+    else:
+        session = _require_production_session(_input_session)
+        try:
+            session._require_validation_locators(repository_root, approved_roots_path, _approved_roots_id)
+            release = _recompute_matcher_validation_from_session(
+                session, generated_at_utc=generated_at_utc,
+                valid_until_utc=valid_until_utc, include_full=include_full,
+                approved_roots_id=_approved_roots_id,
+            )
+            session.terminal_reproof()
+        except BaseException:
+            session._abort()
+            raise
     evaluator = MatcherCapabilityEvaluator(release.expectation)
     publisher = MatcherCapabilityPublisher(
         evaluator,

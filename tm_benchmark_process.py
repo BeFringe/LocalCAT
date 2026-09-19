@@ -96,9 +96,21 @@ from tm_benchmark import (
     _record_payload,
     benchmark_digest,
     benchmark_implementation_fingerprint,
+    _benchmark_implementation_fingerprint_from_session,
+    _load_benchmark_contract_from_session,
+    _parse_benchmark_contract_text,
+    _recompute_benchmark_contract_inputs,
     iter_corpus_records,
     load_benchmark_contract,
     recompute_benchmark_inputs,
+)
+from tm_gate_inputs import (
+    _GateInputSession, _GateInputReference, _read_input_text, _require_session,
+    _require_production_session, _source_input_locator,
+)
+from tm_benchmark_worker import (
+    _TestFrozenTransport, _WorkerPipes, _run_worker_child,
+    _source_worker_pipes, _worker_input_window,
 )
 from tm_benchmark_latency import validate_environment_for_path
 from tm_benchmark_platform_io import (
@@ -847,7 +859,17 @@ def process_evidence_digest(evidence: TMBenchmarkProcessEvidence) -> str:
     """Canonical digest over every evidence fact except the digest itself."""
     if type(evidence) is not TMBenchmarkProcessEvidence:
         raise TypeError("evidence must be TMBenchmarkProcessEvidence")
-    payload: dict[str, object] = {
+    return benchmark_digest(
+        PROCESS_EVIDENCE_DIGEST_VERSION,
+        "process-evidence",
+        [_process_evidence_digest_payload(evidence)],
+    )
+
+
+def _process_evidence_digest_payload(
+    evidence: TMBenchmarkProcessEvidence,
+) -> dict[str, object]:
+    return {
         "actual_index_kind": evidence.actual_index_kind,
         "artifact_snapshot": artifact_snapshot_to_payload(
             evidence.artifact_snapshot
@@ -892,11 +914,6 @@ def process_evidence_digest(evidence: TMBenchmarkProcessEvidence) -> str:
         "test_mode": evidence.test_mode,
         "worker_protocol_digest": evidence.worker_protocol_digest,
     }
-    return benchmark_digest(
-        PROCESS_EVIDENCE_DIGEST_VERSION,
-        "process-evidence",
-        [payload],
-    )
 
 
 
@@ -1769,10 +1786,19 @@ class _WorkerRequest:
     proof_query_version: str
     implementation_fingerprint: str
     protocol_digest: str
+    _input_session: _GateInputSession | None = field(default=None, repr=False, compare=False)
+
+
+def _input_fingerprint(session: _GateInputSession | None) -> str:
+    if session is None:
+        return benchmark_implementation_fingerprint()
+    return _benchmark_implementation_fingerprint_from_session(_require_session(session))
 
 
 def _validate_worker_request(
     payload: Mapping[str, object],
+    *,
+    _input_session: _GateInputSession | None = None,
 ) -> _WorkerRequest:
     fields = _strict_fields(
         payload,
@@ -1824,6 +1850,14 @@ def _validate_worker_request(
         "canonical store id",
     )
     test_mode = _require_builtin_bool(fields["test_mode"], "test mode")
+    if _input_session is not None:
+        (_require_session if test_mode else _require_production_session)(_input_session)
+        committed_contract = _load_benchmark_contract_from_session(_input_session)
+        # Source test-mode historically permits a different strict generator
+        # contract. It remains test-only; real evidence must use this child's
+        # independently read committed inputs.
+        if not test_mode and contract != committed_contract:
+            raise _WorkerError("PROCESS.CONTRACT_DIGEST_MISMATCH")
     proof_query_version = _require_identity(
         fields["proof_query_version"],
         "proof query version",
@@ -1835,7 +1869,7 @@ def _validate_worker_request(
         "implementation fingerprint",
     )
     try:
-        current_fingerprint = benchmark_implementation_fingerprint()
+        current_fingerprint = _input_fingerprint(_input_session)
     except (TypeError, ValueError) as error:
         raise _WorkerError("PROCESS.IMPLEMENTATION_INVALID") from error
     if implementation_fingerprint != current_fingerprint:
@@ -1914,6 +1948,7 @@ def _validate_worker_request(
         proof_query_version=proof_query_version,
         implementation_fingerprint=implementation_fingerprint,
         protocol_digest=caller_protocol_digest,
+        _input_session=_input_session,
     )
 
 
@@ -1931,8 +1966,9 @@ def _request_payload(
     resource_id: str,
     canonical_store_id: str,
     test_mode: bool,
+    _input_session: _GateInputSession | None = None,
 ) -> dict[str, object]:
-    implementation_fingerprint = benchmark_implementation_fingerprint()
+    implementation_fingerprint = _input_fingerprint(_input_session)
     protocol_digest = worker_protocol_digest(
         contract_digest=contract_digest,
         corpus_digest=corpus_digest,
@@ -2021,6 +2057,8 @@ def _run_measured_lifecycle(
     started_ns: int,
     start_usage: object,
 ) -> _MeasuredFacts:
+    if request._input_session is not None:
+        _require_session(request._input_session)
     contract = request.contract
     execution_path = request.execution_path
     fixture_path = Path(request.fixture_path)
@@ -2201,7 +2239,7 @@ def _run_measured_lifecycle(
     if worker_protocol != request.protocol_digest:
         raise _WorkerError("PROCESS.PROTOCOL_DIGEST_MISMATCH")
     try:
-        implementation_fingerprint = benchmark_implementation_fingerprint()
+        implementation_fingerprint = _input_fingerprint(request._input_session)
     except (TypeError, ValueError) as error:
         raise _WorkerError("PROCESS.IMPLEMENTATION_INVALID") from error
     if implementation_fingerprint != request.implementation_fingerprint:
@@ -2307,13 +2345,16 @@ def _evidence_from_facts(facts: _MeasuredFacts) -> TMBenchmarkProcessEvidence:
     )
 
 
-def _worker_main(argv: list[str]) -> int:
-    if argv != [WORKER_MODE_FLAG]:
-        sys.stderr.write(
-            "usage: python -m tm_benchmark_process --worker\n"
-        )
-        return 2
+def _serve_worker(pipes: _WorkerPipes, session: _GateInputSession) -> int:
+    """E10 consumer: platform supplies this child's session and binary pipes.
+
+No console, mode, path or inherited parent object establishes authority here.
+Source CLI uses the same core with its own newly composed input window.
+"""
     try:
+        if type(pipes) is not _WorkerPipes:
+            raise TypeError("worker requires exact binary endpoints")
+        _require_session(session)
         started_ns = time.perf_counter_ns()
         rss_platform, _rss_unit = _rss_platform_facts()
         del rss_platform, _rss_unit
@@ -2322,9 +2363,9 @@ def _worker_main(argv: list[str]) -> int:
             if sys.platform == "win32"
             else _resource_module().getrusage(_resource_module().RUSAGE_SELF)
         )
-        raw_request = sys.stdin.buffer.read()
+        raw_request = pipes.read_request()
         payload = _read_worker_request(raw_request)
-        request = _validate_worker_request(payload)
+        request = _validate_worker_request(payload, _input_session=session)
         facts = _run_measured_lifecycle(
             request,
             started_ns=started_ns,
@@ -2332,20 +2373,55 @@ def _worker_main(argv: list[str]) -> int:
         )
         evidence = _evidence_from_facts(facts)
         payload_out = _evidence_payload(evidence)
-        sys.stdout.write(_canonical_json(payload_out) + "\n")
-        sys.stdout.flush()
+        digest_payload = _process_evidence_digest_payload(evidence)
+        # Include strict evidence construction and full encoding in the peak.
+        # Release this provisional encoding before the bounded final seal.
+        _canonical_json(payload_out)
+        if _input_fingerprint(session) != request.implementation_fingerprint:
+            raise _WorkerError("PROCESS.IMPLEMENTATION_CHANGED")
+        session.terminal_reproof()
+        terminal_usage = (
+            windows_peak_working_set_bytes()
+            if sys.platform == "win32"
+            else _resource_module().getrusage(_resource_module().RUSAGE_SELF)
+        )
+        _platform, raw_unit = _rss_platform_facts()
+        terminal_rss = _rss_bytes(terminal_usage, raw_unit)
+        if terminal_rss < evidence.rss_terminal_bytes:
+            raise _WorkerError("PROCESS.RSS_MONOTONIC_VIOLATION")
+        # No input access or business work follows terminal: only RSS scalars,
+        # their existing canonical digest, and the final wire encoding change.
+        for field_name in ("peak_rss_bytes", "rss_terminal_bytes"):
+            payload_out[field_name] = terminal_rss
+            digest_payload[field_name] = terminal_rss
+        payload_out["evidence_digest"] = benchmark_digest(
+            PROCESS_EVIDENCE_DIGEST_VERSION, "process-evidence", [digest_payload]
+        )
+        pipes.write_result(_canonical_json(payload_out) + "\n")
         return 0
     except _WorkerError as error:
-        sys.stderr.write(
-            _canonical_json({"error_code": error.error_code}) + "\n"
-        )
-        sys.stderr.flush()
-        return 1
+        code = error.error_code
     except Exception:
-        sys.stderr.write(
-            _canonical_json({"error_code": "PROCESS.CHILD_FAILED"}) + "\n"
-        )
-        sys.stderr.flush()
+        code = "PROCESS.CHILD_FAILED"
+    if type(session) is _GateInputSession:
+        session._abort()
+    try:
+        pipes.write_error(_canonical_json({"error_code": code}) + "\n")
+    except Exception:
+        pass
+    return 1
+
+
+def _worker_main(argv: list[str]) -> int:
+    if argv != [WORKER_MODE_FLAG]:
+        if sys.stderr is not None:
+            sys.stderr.write("usage: python -m tm_benchmark_process --worker\n")
+        return 2
+    try:
+        pipes = _source_worker_pipes()
+        with _worker_input_window(None, test_mode=False) as session:
+            return _serve_worker(pipes, session)
+    except Exception:
         return 1
 
 
@@ -2364,7 +2440,7 @@ def _child_stderr_code(stderr: str) -> str:
 
 def run_process_migration_evidence(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     execution_path: BenchmarkExecutionPath,
     run_root: Path,
     fixture_path: Path | None = None,
@@ -2374,6 +2450,9 @@ def run_process_migration_evidence(
     test_record_count: int | None = None,
     test_seed: int | None = None,
     timeout_seconds: float = 600.0,
+    _input_session: _GateInputSession | None = None,
+    _test_frozen_transport: _TestFrozenTransport | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> TMBenchmarkProcessEvidence:
     """Parent runner: verify inputs, spawn one isolated child, return evidence.
 
@@ -2384,6 +2463,22 @@ def run_process_migration_evidence(
     spawned, and is excluded from measured child cost.
     """
 
+    if _input_session is None:
+        if contract_path is None or _contract_input is not None:
+            raise TypeError("relative contract inputs require a live input session")
+        with _worker_input_window(None, test_mode=test_mode, contract_path=contract_path) as session:
+            result = run_process_migration_evidence(
+                contract_path=_source_input_locator(contract_path), execution_path=execution_path,
+                run_root=run_root, fixture_path=fixture_path, resource_id=resource_id,
+                canonical_store_id=canonical_store_id, test_mode=test_mode,
+                test_record_count=test_record_count, test_seed=test_seed,
+                timeout_seconds=timeout_seconds, _input_session=session,
+                _test_frozen_transport=_test_frozen_transport,
+            )
+        return result
+    (_require_session if test_mode else _require_production_session)(_input_session)
+    if _test_frozen_transport is not None and not test_mode:
+        raise TypeError("test transport cannot produce final evidence")
     if type(execution_path) is not BenchmarkExecutionPath:
         raise TypeError("execution path must be BenchmarkExecutionPath")
     if type(run_root) is not _NATIVE_PATH_TYPE:
@@ -2408,7 +2503,9 @@ def run_process_migration_evidence(
     ) or timeout_seconds <= 0:
         raise ValueError("timeout seconds must be a positive finite float")
 
-    contract = load_benchmark_contract(contract_path)
+    contract = _parse_benchmark_contract_text(_read_input_text(
+        _input_session._resolve_input(contract_path, _contract_input, "benchmark_tm_contract.json")
+    ))
     contract_digest = benchmark_contract_digest(contract)
     if test_mode:
         if test_record_count is None:
@@ -2440,7 +2537,7 @@ def run_process_migration_evidence(
         )
         corpus_record_count = test_record_count
     else:
-        recompute_benchmark_inputs(contract_path)
+        _recompute_benchmark_contract_inputs(contract)
         corpus_digest = contract.corpus_digest
         corpus_record_count = contract.corpus_record_count
         records = iter_corpus_records(
@@ -2502,27 +2599,13 @@ def run_process_migration_evidence(
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
         test_mode=test_mode,
+        _input_session=_input_session,
     )
     request_json = _canonical_json(request)
-    environment = dict(os.environ)
-    environment["PYTHONIOENCODING"] = "utf-8"
-    environment["PYTHONWARNINGS"] = "ignore"
     try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "tm_benchmark_process",
-                WORKER_MODE_FLAG,
-            ],
-            input=request_json,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            cwd=Path(__file__).resolve().parent,
-            env=environment,
-            timeout=timeout_seconds,
-            check=False,
+        completed = _run_worker_child(
+            "migration", request_json, timeout_seconds=timeout_seconds,
+            test_mode=test_mode, _test_frozen_transport=_test_frozen_transport,
         )
     except OSError as error:
         raise ProcessEvidenceError("PROCESS.CHILD_SPAWN_FAILED") from error
@@ -2547,7 +2630,7 @@ def run_process_migration_evidence(
     ):
         raise ProcessEvidenceError("PROCESS.IMPLEMENTATION_MISMATCH")
     try:
-        implementation_after = benchmark_implementation_fingerprint()
+        implementation_after = _input_fingerprint(_input_session)
     except (TypeError, ValueError) as error:
         raise ProcessEvidenceError("PROCESS.IMPLEMENTATION_INVALID") from error
     if evidence.implementation_fingerprint != implementation_after:

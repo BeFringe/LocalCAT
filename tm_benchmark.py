@@ -78,6 +78,10 @@ from pathlib import Path, PurePath
 import re
 import stat
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tm_gate_inputs import _GateInputSession, _InputFile
 
 from tm_contracts import (
     BENCHMARK_CONTRACT_VERSION,
@@ -107,6 +111,7 @@ BENCHMARK_IMPLEMENTATION_SOURCE_PATHS = (
     "platform_fs_contracts.py",
     "platform_fs_posix.py",
     "platform_fs_windows.py",
+    "platform_source_authority.py",
     "text_matcher.py",
     "tm_activation_journal.py",
     "tm_activation_recovery.py",
@@ -117,11 +122,13 @@ BENCHMARK_IMPLEMENTATION_SOURCE_PATHS = (
     "tm_benchmark_platform_io.py",
     "tm_benchmark_process.py",
     "tm_benchmark_query_process.py",
+    "tm_benchmark_worker.py",
     "tm_candidate_index.py",
     "tm_candidate_store_contracts.py",
     "tm_content_attestation.py",
     "tm_contracts.py",
     "tm_gate_b.py",
+    "tm_gate_inputs.py",
     "tm_migration.py",
     "tm_retrieval.py",
     "tm_retrieval_capability.py",
@@ -694,8 +701,17 @@ def _canonical_json(value: Mapping[str, object]) -> str:
     )
 
 
-def _stable_benchmark_source_digest(path: Path) -> str:
+def _stable_benchmark_source_digest(path: _InputFile) -> str:
     """Hash one direct regular implementation member without aliases."""
+
+    from tm_gate_inputs import _GateInputReference, _read_input_bytes
+
+    if type(path) is _GateInputReference:
+        return hashlib.sha256(_read_input_bytes(path)).hexdigest()
+    if not isinstance(path, Path):
+        raise TypeError("benchmark implementation input must be exact")
+    if getattr(sys, "frozen", False):
+        raise RuntimeError("frozen fingerprint cannot reopen a source pathname")
 
     if sys.platform == "win32":
         from platform_fs import compose_platform_file_backend
@@ -821,9 +837,24 @@ def benchmark_implementation_fingerprint(
         raise ValueError("repository root is unavailable") from error
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         raise ValueError("repository root must be a direct directory")
+
+    from tm_gate_inputs import _open_source_input_session
+
+    with _open_source_input_session(root) as session:
+        result = _benchmark_implementation_fingerprint_from_session(session)
+    return result
+
+
+def _benchmark_implementation_fingerprint_from_session(
+    session: _GateInputSession,
+) -> str:
+    """Recompute the original fingerprint grammar from retained input bytes."""
+    from tm_gate_inputs import _require_session
+
+    session = _require_session(session)
     def capture() -> tuple[tuple[str, str], ...]:
         return tuple(
-            (relative, _stable_benchmark_source_digest(root / relative))
+            (relative, _stable_benchmark_source_digest(session.input(relative)))
             for relative in BENCHMARK_IMPLEMENTATION_SOURCE_PATHS
         )
 
@@ -1440,13 +1471,30 @@ def load_benchmark_contract(path: Path) -> BenchmarkContract:
     """
     if not isinstance(path, Path):
         raise TypeError("contract path must be a Path")
+    from tm_gate_inputs import _read_input_text
+
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = _read_input_text(path)
     except OSError as exc:
         raise ValueError(
             "cannot read committed benchmark contract file"
         ) from exc
 
+    return _parse_benchmark_contract_text(raw)
+
+
+def _load_benchmark_contract_from_session(
+    session: _GateInputSession,
+    *,
+    contract_id: str = "benchmark_tm_contract.json",
+) -> BenchmarkContract:
+    from tm_gate_inputs import _read_input_text, _require_session
+
+    session = _require_session(session)
+    return _parse_benchmark_contract_text(_read_input_text(session.input(contract_id)))
+
+
+def _parse_benchmark_contract_text(raw: str) -> BenchmarkContract:
     def reject_non_finite(value: str) -> None:
         raise ValueError(
             f"non-finite JSON number is not allowed: {value}"
@@ -1489,6 +1537,11 @@ def recompute_benchmark_inputs(
     parameters, and every digest/count is compared.  Any difference raises.
     """
     contract = load_benchmark_contract(contract_path)
+    return _recompute_benchmark_contract_inputs(contract)
+
+
+def _recompute_benchmark_contract_inputs(contract: BenchmarkContract) -> BenchmarkInputPlan:
+    """Recompute the existing grammar from an already session-bound contract."""
     plan = compute_benchmark_input_plan()
     checks = (
         (

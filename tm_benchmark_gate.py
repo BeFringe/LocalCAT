@@ -137,6 +137,12 @@ from tm_benchmark import (
     benchmark_digest,
     benchmark_implementation_fingerprint,
     load_benchmark_contract,
+    _benchmark_implementation_fingerprint_from_session,
+    _parse_benchmark_contract_text,
+)
+from tm_gate_inputs import (
+    _GateInputSession, _GateInputReference, _read_input_text, _require_session, _require_production_session,
+    _GateInputOwner, _retain_source_input_owner, _source_input_locator,
 )
 from tm_benchmark_latency import (
     LATENCY_EVIDENCE_SCHEMA_VERSION,
@@ -2471,6 +2477,8 @@ class _GateDRunReceipt:
         "bundle_digest",
         "_sealed",
         "test_mode",
+        "_input_owner",
+        "_input_window",
     )
 
     artifact_digest: str
@@ -2479,6 +2487,8 @@ class _GateDRunReceipt:
     bundle_digest: str
     _sealed: bool
     test_mode: bool
+    _input_owner: _GateInputOwner | None
+    _input_window: _GateInputSession | None
 
     def __init__(
         self,
@@ -2489,6 +2499,7 @@ class _GateDRunReceipt:
         artifact_digest: str,
         test_mode: bool,
         _factory_key: object,
+        _input_session: _GateInputSession | None,
     ) -> None:
         if _factory_key is not _GATE_D_RUN_RECEIPT_FACTORY_KEY:
             raise TypeError("Gate D run receipts are owner-issued")
@@ -2498,6 +2509,15 @@ class _GateDRunReceipt:
         self.artifact_size = artifact_size
         self.artifact_digest = artifact_digest
         self.test_mode = test_mode
+        self._input_window = _input_session
+        if _input_session is None:
+            if not test_mode:
+                raise TypeError("production receipt requires a completed input window")
+            self._input_owner = None
+        else:
+            if type(_input_session) is not _GateInputSession:
+                raise TypeError("receipt input window must be exact")
+            self._input_owner = _input_session._completed_owner()
         self._sealed = True
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -2580,6 +2600,7 @@ def _issue_benchmark_gate_d_run_result(
     artifact_size: int,
     artifact_digest: str,
     test_mode: bool,
+    _input_session: _GateInputSession | None = None,
 ) -> BenchmarkGateDRunResult:
     receipt = _GateDRunReceipt(
         bundle=bundle,
@@ -2588,6 +2609,7 @@ def _issue_benchmark_gate_d_run_result(
         artifact_digest=artifact_digest,
         test_mode=test_mode,
         _factory_key=_GATE_D_RUN_RECEIPT_FACTORY_KEY,
+        _input_session=_input_session,
     )
     return BenchmarkGateDRunResult(
         bundle=bundle,
@@ -2597,6 +2619,37 @@ def _issue_benchmark_gate_d_run_result(
         test_mode=test_mode,
         _receipt=receipt,
     )
+
+
+def _gate_d_receipt_owner(run_result: BenchmarkGateDRunResult) -> _GateInputOwner:
+    if type(run_result) is not BenchmarkGateDRunResult:
+        raise TypeError("Gate D run result must be exact")
+    run_result.__post_init__()
+    owner = run_result._receipt._input_owner
+    if type(owner) is not _GateInputOwner:
+        raise BenchmarkGateDError("GATE_D.TEST_EVIDENCE_FORBIDDEN")
+    try:
+        owner._require_production()
+        window = run_result._receipt._input_window
+        if type(window) is not _GateInputSession or window._completed_owner() is not owner:
+            raise RuntimeError("receipt input window is no longer completed")
+    except RuntimeError as error:
+        raise BenchmarkGateDError("GATE_D.INPUT_EPOCH_INVALID") from error
+    return owner
+
+
+def _require_receipt_session(run_result: BenchmarkGateDRunResult, session: _GateInputSession) -> None:
+    owner = _gate_d_receipt_owner(run_result)
+    if _require_production_session(session)._production_owner() is not owner:
+        raise BenchmarkGateDError("GATE_D.INPUT_EPOCH_MISMATCH")
+    window = run_result._receipt._input_window
+    if type(window) is not _GateInputSession:
+        raise BenchmarkGateDError("GATE_D.INPUT_EPOCH_INVALID")
+    session._require_same_epoch(window)
+
+
+def _gate_d_source_root() -> Path:
+    return Path(__file__).absolute().parent
 
 
 _GATE_D_ATTESTATION_SCHEMA_VERSION = "localcat.gate-d-attestation.v1"
@@ -2666,20 +2719,24 @@ def _gate_d_runtime_identity() -> dict[str, object]:
 
 def _gate_d_attestation_compatibility(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     base_manifest: RetrievalCapabilityManifest,
     bundle: BenchmarkEvidenceBundle,
     device_key: bytes,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> dict[str, object]:
-    if type(contract_path) is not _NATIVE_PATH_TYPE or not contract_path.is_absolute():
+    if _input_session is not None:
+        _require_production_session(_input_session)
+    if contract_path is not None and (type(contract_path) is not _NATIVE_PATH_TYPE or not contract_path.is_absolute()):
         raise ValueError("Gate D contract path must be absolute")
     if type(bundle) is not BenchmarkEvidenceBundle:
         raise TypeError("Gate D attestation bundle must be exact")
     _validate_benchmark_evidence_bundle(bundle)
-    contract = load_benchmark_contract(contract_path)
+    contract = _load_contract(contract_path, _input_session=_input_session, _contract_input=_contract_input)
     if benchmark_contract_digest(contract) != bundle.contract_digest:
         raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
-    current_fingerprint = benchmark_implementation_fingerprint()
+    current_fingerprint = _gate_d_input_fingerprint(_input_session)
     if current_fingerprint != bundle.implementation_fingerprint:
         raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
     return {
@@ -2815,14 +2872,17 @@ def _gate_d_device_key(state_root: Path, *, create: bool) -> bytes:
 
 def _persist_gate_d_attestation_posix(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     state_root: Path,
     base_manifest: RetrievalCapabilityManifest,
     run_result: BenchmarkGateDRunResult,
     issued_at_utc: datetime,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> None:
     """Seal one real Gate D run for same-device compatible restoration."""
 
+    _require_receipt_session(run_result, _require_production_session(_input_session))
     if type(run_result) is not BenchmarkGateDRunResult:
         raise TypeError("Gate D attestation run result must be exact")
     run_result.__post_init__()
@@ -2844,6 +2904,8 @@ def _persist_gate_d_attestation_posix(
             base_manifest=base_manifest,
             bundle=run_result.bundle,
             device_key=key,
+            _input_session=_input_session,
+            _contract_input=_contract_input,
         ),
         "issued_at_utc": issued,
         "schema_version": _GATE_D_ATTESTATION_SCHEMA_VERSION,
@@ -2883,6 +2945,7 @@ def _persist_gate_d_attestation_posix(
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        _require_production_session(_input_session).terminal_reproof()
         os.replace(temporary, final_path)
         directory = os.open(root, os.O_RDONLY)
         try:
@@ -2904,12 +2967,16 @@ def _persist_gate_d_attestation_posix(
 
 def _restore_gate_d_attestation_posix(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     state_root: Path,
     base_manifest: RetrievalCapabilityManifest,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> BenchmarkGateDRunResult:
     """Verify and re-mint one Core run receipt from same-device evidence."""
 
+    if _input_session is not None:
+        _require_production_session(_input_session)
     root = _gate_d_require_state_root(state_root, create=False)
     key = _gate_d_device_key(root, create=False)
     raw = _gate_d_secure_read(
@@ -2973,6 +3040,8 @@ def _restore_gate_d_attestation_posix(
             base_manifest=base_manifest,
             bundle=bundle,
             device_key=key,
+            _input_session=_input_session,
+            _contract_input=_contract_input,
         )
         if parsed["compatibility"] != compatibility:
             raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
@@ -2980,12 +3049,14 @@ def _restore_gate_d_attestation_posix(
         raise
     except (UnicodeError, TypeError, ValueError) as error:
         raise BenchmarkGateDError("GATE_D.ATTESTATION_INVALID") from error
+    _require_production_session(_input_session).terminal_reproof()
     return _issue_benchmark_gate_d_run_result(
         bundle=bundle,
         bundle_digest=bundle_digest,
         artifact_size=artifact_size,
         artifact_digest=artifact_digest,
         test_mode=False,
+        _input_session=_input_session,
     )
 
 
@@ -3243,12 +3314,15 @@ def _gate_d_windows_owner_context(
 
 def _persist_gate_d_attestation_windows(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     state_root: Path,
     base_manifest: RetrievalCapabilityManifest,
     run_result: BenchmarkGateDRunResult,
     issued_at_utc: datetime,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> None:
+    _require_receipt_session(run_result, _require_production_session(_input_session))
     if type(run_result) is not BenchmarkGateDRunResult:
         raise TypeError("Gate D attestation run result must be exact")
     run_result.__post_init__()
@@ -3292,6 +3366,8 @@ def _persist_gate_d_attestation_windows(
                 base_manifest=base_manifest,
                 bundle=run_result.bundle,
                 device_key=key,
+                _input_session=_input_session,
+                _contract_input=_contract_input,
             ),
             "issued_at_utc": issued,
             "schema_version": _GATE_D_WINDOWS_ATTESTATION_SCHEMA_VERSION,
@@ -3348,6 +3424,7 @@ def _persist_gate_d_attestation_windows(
             _GATE_D_WINDOWS_LOCK_NAME,
             _GATE_D_WINDOWS_LOCK_PAYLOAD,
         )
+        _require_production_session(_input_session).terminal_reproof()
         pending = private_parent.begin_publish(
             candidate,
             _GATE_D_ATTESTATION_FILE_NAME,
@@ -3433,10 +3510,14 @@ def _persist_gate_d_attestation_windows(
 
 def _restore_gate_d_attestation_windows(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     state_root: Path,
     base_manifest: RetrievalCapabilityManifest,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> BenchmarkGateDRunResult:
+    if _input_session is not None:
+        _require_production_session(_input_session)
     authorities: list[Any] = []
     try:
         (
@@ -3569,6 +3650,8 @@ def _restore_gate_d_attestation_windows(
                 base_manifest=base_manifest,
                 bundle=bundle,
                 device_key=key,
+                _input_session=_input_session,
+                _contract_input=_contract_input,
             )
             if parsed["compatibility"] != compatibility:
                 raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
@@ -3602,12 +3685,14 @@ def _restore_gate_d_attestation_windows(
         authorities.append(terminal_attestation_evidence)
         persistent_private.consume_verified(verified, context)
         authorities.remove(verified)
+        _require_production_session(_input_session).terminal_reproof()
         return _issue_benchmark_gate_d_run_result(
             bundle=bundle,
             bundle_digest=bundle_digest,
             artifact_size=artifact_size,
             artifact_digest=artifact_digest,
             test_mode=False,
+            _input_session=_input_session,
         )
     finally:
         active_error = sys.exception()
@@ -3620,12 +3705,32 @@ def _restore_gate_d_attestation_windows(
 
 def _persist_gate_d_attestation(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     state_root: Path,
     base_manifest: RetrievalCapabilityManifest,
     run_result: BenchmarkGateDRunResult,
     issued_at_utc: datetime,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> None:
+    if _input_session is None:
+        if _contract_input is not None:
+            raise TypeError("contract references require their explicit live input window")
+        owner = _gate_d_receipt_owner(run_result)
+        if not owner._is_retained():
+            raise BenchmarkGateDError("GATE_D.INPUT_SESSION_REQUIRED")
+        try:
+            with owner.open_session() as session:
+                return _persist_gate_d_attestation(
+                    contract_path=contract_path, state_root=state_root,
+                    base_manifest=base_manifest, run_result=run_result,
+                    issued_at_utc=issued_at_utc, _input_session=session,
+                    _contract_input=_contract_input,
+                )
+        except BaseException:
+            owner.close()
+            raise
+    _require_receipt_session(run_result, _require_production_session(_input_session))
     if sys.platform != "win32":
         return _persist_gate_d_attestation_posix(
             contract_path=contract_path,
@@ -3633,6 +3738,8 @@ def _persist_gate_d_attestation(
             base_manifest=base_manifest,
             run_result=run_result,
             issued_at_utc=issued_at_utc,
+            _input_session=_input_session,
+            _contract_input=_contract_input,
         )
     try:
         return _persist_gate_d_attestation_windows(
@@ -3641,6 +3748,8 @@ def _persist_gate_d_attestation(
             base_manifest=base_manifest,
             run_result=run_result,
             issued_at_utc=issued_at_utc,
+            _input_session=_input_session,
+            _contract_input=_contract_input,
         )
     except BenchmarkGateDError:
         raise
@@ -3657,21 +3766,43 @@ def _persist_gate_d_attestation(
 
 def _restore_gate_d_attestation(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     state_root: Path,
     base_manifest: RetrievalCapabilityManifest,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> BenchmarkGateDRunResult:
+    if _input_session is None:
+        if contract_path is None or _contract_input is not None:
+            raise TypeError("relative contract restoration requires a live input session")
+        owner = _retain_source_input_owner(_gate_d_source_root())
+        try:
+            owner._associate_source_path(contract_path)
+            with owner.open_session() as session:
+                return _restore_gate_d_attestation(
+                    contract_path=contract_path, state_root=state_root,
+                    base_manifest=base_manifest, _input_session=session,
+                    _contract_input=_contract_input,
+                )
+        except BaseException:
+            owner.close()
+            raise
+    _require_production_session(_input_session)
     if sys.platform != "win32":
         return _restore_gate_d_attestation_posix(
             contract_path=contract_path,
             state_root=state_root,
             base_manifest=base_manifest,
+            _input_session=_input_session,
+            _contract_input=_contract_input,
         )
     try:
         return _restore_gate_d_attestation_windows(
             contract_path=contract_path,
             state_root=state_root,
             base_manifest=base_manifest,
+            _input_session=_input_session,
+            _contract_input=_contract_input,
         )
     except BenchmarkGateDError:
         raise
@@ -3754,10 +3885,33 @@ def _validate_contract_path(contract_path: object) -> None:
         raise BenchmarkGateDError("GATE_D.CONTRACT_INVALID")
 
 
-def _load_contract(contract_path: Path) -> BenchmarkContract:
+def _gate_d_input_fingerprint(session: _GateInputSession | None) -> str:
     try:
+        if session is None:
+            return benchmark_implementation_fingerprint()
+        return _benchmark_implementation_fingerprint_from_session(
+            _require_session(session)
+        )
+    except RuntimeError as error:
+        raise ValueError("Gate D input session is no longer valid") from error
+
+
+def _load_contract(
+    contract_path: Path | None,
+    *,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
+) -> BenchmarkContract:
+    try:
+        if _input_session is not None:
+            session = _require_session(_input_session)
+            return _parse_benchmark_contract_text(
+                _read_input_text(session._resolve_input(contract_path, _contract_input, "benchmark_tm_contract.json"))
+            )
+        if contract_path is None or _contract_input is not None:
+            raise TypeError("relative contract inputs require a live input session")
         return load_benchmark_contract(contract_path)
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RuntimeError, KeyError) as error:
         raise BenchmarkGateDError("GATE_D.CONTRACT_INVALID") from error
 
 
@@ -4409,9 +4563,12 @@ def _publish_evidence_bundle_windows(
     digest: str,
     artifact_size: int,
     artifact_digest: str,
+    _input_session: _GateInputSession | None = None,
 ) -> tuple[str, int, str, BenchmarkEvidenceBundle]:
     """Publish one Windows bundle through the rooted platform authority."""
 
+    if _input_session is not None:
+        _require_production_session(_input_session)
     authorities: list[Any] = []
     candidate: CandidateFile | None = None
     pending: PendingPublication | None = None
@@ -4609,8 +4766,10 @@ def _publish_evidence_bundle_windows(
         if terminal != preliminary:
             raise BenchmarkGateDError("GATE_D.CLEANUP_PENDING")
         try:
-            implementation_after_publish = benchmark_implementation_fingerprint()
-        except (TypeError, ValueError) as error:
+            implementation_after_publish = _gate_d_input_fingerprint(_input_session)
+            if _input_session is not None:
+                _input_session.terminal_reproof()
+        except (TypeError, ValueError, RuntimeError) as error:
             _windows_evidence_reject_published(
                 "GATE_D.IMPLEMENTATION_INVALID",
                 pending=pending,
@@ -4657,6 +4816,8 @@ def _publish_evidence_bundle_windows(
 def _publish_evidence_bundle(
     bundle: BenchmarkEvidenceBundle,
     evidence_path: Path,
+    *,
+    _input_session: _GateInputSession | None = None,
 ) -> tuple[str, int, str, BenchmarkEvidenceBundle]:
     """Atomically persist one bundle and return its strict durable readback.
 
@@ -4670,6 +4831,8 @@ def _publish_evidence_bundle(
     failures never report success.
     """
 
+    if _input_session is not None:
+        _require_production_session(_input_session)
     serialized = benchmark_evidence_bundle_to_json(bundle)
     digest = benchmark_evidence_bundle_digest(bundle)
     payload = serialized.encode("utf-8")
@@ -4683,6 +4846,7 @@ def _publish_evidence_bundle(
             digest=digest,
             artifact_size=artifact_size,
             artifact_digest=artifact_digest,
+            _input_session=_input_session,
         )
     parent = evidence_path.parent
     try:
@@ -4742,8 +4906,10 @@ def _publish_evidence_bundle(
         ):
             raise BenchmarkGateDError("GATE_D.EVIDENCE_READBACK_MISMATCH")
         try:
-            implementation_after_publish = benchmark_implementation_fingerprint()
-        except (TypeError, ValueError) as error:
+            implementation_after_publish = _gate_d_input_fingerprint(_input_session)
+            if _input_session is not None:
+                _input_session.terminal_reproof()
+        except (TypeError, ValueError, RuntimeError) as error:
             raise BenchmarkGateDError(
                 "GATE_D.IMPLEMENTATION_INVALID"
             ) from error
@@ -4933,25 +5099,36 @@ def _require_oracle_clear(evidence: OracleRecallEvidence) -> None:
 
 def _run_benchmark_gate_d_core(
     *,
-    contract_path: Path,
+    contract_path: Path | None,
     work_root: Path,
     evidence_path: Path,
     ports: _GateDRunnerPorts,
     test_mode: bool,
     test_record_count: int | None,
     test_seed: int | None,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> BenchmarkGateDRunResult:
+    if not test_mode and _input_session is None:
+        raise TypeError("production Gate D requires a complete input session")
+    if _input_session is not None:
+        _require_production_session(_input_session)
     if not test_mode and ports is not _DEFAULT_GATE_D_RUNNER_PORTS:
         raise BenchmarkGateDError("GATE_D.PORT_INJECTION_FORBIDDEN")
     if not test_mode and (
         test_record_count is not None or test_seed is not None
     ):
         raise BenchmarkGateDError("GATE_D.TEST_PARAMETERS_INVALID")
-    _validate_contract_path(contract_path)
+    if _input_session is not None:
+        _contract_input = _input_session._resolve_input(contract_path, _contract_input, "benchmark_tm_contract.json")
+    elif _contract_input is not None or contract_path is None:
+        raise TypeError("relative contract inputs require a live input session")
+    if contract_path is not None:
+        _validate_contract_path(contract_path)
     _validate_work_root(work_root)
     _validate_evidence_path(evidence_path)
     try:
-        implementation_before = benchmark_implementation_fingerprint()
+        implementation_before = _gate_d_input_fingerprint(_input_session)
     except (TypeError, ValueError) as error:
         raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_INVALID") from error
     windows_tree: _WindowsGateDRunTree | None = None
@@ -4974,7 +5151,7 @@ def _run_benchmark_gate_d_core(
     fallback_process: TMBenchmarkProcessEvidence | None = None
     try:
         _require_outside_run_subtree(private_dir, evidence_path)
-        contract = _load_contract(contract_path)
+        contract = _load_contract(contract_path, _input_session=_input_session, _contract_input=_contract_input)
         if windows_tree is None:
             (
                 process_fts5_root,
@@ -5001,6 +5178,21 @@ def _run_benchmark_gate_d_core(
         )
         _require_oracle_clear(fts5_oracle)
         _require_oracle_clear(fallback_oracle)
+        # Only the locked real workers consume the Gate's exact input window;
+        # synthetic runner ports remain test-only and keep their old contract.
+        worker_inputs = (
+            {"_input_session": _input_session}
+            if (
+                ports is _DEFAULT_GATE_D_RUNNER_PORTS
+                and ports.run_process_migration_evidence is run_process_migration_evidence
+                and ports.run_query_process_evidence is run_query_process_evidence
+                and _input_session is not None
+            )
+            else {}
+        )
+        migration_inputs: dict[str, object] = dict(worker_inputs)
+        if worker_inputs:
+            migration_inputs["_contract_input"] = _contract_input
         fts5_process = ports.run_process_migration_evidence(
             contract_path=contract_path,
             execution_path=BenchmarkExecutionPath.FTS5_TRIGRAM,
@@ -5008,6 +5200,7 @@ def _run_benchmark_gate_d_core(
             test_mode=test_mode,
             test_record_count=test_record_count,
             test_seed=test_seed,
+            **migration_inputs,
         )
         fallback_process = ports.run_process_migration_evidence(
             contract_path=contract_path,
@@ -5016,9 +5209,10 @@ def _run_benchmark_gate_d_core(
             test_mode=test_mode,
             test_record_count=test_record_count,
             test_seed=test_seed,
+            **migration_inputs,
         )
-        fts5_run = ports.run_query_process_evidence(fts5_process)
-        fallback_run = ports.run_query_process_evidence(fallback_process)
+        fts5_run = ports.run_query_process_evidence(fts5_process, **worker_inputs)
+        fallback_run = ports.run_query_process_evidence(fallback_process, **worker_inputs)
         bundle = ports.combine_benchmark_evidence(
             fts5_run,
             fallback_run,
@@ -5028,7 +5222,7 @@ def _run_benchmark_gate_d_core(
         if type(bundle) is not BenchmarkEvidenceBundle:
             raise BenchmarkGateDError("GATE_D.BUNDLE_INVALID")
         try:
-            implementation_after = benchmark_implementation_fingerprint()
+            implementation_after = _gate_d_input_fingerprint(_input_session)
         except (TypeError, ValueError) as error:
             raise BenchmarkGateDError(
                 "GATE_D.IMPLEMENTATION_INVALID"
@@ -5040,7 +5234,7 @@ def _run_benchmark_gate_d_core(
         ):
             raise BenchmarkGateDError("GATE_D.IMPLEMENTATION_CHANGED")
         bundle_digest, artifact_size, artifact_digest, readback = (
-            _publish_evidence_bundle(bundle, evidence_path)
+            _publish_evidence_bundle(bundle, evidence_path, _input_session=_input_session)
         )
     except BaseException:
         try:
@@ -5083,6 +5277,29 @@ def _run_benchmark_gate_d_core(
         artifact_size=artifact_size,
         artifact_digest=artifact_digest,
         test_mode=test_mode,
+        _input_session=_input_session,
+    )
+
+
+def _run_benchmark_gate_d_from_session(
+    session: _GateInputSession,
+    *,
+    contract_path: Path | None,
+    work_root: Path,
+    evidence_path: Path,
+    _contract_input: _GateInputReference | None = None,
+) -> BenchmarkGateDRunResult:
+    """Internal composition route; input proof is separate from code authority.
+
+    The caller's existing execution graph must cover Core and all runner ports.
+    Fresh-worker launch remains owned by the worker adapters.  This function
+    never accepts replacement ports or caller-authored evidence.
+    """
+    return _run_benchmark_gate_d_core(
+        contract_path=contract_path, work_root=work_root, evidence_path=evidence_path,
+        ports=_DEFAULT_GATE_D_RUNNER_PORTS, test_mode=False,
+        test_record_count=None, test_seed=None, _input_session=_require_session(session),
+        _contract_input=_contract_input,
     )
 
 
@@ -5109,25 +5326,33 @@ def run_benchmark_gate_d(
     never produce final evidence.
     """
 
-    return _run_benchmark_gate_d_core(
-        contract_path=contract_path,
-        work_root=work_root,
-        evidence_path=evidence_path,
-        ports=_DEFAULT_GATE_D_RUNNER_PORTS,
-        test_mode=False,
-        test_record_count=None,
-        test_seed=None,
-    )
+    _validate_contract_path(contract_path)
+    contract_path = _source_input_locator(contract_path)
+    owner = _retain_source_input_owner(_gate_d_source_root())
+    try:
+        owner._associate_source_path(contract_path)
+        with owner.open_session() as session:
+            return _run_benchmark_gate_d_core(
+                contract_path=contract_path, work_root=work_root,
+                evidence_path=evidence_path, ports=_DEFAULT_GATE_D_RUNNER_PORTS,
+                test_mode=False, test_record_count=None, test_seed=None,
+                _input_session=session,
+            )
+    except BaseException:
+        owner.close()
+        raise
 
 
 def _run_benchmark_gate_d_test(
-    contract_path: Path,
+    contract_path: Path | None,
     work_root: Path,
     evidence_path: Path,
     *,
     ports: _GateDRunnerPorts,
     test_record_count: int,
     test_seed: int | None = None,
+    _input_session: _GateInputSession | None = None,
+    _contract_input: _GateInputReference | None = None,
 ) -> BenchmarkGateDRunResult:
     """Private owner test seam: injected exact-type ports, always test-marked.
 
@@ -5152,6 +5377,8 @@ def _run_benchmark_gate_d_test(
         test_mode=True,
         test_record_count=test_record_count,
         test_seed=test_seed,
+        _input_session=_input_session,
+        _contract_input=_contract_input,
     )
 
 
@@ -5275,6 +5502,8 @@ def _publish_retrieval_capability_gate_d_prepared(
         _PreparedPublicationT,
     ],
     _publication_bindings: _GateDPublicationBindings,
+    _input_session: _GateInputSession | None = None,
+    _close_input_owner: bool = False,
 ) -> _PreparedPublicationT:
     """Compose and publish one Gate D manifest through the exact publisher.
 
@@ -5289,6 +5518,8 @@ def _publish_retrieval_capability_gate_d_prepared(
     constructs a publisher/evaluator and never grants availability itself.
     """
 
+    if _input_session is not None:
+        _require_production_session(_input_session)
     if (
         type(_publication_bindings) is not tuple
         or len(_publication_bindings) != 15
@@ -5315,6 +5546,29 @@ def _publish_retrieval_capability_gate_d_prepared(
     ) = _publication_bindings
     validated_transition = validated_transition_raw
 
+    if (
+        _input_session is None
+        and type(run_result) is run_result_type
+        and type(run_result._receipt) is run_receipt_type
+        and not run_result.test_mode
+    ):
+        owner = _gate_d_receipt_owner(run_result)
+        if owner._is_retained():
+            try:
+                with owner.open_session() as session:
+                    return _publish_retrieval_capability_gate_d_prepared(
+                        base_manifest, run_result, publisher,
+                        generated_at_utc=generated_at_utc,
+                        valid_until_utc=valid_until_utc,
+                        evaluated_at_utc=evaluated_at_utc,
+                        prepare_publication=prepare_publication,
+                        _publication_bindings=_publication_bindings,
+                        _input_session=session,
+                        _close_input_owner=True,
+                    )
+            finally:
+                owner.close()
+
     try:
         if type(base_manifest) is not manifest_type:
             raise benchmark_error_type("GATE_D.MANIFEST_INVALID")
@@ -5331,9 +5585,15 @@ def _publish_retrieval_capability_gate_d_prepared(
             raise benchmark_error_type("GATE_D.RUN_RESULT_INVALID")
         if run_result.test_mode:
             raise benchmark_error_type("GATE_D.TEST_EVIDENCE_FORBIDDEN")
+        if _input_session is None:
+            raise benchmark_error_type("GATE_D.INPUT_SESSION_REQUIRED")
+        _require_receipt_session(run_result, _require_production_session(_input_session))
         bundle = run_result.bundle
         try:
-            current_fingerprint = implementation_fingerprint()
+            current_fingerprint = (
+                implementation_fingerprint() if _input_session is None
+                else _gate_d_input_fingerprint(_input_session)
+            )
         except (TypeError, ValueError) as error:
             raise benchmark_error_type(
                 "GATE_D.IMPLEMENTATION_INVALID"
@@ -5377,7 +5637,10 @@ def _publish_retrieval_capability_gate_d_prepared(
             gram_fallback_benchmark=fallback_evidence,
         )
         try:
-            terminal_fingerprint = implementation_fingerprint()
+            terminal_fingerprint = (
+                implementation_fingerprint() if _input_session is None
+                else _gate_d_input_fingerprint(_input_session)
+            )
         except (TypeError, ValueError) as error:
             raise benchmark_error_type(
                 "GATE_D.IMPLEMENTATION_INVALID"
@@ -5409,7 +5672,14 @@ def _publish_retrieval_capability_gate_d_prepared(
             candidate: RetrievalCapabilitySnapshot,
         ) -> _PreparedPublicationT:
             core_result = validate_candidate(candidate)
-            return prepare_publication(core_result)
+            prepared = prepare_publication(core_result)
+            if _input_session is not None:
+                try:
+                    _input_session.terminal_reproof()
+                    _input_session._prepare_publication(close_owner=_close_input_owner)
+                except (TypeError, ValueError, RuntimeError) as error:
+                    raise benchmark_error_type("GATE_D.IMPLEMENTATION_INVALID") from error
+            return prepared
 
         publication_result = validated_transition(
             publisher,
@@ -5418,6 +5688,7 @@ def _publish_retrieval_capability_gate_d_prepared(
             expected_current=expected_current,
             validator=prepare_candidate,
             _snapshot_descriptor=snapshot_descriptor,
+            _publication_window=_input_session._publication_window() if _input_session is not None else None,
         )
     except benchmark_error_type:
         raise

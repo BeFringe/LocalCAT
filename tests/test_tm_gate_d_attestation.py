@@ -11,9 +11,11 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TypedDict
 from unittest.mock import patch
 
 import tm_benchmark_gate
+from tests.gate_d_input_support import issue_source_bound_fixture_result
 from platform_fs_contracts import (
     PlatformFileError,
     PlatformFileErrorCode,
@@ -29,6 +31,12 @@ ROOT = Path(__file__).resolve().parents[1]
 EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
 
 
+class _AttestationInputs(TypedDict):
+    contract_path: Path
+    state_root: Path
+    base_manifest: tm_benchmark_gate.RetrievalCapabilityManifest
+
+
 class GateDAttestationTests(unittest.TestCase):
     @staticmethod
     def _run_result():
@@ -36,7 +44,7 @@ class GateDAttestationTests(unittest.TestCase):
         artifact = tm_benchmark_gate.benchmark_evidence_bundle_to_json(
             bundle
         ).encode("utf-8")
-        return tm_benchmark_gate._issue_benchmark_gate_d_run_result(
+        return issue_source_bound_fixture_result(
             bundle=bundle,
             bundle_digest=bundle.bundle_digest,
             artifact_size=len(artifact),
@@ -161,7 +169,7 @@ class GateDAttestationTests(unittest.TestCase):
             PlatformFileErrorCode.RECOVERY_REQUIRED,
             retryable=True,
         )
-        common = {
+        common: _AttestationInputs = {
             "contract_path": (ROOT / "benchmark_tm_contract.json").resolve(),
             "state_root": (ROOT / ".unused-gate-d-state").resolve(),
             "base_manifest": _base_capability_manifest(),
@@ -244,7 +252,7 @@ class GateDAttestationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             state_root = (Path(temporary) / "gate-d").resolve()
             manifest = _base_capability_manifest()
-            kwargs = {
+            kwargs: _AttestationInputs = {
                 "contract_path": (ROOT / "benchmark_tm_contract.json").resolve(),
                 "state_root": state_root,
                 "base_manifest": manifest,
@@ -354,7 +362,7 @@ class GateDAttestationTests(unittest.TestCase):
             )
             with patch.object(
                 tm_benchmark_gate,
-                "benchmark_implementation_fingerprint",
+                "_gate_d_input_fingerprint",
                 return_value="f" * 64,
             ):
                 with self.assertRaises(tm_benchmark_gate.BenchmarkGateDError) as ctx:

@@ -82,6 +82,10 @@ from tm_gate_a import (
     require_paths,
     require_string,
 )
+from tm_gate_inputs import (
+    _GateInputSession, _InputFile, _input_at, _read_input_text,
+    _require_session, _source_validation_inputs,
+)
 from tm_retrieval import (
     ExactContextClassification,
     FuzzyScoringResult,
@@ -457,8 +461,37 @@ def recompute_retrieval_validation(
     the evaluator stays fail-closed.
     """
 
-    if not isinstance(repository_root, Path) or not repository_root.is_dir():
-        raise ValueError("repository_root must be an existing directory")
+    with _source_validation_inputs(repository_root, approved_roots_path) as (session, roots):
+        result = _recompute_retrieval_validation_inputs(
+            session, roots, generated_at_utc=generated_at_utc,
+            valid_until_utc=valid_until_utc,
+        )
+    return result
+
+
+def _recompute_retrieval_validation_from_session(
+    session: _GateInputSession,
+    *,
+    generated_at_utc: datetime,
+    valid_until_utc: datetime,
+    approved_roots_id: str = "tests/fixtures/retrieval_gate_c_roots_v1.json",
+) -> RetrievalValidationRelease:
+    session = _require_session(session)
+    return _recompute_retrieval_validation_inputs(
+        session, session.input(approved_roots_id),
+        generated_at_utc=generated_at_utc, valid_until_utc=valid_until_utc,
+    )
+
+
+def _recompute_retrieval_validation_inputs(
+    repository_root: _GateInputSession,
+    approved_roots_path: _InputFile,
+    *,
+    generated_at_utc: datetime,
+    valid_until_utc: datetime,
+) -> RetrievalValidationRelease:
+    _require_session(repository_root)
+    repository_root._require_bound_input(approved_roots_path)
     generated = _require_utc(generated_at_utc, "generated_at_utc")
     valid_until = _require_utc(valid_until_utc, "valid_until_utc")
     lifetime = valid_until - generated
@@ -506,15 +539,15 @@ def recompute_retrieval_validation(
             (evaluator_path,),
         )
         transcript = _observe_context_transcript(
-            repository_root / _CONTEXT_VECTORS_FIXTURE,
+            _input_at(repository_root, _CONTEXT_VECTORS_FIXTURE),
         )
         fuzzy_transcript = _observe_fuzzy_scoring_transcript(
-            repository_root / _CONTEXT_VECTORS_FIXTURE,
+            _input_at(repository_root, _CONTEXT_VECTORS_FIXTURE),
         )
         if not fuzzy_transcript:
             raise ValueError("fuzzy scoring transcript must not be empty")
         store_transcript = _observe_store_transcript(
-            repository_root / _CONTEXT_VECTORS_FIXTURE,
+            _input_at(repository_root, _CONTEXT_VECTORS_FIXTURE),
         )
         if not store_transcript:
             raise ValueError("store transcript must not be empty")
@@ -525,7 +558,7 @@ def recompute_retrieval_validation(
             }
         )
         service_transcript = _observe_service_transcript(
-            repository_root / _CONTEXT_VECTORS_FIXTURE,
+            _input_at(repository_root, _CONTEXT_VECTORS_FIXTURE),
             expectation=expectation,
             observed_context_digest=observed_context_digest,
             harness_fuzzy_core_digest=canonical_digest(
@@ -734,13 +767,11 @@ def _benchmark_expectation(
     )
 
 
-def _load_approved_roots(path: Path) -> dict[str, ValidationJsonValue]:
-    if not isinstance(path, Path) or not path.is_file():
-        raise ValueError("approved_roots_path must be an existing file")
+def _load_approved_roots(path: _InputFile) -> dict[str, ValidationJsonValue]:
     return _load_json(path, "retrieval roots")
 
 
-def _load_json(path: Path, label: str) -> dict[str, ValidationJsonValue]:
+def _load_json(path: _InputFile, label: str) -> dict[str, ValidationJsonValue]:
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON constant in {label}: {value}")
 
@@ -758,7 +789,7 @@ def _load_json(path: Path, label: str) -> dict[str, ValidationJsonValue]:
         loaded: object = cast(
             object,
             json.loads(
-                path.read_text(encoding="utf-8"),
+                _read_input_text(path),
                 parse_constant=reject_constant,
                 object_pairs_hook=reject_duplicates,
             ),
@@ -771,7 +802,7 @@ def _load_json(path: Path, label: str) -> dict[str, ValidationJsonValue]:
 
 
 def _observe_context_transcript(
-    fixture_path: Path,
+    fixture_path: _InputFile,
 ) -> list[dict[str, object]]:
     vectors = _load_context_vectors(fixture_path)
     transcript: list[dict[str, object]] = []
@@ -806,7 +837,7 @@ def _observe_context_transcript(
 
 
 def _observe_fuzzy_scoring_transcript(
-    fixture_path: Path,
+    fixture_path: _InputFile,
 ) -> list[dict[str, object]]:
     """Score the frozen fuzzy vectors and emit one body-safe transcript.
 
@@ -865,7 +896,7 @@ def _observe_fuzzy_scoring_transcript(
 
 
 def _load_context_vectors(
-    path: Path,
+    path: _InputFile,
 ) -> list[Mapping[str, ValidationJsonValue]]:
     payload = _load_fixture_payload(path)
     raw_vectors = _require_list(payload.get("vectors"), "context vectors")
@@ -889,7 +920,7 @@ def _load_context_vectors(
 
 
 def _load_fixture_payload(
-    path: Path,
+    path: _InputFile,
 ) -> dict[str, ValidationJsonValue]:
     payload = _load_json(path, "retrieval vectors")
     if set(payload) != {
@@ -921,7 +952,7 @@ def _load_fixture_payload(
 
 
 def _load_fuzzy_scoring_vectors(
-    path: Path,
+    path: _InputFile,
 ) -> list[Mapping[str, ValidationJsonValue]]:
     payload = _load_fixture_payload(path)
     fuzzy = _require_mapping(
@@ -1665,7 +1696,7 @@ def _fuzzy_transcript_entry(
 
 
 def _observe_store_transcript(
-    fixture_path: Path,
+    fixture_path: _InputFile,
 ) -> list[dict[str, object]]:
     """Execute one real temporary-store journey and emit one body-safe entry.
 
@@ -3674,7 +3705,7 @@ def _verify_harness_snapshot(
 
 
 def _observe_service_transcript(
-    fixture_path: Path,
+    fixture_path: _InputFile,
     *,
     expectation: RetrievalCapabilityExpectation,
     observed_context_digest: str,

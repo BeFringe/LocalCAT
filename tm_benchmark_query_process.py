@@ -72,7 +72,14 @@ from platform_fs_contracts import PlatformFileError
 from tm_benchmark import (
     benchmark_digest,
     benchmark_implementation_fingerprint,
+    _benchmark_implementation_fingerprint_from_session,
+    _load_benchmark_contract_from_session,
     iter_fuzzy_queries,
+)
+from tm_gate_inputs import _GateInputSession, _require_session, _require_production_session
+from tm_benchmark_worker import (
+    _TestFrozenTransport, _WorkerPipes, _run_worker_child,
+    _source_worker_pipes, _worker_input_window,
 )
 from tm_benchmark_latency import (
     DEFAULT_TIMING_CLOCK_NAME,
@@ -839,6 +846,13 @@ class _WorkerRequest:
     actual_index_kind: str
     path_config_digest: str
     protocol_digest: str
+    _input_session: _GateInputSession | None = field(default=None, repr=False, compare=False)
+
+
+def _input_fingerprint(session: _GateInputSession | None) -> str:
+    if session is None:
+        return benchmark_implementation_fingerprint()
+    return _benchmark_implementation_fingerprint_from_session(_require_session(session))
 
 
 def _read_worker_request(raw: bytes) -> dict[str, object]:
@@ -856,6 +870,8 @@ def _read_worker_request(raw: bytes) -> dict[str, object]:
 
 def _validate_worker_request(
     payload: Mapping[str, object],
+    *,
+    _input_session: _GateInputSession | None = None,
 ) -> _WorkerRequest:
     try:
         fields = _strict_fields(
@@ -879,8 +895,13 @@ def _validate_worker_request(
         raise _WorkerError("QUERY.PROCESS_EVIDENCE_INVALID") from error
     if process_evidence.proof_query_version != CANDIDATE_PROOF_QUERY_VERSION:
         raise _WorkerError("QUERY.PROOF_VERSION_MISMATCH")
+    if _input_session is not None:
+        (_require_session if process_evidence.test_mode else _require_production_session)(_input_session)
+        committed_contract = _load_benchmark_contract_from_session(_input_session)
+        if not process_evidence.test_mode and process_evidence.contract != committed_contract:
+            raise _WorkerError("QUERY.CONTRACT_DIGEST_MISMATCH")
     try:
-        current_fingerprint = benchmark_implementation_fingerprint()
+        current_fingerprint = _input_fingerprint(_input_session)
     except (TypeError, ValueError) as error:
         raise _WorkerError("QUERY.IMPLEMENTATION_INVALID") from error
     if process_evidence.implementation_fingerprint != current_fingerprint:
@@ -1064,6 +1085,7 @@ def _validate_worker_request(
         actual_index_kind=actual_index_kind,
         path_config_digest=path_config_digest,
         protocol_digest=caller_protocol_digest,
+        _input_session=_input_session,
     )
 
 
@@ -2458,6 +2480,8 @@ def _run_probe(
     *,
     start_usage: object,
 ) -> dict[str, object]:
+    if request._input_session is not None:
+        _require_session(request._input_session)
     fixture_path = Path(request.fixture_path)
     run_root = Path(request.run_root)
     try:
@@ -2621,6 +2645,8 @@ def _run_evidence(
     *,
     start_usage: object,
 ) -> dict[str, object]:
+    if request._input_session is not None:
+        _require_session(request._input_session)
     fixture_path = Path(request.fixture_path)
     run_root = Path(request.run_root)
     try:
@@ -2689,7 +2715,7 @@ def _run_evidence(
         rss_scope=contract.rss_scope,
     )
     try:
-        implementation_fingerprint = benchmark_implementation_fingerprint()
+        implementation_fingerprint = _input_fingerprint(request._input_session)
     except (TypeError, ValueError) as error:
         raise _WorkerError("QUERY.IMPLEMENTATION_INVALID") from error
     if (
@@ -2758,51 +2784,91 @@ def _run_evidence(
     return query_process_evidence_to_payload(evidence)
 
 
-def _worker_main(argv: list[str]) -> int:
-    if argv != [QUERY_WORKER_MODE_FLAG]:
-        sys.stderr.write(
-            "usage: python -m tm_benchmark_query_process --worker\n"
-        )
-        return 2
+def _serve_worker(pipes: _WorkerPipes, session: _GateInputSession) -> int:
+    """Consume this child's own E10 inputs and explicitly attached pipes."""
     try:
+        if type(pipes) is not _WorkerPipes:
+            raise TypeError("worker requires exact binary endpoints")
+        _require_session(session)
         if sys.platform == "win32":
             start_usage: object = windows_peak_working_set_bytes()
         else:
             resource_module = _query_resource_module()
             start_usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
-        raw_request = sys.stdin.buffer.read()
+        raw_request = pipes.read_request()
         payload = _read_worker_request(raw_request)
-        request = _validate_worker_request(payload)
+        request = _validate_worker_request(payload, _input_session=session)
         if request.mode == "probe":
             response_payload = _run_probe(
                 request,
                 start_usage=start_usage,
+            )
+            probe = query_probe_from_payload(response_payload)
+            digest_payload = _probe_payload_facts(probe)
+            previous_rss = probe.query_rss_terminal_bytes
+            digest_key, digest_version, digest_domain = (
+                "probe_digest", QUERY_PROBE_DIGEST_VERSION, "query-probe"
             )
         else:
             response_payload = _run_evidence(
                 request,
                 start_usage=start_usage,
             )
+            evidence = query_process_evidence_from_payload(response_payload)
+            digest_payload = _query_process_evidence_digest_payload(evidence)
+            previous_rss = evidence.query_rss_terminal_bytes
+            digest_key, digest_version, digest_domain = (
+                "evidence_digest", QUERY_EVIDENCE_DIGEST_VERSION, "query-process-evidence"
+            )
+        digest_payload["environment"] = response_payload["environment"]
         envelope: dict[str, object] = {
             "kind": request.mode,
             "payload": response_payload,
             "protocol": QUERY_WORKER_PROTOCOL_VERSION,
             "query_pid": os.getpid(),
         }
-        sys.stdout.write(_canonical_json(envelope) + "\n")
-        sys.stdout.flush()
+        # Construct, strictly validate and fully encode before the final peak;
+        # discard the provisional encoding so sealing needs no second buffer.
+        _canonical_json(envelope)
+        if _input_fingerprint(session) != request.process_evidence.implementation_fingerprint:
+            raise _WorkerError("QUERY.IMPLEMENTATION_CHANGED")
+        session.terminal_reproof()
+        terminal_rss, _raw_unit = _terminal_rss_facts(start_usage)
+        if terminal_rss < previous_rss:
+            raise _WorkerError("QUERY.RSS_MONOTONIC_VIOLATION")
+        # Terminal closed this input epoch. Only the final RSS scalars and
+        # their canonical digest/encoding remain; do not reopen or revalidate.
+        for field_name in ("query_peak_rss_bytes", "query_rss_terminal_bytes"):
+            response_payload[field_name] = terminal_rss
+            digest_payload[field_name] = terminal_rss
+        response_payload[digest_key] = benchmark_digest(
+            digest_version, digest_domain, [digest_payload]
+        )
+        pipes.write_result(_canonical_json(envelope) + "\n")
         return 0
     except _WorkerError as error:
-        sys.stderr.write(
-            _canonical_json({"error_code": error.error_code}) + "\n"
-        )
-        sys.stderr.flush()
-        return 1
+        code = error.error_code
     except Exception:
-        sys.stderr.write(
-            _canonical_json({"error_code": "QUERY.CHILD_FAILED"}) + "\n"
-        )
-        sys.stderr.flush()
+        code = "QUERY.CHILD_FAILED"
+    if type(session) is _GateInputSession:
+        session._abort()
+    try:
+        pipes.write_error(_canonical_json({"error_code": code}) + "\n")
+    except Exception:
+        pass
+    return 1
+
+
+def _worker_main(argv: list[str]) -> int:
+    if argv != [QUERY_WORKER_MODE_FLAG]:
+        if sys.stderr is not None:
+            sys.stderr.write("usage: python -m tm_benchmark_query_process --worker\n")
+        return 2
+    try:
+        pipes = _source_worker_pipes()
+        with _worker_input_window(None, test_mode=False) as session:
+            return _serve_worker(pipes, session)
+    except Exception:
         return 1
 
 
@@ -2893,6 +2959,8 @@ def _run_query_child(
     *,
     mode: str,
     timeout_seconds: float,
+    _input_session: _GateInputSession | None = None,
+    _test_frozen_transport: _TestFrozenTransport | None = None,
 ) -> tuple[
     dict[str, object],
     int,
@@ -2911,6 +2979,13 @@ def _run_query_child(
         raise QueryProcessError("QUERY.TEST_MODE_MISMATCH")
     if mode == "evidence" and process_evidence.test_mode:
         raise QueryProcessError("QUERY.TEST_MODE_MISMATCH")
+    if _input_session is not None:
+        (_require_session if process_evidence.test_mode else _require_production_session)(_input_session)
+        if _input_fingerprint(_input_session) != process_evidence.implementation_fingerprint:
+            raise QueryProcessError("QUERY.IMPLEMENTATION_MISMATCH")
+        committed_contract = _load_benchmark_contract_from_session(_input_session)
+        if not process_evidence.test_mode and committed_contract != process_evidence.contract:
+            raise QueryProcessError("QUERY.CONTRACT_DIGEST_MISMATCH")
     if type(timeout_seconds) is not float or not math.isfinite(
         timeout_seconds
     ) or timeout_seconds <= 0:
@@ -2951,25 +3026,11 @@ def _run_query_child(
     if type(request_protocol_digest) is not str:
         raise QueryProcessError("QUERY.REQUEST_INVALID")
     request_json = _canonical_json(request)
-    environment = dict(os.environ)
-    environment["PYTHONIOENCODING"] = "utf-8"
-    environment["PYTHONWARNINGS"] = "ignore"
     try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "tm_benchmark_query_process",
-                QUERY_WORKER_MODE_FLAG,
-            ],
-            input=request_json,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            cwd=Path(__file__).resolve().parent,
-            env=environment,
-            timeout=timeout_seconds,
-            check=False,
+        completed = _run_worker_child(
+            "query", request_json, timeout_seconds=timeout_seconds,
+            test_mode=process_evidence.test_mode,
+            _test_frozen_transport=_test_frozen_transport,
         )
     except OSError as error:
         raise QueryProcessError("QUERY.CHILD_SPAWN_FAILED") from error
@@ -3234,17 +3295,26 @@ def run_query_process_probe(
     process_evidence: TMBenchmarkProcessEvidence,
     *,
     timeout_seconds: float = 120.0,
+    _input_session: _GateInputSession | None = None,
+    _test_frozen_transport: _TestFrozenTransport | None = None,
 ) -> QueryProbeRunResult:
     """Run one isolated query child in test-only probe mode.
 
     Requires test-mode process evidence and returns the raw probe facts plus
     the local query-child pid and artifact locators.  Never final evidence.
     """
+    if _input_session is None:
+        with _worker_input_window(None, test_mode=True) as session:
+            result = run_query_process_probe(process_evidence, timeout_seconds=timeout_seconds, _input_session=session, _test_frozen_transport=_test_frozen_transport)
+        return result
+    _require_session(_input_session)
     payload, query_child_pid, run_root, fixture_path, artifact_pre, artifact_post, request_protocol_digest = (
         _run_query_child(
             process_evidence,
             mode="probe",
             timeout_seconds=timeout_seconds,
+            _input_session=_input_session,
+            _test_frozen_transport=_test_frozen_transport,
         )
     )
     try:
@@ -3261,7 +3331,7 @@ def run_query_process_probe(
         raise QueryProcessError("QUERY.ARTIFACT_MUTATED")
     if not _artifact_snapshots_equal(artifact_pre, probe.artifact_post):
         raise QueryProcessError("QUERY.ARTIFACT_MUTATED")
-    return QueryProbeRunResult(
+    result = QueryProbeRunResult(
         probe=probe,
         query_child_pid=query_child_pid,
         run_root=run_root,
@@ -3269,12 +3339,16 @@ def run_query_process_probe(
         artifact_pre=artifact_pre,
         artifact_post=artifact_post,
     )
+    if _input_fingerprint(_input_session) != process_evidence.implementation_fingerprint:
+        raise QueryProcessError("QUERY.IMPLEMENTATION_CHANGED")
+    return result
 
 
 def run_query_process_evidence(
     process_evidence: TMBenchmarkProcessEvidence,
     *,
     timeout_seconds: float = 600.0,
+    _input_session: _GateInputSession | None = None,
 ) -> QueryProcessRunResult:
     """Run one isolated query child producing full query-process evidence.
 
@@ -3283,11 +3357,17 @@ def run_query_process_evidence(
     is produced by the real exact/fuzzy latency pipeline on the reopened
     canonical generation.
     """
+    if _input_session is None:
+        with _worker_input_window(None, test_mode=False) as session:
+            result = run_query_process_evidence(process_evidence, timeout_seconds=timeout_seconds, _input_session=session)
+        return result
+    _require_production_session(_input_session)
     payload, query_child_pid, run_root, fixture_path, artifact_pre, artifact_post, request_protocol_digest = (
         _run_query_child(
             process_evidence,
             mode="evidence",
             timeout_seconds=timeout_seconds,
+            _input_session=_input_session,
         )
     )
     try:
@@ -3306,7 +3386,7 @@ def run_query_process_evidence(
         raise QueryProcessError("QUERY.ARTIFACT_MUTATED")
     if not evidence.final_evidence:
         raise QueryProcessError("QUERY.EVIDENCE_INVALID")
-    return QueryProcessRunResult(
+    result = QueryProcessRunResult(
         process_evidence=process_evidence,
         evidence=evidence,
         query_child_pid=query_child_pid,
@@ -3316,6 +3396,9 @@ def run_query_process_evidence(
         artifact_post=artifact_post,
         request_protocol_digest=request_protocol_digest,
     )
+    if _input_fingerprint(_input_session) != process_evidence.implementation_fingerprint:
+        raise QueryProcessError("QUERY.IMPLEMENTATION_CHANGED")
+    return result
 
 
 __all__ = [
