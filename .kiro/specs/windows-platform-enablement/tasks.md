@@ -412,7 +412,7 @@
 
 - [ ] 7. 构建完整 frozen-source closure 与 Windows onedir/windowed发行物
 
-- [ ] 7.0 集成frozen pre-build消费合同与WA-07 trusted bootstrap实现
+- [x] 7.0 集成frozen pre-build消费合同与WA-07 trusted bootstrap实现
   - 在1.6全PASS后，集成生成manifest/build前必须存在的owner roots/hooks、WA-06 9.6c/9.6d受信输入与fresh worker消费、WA-07 3.6a `TrustedSourceAuthority`消费实现；WA-01/02/04/05/06及WA-07其余packaged revalidation不得在发行候选生成前标为完成
   - CapabilityHost只消费native entry移交的`TrustedSourceAuthority`，完整Boot TCB先于platform factory与业务import；source阶段结果与最小spike都不得代答full candidate runtime
   - 完成时ledger只追加`FROZEN_PREBUILD_COMMITTED`事实，所有owner row仍等待7.4a post-build revalidation，terminal `MERGED_PASS`继续禁止
@@ -420,7 +420,7 @@
   - _Boundary: Frozen Consumer Amendment Integration_
   - _Depends: 1.6, 6.6b, tm-storage-retrieval-index 9.6c, tm-storage-retrieval-index 9.6d, feature5-ui-integration 3.6a_
 
-- [ ] 7.1 生成deterministic frozen source/fixture/data manifest
+- [x] 7.1 生成deterministic frozen source/fixture/data manifest
   - 从approved owner roots解析Gate A/C/D、benchmark contract与dynamic import递归闭包，记录schema/commit/reason/relative path/kind/SHA-256和UTF-8排序
   - production build要求clean tracked tree；spec/hooks/generator/bootstrap/owner roots、manifest-declared dynamic native roots、locked wheels、bootloader/Python/native runtime全部content-addressed。critical modules只允许source-only collection，无`.pyc`/`__pycache__`/未声明PYZ duplicate；`durability_profiles.json`与power evidence不得作为W3输入
   - 完成时，manifest generator可重复产生byte-identical output并覆盖真实`.py`、JSON/TXT fixtures及获批tm/terms/logo/benchmark assets
@@ -561,3 +561,8 @@
 - Task 4.4b：历史 `CHILD_FAILED` 只有包装码且子进程输出被丢弃，无法从旧日志追溯原始偶发失败。新增诊断必须继续限制在白名单安全事实，不记录项目正文、路径、参数或异常原文。
 - 隔离空资源或单条 TM 的启动测试不能替代用户实际 Start Menu 配置计时；性能调查和偶发失败保持独立验收。
 - Task 3.3 已规定完整既有 W1 payload 在活身份、私有安全与内容复证后直接进入 `LockFileEx`；无写入的普通取得不执行 `FlushFileBuffers`，首次创建和 strict-prefix 恢复仍须 write/flush/readback。
+
+## Implementation Notes
+
+- Task 7.0：owner声明只引用Core原Gate roots/benchmark inventory及动态import常量；7.1须解析当前提交，不复用旧静态盘点清单。历史source提交因ADR-027重写而非当前祖先，ledger保留原事实并按全tree字节核定当前可达定位；后续build输入须绑定实际当前提交，不以历史hash或patch-equivalent代答。
+- Task 7.1：动态目标只接受可证明的有限AST常量；普通source与spec/helper共用闭包规则，未知annotation scope与可见重绑明确拒绝。后续build须提供完整tracked build_inputs及实际collection/TOC，不能用开发清单或native输入DAG代替生产内容寻址、真实PE闭包和runtime attestation；接口见task71-validation.md的归档链接。

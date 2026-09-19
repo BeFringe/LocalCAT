@@ -1,6 +1,6 @@
 # Task 7 前置消费合同修订
 
-状态：**已批准，构建前消费正在集成；完整 frozen 尚未验收**。以下记录 WA-06 R4 获批 W3 合同，当前完成范围以 owning tasks 为准。
+状态：**已批准，构建前消费实现已提交；完整 frozen 运行尚未验收**。用户于 2026-09-19 批准 WA-06 R4 及平台/WA-07 的 Design/Tasks/ledger 增量，Core 9.6c/9.6d、WA-07 3.6a 和平台 7.0/7.1 已完成。当前集成定位见 [ledger](cross-spec-amendments.md)。下文保留 R4 获批时的 W3 合同；普通发行按 ADR-028 重新设计，不自动继承完整 Boot TCB 前置。
 
 ## 已批准事项
 
