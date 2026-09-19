@@ -44,6 +44,11 @@ from tm_contracts import (
     contract_to_json,
 )
 from tm_similarity import SimilarityScorerV1
+from tm_gate_inputs import (
+    _GateInputSession, _GateInputReference, _InputRoot, _InputFile,
+    _input_at, _read_input_bytes, _read_input_text, _relative_input_id,
+    _require_session, _source_validation_inputs,
+)
 
 
 GATE_A_SCHEMA_VERSION = "feature5-gate-a-v1"
@@ -120,7 +125,26 @@ def recompute_gate_a(
 ) -> GateAEvidenceReport:
     """Recompute independent CONTRACTS/SIMILARITY/TEXT evidence grants."""
 
-    root = _require_directory(repository_root, "repository_root")
+    with _source_validation_inputs(repository_root, approved_roots_path) as (session, roots):
+        result = _recompute_gate_a_inputs(session, roots)
+    return result
+
+
+def _recompute_gate_a_from_session(
+    session: _GateInputSession,
+    *,
+    approved_roots_id: str = "tests/fixtures/feature5_gate_a_v1.json",
+) -> GateAEvidenceReport:
+    session = _require_session(session)
+    return _recompute_gate_a_inputs(session, session.input(approved_roots_id))
+
+
+def _recompute_gate_a_inputs(
+    root: _GateInputSession,
+    approved_roots_path: _InputFile,
+) -> GateAEvidenceReport:
+    _require_session(root)
+    root._require_bound_input(approved_roots_path)
     approved = load_approved_roots(approved_roots_path)
     raw_components = require_mapping(
         approved["components"],
@@ -269,7 +293,7 @@ def _make_component_evidence(
 
 def _component_transcript_digest(
     component: GateAComponent,
-    repository_root: Path,
+    repository_root: _InputRoot,
 ) -> str:
     if component is GateAComponent.CONTRACTS:
         transcript = _contracts_transcript()
@@ -573,9 +597,9 @@ def _capture_rejection(case_id: str, serialized: str) -> dict[str, str]:
     return {"case_id": case_id, "error_type": "NOT_REJECTED"}
 
 
-def _similarity_transcript(repository_root: Path) -> dict[str, object]:
+def _similarity_transcript(repository_root: _InputRoot) -> dict[str, object]:
     fixture = _load_json(
-        repository_root / "tests/fixtures/tm_similarity_vectors.json"
+        _input_at(repository_root, "tests/fixtures/tm_similarity_vectors.json")
     )
     scorer = SimilarityScorerV1()
     observed: list[dict[str, object]] = []
@@ -605,9 +629,9 @@ def _similarity_transcript(repository_root: Path) -> dict[str, object]:
     }
 
 
-def _all_matcher_transcript(repository_root: Path) -> dict[str, object]:
+def _all_matcher_transcript(repository_root: _InputRoot) -> dict[str, object]:
     fixture = _load_json(
-        repository_root / "tests/fixtures/text_matcher_v1_vectors.json"
+        _input_at(repository_root, "tests/fixtures/text_matcher_v1_vectors.json")
     )
     vectors = tuple(
         require_mapping(item, "text matcher vector")
@@ -620,10 +644,10 @@ def _all_matcher_transcript(repository_root: Path) -> dict[str, object]:
 
 
 def basic_matcher_cohort_transcript(
-    repository_root: Path,
+    repository_root: _InputRoot,
 ) -> dict[str, object]:
     fixture = _load_json(
-        repository_root / "tests/fixtures/text_matcher_v1_vectors.json"
+        _input_at(repository_root, "tests/fixtures/text_matcher_v1_vectors.json")
     )
     ids = {
         "legacy-case-sensitive-contiguous",
@@ -662,10 +686,10 @@ def basic_matcher_cohort_transcript(
 
 
 def full_matcher_cohort_transcript(
-    repository_root: Path,
+    repository_root: _InputRoot,
 ) -> dict[str, object]:
     fixture = _load_json(
-        repository_root / "tests/fixtures/text_matcher_v1_vectors.json"
+        _input_at(repository_root, "tests/fixtures/text_matcher_v1_vectors.json")
     )
     vectors = tuple(
         vector
@@ -732,10 +756,9 @@ def _run_matcher_vectors(
     }
 
 
-def unicode_transcript(repository_root: Path) -> dict[str, object]:
+def unicode_transcript(repository_root: _InputRoot) -> dict[str, object]:
     fixture = _load_json(
-        repository_root
-        / "tests/fixtures/text_matcher_unicode_vectors.json"
+        _input_at(repository_root, "tests/fixtures/text_matcher_unicode_vectors.json")
     )
     fold_observed: list[dict[str, object]] = []
     for raw in _require_list(fixture.get("fold_vectors"), "fold vectors"):
@@ -824,16 +847,13 @@ def unicode_transcript(repository_root: Path) -> dict[str, object]:
 
 
 def _word_break_conformance_transcript(
-    repository_root: Path,
+    repository_root: _InputRoot,
 ) -> dict[str, object]:
-    path = (
-        repository_root
-        / "tests/fixtures/unicode-16.0.0-WordBreakTest.txt"
-    )
+    path = _input_at(repository_root, "tests/fixtures/unicode-16.0.0-WordBreakTest.txt")
     transcript_hasher = hashlib.sha256()
     checked = 0
     for line_number, raw_line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(),
+        _read_input_text(path).splitlines(),
         start=1,
     ):
         payload = raw_line.split("#", 1)[0].strip()
@@ -862,9 +882,9 @@ def _word_break_conformance_transcript(
 
 
 def load_approved_roots(
-    path: Path,
+    path: _InputFile,
 ) -> Mapping[str, ValidationJsonValue]:
-    payload = _load_json(_require_file(path, "approved_roots_path"))
+    payload = _load_json(path)
     if payload.get("schema_version") != GATE_A_SCHEMA_VERSION:
         raise ValueError("unsupported Gate A roots schema")
     if set(payload) != {"schema_version", "components", "matcher"}:
@@ -872,7 +892,7 @@ def load_approved_roots(
     return payload
 
 
-def _load_json(path: Path) -> dict[str, ValidationJsonValue]:
+def _load_json(path: _InputFile) -> dict[str, ValidationJsonValue]:
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON constant: {value}")
 
@@ -890,7 +910,7 @@ def _load_json(path: Path) -> dict[str, ValidationJsonValue]:
         loaded: object = cast(
             object,
             json.loads(
-                path.read_text(encoding="utf-8"),
+                _read_input_text(path),
                 parse_constant=reject_constant,
                 object_pairs_hook=reject_duplicates,
             ),
@@ -903,16 +923,16 @@ def _load_json(path: Path) -> dict[str, ValidationJsonValue]:
 
 
 def aggregate_paths_digest(
-    repository_root: Path,
+    repository_root: _InputRoot,
     relative_paths: tuple[str, ...],
 ) -> str:
     entries: list[dict[str, str]] = []
     for relative in relative_paths:
-        path = repository_root / relative
+        path = _input_at(repository_root, relative)
         entries.append(
             {
                 "path": relative,
-                "sha256": _sha256(path.read_bytes()),
+                "sha256": _sha256(_read_input_bytes(path)),
             }
         )
     return canonical_digest(entries)
@@ -980,9 +1000,7 @@ def require_paths(
     if len(paths) != len(set(paths)) or paths != tuple(sorted(paths)):
         raise ValueError(f"{field_name} must be unique and sorted")
     for path in paths:
-        candidate = Path(path)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            raise ValueError(f"{field_name} must contain safe relative paths")
+        _relative_input_id(path)
     return paths
 
 
