@@ -1,6 +1,10 @@
 # 实施计划
 
-> **APPROVED FOR STAGED IMPLEMENTATION**：本计划按“现场失败/通过矩阵 → Windows 文件系统/锁适配 → consumer amendments → frozen-source/Windows packaging → clean EXE E2E”排序。ADR-020～026、`windows-platform-enablement` owning scope、WA-01～08 current R/D/T request、ledger与独立Design review均已闭合；ADR-024/025的活动合同同步由Task 0.6记录，ADR-026的Parser收窄由Task 0.7记录。从Task 1起仍必须逐项满足task/integration/evidence依赖，任何早期局部通过都不构成Windows Feature GO。owner 指 Spec/合同 authority；branch 只记录提交血缘，worktree/Agent/thread 都不是 owner。单个执行者或独立 reviewer 可以覆盖多个 Spec，但不能借此跨越各 Spec 审批门。实施/累计复审节奏见 `review-clustering.md`。
+> **SOURCE COMPLETE / W3 CONTINUATION NOT VERIFIED**：Task 1–6 的 Windows source 已交付。本线保留 W3 强证明路线的批准合同与实现；Core 9.6c/9.6d、Feature5 3.6a 和平台 7.0/7.1 已完成各自构建前范围，7.2 及后续发行任务仍未完成。下方 Task 7–10 是强证明路线的任务图；producer 中间实现及后续未验收增量不能视为任务完成。[ADR-028](../../steering/adr/adr-028.md) 已解除普通 frozen 对完整 Boot TCB 的强制依赖，强证明研究不阻塞 source 或普通发行。
+
+source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA-08 5.4a 与平台 6.6b 验收，状态为 `WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`；证据见 [launcher](../../../windows_user_managed_launcher_evidence.json) 和 [用户旅程](../../../qt_editor_windows_source_evidence.json)。本次文档同步不重签 runtime evidence。
+
+原实施顺序和 task 编号保留。owner 指 Spec/合同 authority；branch 记录提交血缘，worktree/Agent/thread 不改变业务所有权。评审节奏见 `review-clustering.md`，其旧 W3 条款服从 ADR-028 的适用范围。
 
 - [x] 0. 闭合 ADR、所有权、跨 Spec amendment 与设计授权
 
@@ -349,7 +353,7 @@
   - _Boundary: Persistence Recovery Matrix_
   - _Depends: 5.2, 5.3, 5.4_
 
-- [ ] 6. 集成TM Core/Feature5 UI amendments并完成activation/FTS5恢复
+- [x] 6. 集成TM Core/Feature5 UI amendments并完成activation/FTS5恢复
 
 - [x] 6.1 验证并集成 WA-06 TM Core amendment
   - 核对W1/W2及ADR-023/024/025 superseding映射、当前approved R/D/T request revision与task suffix、feature5 commit可达性和activation/attestation/recovery evidence；任何非current revision或V1 private profile实现不得进入集成
@@ -409,6 +413,10 @@
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 7.1, 8.1, 9.1, 9.3, 9.4_
   - _Boundary: Windows User-managed Source Runtime Milestone_
   - _Depends: 5.5, 6.5, qt-editor-json-mvp-increment 5.4a_
+
+## 后置 frozen：旧计划待按 ADR-028 映射
+
+以下保留已完成项和未完成项的历史状态；取消普通发行中的强证明要求不等于这些实现已通过。下一步先收束执行产物与 Core/Host 输入的绑定、必要入口校验和最小真实包内用户旅程，再修订具体任务。
 
 - [ ] 7. 构建完整 frozen-source closure 与 Windows onedir/windowed发行物
 
@@ -564,5 +572,5 @@
 
 ## Implementation Notes
 
-- Task 7.0：owner声明只引用Core原Gate roots/benchmark inventory及动态import常量；7.1须解析当前提交，不复用旧静态盘点清单。历史source提交因ADR-027重写而非当前祖先，ledger保留原事实并按全tree字节核定当前可达定位；后续build输入须绑定实际当前提交，不以历史hash或patch-equivalent代答。
-- Task 7.1：动态目标只接受可证明的有限AST常量；普通source与spec/helper共用闭包规则，未知annotation scope与可见重绑明确拒绝。后续build须提供完整tracked build_inputs及实际collection/TOC，不能用开发清单或native输入DAG代替生产内容寻址、真实PE闭包和runtime attestation；接口见task71-validation.md的归档链接。
+- Task 7.0：owner 声明引用 Core 的 Gate roots、benchmark inventory 和动态 import 常量；构建读取当前实现，不复用历史静态盘点清单。
+- Task 7.1：动态目标只接受可证明的有限 AST 常量；source 与 spec/helper 共用闭包规则。production 输入还须绑定实际 collection/TOC；接口见[构建输入](frozen-build-inputs.md)、[绑定](frozen-build-bindings.md)和[作用域](frozen-build-scopes.md)。这些 W3 工具不自动成为普通发行前置。

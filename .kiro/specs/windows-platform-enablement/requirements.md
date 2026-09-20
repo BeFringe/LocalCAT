@@ -1,7 +1,13 @@
 # 需求文档
 
+## 当前交付范围（2026-09-20 修订）
+
+Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 launcher 已完成 Task 6.6b 用户旅程。后置 frozen 追求最终用户无需另装 Python/Qt，独立验收，不阻塞 source。
+
+[ADR-028](../../steering/adr/adr-028.md) 已取代普通 frozen 的完整 Boot TCB、定制 native entry 与 retained-source-only 强证明前置。本线保留 Requirement 10 的 W3 专用证明及 Requirement 11/12 对它的引用，用于强证明路线的独立续接，不直接驱动普通发行实现；自包含、可追溯构建、必要数据保护、Core Gate 与真实 packaged E2E 目标继续保留。新的输入身份/消费设计尚待收束，旧 W3 失败不改记为通过。Requirement 1–9 的 source 数据与业务合同保持有效。
+
 ## 简介
-Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT UI 依赖，并独立验证 Qt `windows` 平台插件和 SQLite FTS5；但 `ui-mvp@b925b80` 的 LocalCAT 源码会在导入 `fcntl` 时中止，Windows 又不具备现有 POSIX rooted-handle、文件锁和目录 durability 原语，因此项目持久化、TM 生命周期和 frozen EXE 均不可用。本 Spec 在不削弱 macOS/Linux fail-closed 契约的前提下，为 Windows 建立等价的能力证明和发布路径，直到真实 EXE 上的启动、项目保存/重开、TM 激活/重启恢复、TMX 导入与 FTS5 全部通过。
+立项时，`ui-mvp@b925b80` 因直接导入 `fcntl` 而无法在 Windows 运行。本 Spec 已通过平台端口与 consumer 适配闭合 source 的 Qt、项目持久化、TM 生命周期、TMX 和 FTS5；frozen 是下一条独立交付线。Windows 与 POSIX 使用各自的文件系统原语，保护相同的用户数据与业务结果。
 
 ## 边界说明
 - **范围内**：Windows 原生 rooted file authority、路径逃逸与 reparse 防护、跨进程锁、原子发布与恢复；所有现有 POSIX 文件语义消费者的共享平台边界接入；LocalCAT Qt 启动、项目生命周期、TM 生命周期、TMX 导入、FTS5；依赖用户管理 CPython/venv/source 的轻量 Windows 启动入口；PyInstaller `--onedir --windowed` frozen-source 能力证明、资源收集和 Windows 发行物验证；Qt speaker avatar 的 Windows 功能回归；macOS/Linux 回归保护。
@@ -13,7 +19,7 @@ Windows 11 用户当前可以在干净的 CPython 3.14 x64 环境安装 LocalCAT
 - **被修订的既有范围说明**：`parser-subsystem-extraction/design.md` 中尚未落地的 Windows native rooted-handle 规划；`ui-mvp@b925b80` 仅在 POSIX 文件语义下可组合的现状。
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
 - **审批状态**：ADR-020～026、owning scope、WA-01～08 current R/D/T amendment acknowledgement及平台Requirements/Design/Tasks均已批准；ADR-024/025对主体环境矩阵与发布耐久门的后续取代关系由Task 0.6同步，ADR-026对Parser发布状态的收窄由Task 0.7同步；实施仍仅按本Spec task依赖逐簇进入，审批不代替实现或发布证据。
-- **交付路线**：Windows source compatibility 与 ADR-022 frozen distribution 是两个累计验收阶段。source 阶段可先形成依赖用户管理 CPython 3.14 x64、venv、`requirements-ui.txt` 与受审 source tree 的本地运行入口；它不铸造 `TrustedSourceAuthority`、不满足 Requirement 10～12，也不改变 frozen 最终发行门。W3 custom in-process entry 的规划可与 source 平台迁移并行，gate-quality spike 在 W1 rooted contract 冻结后、任何 frozen consumer merge前完成。
+- **交付路线**：source 已完成用户管理 CPython 3.14 x64、venv、`requirements-ui.txt`、source 与轻量入口的产品验收；它不铸造 frozen authority。frozen 后置独立验收；2026-09-20 项目 owner 批准按 ADR-028 收窄其证明范围，取代原 W3 强证明作为唯一发行前置的安排。
 - **导出输出收尾修订**：ADR-027 已获批准，仅修订 Windows ResourcePackage/TMX 正常完成后留下内部协调锁文件的行为；相邻 `language-resource-portability` 6.7–6.8 与 `tmx-context-interchange` 8.8–8.9 分别承载导出结果。既有 Requirement 3 的并发互斥继续成立，其他持久锁、直接 CSV/JSONL 导出与 POSIX 行为不在本修订范围。
 
 ## 需求
