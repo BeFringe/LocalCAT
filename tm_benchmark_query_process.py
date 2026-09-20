@@ -461,6 +461,7 @@ def _expected_run_root_entry_names(
             fixture_path.name,
             sidecar_name,
             manifest_path.name,
+            f".{sidecar_name}.localcat-initial-activation.lock",
             f".{sidecar_name}.localcat-activation-journal.json",
             f".{sidecar_name}.localcat-activation-terminal.json",
             f".{sidecar_name}.localcat-activated-lineage.json",

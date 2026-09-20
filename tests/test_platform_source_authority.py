@@ -142,9 +142,12 @@ class RootedSourceAuthorityTests(unittest.TestCase):
                         self.assertTrue(source.is_current())
                         return
 
-                with self.assertRaises(PlatformFileError):
-                    with authority.proof_window():
-                        self.assertFalse(source.is_current())
+                with authority.proof_window():
+                    self.assertFalse(source.is_current())
+                    # A rejected probe is not a successfully consumed file.
+                    # Rebinding must reject it before the operation can use it.
+                    with self.assertRaises(PlatformFileError):
+                        authority.bind_path(source_path)
             finally:
                 authority.close()
 
