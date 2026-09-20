@@ -40,6 +40,15 @@ def calls() -> Iterator[list[tuple[str, str, dict[str, Any]]]]:
     def observe(frame: FrameType, event: str, arg: object) -> None:
         if event == "call":
             values = dict(frame.f_locals)
+            if (
+                frame.f_globals.get("__name__") == "tm_retrieval_capability"
+                and frame.f_code.co_name == "__init__"
+                and type(values.get("self")).__name__ == "RetrievalCapabilityPublisher"
+            ):
+                caller = frame.f_back
+                values["publisher_caller"] = (
+                    caller.f_globals.get("__name__"), caller.f_code.co_name
+                ) if caller is not None else None
             if frame.f_globals.get("__name__") == "tm_benchmark_gate" and values.get("_contract_input") is not None:
                 session = values.get("_input_session", values.get("session"))
                 values["bound_current_window"] = values["_contract_input"]._belongs_to(session)
@@ -169,7 +178,18 @@ class FrozenHostInputTests(unittest.TestCase):
         self.assertIn("tests/fixtures/retrieval_gate_c_roots_v1.json", terminal[0]["consumed_ids_snapshot"])
         self.assertFalse(entries(observed, "platform_source_authority", "compose_rooted_source_authority"))
         self.assertFalse(entries(observed, "tm_retrieval_validation", "recompute_retrieval_validation"))
-        self.assertFalse([values for values in entries(observed, "tm_retrieval_capability", "__init__") if type(values.get("self")).__name__ == "RetrievalCapabilityPublisher"])
+        # Core may construct private publishers to check retrieval semantics.
+        # Provisional inputs must never reach Host service composition/install.
+        publishers = [values for values in entries(observed, "tm_retrieval_capability", "__init__") if type(values.get("self")).__name__ == "RetrievalCapabilityPublisher"]
+        for publisher in publishers:
+            self.assertEqual(
+                publisher["publisher_caller"],
+                ("tm_retrieval_validation", "_harness_capability_publisher"),
+            )
+        self.assertFalse(entries(observed, "capability_host", "compose_service"))
+        self.assertFalse(entries(observed, "capability_host", "_install_gate_c_service"))
+        self.assertEqual(result, before)
+        self.assertEqual(composition.host.retrieval_snapshot(), before)
         self.assertEqual(result.generation, before.generation)
         self.assertFalse(result.display.context_available)
 

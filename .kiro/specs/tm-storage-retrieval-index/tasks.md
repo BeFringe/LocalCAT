@@ -603,7 +603,9 @@
 
 ## Implementation Notes
 
-- Task 9.6b：候选 `3c20cf46a8a4` 已实际执行原正式 oracle、100k FTS5/fallback Gate D，取得本机资格并由原 Host owner 持久发布；canonical 激活/冷开、TM 自身 W1 竞争、snapshot 发布失败/释放重试及 fresh 目录不携带资格的消费证据经独立有限批准。见[当前候选证据](../../../windows_ordinary_frozen_evidence.json)。本轮只收束 Windows 功能阶段；受影响 POSIX 定向回归尚未取得，整项继续未勾选，不重签旧 owner 或发行验收。
+- Task 9.6b：候选 `3c20cf46a8a4` 已实际执行原正式 oracle、100k FTS5/fallback Gate D，取得本机资格并由原 Host owner 持久发布；canonical 激活/冷开、TM 自身 W1 竞争、snapshot 发布失败/释放重试及 fresh 目录不携带资格的消费证据经独立有限批准。见[候选与后续回归证据](../../../windows_ordinary_frozen_evidence.json)。这些事实仍只属于原候选；整项继续未勾选，不重签旧 owner 或发行验收。
+
+- Task 9.6b：真实 macOS 回归发现 migration/query 的 POSIX 工件闭集遗漏原 activation owner 必须保留的确定名锁。两端纳入该成员后继续完整核验身份及内容，拒绝字节漂移、外来锁和链接；不删除锁或泛化放行。修复后的 source 回归已取得，但 worker 源码变化会改变 Core fingerprint，新 Windows 候选须实际重跑 C/oracle/100k 双路径 D，并按平台 Requirement 12 闭合最终候选消费，不能继承 `3c20cf46a8a4` 的资格。
 
 - Task 9.6b：受影响 Windows 冷开与恢复补验中，测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。仅修正测试观察与清理，保留原恢复/字节/阶段断言。原定向运行 86 项中 81 项通过、5 项受该问题影响；修后 5 项在原长路径全部通过（50.523 秒、exit 0、无 skip），经独立评审。原失败日志保留，产品候选与 Core fingerprint 不变；本任务仍待完整候选验收。
 

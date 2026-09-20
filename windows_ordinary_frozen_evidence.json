@@ -578,9 +578,9 @@
     "全部当前Windows业务实验在现有用户下使用独立合成数据与清理后的进程环境；不能据此声称已在未安装Python/Qt的另一Windows环境验收。"
   ],
   "remaining": [
-    "共享代码改变触发的POSIX定向回归尚未执行；Core9.6b/Feature5 6.6b/平台7.3保持未勾选。Mac SSH超时、mac.local解析失败，本机Docker启动因Inference socket失败；未执行项不记PASS或skip替代。",
-    "无Python/Qt的独立Windows环境启动与短保存/冷重开尚未取得；当前清理PATH与Python/Qt环境变量的同机观察不代答此项。",
-    "指定8个owner候选子项经独立评审关闭；其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
+    "真实Mac回归及POSIX锁清单修复见source_regression_followup。修复改变Core fingerprint，须构建新候选并重跑正式C/oracle/100k双路径D及最终候选必测消费；Core9.6b/Feature5 6.6b/平台7.3保持未勾选，原3c20候选未包含此修复。",
+    "无Python/Qt的独立Windows环境启动与短保存/冷重开尚未取得；用户确认暂缺该环境，先完成其余验证并保留缺口。清理PATH与Python/Qt环境变量的同机观察不代答此项。",
+    "指定8个owner候选子项保留原3c20上的独立验收事实，不自动改签给后续候选；其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
   ],
   "owner_journeys": {
     "review_status": "APPROVED",
@@ -602,7 +602,7 @@
     "feature5_7_4b": "错owner候选拒绝、资格缺失/损坏/兼容/ACL/MIC拒绝、局部TM不可用、实际worker异常退出与关闭取消均保留安全投影；实际transport矩阵与Core/Host分类测试按层关联，不把每个transport异常说成逐项GUI全量100k重跑。",
     "qt_5_2b_5_3b": "正常首页/显式项目、候选logo/icon、默认资源播种/保留、无catalog fallback及实际windowed窗口；缺失/损坏qwindows插件显示Qt错误并非零退出，错误项目参数稳定失败。对已观察的设置对话框发送Escape后主窗口仍可用，正常关闭无worker遗留。",
     "qt_tools": "实际搜索与导航、raw speaker盘点/browse、预处理preview/确认/apply/undo及规则保存冷读、术语create/update/冷读/delete；原项目内容和confirmed经撤销恢复，术语删除保留原五条记录，资格字节未变。",
-    "dependency_limits": "Core9.6b、Feature5 6.6b/7.6b/9.2a、平台7.3/7.4及Qt5.4b仍等待受影响POSIX回归或干净Windows环境与累计验收；这些实际观察不越过依赖完成整项。",
+    "dependency_limits": "Core9.6b、Feature5 6.6b/7.6b/9.2a、平台7.3/7.4及Qt5.4b仍等待修复后候选重验、干净Windows环境与累计验收；这些原候选实际观察不越过依赖完成整项。",
     "focused_review_validation": {
       "observer": "ordinary_owner_completion_review",
       "command": "python -m unittest -v tests.test_qt_source_resources tests.test_windows_ordinary_transport",
@@ -644,6 +644,27 @@
       "scope": "原Windows运行记录中的33项persistence与17项Qt/source矩阵，仅复用本轮未变owner深入范围。source_records只作实现比对索引，不当运行证据；改变的Windows端口与普通入口使用当前候选/定向结果，原source Gate与UI成功不改签。"
     },
     "avatar_conditions": "96613f3至当前qt_speaker_avatar.py、qt_resource_contracts.py、tests/test_qt_source_resources.py及requirements-ui.txt均无diff；原Python3.14.7/PySide6 6.11.1与候选一致，完整候选inventory无avatar声明。当前source_resources三项定向复验通过，本候选实测fallback，未把无catalog写成实际catalog命中。"
+  },
+  "source_regression_followup": {
+    "scope": "macOS 26.2 arm64 / CPython3.14.7 / Qt6.11.1真实source回归。612a3ca源码包加五个明确文件overlay；原result.json的source_commit仅标识archive基线，未把修复后结果归给未修改的612a3ca或Windows候选。",
+    "repair": "migration/query两端仅增加确定名的持久activation lock，继续完整identity/SHA-256、single-link/no-follow核验。Host测试允许Core私有harness publisher但禁止Host安装；source测试要求负向probe后的实际bind拒绝，不要求未消费窗口重复抛错。",
+    "validation": {
+      "mac_affected": {"tests": 110, "failures": 0, "errors": 0, "skipped": 1, "skip_scope": "Windows专属import检查", "seconds": 28.774, "exit_code": 0},
+      "windows_affected": {"tests": 122, "failures": 0, "errors": 0, "skipped": 0, "seconds": 183.09, "exit_code": 0, "command": "artifacts/windows/ordinary-build-venv/Scripts/python.exe -B -m unittest -v tests.test_tm_benchmark_worker tests.test_tm_benchmark_query_process tests.test_capability_host_frozen_inputs tests.test_platform_source_authority"},
+      "independent_mac": {"tests": 40, "failures": 0, "errors": 0, "skipped": 1, "skip_scope": "Windows专属import检查", "seconds": 11.59, "exit_code": 0}
+    },
+    "evidence": [
+      {"path": "artifacts/windows/ordinary-qualification/posix-lock-tested-inputs.json", "sha256": "ead5c3fcb632d74b2788ce1b96af7560cf7a13a426d52a2957c4b58e65905c4f"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-lock-tested.patch", "sha256": "e81a7b99a41c9f00289f80bc2336c8bd91466c1196d652216c7fecdd361d4e4b"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-lock-flag-off.log", "sha256": "2ce15d9b033a0df65c329614f629135288a5256547f832dcfbdacb919ddefd01"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-lock-flag-on-final.log", "sha256": "05be05b9d5d5b74dd4dede0652d753e04f48b5aadecd5b0839f31b68bd6adbe0"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-lock-final.log", "sha256": "ff2286d0991528850d82a16da8d92b8ac76f1bf2a093eb6e8fb196663c664926"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-20260920T232435447583Z/result.json", "sha256": "a0030e6fc5003531bccd5a29555563d0944fd2ba03728aed80e8f8f46eaba889"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-20260920T232435447583Z/stderr.log", "sha256": "c74b2b3dabcb336cc7cff66a004800c52e6f82eeda6c6f2aff1780fe83070736"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-fix-windows-py314.log", "sha256": "3fa85f1b8f31e571f2889dd1589f439c5e5a04c3eccb44d118507547ef5bb4e5"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-lock-independent-review.log", "sha256": "b3b1ef995b508a75de4fc85ae80351c31b41ee1cfde480d7e885e9836b124c53"}
+    ],
+    "candidate_impact": "两处worker属于Core fingerprint输入。新候选须真实重跑正式Gate并重闭合平台12.1–12.2；未改变的深入owner矩阵依12.5复用。本节不修改原candidate/formal_gate事实，不签发资格或发行PASS。"
   },
   "review_candidate_archive": {
     "status": "CANDIDATE_NOT_RELEASE_VERIFIED",
