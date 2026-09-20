@@ -1,10 +1,10 @@
 # 需求文档
 
-## 当前交付范围（普通 frozen 修订待审）
+## 当前交付范围（普通 frozen 修订已批准）
 
 Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 launcher 已完成 Task 6.6b 用户旅程。后置 frozen 追求最终用户无需另装 Python/Qt，独立验收，不阻塞 source。
 
-[ADR-028](../../steering/adr/adr-028.md) 已批准普通桌面产品边界。下文 Requirement 10–12 是替换旧 W3 来源、资源和发行验收条款的待审修订；批准前不得实施。Requirement 1–9 的 source 数据与业务合同、原 source/W3 构建前完成事实及证据范围保留。旧版本可从 `6531b1e` 追溯，不再把旧 W3 正文作为本路线的活动指令。
+[ADR-028](../../steering/adr/adr-028.md) 已批准普通桌面产品边界。用户明确批准 `reassessment@3e41130` 的下列 Requirement 10–12、对应 Design/Tasks 与已列明相邻 owner 修订，按现有依赖实施。Requirement 1–9 的 source 数据与业务合同、原 source/W3 构建前完成事实及证据范围保留。旧版本可从 `6531b1e` 追溯，不再把旧 W3 正文作为本路线的活动指令；本次审批不签发候选或正式 Gate 验收。
 
 ## 简介
 立项时，`ui-mvp@b925b80` 因直接导入 `fcntl` 而无法在 Windows 运行。本 Spec 已通过平台端口与 consumer 适配闭合 source 的 Qt、项目持久化、TM 生命周期、TMX 和 FTS5；frozen 是下一条独立交付线。Windows 与 POSIX 使用各自的文件系统原语，保护相同的用户数据与业务结果。
@@ -21,7 +21,7 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 - **历史审批状态**：ADR-020～026、owning scope、原 WA-01～08 R/D/T amendment acknowledgement 及当时平台 Requirements/Design/Tasks 已批准；ADR-024/025 的后续取代关系由 Task 0.6 同步，ADR-026 对 Parser 发布状态的收窄由 Task 0.7 同步。它们不批准本轮普通 frozen 修订，也不代替实现或发布证据。
 - **交付路线**：source 已完成用户管理 CPython 3.14 x64、venv、`requirements-ui.txt`、source 与轻量入口的产品验收；它不铸造 frozen authority。frozen 后置独立验收；2026-09-20 项目 owner 批准按 ADR-028 收窄其证明范围，取代原 W3 强证明作为唯一发行前置的安排。
 - **导出输出收尾修订**：ADR-027 已获批准，仅修订 Windows ResourcePackage/TMX 正常完成后留下内部协调锁文件的行为；相邻 `language-resource-portability` 6.7–6.8 与 `tmx-context-interchange` 8.8–8.9 分别承载导出结果。既有 Requirement 3 的并发互斥继续成立，其他持久锁、直接 CSV/JSONL 导出与 POSIX 行为不在本修订范围。
-- **本轮审批范围**：以 `reassessment@8890813` 为修订基点，Requirement 10–12、对应 Design/Tasks 及受影响 Core、Host、Qt 消费接缝待人工审批；上述历史批准不覆盖本轮。用户授权本轮共同拟稿供审，不表示逐阶段批准或实施授权。ADR-028 已足以承载边界，本轮不新增 ADR 或治理层。
+- **本轮审批范围**：用户明确批准 `reassessment@3e41130` 的普通 frozen 活动 Requirements、Design、Tasks 及已列明相邻 owner 修订；优先进入平台 7.2a 与 Core 9.6e，再按既定依赖继续 Host 和生命周期整合。输入摘要与 fixture/contract 内容的区分、真实 Gate 消费及 worker 回收由正式任务验证；失败只修正具体接缝，超出批准边界时另提精确 delta。ADR-028 已足以承载边界，本轮不新增 ADR 或治理层，不重签历史验收。
 
 ## 需求
 

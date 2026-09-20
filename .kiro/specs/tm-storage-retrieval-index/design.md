@@ -49,13 +49,13 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 
 ### Windows Compatibility Amendment WA-06（current R4）
 
-- **ADR mapping**：follow adopted ADR-020/021 as supplemented by ADR-023/024/025。WA-06 `R3`取代`R2`时保持V2 security profile、采用provider-agnostic current-primary-token与`WindowsDocumentedPublishV1`；2026-09-19获批的`R4`补齐原W3输入与fresh worker消费。下述普通frozen增量按ADR-028拟稿，尚待人工审批；不重签R4或source验收。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
+- **ADR mapping**：follow adopted ADR-020/021 as supplemented by ADR-023/024/025。WA-06 `R3`取代`R2`时保持V2 security profile、采用provider-agnostic current-primary-token与`WindowsDocumentedPublishV1`；2026-09-19获批的`R4`补齐原W3输入与fresh worker消费。下述普通frozen增量已获用户按 `reassessment@3e41130` 明确批准，遵循ADR-028；不重签R4或source验收。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
 - **Platform composition**：activation/snapshot/schema/attestation modules消费`ProcessFileLock`、`RootedFileSystem`、`ExistingFileDurability`、`BoundDirectoryAuthority.begin_publish()`产生的`PendingPublication`与`PrivateStorageProof`；不在Core复制`fcntl`/dirfd或裸Win32调用。未发布stage的POSIX实现保持file fsync与parent fsync；Windows实现通过同一retained synchronization handle完成`FlushFileBuffers`和exact content/live identity复证，并对parent/root执行live reproof，不把它表述为Windows directory fsync。任一同步或复证缺失/漂移都不得登记sealed registry，冷重开只能重建该stage或保持unavailable；canonical publication仍只走5.7a的`PendingPublication`协议。
 - **Private proof**：owner envelope嵌套`WindowsPrivateProof`，以`security_profile_id=WindowsPrivateSecurityV2`及descriptor digest绑定exact TokenUser owner+DACL+medium/high MIC projection；handle-bound label读取使用`LABEL_SECURITY_INFORMATION`而非完整SACL权限。资格来自实际current process primary token，standard/elevated正向及same-SID low/restricted负向分别验证；local/domain/Entra等provider origin不进入proof。FileId只作live observation，recreate/reuse与security profile/token变化进入re-attestation或fail-stop，不改store id/generation；V1/unknown profile不兼容读取。
 - **Publication/FTS5**：activation、snapshot与export在local fixed NTFS上按`WindowsDocumentedPublishV1`完成write-through/flush、handle-bound naming、retained exact readback；owner在`PendingPublication`存活时提交自身journal/receipt并复证业务state，再调用platform terminal reproof。不确定时platform返回`RECOVERY_REQUIRED`，owner在故障注入、two-process/process kill、app restart与正常OS reboot后只接受完整old、完整new或recovery-only；source/frozen均不加载硬件durability registry。普通frozen的程序来源按下节合同，不继承W3 strict closure；用户数据端口与FTS5/fallback create-query-reopen的保证不变，候选必测和未改变owner证据复用按平台Requirement 12与本Spec 9.6b执行。
 - **Explicit replacement**：Windows显式import/rebuild从source rooted preflight取得同一resource-scoped reservation与caller-held root/lock，构建fresh portable stage并沿replacement activation envelope把prior `N`切换为candidate `N+1`；DB/manifest publication继续消费`PendingPublication`，只有terminal `READY`可以更新binding并清除divergence。replacement使用独立的版本化discriminator绑定prior store/generation、active attestation与backup proof、candidate store和next generation，并将私有namespace限制为current completed chain加至多一个pending replacement；不得放宽或重解释现有first-activation v3/generation-zero codec。schema upgrade保持其独立后续边界。
 
-#### R4已完成范围与普通packaged消费修订（待人工审批）
+#### R4已完成范围与普通packaged消费修订（已批准；待实施）
 
 [Task 7前置修订](../windows-platform-enablement/task7-prebuild-consumption-amendment.md)与9.6c/9.6d保留原W3构建前接口、source回归和发布协调的完成事实。普通packaged的活动合同为下文；R4的native producer、retained-source、E10和原线程native调度不再是此路径的前置，也不被重新标为已通过。Core仍拥有Gate A/C approved roots grammar、fixture解析、relative-id集合、digest、Gate D fingerprint、benchmark contract及所有Gate判定。平台拥有候选构建/入口/传输，Feature5拥有Host组合和UI调度。
 
@@ -104,7 +104,7 @@ Core继续拥有严格request/result codec、独立fresh migration/query child�
 
 #### 本轮治理与待验证范围
 
-本轮依据ADR-009/013/020/021及其已采纳修订、ADR-028调整现有owning合同，不修改Steering、不新增ADR或public capability/持久schema。Requirements WA-06第5条、上述Design和9.6b/9.6e共同拟稿待人工审批；旧审批只覆盖原source/R4成果。相邻平台与Feature5须同步候选关联、Host组合和取消消费，但不能变成第二个Core owner。
+本轮依据ADR-009/013/020/021及其已采纳修订、ADR-028调整现有owning合同，不修改Steering、不新增ADR或public capability/持久schema。用户明确批准 `reassessment@3e41130` 的Requirements WA-06第5条、上述Design和9.6b/9.6e；旧审批仍只覆盖原source/R4成果，本次不重签验收。相邻平台与Feature5须同步候选关联、Host组合和取消消费，但不能变成第二个Core owner。
 
 尚未证明的是普通入口能否在无checkout的真实候选中完整消费上述有限输入，以及现有fingerprint/Gate C汇总能否仅靠构建输入摘要保持既定grammar。下一次经批准的7.2/9.6e实验先跑实际Matcher、Gate C输入与小样本migration→query→oracle/结果消费，记录发生路径读取的具体消费者、子进程退出和各阶段成本；缺输入、ambient source读取、跨候选结果、取消后未回收或正式消费者被test seam替代均为失败。若需要超出本节的副本、字段或组合边界，先归属本owner并修订该delta，不扩大为全包证明。
 

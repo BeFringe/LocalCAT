@@ -80,7 +80,7 @@ Parser 只回答四类问题：这个输入按什么用途和格式读取、如�
 - **Writer port**：canonical serializer 仍只生成 bytes；Source Boundary明确选择`CREATE_IF_ABSENT`或在调用owner持有destination-family排他lease时使用`REPLACE_UNDER_LOCK`。candidate保持打开完成write/content flush后相对bound parent rename，捕获final facts、关闭全部candidate handles，再以retained destination readback handle闭合exact bytes/digest与terminal reproof，随后才签发receipt。Parser writer不创建journal/LKG或跨进程recovery authority；平台failure/ambiguity不得被折成成功或pathname-only fallback。
 - **Verification**：source 与 frozen 两种 composition 都覆盖 junction/reparse、hardlink、ancestor/final swap、body-unread、candidate close/reopen及publish/kill边界；进程终止只允许目标为完整old或完整new，未取得同进程terminal proof不得有成功receipt，遗留candidate不得按名称扫描后自动采信或清理；POSIX当前合同做parity regression。
 
-普通 frozen 的待审适用范围：Task 5.12b 使用平台 7.2 的实际 EXE 和标准 bundle 模块/必要数据，不要求 W3 native entry 或 Parser 源码副本。上述 rooted 与失败保证不变；候选业务调用和关键反例实际执行，未变 owner 深入矩阵按平台 Requirement 12 复用，端口/依赖/调用合同变化时重验受影响范围，不重签 source 证据。
+普通 frozen 的适用范围已获用户按 `reassessment@3e41130` 批准：Task 5.12b 使用平台 7.2 的实际 EXE 和标准 bundle 模块/必要数据，不要求 W3 native entry 或 Parser 源码副本。上述 rooted 与失败保证不变；候选业务调用和关键反例实际执行，未变 owner 深入矩阵按平台 Requirement 12 复用，端口/依赖/调用合同变化时重验受影响范围，不重签 source 证据。
 
 | 项目 | 处置 |
 |---|---|

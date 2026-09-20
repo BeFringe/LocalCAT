@@ -1,6 +1,6 @@
 # 实施计划
 
-> **SOURCE COMPLETE / ORDINARY FROZEN 待审修订**：Task 0–6、Core 9.6c/9.6d、Feature5 3.6a 与平台 7.0/7.1 的完成事实保留；这些历史条目的 Requirements 编号按 `6531b1e` 当时版本解释，不重签成新 Requirement 10–12 的验收。下方 7.2 及以后为普通 frozen 的新待审任务，未经本轮 Requirements → Design → Tasks 人工批准不得实施。
+> **SOURCE COMPLETE / ORDINARY FROZEN 规格已批准、候选未验收**：用户明确批准 `reassessment@3e41130` 的普通 frozen 活动 Requirements / Design / Tasks 与已列明相邻 owner 修订，先进入 7.2a 与 Core 9.6e，再按原依赖贯通 Host 和生命周期。Task 0–6、Core 9.6c/9.6d、Feature5 3.6a 与平台 7.0/7.1 的完成事实保留；这些历史条目的 Requirements 编号按 `6531b1e` 当时版本解释，不重签成新 Requirement 10–12 的验收。新任务在实际验证前保持未完成，不预填候选或正式 Gate PASS。
 
 source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA-08 5.4a 与平台 6.6b 验收，状态为 `WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`；证据见 [launcher](../../../windows_user_managed_launcher_evidence.json) 和 [用户旅程](../../../qt_editor_windows_source_evidence.json)。本次文档同步不重签 runtime evidence。
 
@@ -414,9 +414,9 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Windows User-managed Source Runtime Milestone_
   - _Depends: 5.5, 6.5, qt-editor-json-mvp-increment 5.4a_
 
-## 后置普通 frozen：待审实施计划
+## 后置普通 frozen：已批准实施计划
 
-7.0/7.1 只保留原 W3 构建前完成事实，其历史 Depends 不再是新普通任务的执行门；普通任务从已完成 source 和本轮批准合同进入。旧未完成任务已由下列活动正文替换，原内容可追溯 Git，不另建档案。HANDOFF/REVIEW 本轮只读保留；待意见落实、未决项已有 owner 且正式规格获批后，随规格收束移除两份临时材料并清理引用，保留其原 Git 提交，不新建重复归档。
+7.0/7.1 只保留原 W3 构建前完成事实，其历史 Depends 不再是新普通任务的执行门；普通任务从已完成 source 和本轮批准合同进入。旧未完成任务已由下列活动正文替换，原内容可追溯 Git，不另建档案。构建摘要/实际内容接缝及 windowed 管道、取消回收的不确定性已归入 7.2a–c、Core 9.6e 和 Feature5 3.6b；规格收束不改变原 Git 历史。
 
 - [ ] 7. 从普通候选贯通 Core、资格与产品旅程
 

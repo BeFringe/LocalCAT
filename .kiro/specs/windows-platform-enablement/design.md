@@ -2,7 +2,7 @@
 
 ## 当前适用范围
 
-source 的平台与业务设计已完成 Task 6.6b 验收。普通 frozen 的本轮 Design 与 Requirement 10–12、对应 Tasks 一起提交审阅，**尚未批准实施**。依据已采纳 [ADR-028](../../steering/adr/adr-028.md)，本文替换旧 W3 的活动发行设计；原设计与验收范围由 `6531b1e` 及原任务追溯，不在此并列两套执行合同。
+source 的平台与业务设计已完成 Task 6.6b 验收。用户明确批准 `reassessment@3e41130` 的普通 frozen Design、Requirement 10–12、对应 Tasks 与已列明相邻 owner 修订，按既有依赖实施；普通候选尚未验收。依据已采纳 [ADR-028](../../steering/adr/adr-028.md)，本文替换旧 W3 的活动发行设计；原设计与验收范围由 `6531b1e` 及原任务追溯，不在此并列两套执行合同。
 
 保留平台数据/私有权限端口、Core Gate C/D、Host 发布生命周期与构建输入声明。只调整普通 packaged 入口、输入组合、同 EXE worker 和验收接缝；不重开既有数据协议、算法或 source 实现。继承代码和构建前验收不能视为普通发行已实现。
 
@@ -62,7 +62,7 @@ source 的平台与业务设计已完成 Task 6.6b 验收。普通 frozen 的本
 - **Applicable Steering**: `product.md`、`tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md`、`delivery-boundaries.md`、`repository-safety.md`。
 - **Applicable ADRs**: ADR-007/008/009/011/012/013/016/018/019 及 ADR-020～028，按各自已有取代关系适用。
 - **ADR disposition**: Follow adopted ADR-028；移除 ADR-022 决策 3–8、10 和 9/12 的强证明派生门，以及 ADR-023 决策 6 的完整 pre-authority native closure。保留构建可追溯、真实 packaged E2E、LOCK-first、`PendingPublication`、MIC 和数据协议；不新立 ADR，也不更改已有 ADR 正文。
-- **Scope amendment**: 原 source/W3 审批及完成事实保留；本轮普通 frozen R/D/T 与 Core/Host/Qt 受影响消费合同 **Pending**。平台只拥有构建/入口/transport/发行汇总；三种身份分别在既有 owning Design 定义，不建立治理层或第二 publisher。精确范围与审批门见 `cross-spec-amendments.md`。
+- **Scope amendment**: 原 source/W3 审批及完成事实保留；本轮普通 frozen R/D/T 与已列明相邻 owner 受影响消费合同已由用户明确批准，批准基点为 `reassessment@3e41130`。平台只拥有构建/入口/transport/发行汇总；三种身份分别在既有 owning Design 定义，不建立治理层或第二 publisher。精确范围与审批门见 `cross-spec-amendments.md`。
 - **Steering sync**: Approved；Governance owner 同步 `spec-ownership.md`、`roadmap.md` 和长期技术边界；`structure.md` 等待真实 runtime/build 文件落地后再按实际结构更新。本 feature branch 不产生重复 Steering 提交。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
 
@@ -72,7 +72,7 @@ source 的平台与业务设计已完成 Task 6.6b 验收。普通 frozen 的本
 - **Downstream revalidation**：平台 Task 3.3a 交付可选能力；`language-resource-portability` Task 3.3a 与 `tmx-context-interchange` Task 3.4b 分别验证自身终结条件和原始异常语义。三项通过独立评审前不得标记该修订完成。
 
 ### Implementation Authorization
-**普通 frozen 实施 NO-GO：待人工依次审阅 Requirements、Design、Tasks 及受影响 owner 合同。** 本轮共同拟稿不预填审批。原 Task 0–6、7.0/7.1 与 R4 构建前验收仍是各自原范围的事实；不撤销 source，也不授予新候选资格。所有 active task 以本次批准后的依赖为准，不再等待旧 native spike 或完整 W3。
+**普通 frozen 活动规格已获用户批准，批准基点为 `reassessment@3e41130`。** 授权范围包含本轮 Requirements、Design、Tasks 与已列明相邻 owner 修订；优先实施平台 7.2a 与 Core 9.6e，按原依赖继续 Host 和生命周期整合。原 Task 0–6、7.0/7.1 与 R4 构建前验收仍是各自原范围的事实；本次审批不授予候选或正式 Gate 资格。所有 active task 以已批准依赖为准，不再等待旧 native spike 或完整 W3；超出本轮边界的改动仍须提出精确 delta。
 
 ## Architecture
 
@@ -470,7 +470,7 @@ stateDiagram-v2
 - source authority来自受审source tree的rooted/loader合同；不得把W3 `TrustedSourceAuthority`、bundle manifest或`sys.frozen`前置到source composition。
 - 完成source consumer阶段后先由Task 6.6a交付轻量Windows GUI入口：它只用受验证的绝对路径启动专用venv中的`pythonw.exe`和source bootstrap，并固定non-repository CWD、环境清理、图标/版本与失败诊断。WA-08 5.4a随后经该入口运行完整source产品journey，Task 6.6b才汇总`WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`。入口不携带Python/PySide6/Qt/source，也不是Requirement 11发行物。
 
-### 普通 frozen 路线（待审）
+### 普通 frozen 路线（已批准；候选未验收）
 
 0.5.2 只有一个完整交付：已批准的普通消费合同 → 首条真实 packaged Core/worker 调用链 → 本机资格闭环 → 同候选产品验收。小样本和 smoke 是诊断步骤，不形成独立发行。原最小 spike、Core 9.6c/9.6d、Feature5 3.6a、平台 7.0/7.1 保留历史范围，不是普通输入来源已实现的证明，也不要求重新完成 W3。
 
@@ -544,9 +544,9 @@ flowchart TD
 
 只读资源相对发行目录解析；可写配置与托管数据继续使用现有用户目录 owner，项目仍在用户选择的位置。默认 tm/terms 只在目标不存在时播种，不能覆盖用户修改。logo/icon/metadata/qwindows/必要 plugins 和 Gate 输入缺失为候选失败；avatar catalog 可选，声明后检查索引/解码，无匹配保留 fallback。清除 PYTHONPATH 与 Qt 开发路径，在非仓库 CWD、无 Python/Qt 安装的环境验收实际首页和项目参数。
 
-### 设计待审项与下一次实验
+### 已批准范围与下一次实验
 
-本轮尚待平台、Core、Feature5、Qt 的阶段审批；无新增 ADR 请求。需要人工审阅的具体合同是输入—产物绑定是否足够、Core 兼容投影是否覆盖执行/测量依赖、publication 与 child 回收是否完整，以及下节证据复用边界。它们已给出拟议落点，不能用方向认同代替批准。
+用户明确批准 `reassessment@3e41130` 的输入—产物绑定、Core 兼容投影、publication 与 child 回收及下节证据复用合同；无新增 ADR 请求。尚未取得的执行证据归平台 7.2a–c、Core 9.6e 与 Feature5 3.6b：摘要/内容消费、windowed 管道和取消回收须通过真实生产调用链验证。本批准不预判候选或正式 Gate 结果，也不授权超出合同的输入副本、字段或组合扩张。
 
 批准后的第一个实验属于 Task 7.2 的实际生产链：从干净配方构建普通 EXE，经正常入口/用户目录进入真实 Matcher 和 Core session，启动两个真实 worker，以小样本观察 oracle/query 结果、取消和退出。它要消除的未知是：构建输入摘要能否直接贯通既有 fingerprint/Gate C 汇总接口；去掉 native/source-only 后还有哪些隐含源码读取；windowed 管道在标准流不可用时是否可靠；关闭能否回收 child 且保持正确提交胜负。任一需 mock、venv fallback、晚到授权、child 遗留或计量口径改变即失败；按实际归属修正，若需增加来源数据或合同字段先由对应 owner 审阅，不扩展为全第三方 TCB 实验。性能是否满足正式 100k 仍由后续 Task 7.3 确认，本轮不预判 PASS。
 

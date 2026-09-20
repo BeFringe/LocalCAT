@@ -57,7 +57,7 @@
   - _Depends: 2.3a, 3.5a, 5.3, WA-03, WA-04, WA-06_
 - [x] 5.4 运行 Parser/TM/ResourcePackage/Project/Chunk/Qt/fault/architecture/full regression，更新 current-source steering/evidence。
 - [ ] 5.4a 在普通 frozen 候选完成 TMX 真实旅程
-  - 本轮待审：从实际 EXE、non-repository CWD 执行 direct import、三 scope export、冷验证/重开和 package export-only 负向边界；必要数据来自普通 bundle，无 checkout 回退，不要求 Parser `.py` 源码证明。
+  - 本轮已批准（`reassessment@3e41130`）：从实际 EXE、non-repository CWD 执行 direct import、三 scope export、冷验证/重开和 package export-only 负向边界；必要数据来自普通 bundle，无 checkout 回退，不要求 Parser `.py` 源码证明。
   - 候选执行 rooted source 拒绝、零目标 mutation 与恢复反例，按平台 Requirement 12 复用未变 owner 深入证据并重验触发范围；退出时向 Qt 交付真实候选 owner port 和结果，不以 source 验收代答。
   - _Amendment: WA-05_
   - _Delivery phase: frozen post-build_

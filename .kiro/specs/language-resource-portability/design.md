@@ -81,7 +81,7 @@ ResourcePackage 可以复用或后续抽取以下无语义原语：
 
 ### Windows Compatibility Amendment WA-04
 
-- **ADR mapping**：follow ADR-020/025/028。Resource owner 保留 payload/profile/carrier/preview/apply/receipt/repository lifecycle；platform 只交付 rooted/publish facts 与普通 bundle 布局。普通来源及以下验收依赖为待审修订，source 完成范围不变。
+- **ADR mapping**：follow ADR-020/025/028。Resource owner 保留 payload/profile/carrier/preview/apply/receipt/repository lifecycle；platform 只交付 rooted/publish facts 与普通 bundle 布局。普通来源及以下验收依赖已获用户按 `reassessment@3e41130` 批准，source 完成范围不变，普通候选仍待实际验收。
 - **Port migration**：`resource_platform_io.py` 提供无业务语义的 retained-file stream/digest/copy 辅助；`resource_artifact_save.py`、`resource_package.py`、`resource_portability.py`、`resource_receipt_ledger.py`、`resource_repository.py` 与 `termbase_store.py` 消费 `RootedFileSystem`、`ProcessFileLock`、`BoundDirectoryPublisher`，不再内嵌 POSIX dirfd/flock/fsync 分支。
 - **Frozen resources**：实际消费的 package/profile data 按平台普通构建记录映射到 bundle-relative 布局；数据文件不是 import/资格 authority，不为可见性另带 Parser/Core `.py` 副本。资源入口不回退 CWD/checkout。候选业务消费与必要负例实际执行；未变 owner 深入证据及变更重验按平台 Requirement 12，Fuzzy 资格仍归 Core。
 - **Verification**：direct/package export→validate→preview→create/replace→cold reopen 覆盖 Windows junction/swap/share/kill/recovery 和 non-repo CWD；最终由 TM/Termbase owner reader 与 receipt 闭合，不以 ZIP 可打开代替。
