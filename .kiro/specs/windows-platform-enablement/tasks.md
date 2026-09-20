@@ -544,7 +544,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 ## Implementation Notes
 
-- Task 7.3–9.1：`3c20cf46a8a4` 的本机资格、已执行产品旅程与数据保护结果统一记录在[当前候选证据](../../../windows_ordinary_frozen_evidence.json)，原始输出和试验材料仍留在忽略的 `artifacts/windows/`。独立批准仅覆盖 Windows Core/设备资格交互功能阶段；共享 POSIX 定向回归、剩余 owner 验收与累计发行评审仍待闭合，既有历史及所有未完成勾选保持原事实。
+- Task 7.3–9.1：`3c20cf46a8a4` 的本机资格、已执行产品旅程与数据保护结果统一记录在[当前候选证据](../../../windows_ordinary_frozen_evidence.json)，原始输出、待验收 ZIP 和试验材料仍留在忽略的 `artifacts/windows/`。独立评审已关闭 Parser 5.12b、Chunk 1.4b/4.5b、Resource 5.5a、TMX 5.4a、Feature5 7.4b、Qt 5.2b/5.3b 的限定候选范围；共享 POSIX 定向回归、无 Python/Qt 的独立 Windows 环境及其后续汇总仍待闭合。Core/设备资格功能阶段不等于平台 7.3 整项或发行通过。
 
 - Task 9.1：对实际变化的最终路径、内容捕获、W1、输出锁和 SOURCE 窗口补验时，激活用例须复用既有 Windows 长路径清理 helper；不吞清理失败。SOURCE 用例分别证明 Windows 活句柄以 sharing violation 阻断写入、POSIX 在发生变化后终端拒绝，不能用任意 PermissionError 跳过或将两种机制混写。测试修正不改变普通候选或 Core 兼容身份；跨平台和最终候选验收范围继续分别记账。
 

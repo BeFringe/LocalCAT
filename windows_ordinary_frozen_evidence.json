@@ -1,8 +1,8 @@
 {
   "status": "IN_PROGRESS",
   "release_status": "NOT_VERIFIED",
-  "scope": "同一普通候选已执行的 Windows Core、设备资格及用户旅程事实；不是任务整项或0.5.2发行裁决。原始日志、截图、试验脚本保留在忽略的artifacts/windows目录。",
-  "observed_at_utc": "2026-09-20T21:53:28.708490+00:00",
+  "scope": "同一普通候选已执行的 Windows Core、设备资格及用户旅程事实；只按各 owner 已完成范围消费，不是0.5.2发行裁决。原始日志、截图、试验脚本保留在忽略的artifacts/windows目录。",
+  "observed_at_utc": "2026-09-20T22:48:33.417131+00:00",
   "reviewed_source_head": "ec480ff88258fe297700af600d7f66aff31046a7",
   "candidate": {
     "candidate_id": "3c20cf46a8a4b6ddbbcaa2adbcf75fc970896619fbadcb26e69b3c42b68714df",
@@ -321,6 +321,192 @@
         "path": "artifacts/windows/ordinary-qualification/close-worker-ui-failure.json",
         "sha256": "f11a524858f42e56cfa79392a2240f9dba219346bdcc43459244a02706d83419"
       }
+    ],
+    "Chunk锁与中断冷重开": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/chunk-lock-waiting.json",
+        "sha256": "814266b00001be7f01c764559c3576fc080b2a4b198512b531f8d7d82f0ded86"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/chunk-lock-result.json",
+        "sha256": "35719d69b65acc99c5d3de7e8d827c99e95c24db29407382bbb5094ce9d00601"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/chunk-terminate.json",
+        "sha256": "6902814a765088367572184acbaf7ac4e3c765558cb17262fae06fa8c7412c78"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/chunk-reopen-result.json",
+        "sha256": "3d4d8ce81911a7a7fb59b10402abf776569eb983ebd06dd9dc23578779046bc9"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-chunk-interrupt-restored.json",
+        "sha256": "ae2fa4b2185583e4d7e9d92e263b1f9c787abe148c4539cdcc534cb431d56ab0"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/close-chunk-interrupt-reopen.json",
+        "sha256": "f3c257dcb34820e3bd32e49f69651d42fbef901eec71267faae02b97651f69df"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/chunk-observer-initial-failure.json",
+        "sha256": "1f780e46e80c9c88f5a8a16e0d514884bfccf543865b5d32d012181fa3239724"
+      }
+    ],
+    "ResourcePackage明选替换": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-replace-package-preview.json",
+        "sha256": "547a8bec7e0e34907904cb1bb93e25976e9270e2a9efdb8a2b44f6c98013d3a2"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-package-replaced.json",
+        "sha256": "238813ac5b5d7a8927541ded91504eec20d78cf75c109245ba5487abfdc10b28"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/package-replace-before.json",
+        "sha256": "6a3beab52078e3e138e506382cd35ccae1c3b6039b23acf28903e3cbcb11c80c"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/package-replace-after.json",
+        "sha256": "4102357842bfed37281e1c5fe33806bcd367835ef28d4072afba6c5e2b7152fe"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/package-replace-cold.json",
+        "sha256": "4102357842bfed37281e1c5fe33806bcd367835ef28d4072afba6c5e2b7152fe"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-package-replace-cold-matches.json",
+        "sha256": "b685f8d111058367b62546f8fddbdfd0cf2935b574bce4cfb89482c9dc644e88"
+      }
+    ],
+    "TMX拒绝与恢复保留": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/journey-hostile.tmx",
+        "sha256": "9363756e8f79ba1ad18ed86bf1ff5686df3f6c1d343bb8433ab4a02f2b3eb3cc"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tmx-hostile-rejected.json",
+        "sha256": "4e6f5d31a97a8e38de16e3dd148a5946fa9749c88e438cc2c855944f41b76cd7"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/tmx-hostile-result.json",
+        "sha256": "eb80d4354d1fc434e825886ee982721fe018ede5da627957f1aa3e1d58fb9cbe"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/tmx-target-open-ready.json",
+        "sha256": "12c70fa11272f6edf05a3480467723eade2acba265f4eb4cf5c1e1e38b45c923"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tmx-target-open-rejected.json",
+        "sha256": "04904fa69bc7002270cf8bee469e8ccfdbd0c60b09618dcd02ecc7bb99ad4d49"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/tmx-target-open-result.json",
+        "sha256": "99fa2232ee86e33011570eb298d4e93dc9f89b8955991dc17ecf77d1bf01ec9c"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tmx-target-retry-preview.json",
+        "sha256": "d2425f56624da2daeec7a8540377f3c34a6ef49511f37ae1967c194a13f31694"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/close-tmx-boundaries.json",
+        "sha256": "3c011dfd3d7c6254c343c07cceaa6c2ca52518d212ccc7828c14254ba8023177"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/tmx-recovery-retained.json",
+        "sha256": "5223fe7759735a4b1eede2b09bf78f935eec485522fb558d1b173ff281a7a4e1"
+      }
+    ],
+    "Qt正常入口失败诊断": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/entry-missing-plugin/result.json",
+        "sha256": "a5ebe0f1e9cb6ebfbd7787406b911b86220f7a583352475bb8c0a07caa847795"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/entry-missing-plugin/ui-error.json",
+        "sha256": "19f8d09ef20f542427a36b6c63699936ec532c45451ce1f75ac507a0dd655223"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/entry-corrupt-plugin/result.json",
+        "sha256": "194573468551ac207d4deb751182ae18005601033972799e3553b94f9fcb3f47"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/entry-corrupt-plugin/ui-error.json",
+        "sha256": "c4c22e15e231f585f356313658eb0cf06f99c8be76e232850328039feb05ecba"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/entry-missing-project/result.json",
+        "sha256": "189867679799e7096e0660c3dc5232c0a75ffabee97b47beaa37f241c18dd4a5"
+      }
+    ],
+    "Qt项目工具与术语CRUD": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-search-first.json",
+        "sha256": "b259fb22ab4cd6f1f7fd6561a6e9588b8a640574ef42962235fc2414be01b216"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-search-second.json",
+        "sha256": "f3637dd3d63de905811bcfbbe98d6e7dbe0ddfd188725d7e9e171cff0044b3e3"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-inventory.json",
+        "sha256": "5516e3792e5bc7c232811814ff81cb221406e2482e4f928412d944bba7d7bb97"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-browse.json",
+        "sha256": "974ddd4f2a11b901584f9f532a4173f92ecc05234e295ac84f43d9af50bcd7c9"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-preprocess-preview.json",
+        "sha256": "d4fc3b856d7892de7a6e8322c4902e5677cef419c6ce3844f3b6865c535b3c13"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-preprocess-confirm.json",
+        "sha256": "895d1e44ac88dc34bc92bd123517acebe0fd8e57f27d9d0365375994a736d7f4"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-preprocess-applied.json",
+        "sha256": "cc89a67e92feb3ad9bdd52d4a232e3154b4ca7dcc214509638adc2e50bb0884c"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-undone.json",
+        "sha256": "5ab8f1930026a1eafbd4f7c1c2a79d1a496fa0abdad1831baab59f3da902febc"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-term-created.json",
+        "sha256": "7cf4e272400481849524bdea3401b9c7a9c411504be480766ae44cebdfd73d50"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-term-updated.json",
+        "sha256": "070f9e20f7eef5225870f879aa44a4516f90da13f89308c90b96d7683742e3e5"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-term-cold.json",
+        "sha256": "7fe74e129eb3ee1eb132e0ae39b4b0445a02a9f0de0da5666418868626dd443a"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-term-deleted.json",
+        "sha256": "22700fdd22fdd96a0c6e3c068d7bbfa8590cd628593eb2909ce0ce02745c51d8"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-rules-cold.json",
+        "sha256": "9c9cadba0ee69472160d84175c3189f969554727efdc1e15133bc61345e3a5d9"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/qt-tools-content-result.json",
+        "sha256": "594d53db9288155e39b84841206e48997aa9adf845aa153a8fbfab3047b50ef9"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tools-final-cold.json",
+        "sha256": "3e13046eb6f77f73babf2cc3b13a7c31462f5e040c33906c038190b6acd366f0"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/qt-keyboard-escape-result.json",
+        "sha256": "ab1fa0b87760260689aed5c34e9c757044a41dd0ccebdc5b170e3f0b1ea91135"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/close-tools-final.json",
+        "sha256": "9575fc69644662802ea7de90420a18b2fb3756dd80e49ad5b6c3b3f61b04e5b3"
+      }
     ]
   },
   "reused_owner_evidence": {
@@ -384,12 +570,90 @@
     "实际EXE强制中止发生在未保存编辑且无活动发布时；深入durable-phase中断使用受影响source owner矩阵，二者不混写。",
     "TM source受影响86项原跑81项通过、5项失败；只修测试长路径观察后5项重跑通过，不覆盖原失败日志。平台72项最终全过，无skip。",
     "SID/owner深入负向和纯UI兼容规则保留原owner锚及范围；不冒充本候选跨SID或纯UI变体的新运行。",
-    "snapshot成功重试按正常产品行为替换导出manifest；前一次receipt完整内容保留在snapshot-conservation-result，不把现有manifest说成从未变化。"
+    "snapshot成功重试按正常产品行为替换导出manifest；前一次receipt完整内容保留在snapshot-conservation-result，不把现有manifest说成从未变化。",
+    "Chunk中断发生在无活动发布/worker时，不能等同durable-phase kill。初次观察误拿snapshot成功重试前的SQLite字节作基线；保留该失败记录，改核对成功snapshot后的实际TM内容与receipts，未修改原基线。",
+    "TMX目标占用的正常UI结果为TMX.RECOVERY_REQUIRED。释放目标后新的preview仍拒绝，按原owning合同保留恢复材料；没有新增Qt恢复入口，也没有借source调用清除journal来制造成功。",
+    "缺失/损坏qwindows插件由Qt原生错误窗口及非零退出证明失败；早期startup日志的ok阶段不表示已成功创建窗口，未把它改写为ORDINARY稳定错误码。",
+    "当前候选未声明avatar catalog：本候选实测无catalog fallback；唯一命中/大小写/解码/歧义沿用未变avatar owner测试，不修改产物或另造候选扩展声明。",
+    "全部当前Windows业务实验在现有用户下使用独立合成数据与清理后的进程环境；不能据此声称已在未安装Python/Qt的另一Windows环境验收。"
   ],
   "remaining": [
-    "Core9.6b/Feature5 6.6b/平台7.3整项保持未勾选：共享变更触发的POSIX定向回归尚未取得，功能阶段批准不等于整项退出。",
-    "Feature5 7.4b已实际观察worker异常退出到Qt失败投影、Exact保留与零资格安装；仍需按独立累计评审映射其余transport错误的实现/消费复用范围。",
-    "各相邻owner的剩余候选反例、旧证据复用边界、平台7.4/8/9及独立累计发行评审仍需收束。",
-    "Mac SSH连接超时且mac.local无法解析；本机Docker启动因Inference socket错误失败。未执行的POSIX测试不记PASS或skip替代。"
-  ]
+    "共享代码改变触发的POSIX定向回归尚未执行；Core9.6b/Feature5 6.6b/平台7.3保持未勾选。Mac SSH超时、mac.local解析失败，本机Docker启动因Inference socket失败；未执行项不记PASS或skip替代。",
+    "无Python/Qt的独立Windows环境启动与短保存/冷重开尚未取得；当前清理PATH与Python/Qt环境变量的同机观察不代答此项。",
+    "指定8个owner候选子项经独立评审关闭；其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
+  ],
+  "owner_journeys": {
+    "review_status": "APPROVED",
+    "reviewer": "ordinary_owner_completion_review",
+    "approved_tasks": [
+      "parser-subsystem-extraction 5.12b",
+      "collaborative-job-chunks 1.4b",
+      "collaborative-job-chunks 4.5b",
+      "language-resource-portability 5.5a",
+      "tmx-context-interchange 5.4a",
+      "feature5-ui-integration 7.4b",
+      "qt-editor-json-mvp-increment 5.2b",
+      "qt-editor-json-mvp-increment 5.3b"
+    ],
+    "parser_5_12b": "正常入口读取TXT/JSON、canonical保存及冷重开，TMX reparse rooted输入被拒绝且原业务文件不变；沿用原Parser无状态reader/writer，不新增格式或持久恢复owner。",
+    "chunk_1_4b_4_5b": "实际ProjectPackage创建两个chunk、保存和冷重开；启动时metadata W1锁竞争，释放后进入原composition；无活动发布时中止后重开，project/plan身份、revision、完整membership和原文件保持。",
+    "resource_5_5a": "term ResourcePackage export/validate/preview/create与REPLACE_SELECTED均经UI消费并冷读；TM snapshot导出及占用失败保留原数据；TMX package import拒绝，复制导出JSONL不复制资格。此范围不签发Fuzzy资格。",
+    "tmx_5_4a": "实际direct import、managed/project/selected-chunk三scope export及owner内冷验证；hostile DTD/entity与reparse拒绝。目标占用后原文件不变，保留journal/LKG/stage并进入recovery-only；未声称恢复成功。",
+    "feature5_7_4b": "错owner候选拒绝、资格缺失/损坏/兼容/ACL/MIC拒绝、局部TM不可用、实际worker异常退出与关闭取消均保留安全投影；实际transport矩阵与Core/Host分类测试按层关联，不把每个transport异常说成逐项GUI全量100k重跑。",
+    "qt_5_2b_5_3b": "正常首页/显式项目、候选logo/icon、默认资源播种/保留、无catalog fallback及实际windowed窗口；缺失/损坏qwindows插件显示Qt错误并非零退出，错误项目参数稳定失败。对已观察的设置对话框发送Escape后主窗口仍可用，正常关闭无worker遗留。",
+    "qt_tools": "实际搜索与导航、raw speaker盘点/browse、预处理preview/确认/apply/undo及规则保存冷读、术语create/update/冷读/delete；原项目内容和confirmed经撤销恢复，术语删除保留原五条记录，资格字节未变。",
+    "dependency_limits": "Core9.6b、Feature5 6.6b/7.6b/9.2a、平台7.3/7.4及Qt5.4b仍等待受影响POSIX回归或干净Windows环境与累计验收；这些实际观察不越过依赖完成整项。",
+    "focused_review_validation": {
+      "observer": "ordinary_owner_completion_review",
+      "command": "python -m unittest -v tests.test_qt_source_resources tests.test_windows_ordinary_transport",
+      "environment": "vf CPython3.14.7；QT_QPA_PLATFORM=offscreen；TEMP/TMP=E:/Archives/Project/CAT/.validation-ui-mvp/ordinary-runtime/qualification-temp-84fc0bd",
+      "exit_code": 0,
+      "tests": 8,
+      "skipped": 0,
+      "seconds": 0.842,
+      "scope": "独立reviewer本轮实际运行；source资源算法3项与transport消费5项，不是8项新的packaged GUI运行，也不代答POSIX。"
+    }
+  },
+  "owner_reuse": {
+    "status": "HISTORICAL_LIMITED_REUSE",
+    "evidence": {
+      "path": "artifacts/windows/ordinary-qualification/owner-reuse-audit.json",
+      "sha256": "eb6ddb688841c20fbe88afdfe9da13522ce654104e63471a7d487cd304c111b2"
+    },
+    "conditions": "原Windows source与本候选均为Windows11 x64本地NTFS、CPython3.14.7、Qt6.11.1；业务调用合同未变。普通入口、资源来源、Core/Host/worker、改变的平台端口及Qt组合使用本候选事实与当前定向回归，不从这些原source索引推导整体PASS。",
+    "changed_seams": "Resource输出锁/副产物收尾696918d、TMX输出锁收尾842054e由affected-platform-rerun.log中的两owner具体成功/失败/冷恢复测试核对；同一72项日志包括W1、内容捕获、SOURCE及共享publication的instruction/process-termination矩阵。Chunk主题变化已有真实候选dialog观察，不改变原metadata事务。",
+    "limits": "仅记录实现相等与改变接缝依据；原owner文件不重签，原集成bindings改变不授予普通候选资格或发行结论。",
+    "original_execution": {
+      "evidence": {
+        "path": "qt_editor_windows_source_evidence.json",
+        "sha256": "74e7c449ad43e8ac57b3ba3cf8ad18b32689187a6c235768b0b8ad13a14d0fdc"
+      },
+      "original_implementation_anchor": "96613f3e93317ae7c23cb26dfcee2ffa9f93cc5e",
+      "environment": {
+        "os": "Windows-11-10.0.26200-SP0",
+        "architecture": "AMD64",
+        "python": "3.14.7",
+        "python_bits": 64,
+        "pyside6": "6.11.1",
+        "sqlite": "3.50.4"
+      },
+      "selected_matrix_ids": [
+        "current_commit_persistence_owner_revalidation",
+        "qt_source_project_resources_native_runtime_launcher"
+      ],
+      "scope": "原Windows运行记录中的33项persistence与17项Qt/source矩阵，仅复用本轮未变owner深入范围。source_records只作实现比对索引，不当运行证据；改变的Windows端口与普通入口使用当前候选/定向结果，原source Gate与UI成功不改签。"
+    },
+    "avatar_conditions": "96613f3至当前qt_speaker_avatar.py、qt_resource_contracts.py、tests/test_qt_source_resources.py及requirements-ui.txt均无diff；原Python3.14.7/PySide6 6.11.1与候选一致，完整候选inventory无avatar声明。当前source_resources三项定向复验通过，本候选实测fallback，未把无catalog写成实际catalog命中。"
+  },
+  "review_candidate_archive": {
+    "status": "CANDIDATE_NOT_RELEASE_VERIFIED",
+    "artifact": {
+      "path": "artifacts/windows/LocalCAT-0.5.2-candidate-3c20cf46a8a4-windows-x64.zip",
+      "sha256": "6a9f41411c7e77dbcc8933c9a186511427e53f7a97be75264138465ce6fe6400"
+    },
+    "archive_bytes": 55606433,
+    "archived_file_count": 189,
+    "checks": "ZIP CRC、逐文件bytes与原候选一致，封装前后完整candidate inventory验证。",
+    "scope": "供独立Windows环境验收的同一候选ZIP，未取得发行PASS；不含设备资格或device.key。"
+  }
 }

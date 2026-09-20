@@ -394,12 +394,13 @@
   - _Amendment: WA-07_
   - _Depends: 3.5a, 3.8a, 6.7a, 7.4_
 
-- [ ] 7.4b 验证普通packaged输入与生命周期失败投影（已批准；待实施）
+- [x] 7.4b 验证普通packaged输入与生命周期失败投影
   - 实际候选覆盖缺失/错owner输入、加载路径或候选不一致、Core资格不可用、worker协议/超时/异常退出与取消/关闭；保留7.4a数据端口/资源局部失败语义，健康资源仍可用，不回落source authority或activated JSONL。
   - 完成时，Controller/Qt只显示稳定body-safe code，失败不伪装no-match、不暴露原始proof/path，也不把清理未完成报告为成功；不要求W3 Boot TCB/native对抗矩阵。
   - _Amendment: WA-07_
   - _Delivery phase: ordinary frozen candidate acceptance_
   - _Depends: 本轮消费合同获批, 3.6b, 7.4a, ADR-028, windows-platform-enablement 7.2_
+  - _Evidence: [同候选证据](../../../windows_ordinary_frozen_evidence.json)关联实际 transport、Core/Host 分类和 Qt 失败投影；通用 worker 失败消费为 `GATE_D.PROGRAMMER_ERROR`，不将原 PROCESS/QUERY code 写成逐项直达 Qt，也不代答 6.6b/7.6b 的剩余依赖。_
 
 - [x] 7.5 验证 stale/tamper/apply 与写回权限矩阵
   - 对 project/segment/source/resource/capability/threshold epoch 变化和逐字段 suggestion substitution 执行 zero-mutation tests
