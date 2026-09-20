@@ -1,26 +1,26 @@
 {
   "feature_name": "qt-editor-json-mvp-increment",
   "created_at": "2026-07-27T09:51:22Z",
-  "updated_at": "2026-09-20T14:14:44Z",
+  "updated_at": "2026-09-20T14:55:15Z",
   "language": "zh-CN",
-  "phase": "tasks-generated",
+  "phase": "tasks-approved",
   "approvals": {
     "requirements": {
       "generated": true,
-      "approved": false
+      "approved": true
     },
     "design": {
       "generated": true,
-      "approved": false
+      "approved": true
     },
     "tasks": {
       "generated": true,
-      "approved": false
+      "approved": true
     }
   },
-  "ready_for_implementation": false,
+  "ready_for_implementation": true,
   "approval_scope": {
     "historical": "既有Qt增量、表面修订与Windows source审批及完成事实保持原范围，不代表普通frozen已获批或通过。",
-    "pending": "ADR-028普通候选的WA-08资源/入口/验收Requirements、Design与Tasks 5.2b/5.3b/5.4b共同拟稿待人工审批；未获批准不进入实现。"
+    "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 普通候选的 WA-08 资源/入口/验收 Requirements、Design 与 Tasks 5.2b/5.3b/5.4b；按已列明依赖实施，候选必测、证据复用与变更重验仍按原合同执行。本批准不重签既有事实或预填候选/Gate PASS。"
   }
 }

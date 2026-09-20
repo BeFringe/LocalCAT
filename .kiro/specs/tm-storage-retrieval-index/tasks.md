@@ -1,6 +1,6 @@
 # 实施计划
 
-> **普通 frozen 修订待人工审批**：9.6e拟承担首条实际packaged Core/worker调用链，9.6b改为同候选本机资格与Core产品验收；本轮只拟稿，不授权实现。既有[x]、Implementation Notes与source/R4审批保留原事实和证据范围，尤其9.6c/9.6d仅为W3构建前消费实现；不得解读为普通候选已经通过。未改变owner深入证据可按明确不变前提复用，候选上的实际Core/worker/Gate仍需验证。
+> **普通 frozen 任务范围**：9.6e承担首条实际packaged Core/worker调用链，9.6b承担同候选本机资格与Core产品验收。9.6c/9.6d保留原W3构建前消费实现范围；实际Core/worker/Gate及未变owner证据复用分别按下列任务验证。
 
 > **WA-06 Windows compatibility amendment（current R4）**：R4继承R3的source合同并以9.6c/9.6d落实frozen pre-build消费；`R1`/`R2`只保留为已被取代的历史。以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
 
@@ -557,7 +557,7 @@
   - _Amendment: WA-06_
   - _Depends: 5.11a, 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
 
-- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收（待人工审批）
+- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收
   - 在7.2真实调用链产物上运行实际Gate C、oracle与100k双路径Gate D，保留原算法、门限、warmup、计时/RSS口径及strict evidence/publication；由Core真实运行铸造设备资格，不能复用source PASS或小样本诊断签发资格。本任务供平台7.3资格闭环与7.4最终验收消费，不等待它们先通过。
   - 同一候选验证有效资格在进程重启后自动恢复、失配/损坏/权限异常只关闭Fuzzy、启动不自动100k、用户显式重验与原子替换；纯UI/头像候选变化不应无条件撤销检索资格，Core/fixture/runtime/worker计量依赖改变必须使相关身份失配。资格不可随JSONL/ResourcePackage或项目迁移。
   - 在实际候选完成canonical激活与重启恢复、exact/context/fuzzy、FTS5与fallback创建/查询/重开、snapshot/export以及实际消费路径的锁竞争、发布失败、中断恢复、权限/reparse拒绝；失败只接受完整prior、完整new或recovery-only，不损坏既有数据。已完成9.6a的深层状态机/故障矩阵只在实现、依赖、调用合同与关键运行条件均未改变且候选已实际消费时引用；不能以旧source证据覆盖新入口、worker、runtime或改变的数据端口。
@@ -589,7 +589,7 @@
   - _Delivery phase: frozen pre-build_
   - _Depends: 9.6c_
 
-- [ ] 9.6e 贯通普通packaged的真实Core输入、双worker与取消（待人工审批）
+- [ ] 9.6e 贯通普通packaged的真实Core输入、双worker与取消
   - 在现有`tm_gate_inputs`、fingerprint/validation与worker组合接缝消费平台7.2a的实际候选输入；复用原owner/session/epoch与publication，不伪装source/native authority，不复制Host或新增profile框架。fixture/contract实际内容与构建输入摘要各有明确消费者；默认不收集源码副本，确需有限兼容数据先在Design及owner清单列明并评审。
   - 贯通真实Matcher、Gate C输入、`tm_benchmark_gate`→oracle suite/recall evidence的同一session；query parent/child执行owner核验当前兼容身份，纯结果DTO与证据比较不读ambient fingerprint。按Design生成Core检索兼容身份并独立消费平台候选关联，不把全EXE/PYZ摘要当持久资格key。
   - 从普通windowed同一EXE实际启动独立migration/query，消费原严格request/result、fresh PID、timeout与RSS；显式二进制pipes在标准流不可用时仍可用，缺失/错误端点、畸形/截断协议、错候选/请求、非零退出均拒绝，无外部venv或进程内fallback。
