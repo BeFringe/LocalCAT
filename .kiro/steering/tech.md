@@ -26,7 +26,7 @@
 - `LogicController` 的三态与 legacy TM 优先规则保持不变；`EditorController` 单独持有 Qt 项目、搜索、TM/术语 issuance 与资源操作会话。
 - ADR-020 规定 Parser/Chunk/Project/Resource/TMX/TM 只消费 backend-neutral rooted authority、lock、bound publisher 与 opaque live identity；POSIX/Win32 primitive 只能存在于 `windows-platform-enablement` 拥有的平台 adapters/composition，不能散落进业务 owner。
 - ADR-021 只批准 Windows private-storage 的 SID/DACL/AccessCheck 与 `WindowsPrivateProof` 物理表示；Gate D/canonical envelope、generation、journal/LKG 与业务 recovery 继续归原 owner。
-- ADR-022 规定 Windows frozen 发行由单一 bootstrap/build authority 维护完整 Boot TCB、retained-handle exact-byte source loader、真实 `.py`/fixture closure 与 content-addressed onedir release evidence；CapabilityHost/Qt 不得从 frozen boolean、路径或旁置源码反向铸造能力。
+- ADR-028 收窄普通 Windows frozen 的证明范围，部分取代 ADR-022/023 的完整 Boot TCB、定制 native entry 与 retained-source-only loader 前置；保留构建可追溯性、执行产物与 owner evidence 的绑定及真实 packaged E2E。CapabilityHost/Qt 不得从 frozen boolean、路径或旁置未执行源码反向铸造能力。
 - ADR-024规定Windows private主体只按process-primary token、canonical `TokenUser` SID与ACL/MIC实际结果证明；local/domain/Entra来源不进入runtime或mandatory环境矩阵。
 - ADR-025规定普通Windows发布按local NTFS、flush/write-through、handle-bound命名、retained readback与owner recovery闭合；storage硬件profile/forced-power-loss属于未来可选资格，不阻断source或EXE发行。
 
@@ -39,16 +39,19 @@
 - XLSX：`openpyxl>=3.1,<4`。
 - 交互式 Excel：xlwings，可选且只属于 Excel Layer 4。
 - Qt 依赖入口：`requirements-ui.txt`。
-- Windows production target（架构已批准、尚未实现/验证）：Windows 11、CPython 3.14 x64、PyInstaller `--onedir --windowed`；不包含 `xlwings`/Excel、`--onefile`、installer、signing 或未通过完整 capability gate 的 filesystem。
+- Windows source（已完成）：Windows 11、用户安装的 CPython 3.14 x64、专用 venv 与 `requirements-ui.txt`，通过 `--install-windows-launcher` 安装 `LocalCAT Source` 开始菜单入口；项目/TM/TMX/FTS5 用户旅程已验收。
+- Windows frozen（0.5.2，实施中）：最终用户无需另装 Python/Qt；使用普通 PyInstaller `--onedir --windowed`。ADR-028 已批准证明范围收窄，消费设计与同一候选上的业务旅程、数据保护、Core Gate C/D 构成完整发行验收；不包含 `xlwings`/Excel、`--onefile`、installer、signing。macOS frozen 尚未规划。
 
 ```bash
-python -m pip install --user -r requirements-ui.txt
+python -m pip install -r requirements-ui.txt
 python qt_editor.py --sample
 python qt_editor.py --install-desktop-launcher
 python qt_editor.py --install-macos-app
 ```
 
 `qt_editor.py` 顶层只导入标准库，完成参数解析后才加载 PySide6 和窗口模块。Linux 安装流程使用用户级 `.desktop` 与主题图标；macOS 安装流程在 sibling candidate 中验证 universal native launcher、plist/icon 和 LaunchServices 冷启动，再原子替换 user-local `LocalCAT.app`。该 lightweight bundle 绑定安装时的绝对 Python/bootstrap，不复制 Python/PySide；路径变化后必须重新安装。缺 Qt 时输出安装提示并返回非零，缺 openpyxl 时只有 XLSX 导入失败。
+
+Windows 轻量入口固定专用 venv 的绝对 `pythonw.exe`，以 `-I` 启动 stdlib guardian，再启动并等待同运行时的 Qt child；只安装 guardian 与图标，不复制业务源码或依赖。Python/venv/source 移动后重装入口；具体用户命令以 README 为准。
 
 ## 数据与安全规则
 

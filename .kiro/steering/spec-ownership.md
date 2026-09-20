@@ -9,7 +9,7 @@ owner 指拥有 Requirement、Design、Task 与业务合同解释权的 Spec，�
 | 路径 | 角色 | 主要演化位置 | 提交约束 |
 |---|---|---|---|
 | `.kiro/specs/<feature>/` | 单项功能的 Requirements / Design / Tasks / research | 对应功能分支 | 只与该功能的代码、验证或独立 spec 阶段提交一起变更 |
-| `.kiro/steering/` | 项目级长期事实、路线图、ADR 与跨线边界 | `governance/kiro-steering`，批准后合入共享基线 | 不混入单一功能实现提交 |
+| `.kiro/steering/` | 项目级长期事实、路线图、ADR 与跨线边界 | 专门的治理分支，批准后形成共享治理 tip | 不混入单一功能实现提交 |
 | `.kiro/settings/` | cc-sdd 的项目级模板和规则 | 治理分支或独立 `chore(sdd)` 更新 | 记录版本和安装来源；升级前后审阅差异 |
 | `.opencode/skills/kiro-*` | OpenCode 使用的 cc-sdd Agent Skills | 治理分支或独立 `chore(sdd)` 更新 | 只跟踪技能源码；忽略依赖、缓存和锁文件 |
 | `AGENTS.md` | 仓库级 Agent 工作约束 | 治理分支 | 与工作流版本保持一致，不能由功能分支临时改写 |
@@ -28,9 +28,9 @@ owner 指拥有 Requirement、Design、Task 与业务合同解释权的 Spec，�
 | `feature/collaborative-job-chunks` | `collaborative-job-chunks`；该线完成时精确同步 structure/tech/roadmap/spec ownership 中的已实现事实 | ProjectPackage/Workspace owner、Parser/Codec、TM/ResourcePackage/TMX、Sync/provider/account 等相邻规格 |
 | `feature/language-resource-portability` | `language-resource-portability`；该线完成时精确同步 structure/tech/roadmap/spec ownership 中的已实现事实 | ProjectPackage/Workspace/Chunk、Parser/Codec、TMX、Sync/provider/account 等相邻规格 |
 | `codex/windows-platform-enablement` | `windows-platform-enablement`；共享平台合同/backends、bootstrap/build、Spec 内 amendment merge ledger 与 Windows release evidence | Parser、Chunk、Project、Resource、TMX、TM Core、Feature5/UI、Qt 与所有 consumer business invariants |
-| `governance/kiro-steering` | `.kiro/steering/`、ADR、项目认知治理；经审阅的 SDD 基础设施更新 | 所有功能 Spec |
+| 治理线（分支按当前工作分配） | `.kiro/steering/`、ADR、项目认知治理；经审阅的 SDD 基础设施更新 | 所有功能 Spec |
 
-`feature5-ui-integration.md` 与 `feature5-ui-integration-review-clustering.md` 是 `ui-mvp` 拥有的跨层集成 Spec；`roadmap.md`、`repository-safety.md` 与其他 `.kiro/steering/**` 共享治理文件通常只由 `governance/kiro-steering` 提交。例外仅限上表明示可做精确 Steering 同步的垂直线：`maintenance/tm-store-module-extraction`、`feature/multi-document-project-workspace`、`feature/collaborative-job-chunks` 与 `feature/language-resource-portability` 可与 owning Spec 一起提交其 spec-local border/review clustering 和不改写相邻 authority 的实现事实。这些垂直线都不得借此改写相邻 Feature 或未批准的共享路线图。其余垂直线发现冲突时可以提出修订，治理补丁必须先在治理线形成唯一提交，再通过可追踪 merge 由活动线继承，并同时复核受影响的正式 Requirements/Design。`feature5-ui-integration` 的集成实现归 `ui-mvp`；`tm-storage-retrieval-index` 的 Core Spec 与实现归 `feature5`。
+`feature5-ui-integration.md` 与 `feature5-ui-integration-review-clustering.md` 是 `ui-mvp` 拥有的跨层集成 Spec；`roadmap.md`、`repository-safety.md` 与其他 `.kiro/steering/**` 共享治理文件通常只由专门的治理分支提交。例外仅限上表明示可做精确 Steering 同步的垂直线：`maintenance/tm-store-module-extraction`、`feature/multi-document-project-workspace`、`feature/collaborative-job-chunks` 与 `feature/language-resource-portability` 可与 owning Spec 一起提交其 spec-local border/review clustering 和不改写相邻 authority 的实现事实。这些垂直线都不得借此改写相邻 Feature 或未批准的共享路线图。其余垂直线发现冲突时可以提出修订；治理补丁按 `repository-safety.md` 的共享治理 tip 规则形成唯一提交，由开发线续接，并同时复核受影响的正式 Requirements/Design。`feature5-ui-integration` 的集成实现归 `ui-mvp`；`tm-storage-retrieval-index` 的 Core Spec 与实现归 `feature5`。
 
 `windows-platform-enablement` 的已批准 scope 只覆盖 backend-neutral 文件/锁/发布/private-proof contracts、POSIX/Windows adapters 与 composition、Windows frozen bootstrap/build composition、amendment merge ledger 和 release evidence。Parser/Chunk/Project/Resource/TMX/TM/Feature5/Qt 继续拥有各自业务状态机、错误、receipt、journal/LKG、DTO 与产品交互；Windows 线只能通过 owning branch 已批准 amendment 接入，不能复制或就地改写相邻 Spec。`tmx-context-interchange` 的唯一 owner branch 为 `ui-mvp`。Qt speaker avatar 只进入 Windows 索引/解码/fallback 功能回归，不改变现有资源语义、ignore 规则或打包 ownership。
 
@@ -50,4 +50,4 @@ owner 指拥有 Requirement、Design、Task 与业务合同解释权的 Spec，�
 3. 用 `git diff --cached --name-status` 和 `git diff --cached --stat` 核对；
 4. SDD 基础设施、治理、Feature 5 Spec、Qt Spec 和功能代码分别形成语义提交；
 5. worktree 中存在的只读相邻 Spec 不得因“清理范围”被删除；删除会在未来合并时成为真实的仓库删除操作。
-6. 不得在不同 worktree 中重新创建 patch-equivalent 提交；活动分支同步使用 merge/rebase，cherry-pick 仅限显式 backport。
+6. 不得在不同 worktree 中重新创建 patch-equivalent 提交；共享治理按 `repository-safety.md` 的治理 tip 规则继承，其他开发历史可通过 merge/rebase 同步，cherry-pick 仅限显式 backport。
