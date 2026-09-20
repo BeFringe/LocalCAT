@@ -203,4 +203,25 @@ WA-06原R3事实的当前可达tree为`db7e7ef0024d297264fbc7434b28ec7f77adf96c`
 
 WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c/7.2、Core 9.6e 与 Feature5 3.6b 已完成首条实际普通生产链，复现入口与证据范围见各 owning Tasks；其小样本结果不授予正式资格。后续仍按 `7.3 → owner journeys → 7.4 → 8/9/10` 形成对应范围的实际事实，不等待最终汇总才允许首次消费。WA-03 由同候选 Project journey 复验；当前没有普通 `FROZEN_REVALIDATED_PASS` 或 terminal `MERGED_PASS`。
 
+### 普通候选已验收范围
+
+验收按实际候选保留范围，已勾选任务不自动覆盖后续产物。原逐项结果、执行命令、环境、日志摘要与失败记录保留在 Git 标签 [`evidence/ordinary-frozen-c462dd0`](https://github.com/BeFringe/LocalCAT/tree/evidence/ordinary-frozen-c462dd0)；原构建提交 `8589e19` 和 `4d8276f` 由既有标签 [`evidence/ordinary-frozen-e3e731b`](https://github.com/BeFringe/LocalCAT/tree/evidence/ordinary-frozen-e3e731b) 保留。历史摘要不是运行时 Gate、资格或发布 authority。本节只登记集成结论，原始过程材料继续留在忽略的 `artifacts/windows/`，不逐次追加为产品规格或新验收门。
+
+#### 初始候选 3c20
+
+候选 `3c20cf46a8a4b6ddbbcaa2adbcf75fc970896619fbadcb26e69b3c42b68714df` 来自原构建提交 `8589e19`；Core fingerprint 为 `d3d200cdbbc431ff9f4ea8f25bae833e890496394c30d96dbda85111c1a73d89`。这是普通 PyInstaller onedir/windowed 与 same-EXE worker 的实际验收，不是 source 结果改签。
+
+| Owning task | 该候选已验收范围 |
+| --- | --- |
+| Parser `5.12b` | TXT/JSON 打开、canonical 保存与冷开；TMX rooted/reparse 拒绝且用户数据不变。 |
+| Chunk `1.4b/4.5b` | 真实 ProjectPackage 两个 chunk 的保存、冷开、metadata 锁及空闲中断恢复；identity/membership/revision 保持。 |
+| Resource `5.5a` | Termbase ResourcePackage 导出、校验、预览、创建及明选替换后冷开；TM 快照导出、占用目标拒绝；JSONL 搬运不带资格。 |
+| TMX `5.4a` | 直接导入及 managed/project/selected-chunk 三种导出；恶意 XML、reparse、占用目标、package import 拒绝。占用后保留 journal/LKG/stage 并持续 `TMX.RECOVERY_REQUIRED`，未声明恢复成功。 |
+| Feature5 `7.4b` | 输入/资格失败、异常 worker、关闭及取消的安全 UI 投影；深层 transport 反例与 GUI 观察分别保留原范围。 |
+| Qt increment `5.2b/5.3b` | 正常窗口、声明资源、缺失/损坏 qwindows 入口失败、错误项目及退出；项目工具、预处理应用/撤销、规则冷开和术语 CRUD。 |
+
+该候选曾实际执行 Core Gate 与 100k 双路径计量并发布本机资格：FTS5/fallback recall 均为 1，Exact P95 为 1.1434/1.1822 ms、Fuzzy P95 为 371.0043/384.2717 ms、迁移为 75.740321/111.5683844 s、RSS 为 412.07421875/419.875 MiB。原 qualification SHA-256 为 `dbafdbe8fcdee322b9a8dd2726faf13d58e2964bb2f42f0906cfbff7d9c0b6f3`；这些数值不授予后续候选资格。
+
+未变 owner 的 source 复用限定在原 Windows 持久化及 Qt 深入矩阵；前提、变更接缝与摘要见原 `owner-reuse-audit.json`（SHA-256 `eb6ddb688841c20fbe88afdfe9da13522ce654104e63471a7d487cd304c111b2`）。原始任务、source 锚和失败记录不变，后续 Core/worker 改动须重验受影响消费；本次不声明最终发行通过。
+
 `WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
