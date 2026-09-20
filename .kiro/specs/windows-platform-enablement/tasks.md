@@ -1,10 +1,10 @@
 # 实施计划
 
-> **SOURCE COMPLETE / FROZEN REASSESSMENT**：Task 1–6 的 Windows source 已交付。Core 9.6c/9.6d、Feature5 3.6a 和平台 7.0/7.1 的已修复实现、有效测试与必要合同作为继承基线保留；完成标记只描述原构建前范围，不表示普通 PyInstaller 路线已验收。7.2 及后续发行任务仍未完成。按 [ADR-028](../../steering/adr/adr-028.md) 独立设计普通 frozen；下方旧 W3 Task 7–10 仅供映射，不自动继承完整 Boot TCB、定制 native entry 或 source-only 前置。
+> **SOURCE COMPLETE / ORDINARY FROZEN 待审修订**：Task 0–6、Core 9.6c/9.6d、Feature5 3.6a 与平台 7.0/7.1 的完成事实保留；这些历史条目的 Requirements 编号按 `6531b1e` 当时版本解释，不重签成新 Requirement 10–12 的验收。下方 7.2 及以后为普通 frozen 的新待审任务，未经本轮 Requirements → Design → Tasks 人工批准不得实施。
 
 source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA-08 5.4a 与平台 6.6b 验收，状态为 `WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`；证据见 [launcher](../../../windows_user_managed_launcher_evidence.json) 和 [用户旅程](../../../qt_editor_windows_source_evidence.json)。本次文档同步不重签 runtime evidence。
 
-原实施顺序和 task 编号保留。owner 指 Spec/合同 authority；branch 记录提交血缘，worktree/Agent/thread 不改变业务所有权。评审节奏见 `review-clustering.md`，其旧 W3 条款服从 ADR-028 的适用范围。
+已完成编号/正文保留，未完成普通发行任务按真实能力重组。owner 指 Spec/合同 authority；执行顺序以显式依赖为准，7.2 是 7.2a–c 的集成汇总，不能因文档排序让子项等待汇总完成。评审节奏见 `review-clustering.md`。
 
 - [x] 0. 闭合 ADR、所有权、跨 Spec amendment 与设计授权
 
@@ -414,11 +414,11 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Windows User-managed Source Runtime Milestone_
   - _Depends: 5.5, 6.5, qt-editor-json-mvp-increment 5.4a_
 
-## 后置 frozen：旧计划待按 ADR-028 映射
+## 后置普通 frozen：待审实施计划
 
-以下保留已完成项和未完成项的历史状态；取消普通发行中的强证明要求不等于这些实现已通过。下一步先收束执行产物与 Core/Host 输入的绑定、必要入口校验和最小真实包内用户旅程，再修订具体任务。
+7.0/7.1 只保留原 W3 构建前完成事实，其历史 Depends 不再是新普通任务的执行门；普通任务从已完成 source 和本轮批准合同进入。旧未完成任务已由下列活动正文替换，原内容可追溯 Git，不另建档案。HANDOFF/REVIEW 本轮只读保留；待意见落实、未决项已有 owner 且正式规格获批后，随规格收束移除两份临时材料并清理引用，保留其原 Git 提交，不新建重复归档。
 
-- [ ] 7. 构建完整 frozen-source closure 与 Windows onedir/windowed发行物
+- [ ] 7. 从普通候选贯通 Core、资格与产品旅程
 
 - [x] 7.0 集成frozen pre-build消费合同与WA-07 trusted bootstrap实现
   - 在1.6全PASS后，集成生成manifest/build前必须存在的owner roots/hooks、WA-06 9.6c/9.6d受信输入与fresh worker消费、WA-07 3.6a `TrustedSourceAuthority`消费实现；WA-01/02/04/05/06及WA-07其余packaged revalidation不得在发行候选生成前标为完成
@@ -436,133 +436,105 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Frozen Source Manifest_
   - _Depends: 7.0_
 
-- [ ] 7.2 实现native boot entry到CapabilityHost的可信handoff
-  - release-owned native bootloader审计entry前PE imports/delay-load，在首次Python DLL/非KnownDLL load前固定搜索、拒绝CWD/PATH、绑定bundle/native目录，递归枚举native static/delay-load closure与manifest-declared dynamic native roots并对每个非系统DLL完成pre-load retained-handle/root/reparse/live-id/digest proof；未声明dynamic load fail closed，随后才加载、复核actual module identity并移交完整bundle/DLL attestation
-  - `TrustedSourceLoader`从retained handle读取、摘要并直接编译exact `.py` bytes后mint不可序列化`TrustedSourceAuthority`；外置CapabilityHost验证loader attestation/source digest/origin/co_filename/Gate closure，不以metadata相等代答executed bytes；bundle authority不提供或消费durability profile registry
-  - E10后由固定trusted bootstrap只派发两个获批Core worker模式或默认产品启动；每个child独立完成同候选W3 entry和本进程authority，通过定向继承pipes消费严格codec，禁止任意`-m`、参数authority及venv/进程内fallback。native读/复证/关闭保持owner thread，闭合调度等待、取消、撤销与terminal reproof；按W3维护触发器重建inputs并至少重跑1.6完整mandatory矩阵
-  - 完成时，bootstrap不导入待验证adapter但满足W1 invariants，Boot TCB/source/fixture handle-read、bytecode/PYZ、tamper/reparse/DLL injection/circular-trust tests全绿
-  - _Requirements: 1.2, 10.1, 10.2, 10.3, 10.5, 10.6_
-  - _Boundary: Native Boot and Frozen Trust Handoff_
-  - _Depends: 7.1_
+- [ ] 7.2 贯通首条真实普通 packaged 生产调用链
+  - 本项汇总 7.2a–7.2c 的同一实际候选：正常产品入口 → Matcher/Core 输入 → 两个独立 worker → 结果消费/取消/退出。构建和 smoke 不能单独关闭本项，小样本不签发正式 Gate D。
+  - 完成时，真实链无 checkout/venv fallback、无伪装 authority、无过期安装与残留 child；独立累计评审能沿生产入口重放。
+  - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.6, 11.1, 11.3_
+  - _Boundary: Packaged Production Integration_
+  - _Depends: 7.2c_
 
-- [ ] 7.3 建立受版本控制的Windows PyInstaller build definition
-  - 使用`--onedir --windowed`、独立locked build requirements、custom spec/hook与必要的release-owned/customized native bootloader、source-only module map；clean tracked input与所有实际build inputs/dists均有digest，不把PyInstaller/xlwings加入UI runtime requirements
-  - 收集Qt实际plugins与`platforms/qwindows.dll`、`.ico`、version metadata和mandatory data；不从build checkout绝对路径读取runtime依赖
-  - 完成时，clean build venv可由单组PowerShell命令重建相同layout，build exit 0不替代runtime gates
-  - _Requirements: 1.5, 6.1, 6.4, 11.1, 11.2, 11.4_
-  - _Boundary: Windows PyInstaller Build_
-  - _Depends: 7.2_
+- [ ] 7.2a 建立普通 EXE 与 owner 输入的可运行候选
+  - 从已固定构建环境生成 stock onedir/windowed 配方与实际产物清单，复用 owner 声明；明确输入—产物对应及有限输入用途，不引入全部 PYZ 比较或源码镜像。
+  - 提供正常首页/项目参数、用户目录、资源、两个限定内部 worker 分派及可调用的 parent transport：显式二进制管道、候选/请求关联、可中断等待、超时与进程/端点回收。必要环境/配方配置随本项交付，Core 9.6e 不等待后置 7.2b 才能取得这些接口。
+  - 完成时，实际 EXE 到达产品组合入口，候选身份/必要输入/失败诊断可核查，真实 child 具备 Core 可接入的管道与生命周期端口；缺失输入/意外开发依赖被拒绝。尚未完成的 Core 消费如实留给 9.6e/7.2b，不以空窗口或 transport 单测判定 7.2 完成。
+  - _Requirements: 1.5, 6.2, 6.4, 10.1, 10.3, 10.4, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5_
+  - _Boundary: Windows Ordinary Packaging and Entry_
+  - _Depends: 6.6b；本轮平台及 Core/Feature5/Qt R/D/T 人工批准_
 
-- [ ] 7.4 验证dist可见性、资源fallback与repository-path absence
-  - inventory验证qwindows、critical `.py`、fixtures、tm/terms/logo/benchmark、ico/version和实际Qt plugins；assert retained-handle loader attestation、exact executed-source digest与无`.pyc`/PYZ duplicate，并拒绝把已移除的durability registry/power evidence恢复为mandatory输入
-  - manifest声明avatar catalog时验证真实Qt索引/解码匹配；未声明catalog或无匹配头像时验证“— / 无内置头像”fallback。从non-repository CWD/clean environment启动且不访问source checkout
-  - 完成时，missing/extra/tamper/checkout-access均令release validator失败并列出精确artifact
-  - _Requirements: 6.4, 6.5, 10.3, 10.5, 11.2, 11.3, 11.4, 11.5_
-  - _Boundary: Frozen Distribution Visibility_
-  - _Depends: 7.3_
+- [ ] 7.2b 集成真实 Core、Host 与同 EXE worker
+  - 汇合 Core 9.6e 与 Feature5 3.6b：真实 session 贯通 fingerprint/oracle/query；Host 只替换输入组合，复用 publisher、generation/通知及原子提交协议。
+  - 将 7.2a 已提供的 parent transport 接入 Core/Host，验证二进制管道、候选/请求匹配、可中断等待、超时和进程回收；两个 fresh child 消费 Core codec 与原 RSS/计时口径，不回落 venv/进程内。
+  - 完成时，小样本通过真实生产消费者走到严格结果校验和安全状态投影；不生成正式 100k 资格，不用测试 driver 或模拟 authority 代答。
+  - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.6_
+  - _Boundary: Core Host Worker Integration_
+  - _Depends: 7.2a, tm-storage-retrieval-index 9.6e, feature5-ui-integration 3.6b_
 
-- [ ] 7.4a 在同一发行候选完成并集成owner frozen revalidation
-  - 以7.4已验证的同一dist依次闭合WA-01 `5.12b`、WA-02 `1.4b/4.5b`、WA-04 `5.5a`、WA-05 `5.4a`、WA-06 `9.6b`及WA-07 `6.6b/7.4b/7.6b/9.2a`；每项都必须运行真实packaged consumer/API，不得由1.6最小spike、source证据或mock代答
-  - 核对每个owning Spec的route approval、amendment commit可达性、同一bundle manifest/evidence SHA与失败安全语义；任一失败保持该row和下游WA-08 frozen journey为BLOCKED
-  - 完成时各owner row推进为`FROZEN_REVALIDATED_PASS`，但只有WA-08 packaged journey闭合后才可进入terminal `MERGED_PASS`
-  - _Requirements: 5.1, 5.3, 10.3, 10.5, 11.2, 12.3, 12.5_
-  - _Boundary: Post-build Frozen Owner Revalidation Integration_
-  - _Depends: 7.4, WA-01 5.12b, WA-02 1.4b, WA-02 4.5b, WA-04 5.5a, WA-05 5.4a, WA-06 9.6b, WA-07 6.6b, WA-07 7.4b, WA-07 7.6b, WA-07 9.2a_
+- [ ] 7.2c 闭合首条调用链的失败、取消与退出
+  - 在实际 windowed child 验证标准流不可用、缺失/截断管道、畸形结果、错候选/错请求、超时、异常退出与正常关闭；分别观察发布状态和 child/端点回收。
+  - 覆盖取消先赢零安装、合法 commit 先赢完整安装；Qt 不阻塞 join，不以撤销标志代替进程退出。
+  - 完成时，故障有稳定诊断、既有数据/能力状态符合 owner 协议；无 orphan、死锁或晚到授权。分段计时仅定位成本，正式计量边界不变。
+  - _Requirements: 10.3, 10.6, 12.1, 12.3_
+  - _Boundary: Packaged Lifecycle Integration_
+  - _Depends: 7.2b_
 
-- [ ] 7.5 验证并集成 WA-08 Qt increment amendment
-  - 核对Qt owning Spec approvals/task suffix/commit可达性/evidence，运行单JSON editor、bundle resources、qwindows/visible window、avatar功能回归和clean-user journeys
-  - 保持Layer 4/Controller boundary、keyboard/accessibility与旧Qt baseline；不得把Windows平台逻辑散落进widgets
-  - 完成时，WA-08与WR-03 evidence闭合，所有required amendment rows均`MERGED_PASS`
-  - _Requirements: 5.1, 6.2, 6.4, 6.5, 7.1, 11.2, 11.3, 12.5_
-  - _Boundary: Qt Windows Journey Amendment Integration_
-  - _Depends: 0.3c, 7.4a, qt-editor-json-mvp-increment 5.2b, qt-editor-json-mvp-increment 5.3b, qt-editor-json-mvp-increment 5.4b_
+- [ ] 7.3 闭合普通候选的本机 Fuzzy 资格
+  - Core 9.6b 对实际候选执行正式 Matcher/Gate C、oracle 和 100k FTS5/fallback intended paths；Feature5 6.6b 消费唯一 owner 的发布/恢复结果。
+  - 验证本机私有存储、重启恢复、相关实现/运行时/测量改变导致资格失效、显式重验；无资格仅关闭 Fuzzy，启动不自动 100k。纯 UI/头像变化不应无条件改变 Core 兼容身份。
+  - 完成时，算法、门限和计量口径不变的真实资格与恢复/失配证据闭合；失败如实维持关闭，不以成功 JSON 或候选摘要铸造能力。
+  - _Requirements: 8.5, 8.6, 10.2, 10.3, 10.4, 10.5, 10.6, 12.1, 12.3, 12.6_
+  - _Boundary: Core Qualification and Host Consumption Integration_
+  - _Depends: 7.2, tm-storage-retrieval-index 9.6b, feature5-ui-integration 6.6b_
 
-- [ ] 8. 在clean Windows发行环境运行分能力packaged E2E
+- [ ] 7.4 在同一候选贯通完整产品旅程
+  - 汇合 WA-01/02/03/04/05 的实际 packaged API、Feature5 安全投影和 WA-08 Qt journey；owner 使用 7.2 已可运行产物及 7.3 资格，不等待本项先完成。
+  - 覆盖正常首页/项目参数、Project 编辑保存冷重开、TM 激活/重启恢复、TMX 直接导入、FTS5/trigram 创建查询重开、真实建议、qwindows、资源与头像 fallback；默认资源仅缺失时播种。
+  - 完成时，各 owner 证据对应同一候选，Qt 经正常产品入口消费真实业务；如候选变化，按 Requirement 12 重新验证，不拼接不同 EXE。该项不代答 Task 8 的数据反例与最终发行裁决。
+  - _Requirements: 5.1, 5.3, 6.2, 6.5, 7.1, 7.2, 7.4, 8.1, 8.2, 9.1, 9.3, 9.4, 11.2, 11.3, 11.5, 12.1_
+  - _Boundary: Packaged Product Journey Integration_
+  - _Depends: 7.3, WA-01 5.12b, WA-02 1.4b, WA-02 4.5b, WA-04 5.5a, WA-05 5.4a, feature5-ui-integration 9.2a, qt-editor-json-mvp-increment 5.4b_
 
-- [ ] 8.1 验证真实windowed EXE、qwindows与诊断路径
-  - 从clean user profile、清除PYTHONPATH/Qt developer paths、非仓库CWD启动真实EXE，创建可见main window并进入event loop
-  - 分别移除插件/asset/source proof副本验证稳定诊断；windowed模式用受控marker/log/exit helper取得结果
-  - 完成时，正常启动PASS，任何mandatory缺失均明确FAIL而非静默退出
-  - _Requirements: 6.2, 6.3, 6.4, 11.3, 11.5, 12.1_
-  - _Boundary: Packaged Qt Startup_
-  - _Depends: 7.5_
+- [ ] 8. 验证最终候选中的数据保护与失败边界
 
-- [ ] 8.2 验证packaged项目保存/退出/重开
-  - EXE创建/编辑/保存项目，完全退出后重新启动并重开，比较受合同保护content/metadata/authority
-  - 运行target-open、双实例、junction/ancestor swap、save fault与recovery；不得读取checkout或调用venv Python业务模块
-  - 完成时，正常journey与old/new/recovery-only矩阵在真实dist上通过
-  - _Requirements: 7.1, 7.2, 7.3, 7.4, 12.1, 12.2_
-  - _Boundary: Packaged Project Lifecycle_
+- [ ] 8.1 验证干净环境、资源缺失和 worker 生命周期
+  - 对最终候选从干净用户、非仓库 CWD、无 Python/Qt 开发环境启动；验证声明资源缺失/损坏、可选头像 fallback、已有配置/资源不被默认值覆盖。
+  - 在最终候选复验 7.2c 涉及的实际入口/transport/Qt 生命周期；复用的是未变底层机制证据，不是其他 EXE 的集成结果。
+  - 完成时，所有必测失败均可诊断，取消胜负与 child 回收成立，不访问 checkout。
+  - _Requirements: 6.4, 6.5, 10.3, 10.6, 11.2, 11.3, 11.4, 11.5, 12.1, 12.3_
+  - _Boundary: Packaged Entry and Lifecycle Acceptance_
+  - _Depends: 7.4_
+
+- [ ] 8.2 验证项目与 TM 的真实保护/恢复
+  - 经实际消费者执行双实例锁竞争、target-open/发布失败、进程中断/冷重开、权限/reparse 拒绝；核对原项目/资源与 old/new/recovery-only、canonical authority 和 UI 安全投影。
+  - 依据 12.5–12.7 对受影响的 token/ACL/MIC、FileId、share、instruction fault 与 OS reboot 深入矩阵重验；未变部分列明原 owner 证据及不变前提，不重签为本次 PASS。
+  - 完成时，候选实际保护成立，所有触发项有结果，复用有可核查依据；domain/Entra 和硬断电实验不扩成新门。
+  - _Requirements: 2.1, 2.2, 2.3, 3.1, 3.2, 3.4, 4.1, 4.2, 4.3, 7.3, 8.3, 8.4, 8.5, 8.6, 12.2, 12.5, 12.6, 12.7_
+  - _Boundary: Packaged Data Protection and Recovery_
   - _Depends: 8.1_
 
-- [ ] 8.3 (P) 验证packaged TM激活/退出/重启恢复与并发
-  - EXE首次激活合法TM，验证唯一canonical generation；完全退出/重启后恢复相同authority并查询
-  - 运行双EXE竞争、kill、activation instruction fault、attestation tamper/FileId reuse、应用重启与正常OS reboot recovery；未知事实不回落legacy
-  - 完成时，single authority/restart/LKG/recovery与safe UI state全部通过
-  - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 12.1, 12.2, 12.6, 12.7_
-  - _Boundary: Packaged TM Lifecycle_
-  - _Depends: 8.1_
+- [ ] 8.3 验证资源交换与检索失败边界
+  - TMX 错误/逃逸/reparse/读取漂移保持目标零变更；真实 SQLite 创建/查询/重开及缺失 FTS5 的稳定失败，不以 compile-option 代答。
+  - TMX ResourcePackage 保持 export-only、import/apply 负向拒绝；JSONL/ResourcePackage 搬运数据不搬运本机 Fuzzy 资格。
+  - 完成时，失败不损坏原资源、不会被渲染为普通 no-match 或未经批准 fallback，原业务语义不变。
+  - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 10.5, 12.2, 12.3_
+  - _Boundary: Packaged Resource and Retrieval Boundaries_
+  - _Depends: 8.2_
 
-- [ ] 8.4 (P) 验证packaged TMX导入与FTS5持久检索
-  - 从rooted source导入有效TMX并核对count/locale/conflict/canonical bytes；escaped/reparse/swap source保持target零变化
-  - 在published SQLite创建/查询FTS5 trigram，退出EXE后重启并查询相同结果；不以compile-option字符串代替行为
-  - 完成时，TMX与FTS5正常/失败矩阵在真实dist全绿
-  - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 12.1, 12.2_
-  - _Boundary: Packaged TMX and FTS5_
-  - _Depends: 8.1_
+- [ ] 9. 闭合受影响回归与独立发行评审
 
-- [ ] 8.5 重算frozen Gate并验证完整source/resource visibility
-  - 在dist内重算Gate A/C/D与benchmark contract，逐项验证raw `.py` retained-handle/executed-byte binding、fixture handle identity/digest、Boot TCB、data/assets和bundle root
-  - 修改manifest/source/fixture、插入bundle junction/reparse、制造PYZ duplicate或从checkout提供缺失文件都必须fail closed
-  - 完成时，source runtime与frozen Gate结果符合approved contract且zero mandatory skip
-  - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.5_
-  - _Boundary: Packaged Capability Gates_
-  - _Depends: 8.1_
+- [ ] 9.1 核对实际变更与证据复用范围
+  - 对最终 diff/依赖/调用合同/关键运行条件判定 Core、数据端口和共享代码影响；检查业务模块没有重新引入直接 POSIX/Win32 primitive，普通入口没有隐式激活 W3。
+  - 按 Design 验收表运行实际触发的 source/macOS/Linux 回归与 Windows 深入矩阵；未变 owner 证据保留原锚/范围，复用不写成新 PASS。
+  - 完成时，所有触发项通过且复用前提可复核，不机械要求每次纯 UI/头像变化重跑全仓各平台。
+  - _Requirements: 1.1, 1.4, 5.2, 5.3, 5.4, 10.4, 12.3, 12.5, 12.6, 12.7_
+  - _Boundary: Affected Regression and Evidence Reuse_
+  - _Depends: 8.3_
 
-- [ ] 9. 闭合跨平台回归、清单、日志与独立Feature GO预审
-
-- [ ] 9.1 运行direct-platform-primitive与frozen-closure静态门
-  - production consumers不得直接import/use `fcntl/flock/dir_fd/O_DIRECTORY/O_NOFOLLOW/directory fsync`或Win32 wrapper；仅platform adapters/approved bootstrap可出现
-  - frozen roots与代码dependency graph双向核对，任何新增critical module/fixture未入manifest即失败
-  - 完成时，命中均有owner-approved exception或为零，不能以平台条件分支隐藏
-  - _Requirements: 1.1, 5.2, 5.4, 10.2, 12.3_
-  - _Boundary: Platform Boundary Static Gate_
-  - _Depends: 8.2, 8.3, 8.4, 8.5_
-
-- [ ] 9.2 在同一commit运行macOS/Linux全量回归与POSIX parity
-  - 使用任务2.2 characterization和现有CI矩阵验证Parser/Chunk/Project/Resource/TMX/TM/Qt public codes、bytes、recovery和Gate不回退
-  - 平台专属差异只能是approved backend facts；不得把Windows pass换成Mac/Linux skip或改变authority
-  - 完成时，同一full commit获得fresh artifacts，mandatory失败/skip阻塞Feature GO
-  - _Requirements: 1.4, 5.3, 5.4, 12.3, 12.5_
-  - _Boundary: macOS Linux Regression and Parity_
+- [ ] 9.2 汇总同候选证据并完成独立累计评审
+  - 汇总构建输入—产物、候选 ID、环境/版本、命令/退出码/日志、真实业务/失败结果、owner 引用与影响分析；不把测试数量或构建退出码当产品结论。
+  - 独立 reviewer 核对 Requirements 10–12、Core/Host 发布与 worker 生命周期、数据保护、审批和实际 diff；审查强度不降低，Task 8 保持 xhigh 实施/复审。
+  - 完成时，所有阻塞 finding 关闭、候选必测/触发项证据有效、无未批准合同变化，才允许进入最终裁决。
+  - _Requirements: 10.1, 10.2, 10.3, 10.5, 10.6, 11.4, 12.1, 12.2, 12.3, 12.4, 12.5_
+  - _Boundary: Independent Packaged Release Review_
   - _Depends: 9.1_
 
-- [ ] 9.3 生成完整通过/失败矩阵、Windows适配与frozen packaging清单
-  - 汇总baseline→candidate、环境/versions、exact commands、exit/log/checksum、filesystem/lock profiles、instruction fault/process termination/应用重启/正常OS reboot、consumer journeys、source/fixture/resource/Qt inventory
-  - 每项标PASS/FAIL/NOT_RUN与阻塞reason；required项不得以source-only pass、mock、skip、手工patch或推断转绿
-  - 完成时，portable evidence manifest可复核所有日志且没有本机绝对路径作为authority
-  - _Requirements: 11.2, 11.4, 11.5, 12.1, 12.2, 12.3, 12.4, 12.6, 12.7_
-  - _Boundary: Final Reproducible Evidence Package_
-  - _Depends: 9.2_
+- [ ] 10. 完成 Windows 0.5.2 发行裁决
 
-- [ ] 9.4 完成累计对抗性实现评审与最终治理差异核对
-  - Cumulative reviewer从Requirements/Design/ADRs/ledger反向检查实际tree/runtime，重放Boot TCB/executed-byte binding、share/CAS、ACL/FileId、`WindowsDocumentedPublishV1`、Windows source/EXE与Mac/Linux红线
-  - 检查所有WA owning Spec批准、commit可达性、WR evidence、Steering sync与实际delta；实施期新增跨门槛事实必须回到ADR/Spec审批，不能用Implementation Notes补授权
-  - 完成时，无unresolved blocker/major、无未批准delta、diff/checksum/branch tree一致；否则保持NO-GO
-  - _Requirements: 1.2, 5.1, 10.3, 12.2, 12.3, 12.5_
-  - _Boundary: Independent Implementation and Governance Review_
-  - _Depends: 9.3_
-
-- [ ] 10. 完成Windows onedir/windowed最终发布验收
-
-- [ ] 10.1 在同一clean发行候选上完成LocalCAT启动、项目保存/重开、TM激活/重启恢复、TMX导入与FTS5最终闭环
-  - 从全新Windows user profile、非仓库CWD、无Python/Excel依赖启动真实`LocalCAT.exe`并确认可见Qt窗口与`qwindows.dll`
-  - 依次保存/退出/重开项目，首次激活TM/退出/重启恢复，导入rooted TMX并验证count，创建/查询/关闭/重开FTS5 trigram；随后执行双进程锁、target-open、instruction fault、process termination、应用重启与正常OS reboot recovery
-  - 对同一dist重算frozen source/Gates、校验fixtures/data/resources/ico/version与avatar功能回归；归档exact commands、完整日志、PASS/FAIL矩阵、Windows FS/lock清单、frozen-source/packaging清单与SHA-256 inventory
-  - 完成时，所有mandatory项在同一commit/dist上PASS、zero skip/patch/mock，WA/WR ledger与Mac/Linux回归闭合，Governance owner才可将Windows状态从NOT_VERIFIED改为VERIFIED；否则保持NO-GO
-  - _Requirements: 1.1, 1.2, 2.1, 3.1, 4.1, 4.2, 5.1, 6.2, 6.5, 7.1, 7.2, 8.1, 8.2, 9.1, 9.3, 9.4, 10.1, 10.2, 11.1, 11.2, 11.3, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7_
+- [ ] 10.1 对 0.5.2 作最终发行裁决
+  - 以最终候选及 7.4/8/9 的有效证据确认 Qt/Project/TM/TMX/FTS5、必要数据保护与 Core C/D 全部闭合；若审查后改变候选则按 12.7 重新验证，不自动继承结论。
+  - 完成时，required owner 项与本轮审批已闭合、无缺失/跳过/伪造结果，由发行 owner 记录实际 VERIFIED 或 NOT_VERIFIED；当前不预填任何结果。
+  - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7_
   - _Boundary: Final Windows Packaged Feature GO_
-  - _Depends: 9.4_
+  - _Depends: 9.2_
 
 ## Source 维护实施记录
 

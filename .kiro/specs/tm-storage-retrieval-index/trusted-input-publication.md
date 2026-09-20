@@ -1,6 +1,6 @@
 # Core 受信输入的私有 publication 消费合同
 
-本合同记录 Task 9.6c 已实现的私有接口，供 Feature5 消费；对应回归位于 `tests/test_tm_gate_inputs.py`、`tests/test_tm_gate_input_composition.py` 和 `tests/test_tm_gate_publication.py`。普通 frozen 可复用发布与取消语义，输入来源及其与实际执行产物的绑定按 ADR-028 重新设计。接口合同本身不授予真实 frozen 或 100k 性能资格。
+本合同记录Task 9.6c已实现的私有接口，供Feature5消费；对应回归位于`tests/test_tm_gate_inputs.py`、`tests/test_tm_gate_input_composition.py`和`tests/test_tm_gate_publication.py`。下列既有提交/取消竞态语义不变；末节普通packaged消费修订为**待人工审批草案**，不代表9.6e已实现。接口合同本身不授予真实frozen或100k性能资格。
 
 ## 普通引用槽的来源
 
@@ -44,3 +44,13 @@ class References(metaclass=_publication_reference_type):
 禁止在短锁内调用 `_require_epoch`、`_completed_owner`、任何 proof/native/Qt/I/O/import、任意 setter/rollback callback、等待、join 或额外阻塞锁。原 publisher 锁、原观察锁不能由 lifetime mutex 替代。Feature5 后续需要独立验证实际 notification/status 多引用、调度取消和 close 绑定；Core 本轮仅提供并验证这一私有协调协议。
 
 `tm_gate_inputs` 实际调用纯 publication 模块，因此此前已补齐 Matcher build inventory 的 `tm_retrieval_capability.py` 仍保留。整改只按原 path/SHA 聚合算法重算受影响摘要，未再增加 paths、修改 cohort/阈值或 benchmark contract。
+
+## 普通packaged的消费分工（待人工审批）
+
+来源与身份的唯一定义见[Core Design](design.md)的「R4已完成范围与普通packaged消费修订」「检索兼容身份与单次运行身份」，平台候选身份只作当前运行关联；本合同不另定义profile、candidate格式或qualification key。普通输入由现有组合入口建立有限owner/session，使用受控构建所关联的owner输入与当前候选实际执行；不是旧source/native authority的别名。
+
+当前session显式贯通Gate D、oracle及两个worker执行owner。纯DTO和query证据配对只检查传入不可变事实，不从ambient checkout重算fingerprint，也不持有活authority。所有需要当前运行验证的读取由实际持有session的Core owner完成；完成后的receipt仍按原publisher和同epoch协议消费，不能由候选id或构建digest重铸。
+
+普通组合的terminal准备检查当前owner/epoch/window、已消费输入与兼容事实、候选关联和撤销状态，不要求完整source/AST/native复证。snapshot缓存不越过epoch或撤销，也不能将旧evidence解释成当前执行。所有可失败的输入检查与下游准备均在原commit短锁前完成，最内层锁仍只做既有内存状态和引用安装；不改sealed publication bindings或提交胜负规则。
+
+Host/Qt请求取消后，Core依原短锁撤销publication，平台parent transport另行回收其创建的child与pipe。取消先赢则零安装；合法commit先赢则完整安装并记录完成，不能事后倒判成未发生。child退出、句柄close或有界等待都在锁外，Qt不阻塞join。只有这两项义务均有真实观察结果，才能报告取消/关闭清理完成；既有publication单测不能代替同EXE child退出与无晚到授权的候选验证。

@@ -97,6 +97,8 @@ Qt                                   (opaque transfer only)
 - **Source delivery staging**：`1.3a`、`1.4a`、`3.2a` 只依赖已批准的 Windows platform lock/publish/composition 能力，闭合独立 metadata 与 source startup，可先形成并合入第一份 owner commit；它不打开、保存或验证 ProjectPackage。`4.4a`、`4.5a` 是后继 package-coupled 阶段，依赖 `multi-document-project-workspace` 的 Windows tasks `2.8a`、`4.4a`，在平台 C5S 使用真实 ProjectPackage public business API/bytes 完成最终 source 复验。
 - **Completion boundary**：第一阶段的 import、lock、publish 与 crash matrix 只证明 Windows source startup 和独立 metadata authority；WA-02 source owner 最终 PASS 仍要求第二阶段。两阶段可形成有序 owner commits，但不得以 mock、私有 ZIP/manifest 构造、fixture-only workspace 或 skip 填补中间依赖；frozen `1.4b`、`4.5b` 保持独立后置门。
 
+普通 frozen 的待审适用范围：`1.4b/4.5b` 从平台 7.2 实际 EXE 消费既有 composition 与真实 ProjectPackage，不依赖 W3 源码证明或平台 7.4 最终汇总。数据保护和业务合同不变；候选必测、未变 owner 深入矩阵复用及变更触发重验遵循平台 Requirement 12，不把 source evidence 改签为 packaged 结果。
+
 ## Critical Path 与验证锚点
 
 ```text

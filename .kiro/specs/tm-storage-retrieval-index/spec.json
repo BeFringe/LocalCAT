@@ -1,22 +1,26 @@
 {
   "feature_name": "tm-storage-retrieval-index",
   "created_at": "2026-07-27T09:52:52Z",
-  "updated_at": "2026-09-19T03:15:40Z",
+  "updated_at": "2026-09-20T14:14:44Z",
   "language": "zh-CN",
-  "phase": "tasks-approved",
+  "phase": "tasks-generated",
   "approvals": {
     "requirements": {
       "generated": true,
-      "approved": true
+      "approved": false
     },
     "design": {
       "generated": true,
-      "approved": true
+      "approved": false
     },
     "tasks": {
       "generated": true,
-      "approved": true
+      "approved": false
     }
   },
-  "ready_for_implementation": true
+  "ready_for_implementation": false,
+  "approval_scope": {
+    "historical": "既有Requirements 1–9、source与WA-06 R4审批及完成事实保留原范围，9.6c/9.6d完成不代表普通frozen验收。",
+    "pending": "ADR-028下普通packaged的WA-06第5条、Design输入/兼容身份/session/worker合同与Tasks 9.6b/9.6e共同拟稿待人工审批；未获批准不进入实现。"
+  }
 }

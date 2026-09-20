@@ -8,7 +8,7 @@ WA-02 source amendment按两个有序阶段交付。`1.3a`、`1.4a`、`3.2a` 是
 
 本计划保持 brief 的四个 Promotion Cluster，并在它们之前增加只做治理的 Cluster 0。`multi-document-project-workspace` 完整 C2A/C2B/C2C 提供真实 ProjectPackage 作为 Chunk C1 的上游输入。
 
-`spec.json` 的 Requirements/Design/Tasks 三个 `approved` 和 `ready_for_implementation` 已置为 `true`。Cluster 1 只实现 identity/membership/topology/local metadata；不得提前引入 assignment、Controller/Qt、ResourcePackage 或 TMX 责任。
+原 Chunk C0–C4 与 source 的 R/D/T 审批及完成事实保留；本轮普通 frozen `1.4b/4.5b` 与 Design 适用范围尚待人工批准，当前 `spec.json` 的 Design/Tasks 为未批准、`ready_for_implementation=false`。历史 Cluster 1 只拥有 identity/membership/topology/local metadata，不因本轮修订扩入相邻责任。
 
 固定顺序：
 
@@ -102,10 +102,10 @@ Multi-Document C2 complete
   - _Depends: 1.3a, ADR-020, windows-platform-enablement 3.7_
 
 - [ ] 1.4b 闭合Windows frozen import与启动组合
-  - 在W3 custom spike全PASS后，从trusted bootstrap进入同一chunk composition，证明业务import无POSIX-only依赖且不从source checkout补载模块。
+  - 本轮待审：从普通 EXE 进入既有 chunk composition，证明实际业务 import/startup 无 POSIX-only 依赖，使用真实 Windows 端口且不从 checkout 补载模块；退出时同候选可进入 4.5b 的业务验收。
   - _Amendment: WA-02_
   - _Delivery phase: frozen post-build_
-  - _Depends: 1.4a, ADR-022, windows-platform-enablement 7.4_
+  - _Depends: 1.4a, ADR-028, windows-platform-enablement 7.2_
 
 ### Cluster 1 完成门
 
@@ -228,11 +228,12 @@ Multi-Document C2 complete
   - _Amendment: WA-02_
   - _Depends: 1.4a, 4.4a, multi-document-project-workspace 2.8a and 4.4a, windows-platform-enablement C5S_
 
-- [ ] 4.5b 在ADR-022 frozen import harness重放Windows acceptance
-  - 对同一业务矩阵重放frozen composition/startup，证明Boot TCB/source authority失败不会被禁用store、source checkout或source阶段证据旁路。
+- [ ] 4.5b 在普通 frozen 候选完成 Chunk/Project 组合验收
+  - 本轮待审：对真实 ProjectPackage、chunk metadata 与 Controller 执行保存/冷重开、锁竞争和中断恢复，保持 identity/membership/permission 与原发布保证；失败不得禁用 store 或回退 checkout。
+  - 按平台 Requirement 12 引用未变 owner 深入证据并重验变更触发范围；候选业务调用与失败反例实际执行后，向平台 7.4 交付结果，不用旧 source PASS 代答。
   - _Amendment: WA-02_
   - _Delivery phase: frozen post-build_
-  - _Depends: 1.4b, 4.5a, ADR-022, windows-platform-enablement 7.4_
+  - _Depends: 1.4b, 4.5a, ADR-028, windows-platform-enablement 7.2_
 
 ### Cluster 4 完成门
 
