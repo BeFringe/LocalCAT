@@ -704,10 +704,10 @@ def _canonical_json(value: Mapping[str, object]) -> str:
 def _stable_benchmark_source_digest(path: _InputFile) -> str:
     """Hash one direct regular implementation member without aliases."""
 
-    from tm_gate_inputs import _GateInputReference, _read_input_bytes
+    from tm_gate_inputs import _GateInputReference, _input_digest
 
     if type(path) is _GateInputReference:
-        return hashlib.sha256(_read_input_bytes(path)).hexdigest()
+        return _input_digest(path)
     if not isinstance(path, Path):
         raise TypeError("benchmark implementation input must be exact")
     if getattr(sys, "frozen", False):
@@ -848,7 +848,7 @@ def benchmark_implementation_fingerprint(
 def _benchmark_implementation_fingerprint_from_session(
     session: _GateInputSession,
 ) -> str:
-    """Recompute the original fingerprint grammar from retained input bytes."""
+    """Use per-input digests, with Core-specific packaged execution facts."""
     from tm_gate_inputs import _require_session
 
     session = _require_session(session)
@@ -861,16 +861,18 @@ def _benchmark_implementation_fingerprint_from_session(
     source_files = capture()
     if capture() != source_files:
         raise ValueError("benchmark implementation changed during snapshot")
+    fingerprint_inputs = {
+        "proof_query_version": CANDIDATE_PROOF_QUERY_VERSION,
+        "source_files": [list(item) for item in source_files],
+    }
+    execution_digest = session._ordinary_execution_digest()
+    if execution_digest is not None:
+        fingerprint_inputs["ordinary_execution"] = execution_digest
     return hashlib.sha256(
         (
             BENCHMARK_IMPLEMENTATION_FINGERPRINT_VERSION
             + "\0"
-            + _canonical_json(
-                {
-                    "proof_query_version": CANDIDATE_PROOF_QUERY_VERSION,
-                    "source_files": [list(item) for item in source_files],
-                }
-            )
+            + _canonical_json(fingerprint_inputs)
         ).encode("utf-8")
     ).hexdigest()
 
@@ -1487,11 +1489,13 @@ def _load_benchmark_contract_from_session(
     session: _GateInputSession,
     *,
     contract_id: str = "benchmark_tm_contract.json",
+    _contract_input=None,
 ) -> BenchmarkContract:
     from tm_gate_inputs import _read_input_text, _require_session
 
     session = _require_session(session)
-    return _parse_benchmark_contract_text(_read_input_text(session.input(contract_id)))
+    reference = session._resolve_input(None, _contract_input, contract_id)
+    return _parse_benchmark_contract_text(_read_input_text(reference))
 
 
 def _parse_benchmark_contract_text(raw: str) -> BenchmarkContract:

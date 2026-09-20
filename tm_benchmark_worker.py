@@ -1,8 +1,8 @@
 """Core consumption of fresh benchmark worker transports.
 
 Mode/EXE/pipe values select transport, never input or publication authority.
-The frozen production composition is intentionally fail-closed until the
-platform owner supplies its E10 transport and exact authority integration.
+Ordinary frozen uses the current candidate's explicit pipes; the native route
+retains its E10 transport and authority integration.
 """
 
 from __future__ import annotations
@@ -50,11 +50,12 @@ def _run_worker_child(
     timeout_seconds: float,
     test_mode: bool,
     _test_frozen_transport: _TestFrozenTransport | None = None,
+    _input_session: _GateInputSession | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Consume a platform transport without supplying child authorization.
 
-The future platform production branch belongs here, alongside source launch;
-it must create directed pipes and independently bootstrap the same candidate.
+The platform production branch creates directed pipes and independently
+bootstraps the same candidate, alongside the retained source launch.
 The explicit test transport cannot produce non-test benchmark evidence.
 """
     command = _worker_command(kind)
@@ -66,8 +67,13 @@ The explicit test transport cannot produce non-test benchmark evidence.
         raise TypeError("test transport cannot produce final evidence")
     if getattr(sys, "frozen", False):
         if _test_frozen_transport is None:
-            from frozen_worker_transport import run_frozen_child
-            completed = run_frozen_child(command, request_json.encode("utf-8"), timeout_seconds)
+            if _input_session is not None and _input_session._ordinary_candidate() is not None:
+                from frozen_worker_transport import run_ordinary_child
+                completed = run_ordinary_child(command, request_json.encode("utf-8"), timeout_seconds,
+                                               check_live=_input_session._require_live)
+            else:
+                from frozen_worker_transport import run_frozen_child
+                completed = run_frozen_child(command, request_json.encode("utf-8"), timeout_seconds)
         else:
             completed = _test_frozen_transport(command, request_json.encode("utf-8"), timeout_seconds)
         if type(completed) is not subprocess.CompletedProcess or type(completed.returncode) is not int:
@@ -101,6 +107,7 @@ class _WorkerPipes:
     request: io.BufferedIOBase | io.RawIOBase
     result: io.BufferedIOBase | io.RawIOBase
     errors: io.BufferedIOBase | io.RawIOBase | None = None
+    diagnostic: Callable[[Exception], None] | None = None
 
     def __post_init__(self) -> None:
         streams = (self.request, self.result) if self.errors is None else (self.request, self.result, self.errors)
@@ -122,6 +129,14 @@ class _WorkerPipes:
 
     def write_error(self, payload: str) -> None:
         self._write(self.result if self.errors is None else self.errors, payload)
+
+    def report_failure(self, error: Exception) -> None:
+        # Diagnostics cannot affect the strict result protocol or its verdict.
+        if self.diagnostic is not None:
+            try:
+                self.diagnostic(error)
+            except Exception:
+                pass
 
     @staticmethod
     def _write(stream: io.BufferedIOBase | io.RawIOBase, payload: str) -> None:
