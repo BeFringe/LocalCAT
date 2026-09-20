@@ -1,16 +1,16 @@
 # 需求文档
 
-## 当前交付范围（2026-09-20 修订）
+## 当前交付范围（普通 frozen 修订待审）
 
 Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 launcher 已完成 Task 6.6b 用户旅程。后置 frozen 追求最终用户无需另装 Python/Qt，独立验收，不阻塞 source。
 
-[ADR-028](../../steering/adr/adr-028.md) 已取代普通 frozen 的完整 Boot TCB、定制 native entry 与 retained-source-only 强证明前置。下文 Requirement 10 的旧 W3 专用证明及 Requirement 11/12 对它的引用保留为历史映射输入，不再直接驱动普通发行实现；自包含、可追溯构建、必要数据保护、Core Gate 与真实 packaged E2E 目标继续保留。新的输入身份/消费设计尚待收束，旧 W3 失败不改记为通过。Requirement 1–9 的 source 数据与业务合同保持有效。
+[ADR-028](../../steering/adr/adr-028.md) 已批准普通桌面产品边界。下文 Requirement 10–12 是替换旧 W3 来源、资源和发行验收条款的待审修订；批准前不得实施。Requirement 1–9 的 source 数据与业务合同、原 source/W3 构建前完成事实及证据范围保留。旧版本可从 `6531b1e` 追溯，不再把旧 W3 正文作为本路线的活动指令。
 
 ## 简介
 立项时，`ui-mvp@b925b80` 因直接导入 `fcntl` 而无法在 Windows 运行。本 Spec 已通过平台端口与 consumer 适配闭合 source 的 Qt、项目持久化、TM 生命周期、TMX 和 FTS5；frozen 是下一条独立交付线。Windows 与 POSIX 使用各自的文件系统原语，保护相同的用户数据与业务结果。
 
 ## 边界说明
-- **范围内**：Windows 原生 rooted file authority、路径逃逸与 reparse 防护、跨进程锁、原子发布与恢复；所有现有 POSIX 文件语义消费者的共享平台边界接入；LocalCAT Qt 启动、项目生命周期、TM 生命周期、TMX 导入、FTS5；依赖用户管理 CPython/venv/source 的轻量 Windows 启动入口；PyInstaller `--onedir --windowed` frozen-source 能力证明、资源收集和 Windows 发行物验证；Qt speaker avatar 的 Windows 功能回归；macOS/Linux 回归保护。
+- **范围内**：Windows 原生 rooted file authority、路径逃逸与 reparse 防护、跨进程锁、原子发布与恢复；现有消费者的共享平台边界；Qt、项目、TM、TMX、FTS5；已完成的用户管理运行时与轻量 source 入口；普通 `--onedir --windowed` 自包含发行、受控构建可追溯性、真实 Core 消费、同候选业务验收及受影响的跨平台回归。
 - **范围外**：旧 Excel 交互适配器、`xlwings` 或 Microsoft Excel 的安装与验证；`--onefile` 发行；安装器、自动更新、代码签名和商店分发；首版不承诺 remote/UNC share、FAT/exFAT 或不能证明 FileId/reparse/ACL/documented publish 前置的第三方文件系统，在这些位置必须明确 fail closed；当前版本不提供针对 storage controller/cache/power protection 或突然断电的硬件认证；改变翻译业务语义、TM 检索算法或 UI 产品流程；以 monkeypatch、mock、跳过 Gate、降低身份校验或现场修补代替能力实现。
 - **相邻期望**：Feature 5 与 `feature5-ui-integration` 继续拥有 TM/UI 冻结契约；Parser、项目包、资源、TM snapshot/attestation/recovery 与协作分工规格继续拥有各自业务不变量和 consumer 接入实现；本 Spec 只拥有共享跨平台文件系统/锁合同、Windows backend、amendment dispatch/merge ledger、Windows packaging 和最终集成证据。
 
@@ -18,9 +18,10 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 - **Owning spec**：`windows-platform-enablement`；Governance owner 已批准其只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence，并同步到 `.kiro/steering/spec-ownership.md`/`roadmap.md`。
 - **被修订的既有范围说明**：`parser-subsystem-extraction/design.md` 中尚未落地的 Windows native rooted-handle 规划；`ui-mvp@b925b80` 仅在 POSIX 文件语义下可组合的现状。
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
-- **审批状态**：ADR-020～026、owning scope、WA-01～08 current R/D/T amendment acknowledgement及平台Requirements/Design/Tasks均已批准；ADR-024/025对主体环境矩阵与发布耐久门的后续取代关系由Task 0.6同步，ADR-026对Parser发布状态的收窄由Task 0.7同步；实施仍仅按本Spec task依赖逐簇进入，审批不代替实现或发布证据。
+- **历史审批状态**：ADR-020～026、owning scope、原 WA-01～08 R/D/T amendment acknowledgement 及当时平台 Requirements/Design/Tasks 已批准；ADR-024/025 的后续取代关系由 Task 0.6 同步，ADR-026 对 Parser 发布状态的收窄由 Task 0.7 同步。它们不批准本轮普通 frozen 修订，也不代替实现或发布证据。
 - **交付路线**：source 已完成用户管理 CPython 3.14 x64、venv、`requirements-ui.txt`、source 与轻量入口的产品验收；它不铸造 frozen authority。frozen 后置独立验收；2026-09-20 项目 owner 批准按 ADR-028 收窄其证明范围，取代原 W3 强证明作为唯一发行前置的安排。
 - **导出输出收尾修订**：ADR-027 已获批准，仅修订 Windows ResourcePackage/TMX 正常完成后留下内部协调锁文件的行为；相邻 `language-resource-portability` 6.7–6.8 与 `tmx-context-interchange` 8.8–8.9 分别承载导出结果。既有 Requirement 3 的并发互斥继续成立，其他持久锁、直接 CSV/JSONL 导出与 POSIX 行为不在本修订范围。
+- **本轮审批范围**：以 `reassessment@8890813` 为修订基点，Requirement 10–12、对应 Design/Tasks 及受影响 Core、Host、Qt 消费接缝待人工审批；上述历史批准不覆盖本轮。用户授权本轮共同拟稿供审，不表示逐阶段批准或实施授权。ADR-028 已足以承载边界，本轮不新增 ADR 或治理层。
 
 ## 需求
 
@@ -119,35 +120,35 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 4. When LocalCAT 重启后查询先前导入并发布的 TM, the TM 系统 shall 从 canonical SQLite authority 恢复 FTS5 检索，不依赖一次性进程状态。
 5. If FTS5 在发行运行时不可用, the TM 系统 shall 以稳定能力错误阻止依赖该能力的发布或激活，而不是静默退化为未经批准的检索语义。
 
-### Requirement 10：frozen-source 能力证明
-**目标：** 作为能力 Gate 的维护者，我希望 frozen EXE 能证明它执行的安全关键源码和 fixtures 与受审版本一致，以便 PyInstaller 冻结不会绕过 source identity 契约。
+### Requirement 10：普通 frozen 的输入、执行与能力资格
+**目标：** 作为用户和维护者，我希望自包含发行物实际执行经过声明的产品与 Gate，并诚实展示当前设备可用能力，以便打包不会伪造资格或依赖开发环境。
 
 #### 验收标准
-1. When frozen LocalCAT 初始化 capability host, the frozen-source 合同 shall 为所有能力关键模块提供真实、严格存在的 `.py` 来源，并由获批 `TrustedSourceLoader` 从 retained verified handle 读取、摘要和直接编译 exact source bytes；loader metadata alone shall 不构成 executed-byte proof。
-2. When Gate A/C 或其他能力图解析 root manifest, the frozen 产物 shall 包含递归闭包中的源码、JSON/TXT fixtures、摘要和相对路径，并执行与源码环境相同的 Gate。
-3. If frozen 模块的运行来源、executed-source digest、loader attestation、manifest 闭包或 fixture 身份不一致，或关键模块存在 `.pyc`、`__pycache__`、未声明 PYZ duplicate, the capability host shall fail closed，且应用不得宣称相关能力可用。
-4. While 构建 frozen 产物, the 构建流程 shall 不以仅把 `.py` 复制为 data、检查 `origin`/`co_filename`、隐藏导入或跳过 validation 的方式假定 source identity 已满足。
-5. The frozen-source 合同 shall 同时说明源码运行与 frozen 布局的 bundle root 解析，并不得依赖构建机当前工作目录。
-6. When frozen capability host 导入任何能力关键模块或读取 fixture, the release-owned native bootloader shall 审计 entry 前应用 PE import、在首次 Python DLL 或其他非系统 DLL load 前固定 DLL 搜索并绑定 bundle/native directory，递归枚举应用及随包非系统成员的 native static/delay-load closure，并要求 owner manifest 显式声明其 pre-authority 动态 native roots 与系统 API 入口；在任一非系统 DLL 可执行加载前逐个完成 retained-handle rooted/reparse/live-identity/digest 预证明。加载后还 shall 把实际非系统 module 与预证明 handle 复核；未声明应用动态 load、无法闭合的应用依赖或仅依靠顶层 flags/post-load path check 均 shall 使 spike fail closed。随后 native bootloader 移交不可伪造 attestation；Python bootstrap 再闭合版本化应用 Boot TCB（bootloader、Python DLL、pre-authority hooks、必要 stdlib/ctypes/hash/manifest/loader 与随包 native 成员），以不依赖待验证 Python adapter 的原生可信根证明 ancestor/final reparse、live-handle identity、manifest digest 和 handle-read。system allowlist shall 约束应用系统 API 入口与解析策略。不得先信任 capability host 再用其证明自身，也不得声称 Python-level policy 能追溯保护 entry 前加载。
+1. When 构建和运行普通 frozen 候选, the 发行流程 shall 将 clean tracked 产品输入、固定依赖、owner 输入声明与实际产物关联，并使入口、独立 worker 和验收记录能够确认使用同一候选；构建记录本身不得授予业务能力。
+2. When 用户调用 Matcher 或显式执行 Core Gate C/D, the 应用 shall 在该候选内消费实际所需的 contract、fixture 和实现信息并运行真实 Core；输入、执行和结果须属于当前运行，不读取 checkout 或外部 venv 代答。
+3. If 必需输入缺失/不一致、候选混用、运行已撤销或结果不属于当前请求, the 对应消费者 shall 拒绝结果并保持安全状态，给出既有稳定诊断，不把失败表示为能力通过或普通无匹配。
+4. The 普通 frozen shall 不以 frozen 标志、任意 PASS 文件、未执行的旁置源码或伪装 source/native authority 开放能力；不要求完整 Boot TCB、定制 native entry、外置源码逐字执行或第三方内部代码逐事件自证。
+5. When 恢复本机 Fuzzy 资格, the Core shall 依据实际影响检索的实现、Gate/fixture、相关运行时、执行与测量机制及 intended path 判断兼容；无有效资格时只关闭 Fuzzy，保留各自已验证的 Exact/Context，允许用户显式重验而不在启动时自动运行 100k。无关 UI/头像改变不得无条件使资格失效，资源交换不得携带资格。
+6. When migration/query worker 完成、失败、超时或用户取消/关闭, the 应用 shall 保持独立进程测量与既有计量口径、回收自己创建的 child 和端点且不阻塞 Qt 事件循环；取消先于提交胜出时不得安装过期结果，合法提交先胜出时须保留完整已提交结果并如实报告。
 
 ### Requirement 11：Windows onedir/windowed 发行物与资源
 **目标：** 作为 Windows 用户，我希望获得可解压运行的 LocalCAT EXE，以便无需 Python 环境即可使用经过验证的功能。
 
 #### 验收标准
-1. When 构建首个 Windows 发行候选, the 构建流程 shall 使用 PyInstaller `--onedir --windowed`；切换到 `--onefile` shall 视为改变 frozen trust/recovery boundary，并须另立 ADR 后方可实施。
-2. When 检查发行目录, the 产物 shall 包含 `qwindows.dll`、获批 frozen-source 闭包、Gate fixtures、`tm.jsonl`、`terms.csv`、`LocalCAT-logo-silver.png`和`benchmark_tm_contract.json`；发行物shall不要求或消费`durability_profiles.json`或forced-power-loss evidence，其他必须输入缺失或tamper时仍不得mint相应capability。
-3. When 从非仓库当前目录启动 EXE, the 应用 shall 通过 bundle root 解析并加载所需数据和资源。
-4. The Windows 发行物 shall 使用受版本控制的 `.ico`、产品名称和版本元数据，并 shall 不从构建机仓库路径读取运行时依赖。
-5. If 任何必须资源、插件或 source-proof artifact 缺失, the 发行验证 shall 失败并列出精确缺失项。
+1. When 构建 Windows 0.5.2 发行候选, the 构建流程 shall 提供普通 PyInstaller `--onedir --windowed` 产物，使用户无需另装 Python/Qt；onefile、安装器、签名和自动更新不在本次范围。
+2. When 检查发行目录, the 产物 shall 包含实际 Python/Qt/SQLite 依赖、`qwindows.dll`、owner 必需 Gate contract/fixtures、`tm.jsonl`、`terms.csv`、logo、icon 与版本元数据；可选 avatar catalog 须有声明。发行物 shall 不要求旧 source-only 闭包、durability registry 或硬断电证据。
+3. When 从非仓库当前目录启动 EXE 或传入项目参数, the 应用 shall 保持正常首页/打开项目行为，从发行目录取得只读资源，从用户目录取得可写配置与托管数据，且默认资源仅在缺失时播种、不覆盖既有用户数据。
+4. The Windows 发行物 shall 使用受版本控制的构建配方、`.ico`、产品名称和版本元数据，并 shall 在运行时不消费构建机 checkout、外部 venv、CWD 或未声明的开发依赖。
+5. If 必需资源、插件或声明输入缺失/损坏, the 对应入口 shall 给出可诊断失败且发行验收 shall 列出缺失项；未声明可选头像或无匹配时 shall 保留既有无头像 fallback。
 
 ### Requirement 12：端到端发布矩阵与可复现证据
 **目标：** 作为发布审批者，我希望在干净 Windows 环境取得完整、可复现的通过证据，以便最终 EXE 的平台等价性可审计而非凭推断接受。
 
 #### 验收标准
-1. When Windows 发行候选进入验收, the 验证流程 shall 从干净用户配置执行依赖/构建、Qt 启动、项目保存/重开、TM 激活/重启恢复、TMX 导入、SQLite FTS5、qwindows、全部能力 Gate、锁竞争、崩溃恢复和资源可见性测试。
-2. When 运行安全反例矩阵, the 验证流程 shall 覆盖 symlink/junction/reparse、hardlink、ancestor swap、目标占用、进程终止、双进程竞争、替换失败和恢复边界。
-3. If 任一发布阻塞项失败、跳过、只在源码环境通过，或 production build 不能证明 clean tracked tree 与全部实际构建输入的 content-addressed provenance, the Windows 发行状态 shall 保持 NOT_VERIFIED，且不得发布为可用版本。
-4. The 验证交付物 shall 包含可复现 PowerShell 命令、环境与版本清单、完整日志、通过/失败矩阵、Windows 文件系统/锁适配清单和 frozen-source/打包清单。
-5. The 验证流程 shall 在同一提交上运行 Windows 与既有 macOS/Linux 回归，并明确记录平台专属预期差异。
-6. The Windows blocking矩阵 shall 对主体使用provider-agnostic process-primary token shape：standard/elevated正向、同SID low-integrity/restricted负向，以及service/AppContainer/impersonation fail-closed为mandatory；domain/Entra环境只可作为optional非阻断覆盖，缺少这些环境不得构成skip或NO-GO。
-7. The Windows publish blocking矩阵 shall 覆盖process termination、instruction-boundary fault、应用重启与正常OS reboot后的old/new/recovery-only结果；storage bus/controller/cache/power-protection枚举和forced-power-off/power-cut不得作为source、frozen、runtime或最终GO前置。
+1. When Windows 发行候选进入最终验收, the 验证流程 shall 在同一实际候选上验证干净用户/无开发环境、非仓库 CWD、真实 Qt 首页/项目参数、项目编辑保存重开、TM 激活/重启恢复、TMX 直接导入、FTS5/trigram 创建查询重开、真实 Matcher/建议消费、资格恢复/失配，以及 worker 取消/关闭/超时/异常退出和新增资源加载路径。首次普通 packaged 资格及检索兼容性变化 shall 实际执行正式 Gate C/D 与 100k 双 intended paths；后续仅 UI/无关资源变化时，可由当前候选的 Core 核验并恢复同设备、兼容性未变的有效资格，记录原证据及复用依据，不重跑无关性能矩阵或重签旧结果。
+2. When 验证候选的数据保护, the 验证流程 shall 在真实消费者中覆盖默认资源不覆盖、锁竞争、发布失败、中断恢复、权限/reparse 拒绝与既有数据不损坏；同时验证 TMX ResourcePackage 的 import/apply 负向拒绝及资源迁移不携带 Fuzzy 资格。更深入的底层故障矩阵按 12.5–12.7 确定重跑或复用。
+3. If 任一候选必测或实际变更触发的阻塞项失败、跳过、缺少证据，或构建无法追溯 clean tracked 输入及实际依赖, the 发行状态 shall 保持 NOT_VERIFIED；source PASS、小样本、mock、临时补丁或不同 EXE 的成功片段不得代答候选验收。
+4. The 验证交付物 shall 记录候选标识、构建输入—产物清单、环境版本、可复现命令、退出码/日志、逐项结果，以及复用 owner 证据的原锚点、不变前提和本候选消费检查；复用不得改写原证据或标成当前重新运行的 PASS。
+5. When 复用未改变 owner 的深入单测/故障矩阵, the 发行评审 shall 核对实现、依赖、调用合同和关键运行条件均未改变且候选实际消费已验证；任一前提改变须重验受影响范围。Core/索引/Gate/运行时/worker 或计量变化须由 Core 判定对应资格和性能重验；共享数据端口变化须重验相关安全恢复矩阵；共享代码变化须运行受影响的 source/macOS/Linux 回归。纯 UI/头像变化只重验受影响功能与资源路径，不默认重跑全部平台和历史矩阵。
+6. When 候选消费私有存储或本次改变 token/ACL/MIC 端口、调用合同或运行条件, the 验证流程 shall 在候选中证明实际私有存储消费，并对受影响部分重验 provider-agnostic standard/elevated 正向、同 SID low-integrity/restricted 负向及 service/AppContainer/impersonation 拒绝；未改变的深入矩阵仅在 12.5 前提成立时复用。domain/Entra 仍为可选覆盖，不构成环境强制门。
+7. When 候选消费发布恢复或本次改变发布端口、owner 状态机、调用合同或运行条件, the 验证流程 shall 在候选中验证进程中断与应用冷重开，并对受影响边界重验 instruction fault、process termination、应用重启和正常 OS reboot 的 old/new/recovery-only 结果；未改变的深入矩阵按 12.5 复用。硬件掉电认证仍不在范围内。若修复改变候选，shall 更新候选身份、重验受影响项并对最终候选闭合 12.1–12.2，不能拼接旧候选的集成结论。
