@@ -23,6 +23,7 @@ from resource_package_contracts import (
 )
 from resource_portability import ResourcePortabilityService
 from resource_repository import ResourceRepository
+from tests.benchmark_worker_test_support import worker_temporary_directory
 
 
 _TERMS = b"\xef\xbb\xbfsource,target\nlocalcat-term-v1,id-1,Case,Target,true,false\n"
@@ -123,7 +124,7 @@ class ResourceOutputLockRetirementWindowsTests(unittest.TestCase):
 
     def test_tm_jsonl_and_tmx_profiles_also_leave_no_coordination_lock(self) -> None:
         with ExitStack() as stack:
-            raw = stack.enter_context(tempfile.TemporaryDirectory())
+            raw = stack.enter_context(worker_temporary_directory())
             root = Path(raw).resolve()
             repository = ResourceRepository(root / "jsonl-app")
             stack.callback(_remove_activation_quarantine, repository.managed_dir)
@@ -328,7 +329,7 @@ class ResourceOutputLockRetirementWindowsTests(unittest.TestCase):
 
     def test_direct_jsonl_does_not_request_output_lock_retirement(self) -> None:
         with ExitStack() as stack:
-            raw = stack.enter_context(tempfile.TemporaryDirectory())
+            raw = stack.enter_context(worker_temporary_directory())
             root = Path(raw).resolve()
             repository = ResourceRepository(root / "app")
             stack.callback(_remove_activation_quarantine, repository.managed_dir)
