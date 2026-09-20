@@ -1742,6 +1742,15 @@ def evidence_from_json(raw: str) -> OracleRecallEvidence:
     return evidence_from_payload(_parse_strict_json(raw))
 
 
+def _oracle_fingerprint(session, *, test_mode: bool) -> str:
+    if session is None:
+        return benchmark_implementation_fingerprint()
+    from tm_gate_inputs import _require_session, _require_production_session
+    from tm_benchmark import _benchmark_implementation_fingerprint_from_session
+    (_require_session if test_mode else _require_production_session)(session)
+    return _benchmark_implementation_fingerprint_from_session(session)
+
+
 def _build_recall_evidence(
     *,
     contract: BenchmarkContract,
@@ -1754,10 +1763,11 @@ def _build_recall_evidence(
     resource_id: str,
     canonical_store_id: str,
     implementation_fingerprint: str,
+    _input_session=None,
 ) -> OracleRecallEvidence:
     """Execute one path against owner-derived, already validated oracle rows."""
 
-    implementation_before = benchmark_implementation_fingerprint()
+    implementation_before = _oracle_fingerprint(_input_session, test_mode=test_mode)
     if implementation_before != implementation_fingerprint:
         raise RuntimeError("oracle implementation changed before candidate run")
     (
@@ -1842,7 +1852,7 @@ def _build_recall_evidence(
     environment = collect_oracle_environment(fts5_enabled=fts5_enabled)
     validate_oracle_environment(environment, execution_path)
     environment_digest = benchmark_environment_digest(environment)
-    implementation_after = benchmark_implementation_fingerprint()
+    implementation_after = _oracle_fingerprint(_input_session, test_mode=test_mode)
     if (
         implementation_before != implementation_after
         or implementation_after != implementation_fingerprint
@@ -1914,6 +1924,8 @@ def run_oracle_recall_evidence(
     scorer: SimilarityScorerV1 | None = None,
     resource_id: str = ORACLE_DEFAULT_RESOURCE_ID,
     canonical_store_id: str = ORACLE_DEFAULT_CANONICAL_STORE_ID,
+    _input_session=None,
+    _contract_input=None,
 ) -> OracleRecallEvidence:
     """Run one requested path's literal (or miniature test-only) recall evidence.
 
@@ -1977,7 +1989,13 @@ def run_oracle_recall_evidence(
         record_count = contract.oracle_subset_record_count
         query_count = contract.oracle_query_count
 
-    implementation_fingerprint = benchmark_implementation_fingerprint()
+    if _contract_input is not None and _input_session is None:
+        raise ValueError("oracle contract reference requires its input session")
+    implementation_fingerprint = _oracle_fingerprint(_input_session, test_mode=test_mode)
+    if _input_session is not None and (not test_mode or _contract_input is not None):
+        from tm_benchmark import _load_benchmark_contract_from_session
+        if _load_benchmark_contract_from_session(_input_session, _contract_input=_contract_input) != contract:
+            raise ValueError("oracle contract differs from the current input session")
     records = tuple(
         iter_oracle_subset_records(
             seed=contract.corpus_seed,
@@ -2032,6 +2050,7 @@ def run_oracle_recall_evidence(
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
         implementation_fingerprint=implementation_fingerprint,
+        _input_session=_input_session,
     )
 
 
@@ -2040,6 +2059,8 @@ def run_oracle_recall_suite(
     contract: BenchmarkContract,
     fts5_run_root: Path,
     fallback_run_root: Path,
+    _input_session=None,
+    _contract_input=None,
 ) -> tuple[OracleRecallEvidence, OracleRecallEvidence]:
     """Run both literal paths from one owner-derived full-scan oracle.
 
@@ -2062,7 +2083,13 @@ def run_oracle_recall_suite(
         else fts5_run_root.resolve() == fallback_run_root.resolve()
     ):
         raise ValueError("oracle path run roots must be distinct")
-    implementation_fingerprint = benchmark_implementation_fingerprint()
+    if _contract_input is not None and _input_session is None:
+        raise ValueError("oracle contract reference requires its input session")
+    implementation_fingerprint = _oracle_fingerprint(_input_session, test_mode=False)
+    if _input_session is not None:
+        from tm_benchmark import _load_benchmark_contract_from_session
+        if _load_benchmark_contract_from_session(_input_session, _contract_input=_contract_input) != contract:
+            raise ValueError("oracle contract differs from the current input session")
     records = tuple(
         iter_oracle_subset_records(
             seed=contract.corpus_seed,
@@ -2096,6 +2123,7 @@ def run_oracle_recall_suite(
         resource_id=f"{ORACLE_DEFAULT_RESOURCE_ID}.fts5",
         canonical_store_id=f"{ORACLE_DEFAULT_CANONICAL_STORE_ID}.fts5",
         implementation_fingerprint=implementation_fingerprint,
+        _input_session=_input_session,
     )
     fallback = _build_recall_evidence(
         contract=contract,
@@ -2108,6 +2136,7 @@ def run_oracle_recall_suite(
         resource_id=f"{ORACLE_DEFAULT_RESOURCE_ID}.fallback",
         canonical_store_id=f"{ORACLE_DEFAULT_CANONICAL_STORE_ID}.fallback",
         implementation_fingerprint=implementation_fingerprint,
+        _input_session=_input_session,
     )
     return fts5, fallback
 

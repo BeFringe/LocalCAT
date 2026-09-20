@@ -106,7 +106,7 @@ Core继续拥有严格request/result codec、独立fresh migration/query child�
 
 本节依据ADR-009/013/020/021及其已采纳修订、ADR-028定义普通packaged消费，使用既有public capability与持久schema。修订范围登记于平台 [cross-spec-amendments.md](../windows-platform-enablement/cross-spec-amendments.md)。相邻平台与Feature5须同步候选关联、Host组合和取消消费，但不能变成第二个Core owner。
 
-尚未证明的是普通入口能否在无checkout的真实候选中完整消费上述有限输入，以及现有fingerprint/Gate C汇总能否仅靠构建输入摘要保持既定grammar。7.2/9.6e实验先跑实际Matcher、Gate C输入与小样本migration→query→oracle/结果消费，记录发生路径读取的具体消费者、子进程退出和各阶段成本；缺输入、ambient source读取、跨候选结果、取消后未回收或正式消费者被test seam替代均为失败。若需要超出本节的副本、字段或组合边界，先归属本owner并修订该delta，不扩大为全包证明。
+9.6e与平台7.2验证无checkout的真实候选如何消费有限输入，并经实际Matcher、Gate C与小样本migration→query→oracle/结果消费验证调用链。缺输入、ambient source读取、跨候选结果、取消后未回收或正式消费者被test seam替代均为失败。超出本节的副本、字段或组合边界由本owner审阅，不扩大为全包证明；正式100k资格由9.6b验证。
 
 ### Revalidation Triggers
 

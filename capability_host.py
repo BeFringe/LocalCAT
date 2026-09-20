@@ -50,6 +50,7 @@ from capability_frozen_inputs import (
     _FrozenSourceFile,
     _OwnerWaitGuardLock,
     _compose_frozen_capability_source,
+    _OrdinaryCapabilityInputs,
 )
 from tm_gate_inputs import _GateInputSession
 from capability_gated_text_matcher import CapabilityGatedTextMatcherV1
@@ -132,9 +133,9 @@ def _absolute_locator(value: object) -> Path | None:
 
 @contextmanager
 def _host_input_session(
-    authority: RootedSourceAuthority | _FrozenCapabilitySource,
+    authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
 ) -> Iterator[_GateInputSession | None]:
-    if type(authority) is _FrozenCapabilitySource:
+    if type(authority) in (_FrozenCapabilitySource, _OrdinaryCapabilityInputs):
         with authority.input_session() as session:
             yield session
     else:
@@ -142,6 +143,8 @@ def _host_input_session(
 
 
 def _anchor_frozen_source(anchor: _TrackedFileAnchor) -> _FrozenCapabilitySource | None:
+    if anchor.ordinary_inputs is not None:
+        return anchor.ordinary_inputs
     source = anchor.source_file
     return source.owner if type(source) is _FrozenSourceFile else None
 
@@ -156,7 +159,7 @@ def _reference_assignment(target: object, name: str, prior: object, candidate: o
 class _PathIdentity:
     path: Path
     directory: bool
-    source_authority: RootedSourceAuthority | _FrozenCapabilitySource
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs
     source_file: RootedSourceFile | _FrozenSourceFile | None
 
     @classmethod
@@ -165,12 +168,15 @@ class _PathIdentity:
         path: Path,
         *,
         directory: bool,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> _PathIdentity:
-        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             raise TypeError("path identity requires rooted source authority")
         if type(path) is not type(Path()) or not path.is_absolute():
             raise TypeError("path identity locator must be an absolute Path")
+        if type(source_authority) is _OrdinaryCapabilityInputs:
+            source_authority.check_locator(path)
+            return cls(path, directory, source_authority, None)
         if directory:
             if path != source_authority.root_path:
                 raise RuntimeError("source directory identity must be the rooted checkout")
@@ -186,6 +192,12 @@ class _PathIdentity:
         )
 
     def is_current(self) -> bool:
+        if type(self.source_authority) is _OrdinaryCapabilityInputs:
+            try:
+                self.source_authority.check_locator(self.path)
+                return True
+            except (OSError, RuntimeError, ValueError):
+                return False
         if self.directory:
             try:
                 self.source_authority.reprove()
@@ -202,16 +214,21 @@ class _TrackedFileAnchor:
     path: Path
     digest: str
     content: bytes
-    source_file: RootedSourceFile | _FrozenSourceFile
+    source_file: RootedSourceFile | _FrozenSourceFile | None
+    ordinary_inputs: _OrdinaryCapabilityInputs | None = None
 
     @classmethod
     def capture(
         cls,
         path: Path,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> _TrackedFileAnchor:
-        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             raise TypeError("tracked source requires rooted source authority")
+        if type(source_authority) is _OrdinaryCapabilityInputs:
+            from hashlib import sha256
+            content = source_authority.read_data(path.relative_to(source_authority.root_path).as_posix())
+            return cls(path, sha256(content).hexdigest(), content, None, source_authority)
         source = source_authority.bind_path(path)
         return cls(
             path=source.path,
@@ -221,6 +238,11 @@ class _TrackedFileAnchor:
         )
 
     def is_current(self) -> bool:
+        if self.ordinary_inputs is not None:
+            try:
+                return self.ordinary_inputs.read_data(self.path.relative_to(self.ordinary_inputs.root_path).as_posix()) == self.content
+            except (OSError, RuntimeError, ValueError):
+                return False
         return (
             self.source_file.is_current()
             and self.source_file.path == self.path
@@ -241,7 +263,7 @@ class _ApplicationCheckoutIdentity:
         cls,
         factory_source: _PathIdentity,
         approved_roots: _PathIdentity,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
         *,
         frozen_helper_graph: _RuntimeModuleCodeBinding | None = None,
     ) -> _ApplicationCheckoutIdentity:
@@ -881,7 +903,7 @@ class _ModuleSourceCodeAnchor:
         *,
         module_name: str,
         path: Path,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
         named_defaults: dict[str, object] | None = None,
     ) -> _ModuleSourceCodeAnchor:
         source = _TrackedFileAnchor.capture(path, source_authority)
@@ -995,7 +1017,7 @@ class _PendingModuleSourceCodeAnchor:
         *,
         module_name: str,
         path: Path,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
         named_defaults: dict[str, object] | None = None,
     ) -> _PendingModuleSourceCodeAnchor:
         if type(module_name) is not str or not module_name:
@@ -1600,7 +1622,7 @@ class _CoreMatcherFactoryBinding:
     def capture(
         cls,
         value: object,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
         *,
         frozen_helper_anchor: _ModuleSourceCodeAnchor | None = None,
     ) -> _CoreMatcherFactoryBinding:
@@ -1623,6 +1645,9 @@ class _CoreMatcherFactoryBinding:
             raise RuntimeError("Core matcher factory module binding is foreign")
         source_path = _absolute_locator(function.__code__.co_filename)
         module_path = _absolute_locator(getattr(module, "__file__", None))
+        if type(source_authority) is _OrdinaryCapabilityInputs:
+            source_authority.candidate.require_module(module)
+            source_path = module_path
         if source_path is None or module_path is None or source_path != module_path:
             raise RuntimeError("Core matcher factory source identity is foreign")
         kwdefaults = function.__kwdefaults__
@@ -1694,6 +1719,8 @@ class _CoreMatcherFactoryBinding:
         function = self.function
         source_path = _absolute_locator(function.__code__.co_filename)
         module_path = _absolute_locator(getattr(self.module, "__file__", None))
+        if type(self.source.source_authority) is _OrdinaryCapabilityInputs:
+            source_path = module_path
         if source_path is None or module_path is None:
             return False
         return (
@@ -1776,7 +1803,7 @@ class _CoreTypeBinding:
         value: type[object],
         *,
         host_name: str | None,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> _CoreTypeBinding:
         if type(value) is not type:
             raise RuntimeError("Core constructor binding must be a class")
@@ -1823,7 +1850,7 @@ class _CoreTypeBinding:
 class _SourceAnchorGraph:
     """Composition-time source graph retained under one rooted authority."""
 
-    source_authority: RootedSourceAuthority | _FrozenCapabilitySource
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs
     retrieval_approved_roots_anchor: _TrackedFileAnchor
     retrieval_validation_module_anchor: _PendingModuleSourceCodeAnchor
     retrieval_runtime_module_anchors: tuple[
@@ -1839,9 +1866,9 @@ class _SourceAnchorGraph:
     @classmethod
     def capture(
         cls,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> _SourceAnchorGraph:
-        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             raise TypeError("source graph requires RootedSourceAuthority")
         source_authority.reprove()
         root = source_authority.root_path
@@ -1992,10 +2019,10 @@ class _CoreRetrievalValidationBinding:
         value: object,
         release_type: object,
         *,
-        validator_anchor: _ModuleSourceCodeAnchor,
+        validator_anchor: _ModuleSourceCodeAnchor | None,
         approved_roots_anchor: _TrackedFileAnchor,
         core_graphs: tuple[_RuntimeModuleCodeBinding, ...],
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> _CoreRetrievalValidationBinding:
         if type(value) is not FunctionType:
             raise RuntimeError("Core Gate C recomputation must be a function")
@@ -2011,6 +2038,9 @@ class _CoreRetrievalValidationBinding:
             raise RuntimeError("Core Gate C module binding is foreign")
         source_path = _absolute_locator(function.__code__.co_filename)
         module_path = _absolute_locator(getattr(module, "__file__", None))
+        if type(source_authority) is _OrdinaryCapabilityInputs:
+            source_authority.candidate.require_module(module)
+            source_path = module_path
         if source_path is None or module_path is None or source_path != module_path:
             raise RuntimeError("Core Gate C source identity is foreign")
         kwdefaults = function.__kwdefaults__
@@ -2066,7 +2096,7 @@ class _CoreRetrievalValidationBinding:
             validator_graph=_RuntimeModuleCodeBinding.capture(
                 module,
                 validator_anchor,
-            ),
+            ) if validator_anchor is not None else None,
             core_graphs=core_graphs,
             release_type=_CoreTypeBinding.capture(
                 cast(type[object], release_type),
@@ -2109,6 +2139,9 @@ class _CoreRetrievalValidationBinding:
         function = self.function
         source_path = _absolute_locator(function.__code__.co_filename)
         module_path = _absolute_locator(getattr(self.module, "__file__", None))
+        ordinary = type(self.source.source_authority) is _OrdinaryCapabilityInputs
+        if ordinary:
+            source_path = module_path
         if source_path is None or module_path is None:
             return False
         return (
@@ -2139,13 +2172,13 @@ class _CoreRetrievalValidationBinding:
             == self.closure_snapshot
             and source_path == self.source.path
             and module_path == self.source.path
-            and self.source.path == self.validator_graph.anchor.source.path
+            and (ordinary or self.source.path == self.validator_graph.anchor.source.path)
             and self.approved_roots.path
             == self.approved_roots_anchor.path
             and self.source.is_current()
             and self.approved_roots.is_current()
             and self.approved_roots_anchor.is_current()
-            and self.validator_graph.is_current()
+            and (ordinary or self.validator_graph.is_current())
             and all(graph.is_current() for graph in self.core_graphs)
             and self.release_type.is_current()
             and self.expectation_type.is_current()
@@ -2259,7 +2292,7 @@ class _RetrievalCheckoutIdentity:
     def capture(
         cls,
         binding: _CoreRetrievalValidationBinding,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> _RetrievalCheckoutIdentity:
         host_path = _absolute_locator(__file__)
         if host_path is None:
@@ -2332,7 +2365,7 @@ def _load_retrieval_validation_binding(
     validator_anchor: _ModuleSourceCodeAnchor,
     approved_roots_anchor: _TrackedFileAnchor,
     core_graphs: tuple[_RuntimeModuleCodeBinding, ...],
-    source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
 ) -> tuple[_CoreRetrievalValidationBinding, _RetrievalCheckoutIdentity]:
     """Late-bind validator objects under injected tracked-source anchors."""
 
@@ -2378,9 +2411,9 @@ class _RealGateCExecution:
             _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
         ],
         approved_roots_anchor: _TrackedFileAnchor,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> None:
-        if type(validation_module_anchor) is not _PendingModuleSourceCodeAnchor:
+        if type(source_authority) is not _OrdinaryCapabilityInputs and type(validation_module_anchor) is not _PendingModuleSourceCodeAnchor:
             raise TypeError("Gate C execution requires pending validation source")
         if type(module_anchors) is not tuple or any(
             type(anchor) not in {
@@ -2392,7 +2425,7 @@ class _RealGateCExecution:
             raise TypeError("Gate C execution requires module source anchors")
         if type(approved_roots_anchor) is not _TrackedFileAnchor:
             raise TypeError("Gate C execution requires approved roots source")
-        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             raise TypeError("Gate C execution requires rooted source authority")
         self.__validation_module_seed = validation_module_anchor
         self.__module_anchor_seeds = module_anchors
@@ -2403,7 +2436,7 @@ class _RealGateCExecution:
         self.__validation_binding: _CoreRetrievalValidationBinding | None = None
         self.__checkout_identity: _RetrievalCheckoutIdentity | None = None
 
-    def _input_source(self) -> RootedSourceAuthority | _FrozenCapabilitySource:
+    def _input_source(self) -> RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs:
         return self.__source_authority
 
     def _capture_binding(
@@ -2413,6 +2446,13 @@ class _RealGateCExecution:
 
         with self.__materialize_lock:
             with self.__source_authority.proof_window():
+                if type(self.__source_authority) is _OrdinaryCapabilityInputs:
+                    binding, checkout = _load_retrieval_validation_binding(
+                        validator_anchor=None, approved_roots_anchor=self.__approved_roots_anchor,
+                        core_graphs=(), source_authority=self.__source_authority)
+                    if not binding.is_current() or not checkout.is_current():
+                        raise RuntimeError("ordinary Gate C binding changed")
+                    return binding, checkout
                 binding = self.__validation_binding
                 checkout = self.__checkout_identity
                 anchors = self.__module_anchors
@@ -2556,6 +2596,7 @@ class _CoreGateDBinding:
     run_result_type: type[object]
     publication_result_type: type[object]
     publication_bindings: tuple[object, ...]
+    ordinary_modules: tuple[ModuleType, ...] = ()
 
     @classmethod
     def capture(
@@ -2564,12 +2605,13 @@ class _CoreGateDBinding:
         module_anchors: tuple[_ModuleSourceCodeAnchor, ...],
         contract_anchor: _TrackedFileAnchor,
     ) -> _CoreGateDBinding:
+        ordinary = contract_anchor.ordinary_inputs
         expected_names = (
             ("capability_frozen_inputs",) + _GATE_D_MODULE_NAMES
             if _anchor_frozen_source(contract_anchor) is not None
             else _GATE_D_MODULE_NAMES
         )
-        if (
+        if ordinary is None and (
             type(module_anchors) is not tuple
             or len(module_anchors) != len(expected_names)
             or any(
@@ -2579,15 +2621,16 @@ class _CoreGateDBinding:
             or type(contract_anchor) is not _TrackedFileAnchor
         ):
             raise TypeError("Gate D capture requires rooted source anchors")
-        if tuple(anchor.module_name for anchor in module_anchors) != expected_names:
+        if ordinary is None and tuple(anchor.module_name for anchor in module_anchors) != expected_names:
             raise TypeError("Gate D capture requires its complete ordered source graph")
-        modules = tuple(
-            importlib.import_module(anchor.module_name)
-            for anchor in module_anchors
-        )
+        modules = tuple(importlib.import_module(name) for name in _GATE_D_MODULE_NAMES) if ordinary is not None else tuple(
+            importlib.import_module(anchor.module_name) for anchor in module_anchors)
+        if ordinary is not None:
+            for module in modules:
+                ordinary.candidate.require_module(module)
         if any(type(module) is not ModuleType for module in modules):
             raise RuntimeError("Gate D Core modules must be canonical modules")
-        graphs = tuple(
+        graphs = () if ordinary is not None else tuple(
             _RuntimeModuleCodeBinding.capture(
                 cast(ModuleType, module),
                 anchor,
@@ -2658,12 +2701,19 @@ class _CoreGateDBinding:
             publication_bindings=cast(
                 tuple[object, ...], publication_bindings
             ),
+            ordinary_modules=modules if ordinary is not None else (),
         )
         if not binding.is_current():
             raise RuntimeError("Gate D Core owner graph is not current")
         return binding
 
     def is_current(self) -> bool:
+        if self.ordinary_modules:
+            try:
+                for module in self.ordinary_modules:
+                    self.contract_anchor.ordinary_inputs.candidate.require_module(module)
+            except (OSError, RuntimeError, ValueError):
+                return False
         return (
             self.contract_anchor.is_current()
             and all(graph.is_current() for graph in self.graphs)
@@ -2695,7 +2745,7 @@ class _CoreGateDBinding:
             is self.publication_bindings
             and _gate_d_publication_bindings_are_canonical(
                 gate_module=self.gate_module,
-                retrieval_module=self.graphs[-2].module,
+                retrieval_module=self.ordinary_modules[-2] if self.ordinary_modules else self.graphs[-2].module,
                 bindings=self.publication_bindings,
             )
         )
@@ -2989,7 +3039,7 @@ class _RealGateDExecution:
             _ModuleSourceCodeAnchor | _PendingModuleSourceCodeAnchor, ...
         ],
         contract_anchor: _TrackedFileAnchor,
-        source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+        source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     ) -> None:
         if type(module_anchors) is not tuple or any(
             type(anchor) not in {
@@ -3001,7 +3051,7 @@ class _RealGateDExecution:
             raise TypeError("Gate D execution requires module source anchors")
         if type(contract_anchor) is not _TrackedFileAnchor:
             raise TypeError("Gate D execution requires a contract source anchor")
-        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
+        if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             raise TypeError("Gate D execution requires rooted source authority")
         self.__module_anchor_seeds = module_anchors
         self.__module_anchors: tuple[_ModuleSourceCodeAnchor, ...] | None = None
@@ -3017,6 +3067,9 @@ class _RealGateDExecution:
         source = _anchor_frozen_source(self.__contract_anchor)
         return nullcontext() if source is None else source.operation()
 
+    def _owns_ordinary_cleanup(self) -> bool:
+        return self.__contract_anchor.ordinary_inputs is not None
+
     def require_worker_wait_allowed(self) -> None:
         source = _anchor_frozen_source(self.__contract_anchor)
         if source is not None:
@@ -3031,6 +3084,8 @@ class _RealGateDExecution:
 
         with self.__materialize_lock:
             with self.__source_authority.proof_window():
+                if type(self.__source_authority) is _OrdinaryCapabilityInputs:
+                    return _CoreGateDBinding.capture(module_anchors=(), contract_anchor=self.__contract_anchor)
                 anchors = self.__module_anchors
                 if anchors is None:
                     anchors = tuple(
@@ -3615,8 +3670,8 @@ class CapabilityHost(metaclass=_publication_reference_type):
             retrieval=retrieval.display,
         )
 
-    def _bind_frozen_input_waits(self, mint: object, source: _FrozenCapabilitySource) -> None:
-        if mint is not _COMPOSITION_MINT_IDENTITY or type(source) is not _FrozenCapabilitySource:
+    def _bind_frozen_input_waits(self, mint: object, source: _FrozenCapabilitySource | _OrdinaryCapabilityInputs) -> None:
+        if mint is not _COMPOSITION_MINT_IDENTITY or type(source) not in (_FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             raise PermissionError("input wait guards require frozen composition")
         if self.__matcher_handoff.generation or self.__retrieval_handoff.generation or self.__retrieval_gate_c_owner_minted:
             raise RuntimeError("input wait guards must precede owner handoff")
@@ -3630,6 +3685,24 @@ class CapabilityHost(metaclass=_publication_reference_type):
 
         with self.__lock:
             return self.__matcher_handoff
+
+    def _gate_c_diagnostics(self) -> dict[str, object]:
+        """Read-only integration facts; no capability or publication token escapes."""
+        with self.__lock:
+            manifest = self.__retrieval_base_manifest
+            capability = self.__retrieval_publisher.snapshot()
+            facts: dict[str, object] = {
+                "context_available": capability.context.available,
+                "fuzzy_core_available": capability.fuzzy_core.available,
+                "fuzzy_available": self.__retrieval_handoff.display.fuzzy_available,
+            }
+            if manifest is not None:
+                facts.update({name: getattr(manifest, name) for name in
+                              ("retrieval_artifact_digest", "retrieval_build_digest", "fixture_digest", "evaluator_digest")})
+                for name in ("context_cohorts", "fuzzy_core_cohorts"):
+                    facts[name] = [{"cohort_id": row.cohort_id, "cohort_digest": row.cohort_digest,
+                                    "passed": row.passed} for row in getattr(manifest, name)]
+            return facts
 
     def _run_if_matcher_handoff_current(
         self,
@@ -4327,7 +4400,7 @@ class _MatcherValidationOwner:
         include_full: bool,
     ) -> MatcherHandoffSnapshot:
         source = self.__factory_binding.source.source_authority
-        if type(source) is _FrozenCapabilitySource:
+        if type(source) in (_FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             try:
                 with source.operation():
                     return self.__validate_in_operation(
@@ -4437,7 +4510,7 @@ class _RetrievalGateCValidationOwner:
     ) -> RetrievalHandoffSnapshot:
         """Recompute Gate C and swap only one fully validated Core graph."""
         source = self.__execution._input_source()
-        if type(source) is _FrozenCapabilitySource:
+        if type(source) in (_FrozenCapabilitySource, _OrdinaryCapabilityInputs):
             try:
                 with source.operation():
                     return self.__validate_in_operation(
@@ -4615,7 +4688,7 @@ class _RetrievalGateDOwner(metaclass=_publication_reference_type):
                     "evaluated_at_utc": evaluated_at_utc,
                 },
                 name=f"LocalCAT-GateD-{started.epoch}",
-                daemon=True,
+                daemon=not (type(self.__execution) is _RealGateDExecution and self.__execution._owns_ordinary_cleanup()),
             )
             self.__thread = thread
             thread.start()
@@ -4947,7 +5020,7 @@ class CapabilityHostComposition:
         RetrievalGateCValidationOwnerPort | None
     ) = None
     retrieval_gate_d_owner: RetrievalGateDOwnerPort | None = None
-    _frozen_input_source: _FrozenCapabilitySource | None = None
+    _frozen_input_source: _FrozenCapabilitySource | _OrdinaryCapabilityInputs | None = None
 
     def _close_frozen_inputs(self) -> None:
         if self._frozen_input_source is not None:
@@ -4982,13 +5055,13 @@ class CapabilityHostComposition:
 
 def compose_capability_host(
     *,
-    source_authority: RootedSourceAuthority | _FrozenCapabilitySource,
+    source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
     evaluated_at_utc: datetime,
     gate_d_attestation_root: Path | None = None,
 ) -> CapabilityHostComposition:
     """Create the application-owned host and its private validation control."""
 
-    if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource):
+    if type(source_authority) not in (RootedSourceAuthority, _FrozenCapabilitySource, _OrdinaryCapabilityInputs):
         raise TypeError("capability host requires RootedSourceAuthority")
     if getattr(sys, "frozen", False) and type(source_authority) is RootedSourceAuthority:
         raise RuntimeError("frozen Host requires trusted source handoff")
@@ -5030,6 +5103,37 @@ def compose_capability_host(
                 execution=gate_d_execution,
             ),
         )
+
+
+def compose_ordinary_capability_host(
+    *, evaluated_at_utc: datetime, gate_d_attestation_root: Path | None = None,
+) -> CapabilityHostComposition:
+    """Select ordinary loading facts; keep the existing publication owners."""
+    inputs = _OrdinaryCapabilityInputs()
+    try:
+        with inputs.proof_window():
+            matcher = _CoreMatcherFactoryBinding.capture(build_validated_matcher_v1, inputs)
+            checkout = _ApplicationCheckoutIdentity.capture(matcher.source, matcher.approved_roots, inputs)
+            gate_c = _RealGateCExecution(
+                validation_module_anchor=None, module_anchors=(),
+                approved_roots_anchor=_TrackedFileAnchor.capture(inputs.root_path / _RETRIEVAL_APPROVED_ROOTS_RELATIVE_PATH, inputs),
+                source_authority=inputs)
+            gate_d = _RealGateDExecution(
+                module_anchors=(), source_authority=inputs,
+                contract_anchor=_TrackedFileAnchor.capture(inputs.root_path / _GATE_D_CONTRACT_RELATIVE_PATH, inputs))
+            host = CapabilityHost(evaluated_at_utc=evaluated_at_utc)
+            host._bind_frozen_input_waits(_COMPOSITION_MINT_IDENTITY, inputs)
+            return CapabilityHostComposition(
+                host=host, _frozen_input_source=inputs,
+                matcher_validation_owner=host._composition_matcher_owner(
+                    _COMPOSITION_MINT_IDENTITY, checkout_identity=checkout, factory_binding=matcher),
+                retrieval_gate_c_validation_owner=host._composition_gate_c_owner(
+                    _COMPOSITION_MINT_IDENTITY, execution=gate_c),
+                retrieval_gate_d_owner=host._composition_gate_d_owner(
+                    _COMPOSITION_MINT_IDENTITY, attestation_root=gate_d_attestation_root, execution=gate_d))
+    except BaseException:
+        inputs.close()
+        raise
 
 
 def compose_frozen_capability_host(

@@ -300,3 +300,110 @@ def _compose_frozen_capability_source(authority: object) -> _FrozenCapabilitySou
 
 def _test_frozen_capability_source(entries: tuple[tuple[str, bytes], ...], root: Path, *, _scheduler: object | None = None) -> _FrozenCapabilitySource:
     return _FrozenCapabilitySource(None, _key=_CONSTRUCTION_KEY, _test_entries=entries, _test_root=root, _test_scheduler=_scheduler)
+
+
+class _OrdinaryCapabilityInputs:
+    """Host operation scope for the ordinary Core adapter, without source files.
+
+    One operation retains its owner across run/persist/publish windows. Close
+    revokes that owner; the background transport observes revocation and reaps
+    its child. No native scheduler or UI-thread join is needed.
+    """
+
+    def __init__(self) -> None:
+        from frozen_candidate import running_candidate
+        self.candidate = running_candidate()
+        self.root_path = self.candidate.bundle_root
+        self.__local = local()
+        self.__operation_lock = Lock()
+        self.__owner_lock = Lock()
+        self.__owner = None
+        self.__closed = False
+
+    def _require_open(self) -> None:
+        if self.__closed:
+            raise RuntimeError("ordinary Host inputs were revoked")
+
+    @contextmanager
+    def operation(self):
+        self._require_open()
+        if getattr(self.__local, "owner", None) is not None:
+            yield
+            return
+        if not self.__operation_lock.acquire(blocking=False):
+            raise RuntimeError("ordinary Host input operation is already active")
+        owner = None
+        try:
+            owner = _inputs._compose_ordinary_input_owner()
+            with self.__owner_lock:
+                self._require_open()
+                self.__owner = owner
+            self.__local.owner = owner
+            yield
+        finally:
+            self.__local.owner = None
+            with self.__owner_lock:
+                self.__owner = None
+            if owner is not None:
+                owner.close()
+            self.__operation_lock.release()
+
+    @contextmanager
+    def input_session(self):
+        with self.operation():
+            with self.__local.owner.open_session() as session:
+                self.__local.session = session
+                try:
+                    self._require_open()
+                    yield session
+                    if not session._publication_completed():
+                        self._require_open()
+                except BaseException:
+                    session._abort()
+                    raise
+                finally:
+                    self.__local.session = None
+
+    @contextmanager
+    def proof_window(self):
+        # Host binding work shares the operation, not an overlapping session.
+        with self.operation():
+            self.reprove()
+            yield
+            self.reprove()
+
+    def reprove(self) -> None:
+        self._require_open()
+        owner = getattr(self.__local, "owner", None)
+        if owner is not None:
+            owner._require_live()
+
+    def read_data(self, relative: str) -> bytes:
+        self._require_open()
+        session = getattr(self.__local, "session", None)
+        if session is not None:
+            return session.read_bytes(relative)
+        with self.input_session() as current:
+            return current.read_bytes(relative)
+
+    def check_locator(self, path: Path) -> None:
+        self.reprove()
+        relative = path.relative_to(self.root_path).as_posix()
+        if relative == ".":
+            return
+        if relative.endswith(".py"):
+            import importlib
+            self.candidate.require_module(importlib.import_module(relative[:-3].replace("/", ".")))
+        else:
+            self.read_data(relative)
+
+    def require_worker_wait_allowed(self) -> None:
+        from threading import get_ident, main_thread
+        if get_ident() == main_thread().ident:
+            raise RuntimeError("ordinary worker wait cannot block the UI thread")
+
+    def close(self) -> None:
+        with self.__owner_lock:
+            self.__closed = True
+            if self.__owner is not None:
+                self.__owner._revoke_publication()

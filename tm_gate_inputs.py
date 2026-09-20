@@ -7,6 +7,7 @@ explicit frozen test adapter remains provisional and cannot attest a producer.
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
+import hashlib
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import sys
@@ -240,13 +241,65 @@ class _FrozenInputAdapter:
 
 
 @final
+class _OrdinaryInputAdapter:
+    """Installed build digests plus actual data; no source-byte emulation."""
+
+    def __init__(self) -> None:
+        from frozen_candidate import running_candidate
+        self.candidate = running_candidate()
+        self.execution_digest = _ordinary_execution_digest(self.candidate)
+        self.closed = False
+        self.consumed_data: set[str] = set()
+
+    def is_production(self) -> bool:
+        return True
+
+    def reprove(self) -> None:
+        if self.closed:
+            raise RuntimeError("ordinary input adapter is closed")
+
+    @contextmanager
+    def proof_window(self) -> Iterator[None]:
+        self.reprove()
+        self.candidate.recheck_entry()
+        self.consumed_data.clear()
+        try:
+            yield
+        finally:
+            self.reprove()
+            self.candidate.recheck_entry()
+            for relative in self.consumed_data:
+                self.candidate.read_data(relative)
+
+    def read_bytes(self, relative: str, domain: object | None) -> bytes:
+        self.reprove()
+        if domain is not None:
+            raise ValueError("ordinary inputs cannot use source domains")
+        content = self.candidate.read_data(relative)
+        self.consumed_data.add(relative)
+        return content
+
+    def input_digest(self, relative: str, domain: object | None) -> str:
+        self.reprove()
+        if domain is not None:
+            raise ValueError("ordinary inputs cannot use source domains")
+        digest = self.candidate.input_digest(relative)
+        if self.candidate.is_data(relative):
+            self.consumed_data.add(relative)
+        return digest
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@final
 class _GateInputOwner(metaclass=_publication_reference_type):
     """One closed adapter/epoch, with strictly sequential consumer windows."""
 
     __slots__ = ("__adapter", "__thread", "__native_closed", "__publication_lifetime", "__retained", "__epoch", "__window", "__window_started", "__weakref__")  # pyright: ignore[reportUninitializedInstanceVariable]
 
-    def __init__(self, adapter: _SourceInputAdapter | _TestFrozenInputAdapter | _FrozenInputAdapter, *, _key: object, retained: bool = False) -> None:
-        if _key is not _FACTORY_KEY or type(adapter) not in (_SourceInputAdapter, _TestFrozenInputAdapter, _FrozenInputAdapter):
+    def __init__(self, adapter: _SourceInputAdapter | _TestFrozenInputAdapter | _FrozenInputAdapter | _OrdinaryInputAdapter, *, _key: object, retained: bool = False) -> None:
+        if _key is not _FACTORY_KEY or type(adapter) not in (_SourceInputAdapter, _TestFrozenInputAdapter, _FrozenInputAdapter, _OrdinaryInputAdapter):
             raise TypeError("input owner requires a closed Core composition adapter")
         self.__adapter = adapter
         self.__thread = get_ident()
@@ -270,9 +323,9 @@ class _GateInputOwner(metaclass=_publication_reference_type):
 
     def _require_production(self) -> None:
         self._require_live()
-        if type(self.__adapter) not in (_SourceInputAdapter, _FrozenInputAdapter):
+        if type(self.__adapter) not in (_SourceInputAdapter, _FrozenInputAdapter, _OrdinaryInputAdapter):
             raise TypeError("production inputs require internal authority composition")
-        if not cast(_SourceInputAdapter | _FrozenInputAdapter, self.__adapter).is_production():
+        if not cast(_SourceInputAdapter | _FrozenInputAdapter | _OrdinaryInputAdapter, self.__adapter).is_production():
             raise TypeError("production inputs require internal authority composition")
 
     @property
@@ -282,6 +335,8 @@ class _GateInputOwner(metaclass=_publication_reference_type):
             return "test-frozen"
         if type(self.__adapter) is _FrozenInputAdapter:
             return "frozen-production"
+        if type(self.__adapter) is _OrdinaryInputAdapter:
+            return "ordinary-production"
         return "source-production" if self.__adapter.is_production() else "source-borrowed"
 
     def _is_retained(self) -> bool:
@@ -309,6 +364,20 @@ class _GateInputOwner(metaclass=_publication_reference_type):
     def _read(self, relative: str, domain: object | None) -> bytes:
         self._require_live()
         return self.__adapter.read_bytes(relative, domain)
+
+    def _digest(self, relative: str, domain: object | None) -> str:
+        self._require_live()
+        if type(self.__adapter) is _OrdinaryInputAdapter:
+            return self.__adapter.input_digest(relative, domain)
+        return hashlib.sha256(self.__adapter.read_bytes(relative, domain)).hexdigest()
+
+    def _ordinary_candidate(self):
+        self._require_live()
+        return self.__adapter.candidate if type(self.__adapter) is _OrdinaryInputAdapter else None
+
+    def _ordinary_execution_digest(self) -> str | None:
+        self._require_live()
+        return self.__adapter.execution_digest if type(self.__adapter) is _OrdinaryInputAdapter else None
 
     def _start_window(self, stack: ExitStack) -> tuple[object, object]:
         self._require_live()
@@ -392,6 +461,9 @@ class _GateInputReference:
 
     def _read(self) -> bytes:
         return self.__session._read(self.__relative, self.__domain)
+
+    def _digest(self) -> str:
+        return self.__session._digest(self.__relative, self.__domain)
 
     def _belongs_to(self, session: _GateInputSession) -> bool:
         self.__session._require_live()
@@ -503,6 +575,21 @@ class _GateInputSession(metaclass=_publication_reference_type):
 
     def read_bytes(self, relative_id: str) -> bytes:
         return self._read(relative_id, None)
+
+    def _digest(self, relative_id: str, domain: object | None) -> str:
+        self._require_live()
+        relative = _relative_input_id(relative_id)
+        digest = self.__owner._digest(relative, domain)
+        self.__ids.add(relative)
+        return digest
+
+    def _ordinary_candidate(self):
+        self._require_live()
+        return self.__owner._ordinary_candidate()
+
+    def _ordinary_execution_digest(self) -> str | None:
+        self._require_live()
+        return self.__owner._ordinary_execution_digest()
 
     def _read(self, relative_id: str, domain: object | None) -> bytes:
         self._require_live()
@@ -647,6 +734,34 @@ def _compose_frozen_input_owner(authority: object) -> _GateInputOwner:
     return _GateInputOwner(_FrozenInputAdapter(authority, _key=_FACTORY_KEY), _key=_FACTORY_KEY)
 
 
+def _compose_ordinary_input_owner() -> _GateInputOwner:
+    return _GateInputOwner(_OrdinaryInputAdapter(), _key=_FACTORY_KEY)
+
+
+def _ordinary_execution_digest(candidate) -> str:
+    """Core's finite compatibility projection; no whole-EXE or UI identity."""
+    import json
+    import platform
+    import sqlite3
+
+    facts = candidate.execution_facts()
+    expected = {"python", "sqlite", "pyinstaller", "collection", "optimization", "worker_inputs", "runtime_files"}
+    workers = {"frozen_candidate.py", "frozen_ordinary_entry.py", "frozen_worker_entry.py", "frozen_worker_transport.py"}
+    if (set(facts) != expected or facts["python"] != platform.python_version()
+            or facts["sqlite"] != sqlite3.sqlite_version or facts["pyinstaller"] != "6.22.2"
+            or facts["collection"] != "pyz" or facts["optimization"] != sys.flags.optimize
+            or set(facts["worker_inputs"]) != workers
+            or {Path(name).name for name in facts["runtime_files"]} != {"python314.dll", "sqlite3.dll", "_sqlite3.pyd"}):
+        raise RuntimeError("ordinary execution facts do not match Core's supported runtime")
+    for digest in (*facts["worker_inputs"].values(), *facts["runtime_files"].values()):
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise RuntimeError("invalid Core execution input digest")
+    for relative, digest in facts["runtime_files"].items():
+        if hashlib.sha256(candidate._verify_file(relative)).hexdigest() != digest:
+            raise RuntimeError("Core runtime differs from the build facts")
+    return hashlib.sha256(json.dumps(facts, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
 @contextmanager
 def _compose_test_frozen_input_owner(entries: tuple[tuple[str, bytes], ...], *, terminal_results: tuple[bool, ...] = ()) -> Iterator[_GateInputOwner]:
     adapter = _TestFrozenInputAdapter(entries, terminal_results, _key=_TEST_FROZEN_KEY)
@@ -702,6 +817,13 @@ def _read_input_bytes(value: _InputFile) -> bytes:
     with _open_source_input_session(path.parent) as session:
         content = session.read_bytes(path.name)
     return content
+
+
+def _input_digest(value: _InputFile) -> str:
+    """Digest facts never masquerade as readable source content."""
+    if type(value) is _GateInputReference:
+        return value._digest()
+    return hashlib.sha256(_read_input_bytes(value)).hexdigest()
 
 
 def _read_input_text(value: _InputFile) -> str:
