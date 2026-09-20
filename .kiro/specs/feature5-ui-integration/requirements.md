@@ -22,7 +22,7 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 ### Windows Compatibility Amendment WA-07
 
-**普通frozen修订待人工审批**：本轮替换第1、2、5条的W3专属来源/前置要求，不改变已完成source/R4成果、数据保护、Core authority或Requirements 1–9的产品语义。
+**普通frozen修订范围**：第1、2、5条定义普通frozen的来源和前置要求；source/R4成果保留原范围，数据保护、Core authority及Requirements 1–9的产品语义不变。
 
 1. Windows source继续先由platform factory建立ADR-020/021 rooted source、lock与private-proof ports，再组合CapabilityHost、Controller与业务graph。普通frozen按ADR-028从受控构建关联的实际候选进入既有platform/Host组合，检查入口、必要owner输入及加载来源，不要求native entry或完整Boot TCB；缺失或不兼容输入只产生安全startup/capability failure，不伪装source/native authority。
 2. source CapabilityHost保留既有rooted source消费；普通packaged Host消费Core拥有的有限输入/session合同和真实Gate runner，复用原publisher、generation、通知与取消/提交协议。构建清单、旁置源码、`sys.frozen`或UI运行状态均不能自行铸造Gate资格；不以完整AST图、PYZ逐项代码比较或新profile框架作为普通路径的默认前置。

@@ -1,6 +1,6 @@
 # 实施计划
 
-> **普通frozen修订待人工审批**：3.6b与6.6b/7.4b/7.6b/9.2a按ADR-028重排为实际Host贯通、设备资格及同候选消费验收。本轮不授权实现。既有[x]、3.6a正文与Implementation Notes保留source/R4历史范围，其native/source-only接线和原编号依赖不作为普通前置，也不改签为普通候选PASS。
+> **普通frozen任务范围**：3.6b与6.6b/7.4b/7.6b/9.2a分别承担实际Host贯通、设备资格及同候选消费验收。3.6a保留source/R4历史范围，其native/source-only接线和原编号依赖不作为普通前置。
 
 > 本计划只拥有 Feature 5 Core 到当前段 TM suggestions 的跨层闭环与 macOS 入口。owner 指 Spec、task checkbox、代码边界与验收权威，不指 Agent 或 thread；同一 thread 可以依次执行不同簇，但必须重新载入 owning Spec。独立 Qt maintenance、原 Qt Requirement 3 单 JSON 搜索和 Requirement 7 术语 CRUD/管理入口分别在其 owning Spec 记账，不得用本计划的 checkbox 代替。
 
@@ -141,7 +141,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.6, ADR-022, windows-platform-enablement 1.6, tm-storage-retrieval-index 9.6c, tm-storage-retrieval-index 9.6d_
 
-- [ ] 3.6b 贯通普通packaged Host与后台生命周期（待人工审批）
+- [ ] 3.6b 贯通普通packaged Host与后台生命周期
   - 在既有Host composition/Core binding入口消费平台候选关联与Core 9.6e输入session，固定真实Matcher/Gate C/Gate D端口；只解除source AST/原始`.py`/native authority接缝，不复制Host、publisher或新建profile体系。
   - 复用原Gate runner、publisher、lifecycle reservation、generation/通知和Core引用提交计划；oracle/Gate D始终贯通当前session，DTO不携authority或回读ambient source。UI只见原Controller安全投影，候选id不成为资格或持久key。
   - close/取消先按原publication短锁决定胜负，再在锁外安排parent transport有界停止/回收child与端点；Qt只请求/接收异步结果，等待/异常/重入无死锁。取消先赢零安装，合法commit先赢完整记录完成，过期通知不得授权新generation。
@@ -325,7 +325,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.5a, 6.6, ADR-021_
 
-- [ ] 6.6b 在普通候选闭合Windows设备Fuzzy资格交互（待人工审批）
+- [ ] 6.6b 在普通候选闭合Windows设备Fuzzy资格交互
   - 在完成7.2的真实候选消费Core 9.6b的正式C/D与资格owner，验证有效本机资格在进程重启后恢复；缺失、损坏、SID/ACL/MIC异常或检索兼容失配时仅关闭Fuzzy，Exact/Context保持各自Gate，启动不自动100k。
   - 用户显式重验经真实same-EXE worker、原publisher与queued generation刷新卡片；失败/取消不由`RUNNING/SUCCEEDED`或JSON自报结果授权。普通候选关联与持久兼容身份分开，纯UI/头像变更不无条件使检索资格失效，相关Core/runtime/计量变化必须重验。
   - 完成时，真实Qt操作、实际建议消费与Core receipt/资格事实一致，恢复、失配、显式重验和取消胜负均有同候选观察；该结果供平台7.3汇合，不等待平台7.3先通过。
@@ -394,7 +394,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.5a, 3.8a, 6.7a, 7.4_
 
-- [ ] 7.4b 验证普通packaged输入与生命周期失败投影（待人工审批）
+- [ ] 7.4b 验证普通packaged输入与生命周期失败投影
   - 实际候选覆盖缺失/错owner输入、加载路径或候选不一致、Core资格不可用、worker协议/超时/异常退出与取消/关闭；保留7.4a数据端口/资源局部失败语义，健康资源仍可用，不回落source authority或activated JSONL。
   - 完成时，Controller/Qt只显示稳定body-safe code，失败不伪装no-match、不暴露原始proof/path，也不把清理未完成报告为成功；不要求W3 Boot TCB/native对抗矩阵。
   - _Amendment: WA-07_
@@ -422,7 +422,7 @@
   - _Amendment: WA-07_
   - _Depends: 7.2a, 7.4a, windows-platform-enablement 3.7_
 
-- [ ] 7.6b 执行普通Windows候选的集成本地回归（待人工审批）
+- [ ] 7.6b 执行普通Windows候选的集成本地回归
   - 在同一普通`--onedir --windowed`候选、非仓库CWD与无开发环境依赖的用户环境，实际运行canonical/legacy/Trie/raw-speaker、TM表面、JSON/TXT与资源消费；Qt不因未装Excel/xlwings失败，旧Excel adapter条件依赖不扩大为frozen首发承诺。
   - source或构建烟测不代替真实Host/Qt/worker；未改变的底层owner深入单测可按实现、依赖、调用合同和关键运行条件不变且候选已消费的前提引用。共享代码变化触发受影响source/macOS/Linux回归，纯UI资源变化重验对应界面/加载路径，不自动重跑全部历史矩阵。
   - 完成时，实际能力与失败投影不回归、数据不离开本机，证据绑定当前候选并明列复用前提；不签发相邻Project/TMX owner或完整0.5.2结论。
@@ -462,7 +462,7 @@
   - _Requirements: 7.1, 7.2, 7.3, 7.4, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10_
   - _Boundary: Feature GO and Cross-Spec Revalidation_
 
-- [ ] 9.2a 汇合普通Windows候选的CapabilityHost/TM集成验收（待人工审批）
+- [ ] 9.2a 汇合普通Windows候选的CapabilityHost/TM集成验收
   - 在clean-user同候选完成Host启动、真实TM激活/重启恢复、FTS5查询、实际建议消费、设备资格与resource-local安全投影；证据绑定平台候选关联和Core兼容/执行事实，不要求原始`.py`或W3来源链。
   - 依平台Requirement 12核对候选必测、复用的未变owner证据与变更触发重验；任何缺项、失败或不成立的复用前提保持未完成。当前结果交WA-08产品journey与平台7.4汇总，不等待7.4先通过，也不单独宣布0.5.2完成。
   - _Amendment: WA-07_

@@ -71,10 +71,10 @@
 
 ### Windows Compatibility Amendment WA-07
 
-- **审批与ownership**：本节普通packaged合同及对应待办共同拟稿待人工审批，遵循ADR-009/011/013/020/021及其已采纳修订、ADR-028。Feature5/UI继续拥有Controller、CapabilityHost、resource/runtime projection与safe diagnostic；Windows Spec拥有构建、入口、候选关联与transport，TM Core拥有输入/session、资格及activation/private proof。无需新ADR、Steering层或public capability schema。
+- **ADR mapping与ownership**：遵循ADR-009/011/013/020/021及其已采纳修订、ADR-028。Feature5/UI继续拥有Controller、CapabilityHost、resource/runtime projection与safe diagnostic；Windows Spec拥有构建、入口、候选关联与transport，TM Core拥有输入/session、资格及activation/private proof；使用既有public capability schema。
 - **Early composition**：source继续由platform factory构造既有Windows ports再组合Host/Controller。普通packaged入口先取得Windows Design定义的当前候选及有限owner输入，再建立数据端口并进入同一Host/Controller图；允许标准PyInstaller模块装载，不要求native entry、E10或完整Boot TCB。来源不符或输入缺失时明确失败，不回落checkout、外部venv或旧native/source伪装。
 - **有限Host接缝**：在`capability_host.py`现有composition与Core binding构造入口选择source或普通packaged输入；`_SourceAnchorGraph`、完整AST/`_ModuleSourceCodeAnchor`与source `co_filename`证明留给既有source/W3路径。普通组合固定真实Core owner端口，检查其模块与受控构建声明/候选加载路径的关联；不从任意caller factory/callback构造授权，不复制整个Host，不把`capability_frozen_inputs.py`的native wrapper换名作为普通输入。Core负责解析有限输入与真实Gate执行，平台记录只关联输入和实际产物，不铸造capability。
-- **既有R4范围**：3.6a及Core 9.6c/9.6d的完成只涵盖原W3构建前consumer；其native/原线程调度事实与独立review保留原范围。新增待审3.6b复用已经闭合的publisher、lifecycle reservation、generation/通知及Core publication计划，替换普通输入与组合接缝；不重开算法或数据状态机。
+- **既有R4范围**：3.6a及Core 9.6c/9.6d的完成只涵盖原W3构建前consumer；其native/原线程调度事实与独立review保留原范围。已批准的新增3.6b复用已经闭合的publisher、lifecycle reservation、generation/通知及Core publication计划，替换普通输入与组合接缝；不重开算法或数据状态机。
 - **后台session与撤销**：普通后台Gate使用当前Core owner的新session，oracle/worker沿显式execution context传递；session、检索兼容身份由[Core Design](../tm-storage-retrieval-index/design.md)唯一定义，候选身份由[Windows Design](../windows-platform-enablement/design.md)唯一定义。Host只绑定自身generation与当前请求/owner，不持久化新的run身份，不从DTO或展示状态推断资格。close/取消先撤销publication并使等待者得到终态，再由平台parent transport停止并回收自己创建的child；Qt不阻塞join、不等待反向依赖主线程的worker。
 - **Lifecycle projection**：Windows activation/restart、nested private proof与resource lifecycle只经owner public ports进入；Qt状态不携raw ACL/FileId/path/proof，也不把frozen metadata提升为capability。
 - **Pending activation recovery**：Feature5只消费TM owner在existing-only W1下给出的body-free `RECOVERABLE` classification；真实Qt动作复用既有preflight/confirmation/worker，并仍由`activate_initial()`完成恢复与runtime原子换代。其他unavailable状态不取得恢复safe code或operation。

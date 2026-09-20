@@ -276,7 +276,7 @@ Cluster 0 治理/characterization
   - _Depends: 5.4_
 
 - [ ] 5.5a 闭合 frozen ResourcePackage 可见性与消费合同
-  - 本轮待审：在普通候选从 non-repository CWD 执行资源 export/validate/preview/import/apply 与 cold reopen，必要 profile 数据来自普通 bundle，不依赖 checkout 或源码证明副本；TMX package 仍 export-only，资源迁移不迁移 Fuzzy 资格。
+  - 在普通候选从 non-repository CWD 执行资源 export/validate/preview/import/apply 与 cold reopen，必要 profile 数据来自普通 bundle，不依赖 checkout 或源码证明副本；TMX package 仍 export-only，资源迁移不迁移 Fuzzy 资格。
   - 实际候选验证数据保护/失败反例，按平台 Requirement 12 复用未变 owner 深入证据并重验触发范围；退出时交付最终 Qt 旅程所需的 owner port 和证据，不让 Qt/Controller 取得 carrier/Store 权威。
   - _Amendment: WA-04_
   - _Delivery phase: frozen post-build_

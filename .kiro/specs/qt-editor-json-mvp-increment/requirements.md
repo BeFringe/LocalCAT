@@ -22,7 +22,7 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 
 ### Windows Compatibility Amendment WA-08
 
-**普通frozen修订待人工审批**：本轮只更新来源、入口及候选验收接缝；原Qt/source审批与完成事实保留原范围，不据此批准新的packaged实现或签发PASS。
+**普通frozen修订范围**：来源、入口及候选验收接缝；原Qt/source完成事实保留原范围。
 
 1. Windows source与onedir/windowed两种Qt journey必须分别显示真实主窗口，并完成项目保存/重开、TMX路径和资源表面回归；`qwindows.dll`缺失、错误platform plugin或窗口不可见均为启动失败，不得用offscreen结果代替visible验收。
 2. source journey中的`LocalCAT-logo-silver.png`与可选avatar catalog继续从source-owned resource root解析；普通frozen中的logo、Windows icon与声明catalog从ADR-028受控构建关联的当前候选资源根解析，不要求旧W3 authority。两者均不依赖CWD或未经声明的checkout fallback，头像继续只在inventory中按既有安全索引/解码/fallback语义展示。
