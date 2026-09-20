@@ -101,7 +101,7 @@ Multi-Document C2 complete
   - _Amendment: WA-02_
   - _Depends: 1.3a, ADR-020, windows-platform-enablement 3.7_
 
-- [ ] 1.4b 闭合Windows frozen import与启动组合
+- [x] 1.4b 闭合Windows frozen import与启动组合
   - 从普通 EXE 进入既有 chunk composition，证明实际业务 import/startup 无 POSIX-only 依赖，使用真实 Windows 端口且不从 checkout 补载模块；退出时同候选可进入 4.5b 的业务验收。
   - _Amendment: WA-02_
   - _Delivery phase: frozen post-build_
@@ -228,7 +228,7 @@ Multi-Document C2 complete
   - _Amendment: WA-02_
   - _Depends: 1.4a, 4.4a, multi-document-project-workspace 2.8a and 4.4a, windows-platform-enablement C5S_
 
-- [ ] 4.5b 在普通 frozen 候选完成 Chunk/Project 组合验收
+- [x] 4.5b 在普通 frozen 候选完成 Chunk/Project 组合验收
   - 对真实 ProjectPackage、chunk metadata 与 Controller 执行保存/冷重开、锁竞争和中断恢复，保持 identity/membership/permission 与原发布保证；失败不得禁用 store 或回退 checkout。
   - 按平台 Requirement 12 引用未变 owner 深入证据并重验变更触发范围；候选业务调用与失败反例实际执行后，向平台 7.4 交付结果，不用旧 source PASS 代答。
   - _Amendment: WA-02_

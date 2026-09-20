@@ -394,7 +394,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.5a, 3.8a, 6.7a, 7.4_
 
-- [ ] 7.4b 验证普通packaged输入与生命周期失败投影
+- [x] 7.4b 验证普通packaged输入与生命周期失败投影
   - 实际候选覆盖缺失/错owner输入、加载路径或候选不一致、Core资格不可用、worker协议/超时/异常退出与取消/关闭；保留7.4a数据端口/资源局部失败语义，健康资源仍可用，不回落source authority或activated JSONL。
   - 完成时，Controller/Qt只显示稳定body-safe code，失败不伪装no-match、不暴露原始proof/path，也不把清理未完成报告为成功；不要求W3 Boot TCB/native对抗矩阵。
   - _Amendment: WA-07_

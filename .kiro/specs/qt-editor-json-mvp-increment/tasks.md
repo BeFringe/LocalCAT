@@ -366,7 +366,7 @@
   - _Amendment: WA-08_
   - _Depends: 4.2a, 4.8_
 
-- [ ] 5.2b 验证普通候选的Qt资源与头像退化
+- [x] 5.2b 验证普通候选的Qt资源与头像退化
   - 在平台7.2产物从non-repo CWD实际消费候选资源根中的声明logo/icon/catalog，覆盖唯一命中、大小写、解码失败、歧义与无catalog/无匹配fallback；不访问checkout或额外扩大构建输入。
   - 验证只读程序资源与用户目录分离，默认资源只缺失时播种，已有workspace/资源配置字节不被覆盖。完成时，当前候选资源表面与既有语义一致，纯头像变化不触发Core资格失效。
   - _Amendment: WA-08_
@@ -387,7 +387,7 @@
   - _Amendment: WA-08_
   - _Depends: 4.8a, 5.3_
 
-- [ ] 5.3b 验证普通windowed候选的真实窗口与入口
+- [x] 5.3b 验证普通windowed候选的真实窗口与入口
   - 从实际EXE确认候选内`qwindows.dll`/plugin加载、非offscreen主窗口、dialog/icon/keyboard及无console；分别从首页和显式项目参数进入正常产品流程，用户目录不随CWD变化，关闭不遗留本应用创建的worker。
   - 缺失/错误plugin、窗口不可见或错误项目参数不得假报成功；完成时真实窗口与失败诊断有当前候选观察，source venv、offscreen或空窗口探针不得代答。
   - _Amendment: WA-08_
