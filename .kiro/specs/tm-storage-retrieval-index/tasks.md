@@ -589,7 +589,7 @@
   - _Delivery phase: frozen pre-build_
   - _Depends: 9.6c_
 
-- [ ] 9.6e 贯通普通packaged的真实Core输入、双worker与取消
+- [x] 9.6e 贯通普通packaged的真实Core输入、双worker与取消
   - 在现有`tm_gate_inputs`、fingerprint/validation与worker组合接缝消费平台7.2a的实际候选输入；复用原owner/session/epoch与publication，不伪装source/native authority，不复制Host或新增profile框架。fixture/contract实际内容与构建输入摘要各有明确消费者；默认不收集源码副本，确需有限兼容数据先在Design及owner清单列明并评审。
   - 贯通真实Matcher、Gate C输入、`tm_benchmark_gate`→oracle suite/recall evidence的同一session；query parent/child执行owner核验当前兼容身份，纯结果DTO与证据比较不读ambient fingerprint。按Design生成Core检索兼容身份并独立消费平台候选关联，不把全EXE/PYZ摘要当持久资格key。
   - 从普通windowed同一EXE实际启动独立migration/query，消费原严格request/result、fresh PID、timeout与RSS；显式二进制pipes在标准流不可用时仍可用，缺失/错误端点、畸形/截断协议、错候选/请求、非零退出均拒绝，无外部venv或进程内fallback。
@@ -603,6 +603,7 @@
 
 ## Implementation Notes
 
+- Task 9.6e：逐输入摘要只进入原摘要聚合；fixture/contract 仍读取并校验实际内容。Gate 默认 oracle suite 与单 path 入口须沿当前 session 传递已解析的 contract 引用，不能重读默认 contract 而拒绝合法外部 source 合同。小样本 packaged 证据与复现入口见平台 Task 7.2；它不签发 9.6b 的正式 oracle、100k 资格，也不改签 9.6c/9.6d 历史。
 - 2026-09-19 / Task 9.6c publication消费：terminal/窗口退出完成不等于引用提交完成；最终安装须与真实owner撤销共享短内存边界，native/Qt工作先于该边界结束。`MemberDescriptorType`也包含只读或数值C字段，下游引用holder须采用Core固定构造的普通slot协议；原观察锁必须覆盖整套引用安装与失败恢复，布局登记不授予Gate资格。
 
 - 2026-09-19 / Task 9.6c 集成修复：正式Matcher factory的private session路线须显式取消默认source roots locator；共同owner/window不替代CapabilityHost loader/code权威。Gate D/migration的relative contract引用必须属于当前window，persist/restore新窗口从同owner重新绑定；source外部域和冲突locator继续拒绝混用。test-frozen只用于provisional消费，实际native admission仍由平台7.2提供。

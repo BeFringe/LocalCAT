@@ -2848,8 +2848,11 @@ def _serve_worker(pipes: _WorkerPipes, session: _GateInputSession) -> int:
         return 0
     except _WorkerError as error:
         code = error.error_code
-    except Exception:
+        pipes.report_failure(error)
+    except Exception as error:
         code = "QUERY.CHILD_FAILED"
+        if type(pipes) is _WorkerPipes:
+            pipes.report_failure(error)
     if type(session) is _GateInputSession:
         session._abort()
     try:
@@ -3031,6 +3034,7 @@ def _run_query_child(
             "query", request_json, timeout_seconds=timeout_seconds,
             test_mode=process_evidence.test_mode,
             _test_frozen_transport=_test_frozen_transport,
+            _input_session=_input_session,
         )
     except OSError as error:
         raise QueryProcessError("QUERY.CHILD_SPAWN_FAILED") from error
@@ -3198,12 +3202,8 @@ def _adjudicate_evidence_against_process_evidence(
         != process_evidence.implementation_fingerprint
     ):
         raise QueryProcessError("QUERY.IMPLEMENTATION_MISMATCH")
-    try:
-        current_fingerprint = benchmark_implementation_fingerprint()
-    except (TypeError, ValueError) as error:
-        raise QueryProcessError("QUERY.IMPLEMENTATION_INVALID") from error
-    if evidence.implementation_fingerprint != current_fingerprint:
-        raise QueryProcessError("QUERY.IMPLEMENTATION_CHANGED")
+    # This DTO compares supplied execution facts. The parent and child owners
+    # check the current implementation using their own live input sessions.
     if evidence.query_protocol_digest != request_protocol_digest:
         raise QueryProcessError("QUERY.FACT_DRIFT")
     if not evidence.processes_distinct:
