@@ -603,6 +603,8 @@
 
 ## Implementation Notes
 
+- Task 9.6b：受影响 Windows 冷开与恢复补验中，测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。仅修正测试观察与清理，保留原恢复/字节/阶段断言。原定向运行 86 项中 81 项通过、5 项受该问题影响；修后 5 项在原长路径全部通过（50.523 秒、exit 0、无 skip），经独立评审。原失败日志保留，产品候选与 Core fingerprint 不变；本任务仍待完整候选验收。
+
 - Task 9.6b：普通候选真实重验中关闭 Qt 后，oracle 全扫描和候选查询须观察同一输入 owner 的撤销。全扫描按小批次评分检查，候选路径在查询之间及同步建库前后检查；不改变评分、排序、fixture、门限或 worker 计量。此修正改变 Core fingerprint，旧资格必须失配，新候选须实际重跑正式 Gate；不把同步建库前后检查解释为建库内部即时中断，也不提前完成本任务。
 
 - Task 9.6e：逐输入摘要只进入原摘要聚合；fixture/contract 仍读取并校验实际内容。Gate 默认 oracle suite 与单 path 入口须沿当前 session 传递已解析的 contract 引用，不能重读默认 contract 而拒绝合法外部 source 合同。小样本 packaged 证据与复现入口见平台 Task 7.2；它不签发 9.6b 的正式 oracle、100k 资格，也不改签 9.6c/9.6d 历史。
