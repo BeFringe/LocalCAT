@@ -584,6 +584,12 @@ class FullScanQueryOracle:
         object.__setattr__(self, "top10_ids", top10)
 
 
+def _check_oracle_session(session) -> None:
+    if session is not None:
+        from tm_gate_inputs import _require_session
+        _require_session(session)
+
+
 def compute_full_scan_oracle(
     *,
     contract: BenchmarkContract,
@@ -592,6 +598,7 @@ def compute_full_scan_oracle(
     scorer: SimilarityScorerV1 | None = None,
     minimum_similarity: float | None = None,
     top_k: int | None = None,
+    _input_session=None,
 ) -> tuple[FullScanQueryOracle, ...]:
     """Brute-force every query against every record with the frozen scorer.
 
@@ -621,6 +628,7 @@ def compute_full_scan_oracle(
     if top_k != contract.top_k:
         raise ValueError("top_k must equal contract value")
 
+    _check_oracle_session(_input_session)
     records_tuple = _validate_records(records)
     queries_tuple = _validate_queries(queries)
     if len(records_tuple) < top_k:
@@ -630,13 +638,18 @@ def compute_full_scan_oracle(
 
     rows: list[FullScanQueryOracle] = []
     for query in queries_tuple:
+        _check_oracle_session(_input_session)
         if query.reference_record_id is not None:
             if query.reference_record_id not in record_id_set:
                 raise ValueError(
                     "query reference id must belong to the oracle subset"
                 )
         scored: list[tuple[int, float]] = []
-        for record in records_tuple:
+        for index, record in enumerate(records_tuple):
+            # Observe the existing owner between bounded batches, without
+            # changing scores or recomputing the implementation fingerprint.
+            if index % 64 == 0:
+                _check_oracle_session(_input_session)
             evidence = scorer.score(query.query_raw, record.source_raw)
             final_similarity = evidence.final_similarity
             if type(final_similarity) is not float or not math.isfinite(
@@ -663,6 +676,7 @@ def compute_full_scan_oracle(
                 top10_ids=top10_ids,
             )
         )
+    _check_oracle_session(_input_session)
     return tuple(rows)
 
 
@@ -820,6 +834,7 @@ def _run_candidate_path(
     run_root: Path,
     resource_id: str,
     canonical_store_id: str,
+    _input_session=None,
 ) -> tuple[
     str,
     str,
@@ -831,6 +846,7 @@ def _run_candidate_path(
 ]:
     """Execute the real CandidateRetriever/SQLite path for one requested path."""
 
+    _check_oracle_session(_input_session)
     if type(run_root) is not _NATIVE_PATH_TYPE:
         raise TypeError("run root must be a native pathlib.Path")
     if not run_root.is_dir():
@@ -860,11 +876,13 @@ def _run_candidate_path(
             stack.enter_context(
                 patch("tm_sqlite_store._probe_fts5", return_value=False)
             )
+        _check_oracle_session(_input_session)
         store, actual_resource_id = _build_oracle_store(
             fixture_path=fixture_path,
             resource_id=resource_id,
             canonical_store_id=canonical_store_id,
         )
+        _check_oracle_session(_input_session)
         if actual_resource_id != resource_id:
             raise ValueError("oracle store resource id drift")
         health = store.health()
@@ -883,6 +901,7 @@ def _run_candidate_path(
             tuple[int, tuple[int, ...], str, bool, str | None, bool]
         ] = []
         for query in queries:
+            _check_oracle_session(_input_session)
             production_query = TMQuery(
                 query_source=query.query_raw,
                 speaker_raw=None,
@@ -954,6 +973,7 @@ def _run_candidate_path(
                         metadata.truncated,
                     )
                 )
+    _check_oracle_session(_input_session)
     if len(rows) != len(queries):
         raise RuntimeError("candidate path row count mismatch")
     if observed_proof_versions != {CANDIDATE_PROOF_QUERY_VERSION}:
@@ -1783,6 +1803,7 @@ def _build_recall_evidence(
         run_root=run_root,
         resource_id=resource_id,
         canonical_store_id=canonical_store_id,
+        _input_session=_input_session,
     )
     if len(candidate_facts) != len(oracle_rows):
         raise ValueError("candidate facts must align with oracle rows")
@@ -2022,6 +2043,7 @@ def run_oracle_recall_evidence(
             records=records,
             queries=queries,
             scorer=scorer,
+            _input_session=_input_session,
         )
     else:
         if type(oracle) is not tuple:
@@ -2111,6 +2133,7 @@ def run_oracle_recall_suite(
         contract=contract,
         records=records,
         queries=queries,
+        _input_session=_input_session,
     )
     fts5 = _build_recall_evidence(
         contract=contract,
