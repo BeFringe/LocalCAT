@@ -1,9 +1,15 @@
 # Design Document
 
+## 当前适用范围
+
+source 的平台与业务设计已完成 Task 6.6b 验收，安装/维护入口见 README。本线保留完整 Boot TCB、定制 native entry、retained-source-only loader 的 W3 强证明设计及其实现依据；完整 producer 和产品发行尚未验收。[ADR-028](../../steering/adr/adr-028.md) 已解除普通 frozen 对这些证明的强制依赖，强证明研究不反向阻塞 source 或普通发行。
+
+两条发行路线均保留平台数据/私有权限端口、Core Gate C/D、可追溯构建和包内业务验收。普通发行独立设计执行产物与 Core/Host 输入的绑定、入口/加载检查、worker 生命周期和用户旅程；不从本线继承完整 Boot TCB 前置。本线的构建前单测或中间 producer 也不授予最终发行资格。
+
 ## Overview
 本设计把 LocalCAT 现有 POSIX 文件 authority/lock/publish 语义提炼成一个共享平台能力边界，并新增 fail-closed Windows backend。Windows backend 使用文档化 Win32 handle API 固定 rooted ancestor、拒绝 reparse、比较 volume/file identity、执行跨进程锁和 handle-bound publish；上层 Parser、项目、资源、TM 和协作分工继续拥有各自业务状态机与稳定错误映射。
 
-第二条交付线为 Windows frozen distribution：从能力 Gate roots 生成真实 `.py`/fixture closure，使用 PyInstaller `--onedir --windowed` 让安全关键模块从 bundle 内真实源码加载，显式收集 Qt/数据/资源，并在无仓库、非当前目录和干净用户配置下执行 packaged E2E。`research.md` 记录 API 证据与方案比较；本文按已采纳ADR-020～025固定活动边界，实施授权仍由Tasks依赖控制。
+第二条交付线为 Windows frozen distribution：显式收集 Python、Qt、数据和 owner 所需资源，在无 checkout/开发机 venv 依赖的位置完成真实 packaged E2E。优先探索标准 PyInstaller onedir/windowed；普通发行的证明范围以 ADR-028 为准，`research.md` 和下方旧 W3 细节只在未被取代的范围继续适用。
 
 ### Goals
 - 在 Windows 11 本地受支持文件系统上提供与现有 POSIX 合同等强的 rooted read/create、identity、lock、atomic publish、private storage proof 与 recovery 能力。
