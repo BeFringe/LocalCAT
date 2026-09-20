@@ -78,27 +78,47 @@ class RootedSourceAuthorityTests(unittest.TestCase):
             finally:
                 authority.close()
 
-    def test_proof_window_rejects_a_source_changed_before_publication(self) -> None:
+    def test_proof_window_blocks_or_detects_source_change_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_path = root / "module.py"
             source_path.write_bytes(b"VALUE = 1\n")
             authority = compose_rooted_source_authority(root)
             try:
-                with self.assertRaises(PlatformFileError):
+                if os.name == "nt":
+                    from platform_fs_windows import (
+                        FILE_SHARE_DELETE, FILE_SHARE_READ,
+                        FILE_SHARE_WRITE, GENERIC_WRITE,
+                        OPEN_EXISTING,
+                    )
+                    from windows_file_api import WindowsFileAPI, Win32CallError
+
+                    api = WindowsFileAPI.load()
                     with authority.proof_window():
-                        _ = authority.bind_path(source_path)
-                        try:
+                        source = authority.bind_path(source_path)
+                        with self.assertRaises(Win32CallError) as blocked:
+                            with api.open_handle(
+                                str(source_path), desired_access=GENERIC_WRITE,
+                                share_mode=FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                creation_disposition=OPEN_EXISTING,
+                                flags=0,
+                            ):
+                                pass
+                        self.assertEqual(blocked.exception.winerror, 32)
+                        self.assertEqual(source_path.read_bytes(), b"VALUE = 1\n")
+                        self.assertTrue(source.is_current())
+                else:
+                    with self.assertRaises(PlatformFileError):
+                        with authority.proof_window():
+                            _ = authority.bind_path(source_path)
                             source_path.write_bytes(b"VALUE = 2\n")
-                        except PermissionError:
-                            # Windows can deny the attack while the retained
-                            # source handle is open.  In that case there is no
-                            # changed source for the terminal proof to reject.
-                            raise unittest.SkipTest(
-                                "platform retained handle denied source mutation"
-                            )
             finally:
                 authority.close()
+            if os.name == "nt":
+                # The Windows result proves sharing denial, not a terminal
+                # observation of changed bytes. Release must permit the write.
+                source_path.write_bytes(b"VALUE = 2\n")
+                self.assertEqual(source_path.read_bytes(), b"VALUE = 2\n")
 
     def test_proof_window_cache_does_not_cross_operations(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
