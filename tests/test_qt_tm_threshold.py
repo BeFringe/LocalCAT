@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -32,6 +31,7 @@ from tests.test_editor_controller_tm_apply import (
     _canonical_controller,
     _legacy_fixture,
 )
+from tests.benchmark_worker_test_support import worker_temporary_directory
 from tm_application_composition import TMResourceResolver, TMRuntimeHost
 
 
@@ -129,7 +129,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
         self.assertIs(button.property("fuzzyAvailable"), False)
 
     def test_two_available_entries_share_value_state_and_keyboard_updates(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             controller, _runtime, _composition = _canonical_controller(
                 self,
                 Path(temporary),
@@ -197,8 +197,51 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             self.assertIn("82%", window.statusBar().currentMessage())
             window.close()
 
+    def test_completed_denial_does_not_claim_fuzzy_qualification(self) -> None:
+        with worker_temporary_directory() as temporary:
+            controller, _adapter, _runtime, _repository = _legacy_fixture(
+                Path(temporary)
+            )
+            running = FuzzyValidationDisplay(
+                state=FuzzyValidationState.RUNNING, safe_code=None,
+            )
+            completed = FuzzyValidationDisplay(
+                state=FuzzyValidationState.SUCCEEDED, safe_code=None,
+            )
+            closed = RetrievalDisplayState(
+                context_available=True, fuzzy_available=False,
+                safe_codes=("TM.RETRIEVAL.FUZZY_BENCHMARK_MISSING",),
+            )
+            with (
+                patch.object(controller, "tm_fuzzy_validation_status", return_value=running) as lifecycle,
+                patch.object(controller, "tm_retrieval_status", return_value=closed),
+            ):
+                window = QtEditorWindow(controller)
+                dialog = window.create_settings_dialog()
+                window.show()
+                dialog.show()
+                self._events()
+                try:
+                    dialog.status_label.setText("上次验证已完成。")
+                    window._settings_fuzzy_validation_changed(running)
+                    self.assertTrue(window._fuzzy_validation_timer.isActive())
+                    self.assertEqual(dialog.status_label.text(), "Fuzzy 性能验证中。")
+                    lifecycle.return_value = completed
+                    window._poll_fuzzy_validation()
+                    self.assertFalse(window._fuzzy_validation_timer.isActive())
+                    self.assertNotIn("资格已验证", dialog.status_label.text())
+                    self.assertIn("验证已完成", dialog.status_label.text())
+                    self.assertIn(dialog.tm_threshold_state.text(), dialog.status_label.text())
+                    self.assertIn("Fuzzy 不可用", dialog.status_label.text())
+                    self.assertEqual(window.tm_threshold_state.text(), dialog.tm_threshold_state.text())
+                    self.assertIs(window.tm_threshold_chip.property("fuzzyAvailable"), False)
+                    self.assertIs(dialog.tm_threshold_chip.property("fuzzyAvailable"), False)
+                finally:
+                    dialog.close()
+                    window.close()
+
     def test_unavailable_entries_remain_visible_with_one_disabled_reason(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             controller, _adapter, _runtime, _repository = _legacy_fixture(
                 Path(temporary)
             )
@@ -290,7 +333,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             window.close()
 
     def test_retrieval_status_projection_is_query_free_and_defensive(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             controller, _runtime, _composition = _canonical_controller(
                 self,
                 Path(temporary),
@@ -310,7 +353,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             self.assertTrue(second.fuzzy_available)
 
     def test_persistence_failures_keep_both_entries_and_feedback_non_blocking(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             controller, _runtime, _composition = _canonical_controller(
                 self,
                 Path(temporary),
@@ -369,7 +412,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             window.close()
 
     def test_project_switch_and_new_controller_restore_the_same_visible_value(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             controller, _runtime, composition = _canonical_controller(self, root)
             self.assertTrue(
