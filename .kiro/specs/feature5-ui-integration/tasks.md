@@ -470,6 +470,8 @@
 
 ## Implementation Notes
 
+- Task 6.6b：真实普通候选恢复缺失资格、消费不兼容资格时发现 Host 的输入窗口包装器误把 Core 业务拒绝归为输入失败。窗口仅归一自身进入、terminal 与关闭异常；正文异常原对象交回既有 Core binding／Host 生命周期分类，不按错误字符串放行。资格、计量与发布 authority 不变；任务继续等待同候选恢复、负向与产品验收。
+
 - Task 6.6b：验证 lifecycle 的 `SUCCEEDED` 只表示结果已完成发布，合法否定结果也能到达该状态；完成提示复用 fresh Controller 检索安全投影，不由 lifecycle 宣称获得资格，重验开始时清除上次完成提示。Qt poll 回归覆盖这一边界；canonical 测试目录使用现有 Windows 长路径清理 helper。此修正不完成正式性能、资格恢复及同候选交互验收。
 - Task 3.6b：普通组合复用同一 Core owner 下的运行、持久化和发布窗口，以及既有 Host 引用提交和 queued 通知；Qt 关闭只请求撤销，后台 transport 承担等待与 child 回收。首条链的零安装/已提交 generation 和实际退出须分别观察，撤销标志不能代替退出事实。此完成范围不含 6.6b 的设备 Fuzzy 资格交互及后续完整产品旅程。
 - 3.6a：frozen consumer 的 close 必须撤销实际 Core input owner，再于短锁外唤醒 Qt 等待者；Host/通知/owner 的成功引用通过 Core 登记的普通 slot plan 与 snapshot 一起提交。Matcher/Gate C 的最终安装另开同 owner fresh window，不能复用结束窗口；source publication 的 terminal/退出异常仍须完整恢复 prior。合法生产 source issuer/receipt 正控、故障回滚与 Qt queued-terminal/close 已独立验证，但平台 native producer 和同候选 packaged/100k 资格仍分别归 7.2 与 post-build owner 任务，对应回归见 `tests.test_capability_host_frozen_inputs`、`tests.test_qt_owner_dispatch` 和 `tests.test_qt_frozen_composition`。
