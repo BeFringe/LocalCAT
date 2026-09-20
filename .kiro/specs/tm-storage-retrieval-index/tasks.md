@@ -557,7 +557,7 @@
   - _Amendment: WA-06_
   - _Depends: 5.11a, 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
 
-- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收（已批准；待实施）
+- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收（已批准；验收进行中）
   - 在7.2真实调用链产物上运行实际Gate C、oracle与100k双路径Gate D，保留原算法、门限、warmup、计时/RSS口径及strict evidence/publication；由Core真实运行铸造设备资格，不能复用source PASS或小样本诊断签发资格。本任务供平台7.3资格闭环与7.4最终验收消费，不等待它们先通过。
   - 同一候选验证有效资格在进程重启后自动恢复、失配/损坏/权限异常只关闭Fuzzy、启动不自动100k、用户显式重验与原子替换；纯UI/头像候选变化不应无条件撤销检索资格，Core/fixture/runtime/worker计量依赖改变必须使相关身份失配。资格不可随JSONL/ResourcePackage或项目迁移。
   - 在实际候选完成canonical激活与重启恢复、exact/context/fuzzy、FTS5与fallback创建/查询/重开、snapshot/export以及实际消费路径的锁竞争、发布失败、中断恢复、权限/reparse拒绝；失败只接受完整prior、完整new或recovery-only，不损坏既有数据。已完成9.6a的深层状态机/故障矩阵只在实现、依赖、调用合同与关键运行条件均未改变且候选已实际消费时引用；不能以旧source证据覆盖新入口、worker、runtime或改变的数据端口。
@@ -602,6 +602,8 @@
   - _Depends: 本轮Core与相邻消费合同获批, 9.6c, 9.6d, ADR-013, ADR-028, windows-platform-enablement 7.2a_
 
 ## Implementation Notes
+
+- Task 9.6b：候选 `3c20cf46a8a4` 已实际执行原正式 oracle、100k FTS5/fallback Gate D，取得本机资格并由原 Host owner 持久发布；canonical 激活/冷开、TM 自身 W1 竞争、snapshot 发布失败/释放重试及 fresh 目录不携带资格的消费证据经独立有限批准。见[当前候选证据](../../../windows_ordinary_frozen_evidence.json)。本轮只收束 Windows 功能阶段；受影响 POSIX 定向回归尚未取得，整项继续未勾选，不重签旧 owner 或发行验收。
 
 - Task 9.6b：受影响 Windows 冷开与恢复补验中，测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。仅修正测试观察与清理，保留原恢复/字节/阶段断言。原定向运行 86 项中 81 项通过、5 项受该问题影响；修后 5 项在原长路径全部通过（50.523 秒、exit 0、无 skip），经独立评审。原失败日志保留，产品候选与 Core fingerprint 不变；本任务仍待完整候选验收。
 

@@ -544,6 +544,8 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 ## Implementation Notes
 
+- Task 7.3–9.1：`3c20cf46a8a4` 的本机资格、已执行产品旅程与数据保护结果统一记录在[当前候选证据](../../../windows_ordinary_frozen_evidence.json)，原始输出和试验材料仍留在忽略的 `artifacts/windows/`。独立批准仅覆盖 Windows Core/设备资格交互功能阶段；共享 POSIX 定向回归、剩余 owner 验收与累计发行评审仍待闭合，既有历史及所有未完成勾选保持原事实。
+
 - Task 9.1：对实际变化的最终路径、内容捕获、W1、输出锁和 SOURCE 窗口补验时，激活用例须复用既有 Windows 长路径清理 helper；不吞清理失败。SOURCE 用例分别证明 Windows 活句柄以 sharing violation 阻断写入、POSIX 在发生变化后终端拒绝，不能用任意 PermissionError 跳过或将两种机制混写。测试修正不改变普通候选或 Core 兼容身份；跨平台和最终候选验收范围继续分别记账。
 
 - Task 7.2：用 `requirements-frozen-build.txt` 固定构建依赖，在干净 checkout 执行 `python tools/build_windows_ordinary.py`；构建子进程须隔离开发工具 PATH，否则额外 ICU DLL 可能污染 Qt collection。将 `artifacts/windows/ordinary-build/dist/LocalCAT` 复制至仓库外，再执行 `python tools/check_windows_ordinary.py <副本中的 LocalCAT.exe> --report artifacts/windows/ordinary-entry-checks-complete.json`。该工具会在独立副本中临时撤下并恢复输入记录；输出绑定实际候选，过程材料留在已忽略的 `artifacts/windows/`。

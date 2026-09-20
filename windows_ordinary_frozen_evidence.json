@@ -1,0 +1,395 @@
+{
+  "status": "IN_PROGRESS",
+  "release_status": "NOT_VERIFIED",
+  "scope": "同一普通候选已执行的 Windows Core、设备资格及用户旅程事实；不是任务整项或0.5.2发行裁决。原始日志、截图、试验脚本保留在忽略的artifacts/windows目录。",
+  "observed_at_utc": "2026-09-20T21:53:28.708490+00:00",
+  "reviewed_source_head": "ec480ff88258fe297700af600d7f66aff31046a7",
+  "candidate": {
+    "candidate_id": "3c20cf46a8a4b6ddbbcaa2adbcf75fc970896619fbadcb26e69b3c42b68714df",
+    "built_from": "8589e19",
+    "entry": "stock PyInstaller onedir/windowed；正常产品入口及同EXE worker",
+    "implementation_fingerprint": "d3d200cdbbc431ff9f4ea8f25bae833e890496394c30d96dbda85111c1a73d89",
+    "bundle_digest": "8003bdb0fb194dbd056f314bb82fd8d52c4a69ae0ba7717894d8c99daa9863d3",
+    "post_build_changes": "43f8693、ec480ff仅测试观察器/清理及任务notes，未改变此产物或Core兼容身份"
+  },
+  "formal_gate": {
+    "gate_c_evidence": "entry-checks-oracle-cancel.json 内实际 Matcher/Context/SQLite correctness 消费；其小样本性能诊断不是正式Gate D",
+    "gate_d_evidence": "benchmark-candidate-3c20cf46a8a4.json，已由原strict codec复读，Core运行并经原Host owner持久发布",
+    "contract": {
+      "contract_version": "benchmark-v1",
+      "corpus_generator_version": "tm-benchmark-corpus-v1",
+      "corpus_seed": 20260729,
+      "corpus_record_count": 100000,
+      "corpus_digest": "560ebb304362c86af9dec6540dfcb5370b1fcbbdf01b938e6a7b675a3d8c8bfe",
+      "corpus_composition_version": "tm-corpus-composition-v1",
+      "corpus_composition_digest": "e57b794e9b224376724350dab03bd4b8990246b42cd72de956fc23776fa84835",
+      "exact_cohort_digest": "613c92a7b45fd728d920fe92ead0d8bf73e520d512bd6e30cb6cc4dfdd092e9e",
+      "exact_min_samples": 1000,
+      "exact_cohort_count": 1200,
+      "fuzzy_cohort_digest": "7f9c6bc6ca2b9d871ba7a11c01126c7953ad89e68e4d1978f2bc4636ff581b1f",
+      "fuzzy_min_samples": 200,
+      "fuzzy_cohort_count": 240,
+      "oracle_subset_digest": "e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2",
+      "oracle_subset_record_count": 5000,
+      "oracle_query_count": 200,
+      "top_k": 10,
+      "minimum_similarity": 0.6,
+      "warmup_queries_per_cohort": 100,
+      "measured_repeats": 1,
+      "percentile_method": "nearest-rank",
+      "rss_scope": "child-process-lifetime-v1",
+      "candidate_budget_version": "candidate-budget-v1",
+      "scorer_config_digest": "2de89b48cb0c3331aa984e28d4a4fd21fad273cc2f8bd8df65b2bbea8d389034",
+      "fast_path_config_digest": "1a0de4fe6e04903698a87b1e0341cbe092ee49346f580b51c3adefd161e87079",
+      "fallback_path_config_digest": "792f57dba4ba9fbc9a72fa72012a596aaff6e99d6d6bad3c66fb99232111f936",
+      "exact_p95_gate_ms": 50.0,
+      "fuzzy_p95_gate_ms": 500.0,
+      "migration_gate_seconds": 120.0,
+      "peak_rss_gate_mib": 512.0,
+      "candidate_recall_gate": 1.0
+    },
+    "metrics": [
+      {
+        "execution_path": "FTS5_TRIGRAM",
+        "candidate_recall": 1.0,
+        "exact_p95_ms": 1.1434,
+        "fuzzy_top10_p95_ms": 371.0043,
+        "migration_seconds": 75.740321,
+        "peak_rss_mib": 412.07421875,
+        "passed": true,
+        "failed_gates": []
+      },
+      {
+        "execution_path": "GRAM_FALLBACK",
+        "candidate_recall": 1.0,
+        "exact_p95_ms": 1.1822,
+        "fuzzy_top10_p95_ms": 384.2717,
+        "migration_seconds": 111.5683844,
+        "peak_rss_mib": 419.875,
+        "passed": true,
+        "failed_gates": []
+      }
+    ],
+    "qualification_sha256": "dbafdbe8fcdee322b9a8dd2726faf13d58e2964bb2f42f0906cfbff7d9c0b6f3"
+  },
+  "independent_review": {
+    "verdict": "APPROVED_WITH_SCOPE",
+    "reviewer": "ordinary_chain_review",
+    "scope": "Windows Core/设备资格交互的已执行功能阶段，包含TM自身锁与导出失败、fresh目录迁移不带资格；不代答POSIX回归、全部Qt错误投影或发行裁决"
+  },
+  "evidence": {
+    "正式Core执行与资格恢复": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/benchmark-candidate-3c20cf46a8a4.json",
+        "sha256": "92c90bd449eba6d8813a7690e6bcc39ba13a98120b2a7cc824750fa2f593d50d"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/benchmark-candidate-3c20cf46a8a4.summary.json",
+        "sha256": "b092d90cedecd2d62c241ddf198ebb589e0be52566c04176bb2a3198f0449a48"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/entry-checks-oracle-cancel.json",
+        "sha256": "e26de7ce414611e969015e7822e983d109722cae5c0c02c8292e3f2cd7480f39"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-formal-result.json",
+        "sha256": "5461ea74ce58434ac026b3d16748ab8a076370fd73943cda968c74dc1e0d50d1"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-cold-restored.json",
+        "sha256": "931baf1d8155a520b3885f6f2517a97c04a35eb67ae9a0a8a1c5caf4da4e3bf2"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-negative-restored.json",
+        "sha256": "653d8d355c349113d0d1fc47f1a936dfcc6917cfceb0393c903f9937ed9904d4"
+      }
+    ],
+    "资格拒绝与关闭": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-missing.json",
+        "sha256": "8a6d0a5f883019de08b56361bc5737c1d753b719917572d006e7438789c1701f"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-corrupt.json",
+        "sha256": "9e9d8b43c93378d489a38aabe038613f1a4685d55b07d1926a923fc62b13200a"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-compat-negative.json",
+        "sha256": "dee5c1025425d01964b0cd66e276207d815991dc68cebc4fc876157673ce6ff7"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-acl-write-negative.json",
+        "sha256": "d8a96ff4e473f79b07b7c466db175bcc259c12f841248a19444caa43bdd14f70"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-oracle-mic-low-negative.json",
+        "sha256": "1b3f2763ad5e656e4712e80bb0dc2b6b6ad66d5deb1c78b0ff6f5ca1263952cb"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/close-oracle-cancel-new.json",
+        "sha256": "375d964093079973ab92a9a9f297596d804a7684ab6a84ffd20e4b0d139ec66a"
+      }
+    ],
+    "当前TM业务与保护": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tm-activation-finished.json",
+        "sha256": "a955b72d727877338a0c492e7ebc428839a69772c49e184f4a9eb7e0f50f6edf"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/tmx-activated-sqlite.json",
+        "sha256": "bde066f22c9781ad752c50fbb1d57a717944cd64334f29ce58f86a42dc7f3cc0"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tmx-cold-query.json",
+        "sha256": "9f53c6e1edeecb0b28048a9d44e2cecc3cbeba54f4ff02759773bbb911569854"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/tm-lock-bytes-result.json",
+        "sha256": "9d34eff1a73bee18013e3c307f99e48d16bea4e3c2d17eebf2bc3a5a67b9b454"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tm-lock-negative.json",
+        "sha256": "b51950aeaaf77be588fd76d6c09555448c12ca5dd7047959e49a66bb3f2c3bb8"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tm-lock-restored.json",
+        "sha256": "be020e0d05c894adce7d6ec5a2b031fb7b21287b5ee1d9da3e1f63b8b02e0218"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/snapshot-conservation-result.json",
+        "sha256": "80821bef59e42b1b34765ac7ef479a9b1af966cf0e2a688373e085152cede2ae"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/snapshot-target-open-failure-result.json",
+        "sha256": "32f3859dc453c1cdfb1c2d6f518ac29866ea7967a5b05cbe8d5d8535a443be60"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/snapshot-target-open-result.json",
+        "sha256": "ffda6fcf98dfdf485bbf6c57372c5ac2fdb9265c4c57726a1e8025cf768c7095"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-snapshot-target-rejected.json",
+        "sha256": "879328b0aafd3aff7a32479a3b72e4adfc79f6a91a17235857bf1d010ea09dd1"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-snapshot-target-retried.json",
+        "sha256": "22927be7b956490f67ac0eae18d94583b1ec5f4976a60accce101f92754b6519"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/canonical-read-bytes-result.json",
+        "sha256": "964261204cc239e557dc462a8b7937fd7d948ffa6c29cc76b5a19c1ee01a78c2"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-canonical-read-restored.json",
+        "sha256": "7403154afe93dbe250751d01496b58c165904cfd7d92094cf429118447fe5e3a"
+      }
+    ],
+    "Project与Chunk已执行范围": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-project-package-created.json",
+        "sha256": "b6c908e8e1a00ea3f1ada6eff13ae549ea8b919157370b5c213e85d4de30dcc0"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-project-package-cold.json",
+        "sha256": "7289617bd480959c960c3cabd61f0a1490bef3e5a202f08ea213decb661af0d2"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/project-target-open-bytes.json",
+        "sha256": "2a8c0c4078278c3715f63a992b91a82cad8c1c8886821f68cb84401b1b4d963b"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/project-lock-result.json",
+        "sha256": "87e3b9a71119c8fb2b684ebcb0bde56dbcee7910f6fd6094392df179f4947fa4"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/product-crash-content-result.json",
+        "sha256": "1926d2704a1c91b3eb82a35dab712a4b5abe583b1ec87a7396aa67267f36ad05"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/product-crash-exit.json",
+        "sha256": "941f8e73ede32e48878a24d162b4b88c22d4d81717e1ec2e665d198d1d252309"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/product-crash-ui-value.json",
+        "sha256": "54782d9230890c84d80fce48146f55c817127d9acc7e7f72bd34d1221807fdee"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-chunk-published.json",
+        "sha256": "7824c127b3eab2736a7fec56db9491e09b93c6b7488671d8de55b0ceceef8b32"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-chunk-cold-restored.json",
+        "sha256": "1f77289414ba0548cbafdcd1779041362e3d6c185120b8ac18fb3008a2334f11"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/tmx-three-scopes-chunk-facts.json",
+        "sha256": "ed2ffe808d26fe8338d291c985db6c1e5dd19a16c52a9b2c495d204f16e93828"
+      }
+    ],
+    "资源互换与正常入口": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/tmx-package-actual-rejection-bytes.json",
+        "sha256": "bf874a65993252c37a6a9c36a984d828d1cb1bb3d4163a4971b4772f90f7ac0c"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-tmx-package-actual-rejection.json",
+        "sha256": "004e95ce57ce3b2f772ca19e1e56b38360ba82581e72c46e2e452da96bb87379"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reparse-import-result.json",
+        "sha256": "bf874a65993252c37a6a9c36a984d828d1cb1bb3d4163a4971b4772f90f7ac0c"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/termbase-roundtrip-decoded.json",
+        "sha256": "642576a2025db256d7143df8acd76288b3882bc57485d09ec3f9731a21e3e84f"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-termbase-cold-matches.json",
+        "sha256": "d0a93f3aa8c51031aaa97d2b0f2b9276b6356947bb9713ecdec59fdc857aab4c"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/resource-startup-results.json",
+        "sha256": "c4b45f6f60af95dbe0f82f704929c10bb7badf4922e369a6550902bdf1708600"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/wrong-owner-record-result.json",
+        "sha256": "77afb4f9dd1bbaae05ea47e7882b58df3d97ef4216688896098fbe83e5fe7ccc"
+      }
+    ],
+    "迁移不带资格与TXTlegacy": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/transfer-setup.json",
+        "sha256": "41c3a7b9b775d4f71c5ae7b2be56b69f9fc1b983545bc33bfe5a34f877f87e9f"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-transfer-txt.json",
+        "sha256": "17e5f3b6df0f492140b1f32033567920af82a8ff225bd35416fe6b4acaa8f9c1"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-transfer-cold.json",
+        "sha256": "c1072edb6664205c3bd7ac50444b5471755bd9c0694ac9434bfdd9ea32aa01f6"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/journey-plain.saved.json",
+        "sha256": "b16603fff8c6abd0b1de4ead330718242c6dc58942b223307db0e06996271b81"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/close-transfer-cold.json",
+        "sha256": "4ea594659fe82c3972b3993a657b461a0ec8e3f27ea2c0cb375b47cc1acab5df"
+      }
+    ],
+    "Windows受影响回归": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/host-error-regression.log",
+        "sha256": "665916cefc06314fe1cbe5a14e55e569ac6b34eca28f7c0f7b8489ae530addf6"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/oracle-cancel-regression.log",
+        "sha256": "ed00ee73f24300be56aafef2ea6ba182e5da4656319ed8318765041683346f8f"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/affected-platform-rerun.log",
+        "sha256": "43aac35deebafc2fd73df7667c565e7225006f606e73204ecc55563e8da11a3d"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/affected-tm-regression.log",
+        "sha256": "d0ee55257321bab882eb6220632a8cead7d69e6367f612bd7e4ed1935961b216"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/affected-tm-longpath-rerun.log",
+        "sha256": "ad361fa2ba5221e7bcc77c98428a1f4405d56e248fe9f9ea1c7f170f68219974"
+      }
+    ],
+    "实际worker退出到Qt失败投影": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/worker-ui-interruption.json",
+        "sha256": "998232e0398f542782570b863b339aa455373ce81192f080b3b70ca9061c2649"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-worker-interrupted-state.json",
+        "sha256": "ffdd4e36653fa7bfb4213332db50dda70d61aaf81c5015aa7eb0995c143e0327"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/ui-worker-failure-exact.json",
+        "sha256": "6661e94c60f5fa382d08bc52964c9a0102d8be98c4ac43e1ecd006f8f5ed8181"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/worker-ui-failure-persistence.json",
+        "sha256": "3273f09c71f983e4347d3275e5a7e4847d22db1f90790903a1a4dc6a3eb62df8"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/close-worker-ui-failure.json",
+        "sha256": "f11a524858f42e56cfa79392a2240f9dba219346bdcc43459244a02706d83419"
+      }
+    ]
+  },
+  "reused_owner_evidence": {
+    "original_commit": "db5c321c73b70834835f80c2aa27a753cbf539de",
+    "original_source_snapshot_sha256": "47f368bbf21577a7260fad5256efb077ce5f9a81b3b6945658ac4089ad717d13",
+    "original_matrix_sha256": "b82931c5fb8bd2290d4934947ccbffa98dbfc5d7ff1057592d72e0f85b58acab",
+    "status": "HISTORICAL_LIMITED_REUSE",
+    "artifacts": [
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-final-aggregate/c3b-matrix.json",
+        "sha256": "b82931c5fb8bd2290d4934947ccbffa98dbfc5d7ff1057592d72e0f85b58acab"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-final-aggregate/logs/windows-private-standard.log",
+        "sha256": "743647dee507e8cdab49a555a4eded703e40ec64ff299424348726e71d66c812"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-elevated-final/c3b-elevated.json",
+        "sha256": "4c2e88b51be6cd2a54eb09ad27cf6428dcc60c07a82ed81916ef2975184364f7"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-elevated-final/logs/elevated-owner-tamper.log",
+        "sha256": "f431298c3bcce03e8f688e7cc17449a127c27300b6ccfd2aacd0da568749421d"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-elevated-final/logs/elevated-private-positive.log",
+        "sha256": "ef321678dab0e1bafb323fd41a55a22f4b7863f0e3339f1c4b906f84831ad804"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-reboot-pre-final/manifest.json",
+        "sha256": "6a24cf01b36dca5a54b410ecf1c060aeeb7dc9644b21f785f711a44e056c45c2"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-reboot-pre-final/matrix.json",
+        "sha256": "afd58c6230a50779549f24edc1f95f3350b5c05abf024baa090cb2d636ac9144"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-reboot-pre-final/logs/reboot-prepare.stdout.log",
+        "sha256": "93b617fa6ed238f929f3d96363ac57696318ada864f4d6e4c10c68f7b4b07ecd"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-reboot-post-final/manifest.json",
+        "sha256": "96b41cf91e9b07b3427713cb961323732068ebc741523b2a080c49e3596caae8"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-reboot-post-final/matrix.json",
+        "sha256": "9c016547edd6a9467d6504f399e468b692d1c3d4e47f19909850fc55ed4af626"
+      },
+      {
+        "path": "artifacts/windows/ordinary-qualification/reused-owner-db5c321/c3b-reboot-post-final/logs/reboot-resume.stdout.log",
+        "sha256": "3f56c0f5053d0d08cfef2772ac351ef7c3aae3c6325ad447ce58153b33148f60"
+      }
+    ],
+    "unchanged_scope": "独立AST审查确认W2 process-primary token/SID、ACL/MIC、private proof和security调用未变；基础candidate建立、同父rename helper、目的重开及PendingPublication未变。旧standard含实际restricted/Low child和thread impersonation，elevated两项原raw log可核对。",
+    "persistence_scope": "旧prepare/resume由实际Windows LastBootUpTime取boot-session，worker拒绝同boot-session；原manifest及日志记录PREPARED→PASS/NEW。ticket原件未定位，不声称直接核对两次boot数值。仅保留该原OS持久化边界依据。",
+    "changed_scope": "后续lease issuer复证、流式内容摘要、retained-parent retirement/mutable reservation和TM恢复接口不整体继承旧reboot报告；由相应source owner事实及本轮平台72、TM86定向结果核对改变的消费接缝。",
+    "limits": "这不是f28ec5d引用SHA8e2f4cffe9237cb1983748a7d7d4a0d05703a4c59aa16d86eb9af4656a2d9370的原矩阵；后者仍未定位。原验收保留，不重新签为3c20全量token或OS reboot PASS。未改变落盘顺序/rename-share合同/durable phase的普通打包本身不扩成全量重启实验。"
+  },
+  "interpretation_limits": [
+    "entry checks中的两个timeout属于migration的FTS5/fallback两路径；不能写成migration/query各自timeout。畸形回复为真实child响应副本上的外部故障注入。",
+    "实际EXE强制中止发生在未保存编辑且无活动发布时；深入durable-phase中断使用受影响source owner矩阵，二者不混写。",
+    "TM source受影响86项原跑81项通过、5项失败；只修测试长路径观察后5项重跑通过，不覆盖原失败日志。平台72项最终全过，无skip。",
+    "SID/owner深入负向和纯UI兼容规则保留原owner锚及范围；不冒充本候选跨SID或纯UI变体的新运行。",
+    "snapshot成功重试按正常产品行为替换导出manifest；前一次receipt完整内容保留在snapshot-conservation-result，不把现有manifest说成从未变化。"
+  ],
+  "remaining": [
+    "Core9.6b/Feature5 6.6b/平台7.3整项保持未勾选：共享变更触发的POSIX定向回归尚未取得，功能阶段批准不等于整项退出。",
+    "Feature5 7.4b已实际观察worker异常退出到Qt失败投影、Exact保留与零资格安装；仍需按独立累计评审映射其余transport错误的实现/消费复用范围。",
+    "各相邻owner的剩余候选反例、旧证据复用边界、平台7.4/8/9及独立累计发行评审仍需收束。",
+    "Mac SSH连接超时且mac.local无法解析；本机Docker启动因Inference socket错误失败。未执行的POSIX测试不记PASS或skip替代。"
+  ]
+}

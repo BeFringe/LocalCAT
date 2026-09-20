@@ -470,6 +470,8 @@
 
 ## Implementation Notes
 
+- Task 6.6b/7.6b：同一 `3c20cf46a8a4` 候选的实际资格恢复、缺失/损坏/ACL/MIC/兼容拒绝、资源局部不可用及健康结果保留已核对；fresh 目录从导出 JSONL 提供 legacy Exact，TXT 应用译文并保存冷开后 Fuzzy 仍需本机验证。Windows Core/资格交互功能阶段经独立有限批准，证据与原范围见[当前候选证据](../../../windows_ordinary_frozen_evidence.json)。尚未完成的错误投影、共享 POSIX 回归及相邻 owner 验收不由该批准代答，任务保持未勾选。
+
 - Task 6.6b：真实普通候选恢复缺失资格、消费不兼容资格时发现 Host 的输入窗口包装器误把 Core 业务拒绝归为输入失败。窗口仅归一自身进入、terminal 与关闭异常；正文异常原对象交回既有 Core binding／Host 生命周期分类，不按错误字符串放行。资格、计量与发布 authority 不变；任务继续等待同候选恢复、负向与产品验收。
 
 - Task 6.6b：验证 lifecycle 的 `SUCCEEDED` 只表示结果已完成发布，合法否定结果也能到达该状态；完成提示复用 fresh Controller 检索安全投影，不由 lifecycle 宣称获得资格，重验开始时清除上次完成提示。Qt poll 回归覆盖这一边界；canonical 测试目录使用现有 Windows 长路径清理 helper。此修正不完成正式性能、资格恢复及同候选交互验收。
