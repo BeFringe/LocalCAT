@@ -108,8 +108,10 @@ def _remove_long_quarantine(root: Path) -> None:
     quarantine_root = root / ".localcat-activation-quarantine-v1"
     if not quarantine_root.exists():
         return
-    for attempt_directory in quarantine_root.iterdir():
-        for path in attempt_directory.iterdir():
+    for attempt_name in os.listdir("\\\\?\\" + str(quarantine_root)):
+        attempt_directory = quarantine_root / attempt_name
+        for name in os.listdir("\\\\?\\" + str(attempt_directory)):
+            path = attempt_directory / name
             os.unlink("\\\\?\\" + str(path))
         os.rmdir("\\\\?\\" + str(attempt_directory))
     os.rmdir("\\\\?\\" + str(quarantine_root))
