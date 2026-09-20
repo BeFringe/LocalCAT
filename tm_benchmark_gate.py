@@ -5175,6 +5175,10 @@ def _run_benchmark_gate_d_core(
             contract=contract,
             fts5_run_root=oracle_fts5_root,
             fallback_run_root=oracle_fallback_root,
+            **({"_input_session": _input_session, "_contract_input": _contract_input}
+               if ports is _DEFAULT_GATE_D_RUNNER_PORTS
+               and ports.run_oracle_recall_suite is run_oracle_recall_suite
+               and _input_session is not None else {}),
         )
         _require_oracle_clear(fts5_oracle)
         _require_oracle_clear(fallback_oracle)

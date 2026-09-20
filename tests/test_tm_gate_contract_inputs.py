@@ -25,6 +25,81 @@ def _entries() -> tuple[tuple[str, bytes], ...]:
 
 
 class GateContractInputTests(unittest.TestCase):
+    def test_default_gate_runner_reaches_real_oracle_with_the_same_session(self) -> None:
+        import tm_benchmark_oracle as oracle
+
+        class StopBeforeFullScan(RuntimeError):
+            pass
+
+        # This verifies the production call seam, not a 5000/200 result. The
+        # real suite validates its contract and fingerprint before this stop.
+        with worker_temporary_directory() as directory, inputs._compose_source_input_owner(_ROOT) as owner:
+            with owner.open_session() as session:
+                with mock.patch.object(oracle, "benchmark_implementation_fingerprint", side_effect=AssertionError("ambient fingerprint")), \
+                     mock.patch.object(oracle, "_oracle_fingerprint", wraps=oracle._oracle_fingerprint) as observed, \
+                     mock.patch.object(oracle, "compute_full_scan_oracle", side_effect=StopBeforeFullScan) as full_scan:
+                    with self.assertRaises(StopBeforeFullScan):
+                        gate._run_benchmark_gate_d_from_session(
+                            session, contract_path=None, work_root=Path(directory),
+                            evidence_path=Path(directory) / "evidence.json",
+                            _contract_input=session.input(_CONTRACT))
+                    observed.assert_called_once_with(session, test_mode=False)
+                    full_scan.assert_called_once()
+                self.assertFalse((Path(directory) / "evidence.json").exists())
+
+    def test_default_gate_oracle_preserves_external_source_contract_reference(self) -> None:
+        import tm_benchmark_oracle as oracle
+
+        original = benchmark.load_benchmark_contract(_ROOT / _CONTRACT)
+        changed = replace(original, corpus_seed=original.corpus_seed + 1)
+        with worker_temporary_directory() as directory, inputs._compose_source_input_owner(_ROOT) as owner:
+            external = Path(directory) / "external.json"
+            external.write_text(contract_to_json(changed), encoding="utf-8")
+            owner._associate_source_path(external)
+            work = Path(directory) / "work"
+            work.mkdir()
+            with owner.open_session() as session:
+                with mock.patch.object(oracle, "compute_full_scan_oracle", side_effect=RuntimeError("stop before full scan")) as full_scan:
+                    with self.assertRaisesRegex(RuntimeError, "stop before full scan"):
+                        gate._run_benchmark_gate_d_from_session(
+                            session, contract_path=external, work_root=work,
+                            evidence_path=work / "evidence.json", _contract_input=session.input_path(external))
+                    full_scan.assert_called_once()
+                    self.assertEqual(full_scan.call_args.kwargs["contract"], changed)
+                self.assertFalse((work / "evidence.json").exists())
+
+    def test_oracle_entrypoints_require_the_exact_live_contract_reference(self) -> None:
+        import tm_benchmark_oracle as oracle
+
+        original = benchmark.load_benchmark_contract(_ROOT / _CONTRACT)
+        changed = replace(original, corpus_seed=original.corpus_seed + 1)
+        with worker_temporary_directory() as directory, inputs._compose_source_input_owner(_ROOT) as owner, inputs._compose_source_input_owner(_ROOT) as foreign:
+            root = Path(directory)
+            external = root / "external.json"
+            external.write_text(contract_to_json(changed), encoding="utf-8")
+            owner._associate_source_path(external)
+            with owner.open_session() as old:
+                stale = old.input_path(external)
+            with owner.open_session() as session, foreign.open_session() as other:
+                reference = session.input_path(external)
+                calls = (
+                    (oracle.run_oracle_recall_evidence, {"execution_path": BenchmarkExecutionPath.GRAM_FALLBACK, "run_root": root / "single"}),
+                    (oracle.run_oracle_recall_suite, {"fts5_run_root": root / "fts5", "fallback_run_root": root / "fallback"}),
+                )
+                for runner, arguments in calls:
+                    with self.subTest(runner=runner.__name__), mock.patch.object(oracle, "compute_full_scan_oracle", side_effect=RuntimeError("stop before full scan")) as full_scan:
+                        with self.assertRaisesRegex(RuntimeError, "stop before full scan"):
+                            runner(contract=changed, _input_session=session, _contract_input=reference, **arguments)
+                        full_scan.assert_called_once()
+                        self.assertEqual(full_scan.call_args.kwargs["contract"], changed)
+                        full_scan.reset_mock()
+                        for bound_session, bound_input in ((session, stale), (session, other.input(_CONTRACT)), (None, reference)):
+                            with self.assertRaises((TypeError, ValueError, RuntimeError)):
+                                runner(contract=changed, _input_session=bound_session, _contract_input=bound_input, **arguments)
+                        with self.assertRaisesRegex(ValueError, "oracle contract differs"):
+                            runner(contract=original, _input_session=session, _contract_input=reference, **arguments)
+                        full_scan.assert_not_called()
+
     def test_actual_gate_contract_reads_bound_frozen_bytes(self) -> None:
         entries = _entries()
         expected = benchmark.load_benchmark_contract(_ROOT / _CONTRACT)

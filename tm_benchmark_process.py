@@ -2401,8 +2401,11 @@ Source CLI uses the same core with its own newly composed input window.
         return 0
     except _WorkerError as error:
         code = error.error_code
-    except Exception:
+        pipes.report_failure(error)
+    except Exception as error:
         code = "PROCESS.CHILD_FAILED"
+        if type(pipes) is _WorkerPipes:
+            pipes.report_failure(error)
     if type(session) is _GateInputSession:
         session._abort()
     try:
@@ -2606,6 +2609,7 @@ def run_process_migration_evidence(
         completed = _run_worker_child(
             "migration", request_json, timeout_seconds=timeout_seconds,
             test_mode=test_mode, _test_frozen_transport=_test_frozen_transport,
+            _input_session=_input_session,
         )
     except OSError as error:
         raise ProcessEvidenceError("PROCESS.CHILD_SPAWN_FAILED") from error

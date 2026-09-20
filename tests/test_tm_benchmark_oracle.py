@@ -9,13 +9,13 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Any
 import unittest
 from unittest.mock import patch
 
 import tm_benchmark_oracle
+from tests.benchmark_worker_test_support import worker_temporary_directory
 from text_matcher import fold_text_v1
 from tm_benchmark import (
     BenchmarkQuery,
@@ -851,7 +851,7 @@ class OracleRunnerTests(unittest.TestCase):
         record_count: int = 200,
         query_count: int = 40,
     ) -> OracleRecallEvidence:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             return run_oracle_recall_evidence(
                 contract=_CONTRACT,
                 execution_path=execution_path,
@@ -862,7 +862,7 @@ class OracleRunnerTests(unittest.TestCase):
             )
 
     def test_test_mode_requires_explicit_small_counts(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             with self.assertRaises(ValueError):
                 run_oracle_recall_evidence(
                     contract=_CONTRACT,
@@ -881,7 +881,7 @@ class OracleRunnerTests(unittest.TestCase):
                 )
 
     def test_run_root_must_be_closed_before_fixture_creation(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             (root / "foreign").write_text("x", encoding="utf-8")
             with self.assertRaises(ValueError):
@@ -895,7 +895,7 @@ class OracleRunnerTests(unittest.TestCase):
                 )
 
     def test_full_scan_and_candidate_share_one_source_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             with (
                 patch.object(
                     tm_benchmark_oracle,
@@ -1015,7 +1015,7 @@ class OracleRunnerTests(unittest.TestCase):
             records=records,
             queries=queries,
         )
-        with tempfile.TemporaryDirectory() as internal_root:
+        with worker_temporary_directory() as internal_root:
             internal = run_oracle_recall_evidence(
                 contract=_CONTRACT,
                 execution_path=_FTS5,
@@ -1024,7 +1024,7 @@ class OracleRunnerTests(unittest.TestCase):
                 test_record_count=200,
                 test_query_count=40,
             )
-        with tempfile.TemporaryDirectory() as passed_root:
+        with worker_temporary_directory() as passed_root:
             passed = run_oracle_recall_evidence(
                 contract=_CONTRACT,
                 execution_path=_FTS5,
@@ -1058,7 +1058,7 @@ class OracleRunnerTests(unittest.TestCase):
                 top10_ids=tuple(range(1, 11)),
             ),
         )
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             with self.assertRaisesRegex(
                 ValueError,
                 "derive full-scan oracle inside its owner",
@@ -1071,7 +1071,7 @@ class OracleRunnerTests(unittest.TestCase):
                 )
 
     def test_fts5_absence_is_explicit_unavailable_outcome(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             with patch("tm_benchmark_oracle._probe_fts5", return_value=False):
                 with self.assertRaises(OraclePathUnavailableError) as caught:
                     run_oracle_recall_evidence(
@@ -1089,8 +1089,8 @@ class OracleRunnerTests(unittest.TestCase):
         recompute_benchmark_inputs(_ROOT / "benchmark_tm_contract.json")
         started = time.perf_counter()
         with (
-            tempfile.TemporaryDirectory() as fts_root,
-            tempfile.TemporaryDirectory() as fallback_root,
+            worker_temporary_directory() as fts_root,
+            worker_temporary_directory() as fallback_root,
         ):
             fts_evidence, fallback_evidence = run_oracle_recall_suite(
                 contract=_CONTRACT,

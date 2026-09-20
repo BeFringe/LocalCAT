@@ -926,13 +926,15 @@ def aggregate_paths_digest(
     repository_root: _InputRoot,
     relative_paths: tuple[str, ...],
 ) -> str:
+    from tm_gate_inputs import _input_digest
+
     entries: list[dict[str, str]] = []
     for relative in relative_paths:
         path = _input_at(repository_root, relative)
         entries.append(
             {
                 "path": relative,
-                "sha256": _sha256(_read_input_bytes(path)),
+                "sha256": _input_digest(path),
             }
         )
     return canonical_digest(entries)
