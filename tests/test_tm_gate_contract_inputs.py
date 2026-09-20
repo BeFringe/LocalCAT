@@ -25,6 +25,75 @@ def _entries() -> tuple[tuple[str, bytes], ...]:
 
 
 class GateContractInputTests(unittest.TestCase):
+    def test_live_session_preserves_real_full_scan_rows(self) -> None:
+        import tm_benchmark_oracle as oracle
+
+        contract = benchmark.load_benchmark_contract(_ROOT / _CONTRACT)
+        records = tuple(benchmark.iter_oracle_subset_records(
+            seed=contract.corpus_seed, record_count=contract.corpus_record_count, subset_count=20))
+        queries = tuple(benchmark.iter_oracle_queries(
+            seed=contract.corpus_seed, record_count=contract.corpus_record_count,
+            subset_count=20, query_count=40))
+        expected = oracle.compute_full_scan_oracle(contract=contract, records=records, queries=queries)
+        with inputs._compose_source_input_owner(_ROOT) as owner, owner.open_session() as session:
+            actual = oracle.compute_full_scan_oracle(
+                contract=contract, records=records, queries=queries, _input_session=session)
+        self.assertEqual(actual, expected)
+
+    def test_default_gate_stops_real_full_scan_after_owner_revocation(self) -> None:
+        import tm_benchmark_oracle as oracle
+
+        score = oracle.SimilarityScorerV1.score
+        calls = 0
+        with worker_temporary_directory() as directory, inputs._compose_source_input_owner(_ROOT) as owner:
+            def revoke_after_score(scorer, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls > 64:
+                    raise AssertionError("full scan continued after owner revocation")
+                result = score(scorer, *args, **kwargs)
+                owner._revoke_publication()
+                return result
+
+            with mock.patch.object(oracle.SimilarityScorerV1, "score", revoke_after_score), \
+                 mock.patch.object(oracle, "_run_candidate_path") as candidate, \
+                 mock.patch.object(migration, "_run_worker_child") as child:
+                with self.assertRaisesRegex(RuntimeError, "closed|revoked|terminal"), owner.open_session() as session:
+                    gate._run_benchmark_gate_d_from_session(
+                        session, contract_path=None, work_root=Path(directory),
+                        evidence_path=Path(directory) / "evidence.json",
+                        _contract_input=session.input(_CONTRACT))
+                candidate.assert_not_called()
+                child.assert_not_called()
+            self.assertGreater(calls, 0)
+            self.assertLessEqual(calls, 64)
+            self.assertFalse((Path(directory) / "evidence.json").exists())
+
+    def test_single_oracle_stops_between_real_candidate_queries(self) -> None:
+        import tm_benchmark_oracle as oracle
+
+        contract = benchmark.load_benchmark_contract(_ROOT / _CONTRACT)
+        prove = oracle.prove_and_score_fuzzy_candidates
+        calls = 0
+        with worker_temporary_directory() as directory, inputs._compose_source_input_owner(_ROOT) as owner:
+            def revoke_after_query(**kwargs):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise AssertionError("candidate queries continued after owner revocation")
+                result = prove(**kwargs)
+                owner._revoke_publication()
+                return result
+
+            with mock.patch.object(oracle, "prove_and_score_fuzzy_candidates", revoke_after_query):
+                with self.assertRaisesRegex(RuntimeError, "closed|revoked|terminal"), owner.open_session() as session:
+                    oracle.run_oracle_recall_evidence(
+                        contract=contract, execution_path=BenchmarkExecutionPath.GRAM_FALLBACK,
+                        run_root=Path(directory), test_mode=True,
+                        test_record_count=20, test_query_count=40,
+                        _input_session=session, _contract_input=session.input(_CONTRACT))
+            self.assertEqual(calls, 1)
+
     def test_default_gate_runner_reaches_real_oracle_with_the_same_session(self) -> None:
         import tm_benchmark_oracle as oracle
 
