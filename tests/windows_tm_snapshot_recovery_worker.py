@@ -306,10 +306,8 @@ def _retirement_facts(root: Path) -> dict[str, object]:
     if not retirement_root.exists():
         return {"root": None, "receipts": {}}
     receipts: dict[str, object] = {}
-    for receipt_directory in sorted(
-        retirement_root.iterdir(),
-        key=lambda item: item.name,
-    ):
+    for receipt_name in sorted(os.listdir(_test_native_path(retirement_root))):
+        receipt_directory = retirement_root / receipt_name
         receipt_stat = os.lstat(_test_native_path(receipt_directory))
         if not stat.S_ISDIR(receipt_stat.st_mode):
             receipts[receipt_directory.name] = {
@@ -318,7 +316,8 @@ def _retirement_facts(root: Path) -> dict[str, object]:
             }
             continue
         entries: dict[str, object] = {}
-        for entry in sorted(receipt_directory.iterdir(), key=lambda item: item.name):
+        for entry_name in sorted(os.listdir(_test_native_path(receipt_directory))):
+            entry = receipt_directory / entry_name
             entry_stat = os.lstat(_test_native_path(entry))
             if stat.S_ISREG(entry_stat.st_mode):
                 entries[entry.name] = _file_facts(entry)

@@ -313,8 +313,11 @@ def _journal_facts(
     root: Path,
     identity: CanonicalResourceIdentity,
 ) -> dict[str, object]:
+    # Product publication already uses extended paths; the observer must see
+    # the same deep journal files instead of treating MAX_PATH as absence.
+    observation_root = Path("\\\\?\\" + str(root))
     private_root = (
-        root
+        observation_root
         / tm_activation_journal._portable_activation_private_directory_name(
             identity
         )
@@ -424,17 +427,17 @@ def _journal_facts(
         "terminal": _file_facts(terminal),
         "retirement": retirement,
         "candidate_residue": sorted(
-            str(path.relative_to(root))
-            for path in root.rglob("*.candidate")
+            str(path.relative_to(observation_root))
+            for path in observation_root.rglob("*.candidate")
             if path.is_file()
         ),
         "initial_stage_residue": sorted(
             path.name
-            for path in root.glob(".localcat-migration.initial-*")
+            for path in observation_root.glob(".localcat-migration.initial-*")
         ),
         "stage_assets": (
             {
-                name: _file_facts(root / name)
+                name: _file_facts(observation_root / name)
                 for name in (
                     prepared.unsigned.candidate_stage_db_name,
                     prepared.unsigned.candidate_manifest_temp_name,
