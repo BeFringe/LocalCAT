@@ -14,13 +14,15 @@ LocalCAT 面向个人译者提供完全本地的翻译记忆库。当前能力�
 
 ### Windows Compatibility Amendment WA-06（current R4）
 
-WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿用下列Requirements语义，只补齐Design/Tasks中的frozen受信输入与fresh worker pre-build消费合同。`R1`～`R3`保留为dispatch ledger的`SUPERSEDED`历史；既有source evidence保持原始签署锚，不自动成为R4 frozen证据。
+WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿用既有Requirements语义并补齐frozen受信输入与fresh worker pre-build消费合同。`R1`～`R3`保留为dispatch ledger的`SUPERSEDED`历史；既有source evidence保持原始签署锚，不自动成为R4 frozen证据。
+
+**本轮范围修订待人工审批**：仅替换下列第5条中普通frozen的来源约束，并同步本Spec的输入、worker、qualification Design/Tasks；Requirements 1–9的业务语义、正式门限及数据保护不变。ADR-028已批准边界，不代表本轮具体消费合同已获批准；R4的原审批与9.6c/9.6d完成事实仍只覆盖原合同。
 
 1. Windows canonical TM 首次激活、generation 切换、snapshot publication、schema upgrade 与 recovery 必须消费 ADR-020/025 的 process lock、rooted authority与正常`PendingPublication`端口，并保持 SQLite authority、reservation、journal、LKG、generation 与业务 error envelope不变；已激活资源的显式import/rebuild必须在同一resource W1 owner内完成portable full replacement，pre-arm不改变canonical命名状态，post-arm只产生完整prior、完整new或recovery-only，且只有new `READY`清除divergence。实现仍服从`windows-platform-enablement`的前置platform capability与merge依赖。
 2. Windows 私有存储资格必须按 ADR-021经ADR-023/024接管后的`WindowsPrivateSecurityV2`使用provider-agnostic current process primary token事实：exact TokenUser owner、DACL、medium或high mandatory-integrity、`NO_WRITE_UP`、OS access行为与嵌套`WindowsPrivateProof`。local/domain/Entra等provider来源不是mandatory事实且不得进入persistent proof；proof的`security_profile_id`和authority descriptor digest仍绑定V2 canonical owner+DACL+MIC projection。它只替代POSIX物理表示谓词，Gate D/canonical owner envelope、content/phase/generation proof不得由此省略或重铸；V1/unknown profile不得兼容读取或自动迁移。
 3. FileId 只证明一次 live handle observation，不是永久资源身份；recreate/reuse、ACL drift、mixed proof、pending/ambiguous recovery必须 fail closed，设备本地资格只能在同一 owner envelope 内复证。
 4. SQLite FTS5/trigram 和 fallback 必须在 Windows 创建、查询、关闭、进程重开后分别验证；activation、snapshot与export消费`WindowsDocumentedPublishV1`，不确定时平台返回`RECOVERY_REQUIRED`，owner-visible durable state在fault/process kill/app restart/正常OS reboot后只允许完整old、完整new或recovery-only，不得以可打开SQLite或FTS5 available代替capability gate。
-5. source与frozen运行时均不依赖硬件`DurabilityProfile` registry；frozen manifest移除该registry输入，但ADR-022的其他strict bootstrap/source closure要求不变。本 amendment不改变exact/context/fuzzy/scorer、100k门、Excel三态或UI。
+5. source与frozen运行时均不依赖硬件`DurabilityProfile` registry。普通frozen按ADR-028消费受控构建记录所关联的实际候选、必要owner输入与本进程运行时，由真实Core完成Gate与资格发布；不要求ADR-022的native entry、完整Boot TCB或外置源码执行，不得借构建记录、旁置源码或source evidence代替候选上的真实运行。本amendment不改变exact/context/fuzzy/scorer、100k门、Excel三态或UI。
 6. When Windows completed-runtime cold open 已在同一resource W1、同一root与同一线程内完整认证一个无pending的replacement `CURRENT` namespace, Core可把该次认证的exact child handles与内容事实保留到同一次同步open的terminal owner；terminal仍须重新证明W1/root/private-directory绑定、完整有界闭集、每个child的live identity/name binding/private profile、device-secret/MAC及全部owned close。任一漂移或close失败shall保持`ACTIVATING`并返回recovery-required；该证明窗口不得跨open调用、线程、coordinator、generation或进程复用，也不得改变base generation、pending recovery、schema upgrade或历史activation语义。
 
 ## 需求

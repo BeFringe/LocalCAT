@@ -1,6 +1,6 @@
 # 实施计划
 
-> **普通 frozen 继承范围**：下列 W3 构建前任务保留已实现事实及完成标记；其 native/source-only 接线是原合同范围，不自动成为普通发行前置。按 ADR-028 重新设计后，仍须对实际产物验证本 Spec 的业务语义和运行资格，历史验收不代替新候选验证。
+> **普通 frozen 修订待人工审批**：9.6e拟承担首条实际packaged Core/worker调用链，9.6b改为同候选本机资格与Core产品验收；本轮只拟稿，不授权实现。既有[x]、Implementation Notes与source/R4审批保留原事实和证据范围，尤其9.6c/9.6d仅为W3构建前消费实现；不得解读为普通候选已经通过。未改变owner深入证据可按明确不变前提复用，候选上的实际Core/worker/Gate仍需验证。
 
 > **WA-06 Windows compatibility amendment（current R4）**：R4继承R3的source合同并以9.6c/9.6d落实frozen pre-build消费；`R1`/`R2`只保留为已被取代的历史。以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
 
@@ -557,12 +557,17 @@
   - _Amendment: WA-06_
   - _Depends: 5.11a, 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
 
-- [ ] 9.6b 在ADR-022 frozen harness重放Windows canonical TM发布验证
-  - 在W3 custom spike全PASS后重放9.6a；frozen manifest不再包含硬件durability registry输入，CapabilityHost/SQLite/snapshot仍必须服从正常platform publish、trusted source closure且不访问checkout，其他ADR-022 strict frozen要求保持不变。
-  - 同一候选中验证9.6c/9.6d的Gate source/fixture/contract读取、两个独立fresh worker及发布前terminal reproof；完整100k双路径硬门、RSS/timeout与产品发布验证不得缩减或由pre-build单测代答。
+- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收（待人工审批）
+  - 在7.2真实调用链产物上运行实际Gate C、oracle与100k双路径Gate D，保留原算法、门限、warmup、计时/RSS口径及strict evidence/publication；由Core真实运行铸造设备资格，不能复用source PASS或小样本诊断签发资格。本任务供平台7.3资格闭环与7.4最终验收消费，不等待它们先通过。
+  - 同一候选验证有效资格在进程重启后自动恢复、失配/损坏/权限异常只关闭Fuzzy、启动不自动100k、用户显式重验与原子替换；纯UI/头像候选变化不应无条件撤销检索资格，Core/fixture/runtime/worker计量依赖改变必须使相关身份失配。资格不可随JSONL/ResourcePackage或项目迁移。
+  - 在实际候选完成canonical激活与重启恢复、exact/context/fuzzy、FTS5与fallback创建/查询/重开、snapshot/export以及实际消费路径的锁竞争、发布失败、中断恢复、权限/reparse拒绝；失败只接受完整prior、完整new或recovery-only，不损坏既有数据。已完成9.6a的深层状态机/故障矩阵只在实现、依赖、调用合同与关键运行条件均未改变且候选已实际消费时引用；不能以旧source证据覆盖新入口、worker、runtime或改变的数据端口。
+  - 取消/关闭须分别取得publication胜负与child退出/端点回收事实：取消先赢零安装，合法commit先赢完整记录完成；超时、畸形/截断结果、异常退出不留下可发布旧session。任何必测失败或复用前提不成立均保持未完成；只按具体变更触发相关Windows数据矩阵或source/macOS/Linux回归。
+  - 完成时，Core当前候选证据明确关联产物、兼容身份、真实执行与保留/复用范围，交平台7.3/7.4与Feature5验收消费；构建变化后的最终产物按平台Requirement 12重验，不拼接不同EXE的集成片段。
+  - _Requirements: 2.9, 2.10, 2.11, 7.4, 7.5, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7, 9.9, 9.10, 9.12；Windows Compatibility Amendment WA-06 5_
   - _Amendment: WA-06_
-  - _Delivery phase: frozen post-build_
-  - _Depends: 9.6a, 9.6c, 9.6d, ADR-022, ADR-023, ADR-024, ADR-025, windows-platform-enablement 7.4_
+  - _Boundary: Core qualification / canonical TM candidate acceptance_
+  - _Delivery phase: ordinary frozen qualification and candidate acceptance_
+  - _Depends: 本轮Core与相邻消费合同获批, 9.6a, 9.6e, ADR-013, ADR-023, ADR-024, ADR-025, ADR-028, windows-platform-enablement 7.2_
 
 - [x] 9.6c 实现Gate源码、fixture与benchmark输入的受信字节消费
   - 为Gate A/C approved roots、JSON/TXT fixtures、源码摘要及Gate D contract/implementation fingerprint建立内部输入session；保留source公开Path入口，frozen消费只接受真实authority绑定的manifest-relative exact bytes，不允许pathname reopen、fixture复制或任意callback自报proof。
@@ -583,6 +588,18 @@
   - _Boundary: Core Fresh Benchmark Worker Consumption_
   - _Delivery phase: frozen pre-build_
   - _Depends: 9.6c_
+
+- [ ] 9.6e 贯通普通packaged的真实Core输入、双worker与取消（待人工审批）
+  - 在现有`tm_gate_inputs`、fingerprint/validation与worker组合接缝消费平台7.2a的实际候选输入；复用原owner/session/epoch与publication，不伪装source/native authority，不复制Host或新增profile框架。fixture/contract实际内容与构建输入摘要各有明确消费者；默认不收集源码副本，确需有限兼容数据先在Design及owner清单列明并评审。
+  - 贯通真实Matcher、Gate C输入、`tm_benchmark_gate`→oracle suite/recall evidence的同一session；query parent/child执行owner核验当前兼容身份，纯结果DTO与证据比较不读ambient fingerprint。按Design生成Core检索兼容身份并独立消费平台候选关联，不把全EXE/PYZ摘要当持久资格key。
+  - 从普通windowed同一EXE实际启动独立migration/query，消费原严格request/result、fresh PID、timeout与RSS；显式二进制pipes在标准流不可用时仍可用，缺失/错误端点、畸形/截断协议、错候选/请求、非零退出均拒绝，无外部venv或进程内fallback。
+  - 取消从当前execution context传到parent transport；零发布与child回收分别验证，复用既有短锁胜负规则，等待/终止/close在锁外且不阻塞Qt。真实覆盖运行中取消、关闭、超时及commit先赢，不以Event已置位或owner已关闭代替进程退出。
+  - 完成时，受控构建的真实候选在无checkout依赖下经过Core生产消费者，实际Matcher/Gate C输入和小样本migration→query→oracle/结果消费闭合，正常/失败路径没有遗留child或晚到授权；小样本始终为集成诊断、不签发100k资格。source受影响回归保留，原9.6c/9.6d历史证据不改签；平台7.2b/7.2c随后整合Host与产品生命周期。
+  - _Requirements: 8.3, 8.4, 8.5, 8.6, 8.7, 9.9, 9.10, 9.12；Windows Compatibility Amendment WA-06 5_
+  - _Amendment: WA-06_
+  - _Boundary: Core packaged input and fresh worker consumption_
+  - _Delivery phase: ordinary frozen first production chain_
+  - _Depends: 本轮Core与相邻消费合同获批, 9.6c, 9.6d, ADR-013, ADR-028, windows-platform-enablement 7.2a_
 
 ## Implementation Notes
 

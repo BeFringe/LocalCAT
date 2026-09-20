@@ -71,11 +71,13 @@
 
 ### Windows Compatibility Amendment WA-08
 
-- **ADR mapping**：follow ADR-022，并消费WA-03/04/05/07。Qt increment保留单JSON产品journey、silver logo与inventory-only avatar presentation；Windows Spec拥有onedir/windowed build/bootstrap/source closure。
+- **审批与ADR mapping**：本节普通frozen消费与对应R/D/T改动待人工审批，follow ADR-028并消费WA-03/04/05/07；前述Feature GO/既有审批只覆盖原Qt/source范围。Qt increment保留原项目journey、silver logo与inventory-only avatar presentation；Windows Spec拥有普通onedir/windowed构建、候选关联、入口与资源根，不新增Qt authority或Steering层。
 - **Source resources/entry**：source journey从rooted source resource resolver取得logo/avatar catalog；轻量Windows GUI入口只启动用户专用venv的绝对`pythonw.exe`与source bootstrap，提供图标/版本/诊断但不携带runtime或取得packaging authority。
-- **Bundle resources**：frozen Qt通过bootstrap提供的trusted bundle root定位logo、Windows icon与manifest声明的可选avatar catalog，不从CWD、checkout absolute path或待验证module `__file__`推断；catalog存在时沿用casefold索引、歧义/解码失败语义，未声明或无匹配时保持无头像fallback。
+- **Bundle resources**：普通frozen Qt消费平台入口提供的当前候选资源根和构建声明中的logo、Windows icon、可选avatar catalog；标准PyInstaller资源位置由平台resolver解释，Qt不从CWD、checkout或任意`_MEIPASS`值推导authority。catalog存在时沿用casefold索引、歧义/解码失败语义，未声明或无匹配时保持无头像fallback；不为头像启用source loader、PYZ逐项比较或Core资格重验。
+- **产品入口与用户状态**：普通入口复用`qt_editor`正常首页/显式项目参数处理、同一用户目录resolver及Controller组合，不以W3空编辑器入口代替产品启动。资源播种只写缺失默认项，现有workspace、资源配置、项目与TM数据不被覆盖；安装目录承载只读程序资源，用户可变状态仍归原owner和数据端口。Qt不处理候选/session/资格字段，只消费Controller的安全状态与操作结果。
 - **Qt platform**：发行物显式收集PySide6 Qt plugins中的`platforms/qwindows.dll`并以visible window smoke验收；offscreen只保留自动化辅助，不能替代真实Windows窗口。
-- **Journey**：source与clean-user packaged两条路径分别覆盖project save/reopen、TMX/resource入口、avatar catalog index/decode/fallback和non-repo CWD；source阶段只形成user-managed runtime evidence，frozen阶段才形成packaged evidence，失败均保持既有project/resource state并输出body-safe diagnostics。
+- **Journey与依赖**：source保留原user-managed evidence。普通候选先在平台7.2产物运行5.2b/5.3b资源和真实窗口，再由5.4b消费平台7.3资格闭环及WA-03/04/05/07当前可用结果，在同一最终产物完成项目保存/重开、TM激活/恢复、TMX、FTS5、实际建议与资源旅程；其结果供平台7.4汇总，不以7.4通过为前置。所有失败保持既有project/resource state并输出body-safe diagnostics。
+- **验收范围**：入口、资源路径、真实窗口/Qt生命周期和业务集成必须在当前候选验证；未改变的owner状态机深入测试可按平台Requirement 12的不变前提引用。任何candidate修复更新关联并按变更重验，最终不得拼接不同EXE的集成片段。纯界面/头像改变重验受影响布局与资源，不无条件重跑Core 100k或所有平台矩阵；改变共享owner/runtime才触发对应回归。本节不修改数据、Core Gate或已有持久格式，无需新ADR。
 
 ## 架构
 

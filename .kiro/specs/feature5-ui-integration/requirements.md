@@ -22,11 +22,13 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 ### Windows Compatibility Amendment WA-07
 
-1. Windows source启动必须先由platform factory建立ADR-020/021 rooted source、lock与private-proof ports，再import/construct CapabilityHost、Controller或业务graph；Windows frozen启动必须先由ADR-022 native entry/Boot TCB闭合并移交`TrustedSourceAuthority`，随后才建立platform factory并进入业务import。不支持的平台状态只产生安全startup/capability failure，不绕过为path-only proof。
-2. source CapabilityHost只能消费rooted source authority对实际loader/source/fixture digest的既有证明；frozen CapabilityHost只能消费`TrustedSourceLoader`对retained-handle exact executed source的attestation/digest/origin/`co_filename` closure。两种路径均不得用`Path.resolve()`、`lstat()`、`O_NOFOLLOW=0`、loader metadata或PYZ/bytecode duplicate铸造source authority。
+**普通frozen修订待人工审批**：本轮替换第1、2、5条的W3专属来源/前置要求，不改变已完成source/R4成果、数据保护、Core authority或Requirements 1–9的产品语义。
+
+1. Windows source继续先由platform factory建立ADR-020/021 rooted source、lock与private-proof ports，再组合CapabilityHost、Controller与业务graph。普通frozen按ADR-028从受控构建关联的实际候选进入既有platform/Host组合，检查入口、必要owner输入及加载来源，不要求native entry或完整Boot TCB；缺失或不兼容输入只产生安全startup/capability failure，不伪装source/native authority。
+2. source CapabilityHost保留既有rooted source消费；普通packaged Host消费Core拥有的有限输入/session合同和真实Gate runner，复用原publisher、generation、通知与取消/提交协议。构建清单、旁置源码、`sys.frozen`或UI运行状态均不能自行铸造Gate资格；不以完整AST图、PYZ逐项代码比较或新profile框架作为普通路径的默认前置。
 3. Windows canonical activation/restart以ADR-021 cold-open reproof保持Core owner envelope、nested `WindowsPrivateProof`、same store/generation与Gate C/D正交；v3 durable qualification保存portable content/phase、owner facts与nested private proof，live FileId只参与当前会话比较，成功重开不改写durable qualification；UI只投影safe state，不显示raw proof/path或自行判定资格。
 4. packaged resource lifecycle、TM activation/restart与集成回归必须在 non-repository CWD 验证；本 amendment不把PyInstaller build、Qt project/resource journey、TM Core或Resource owner迁入本 Spec。
-5. source与frozen验收分阶段完成：source阶段可先交付用户管理Python/venv的Windows运行时，但不构成packaged release；只有frozen阶段消费ADR-022 authority并完成packaged integration后，本amendment才达到terminal completion。
+5. source已独立交付用户管理Python/venv的Windows运行时；普通frozen须在同一实际候选完成Host/worker、设备资格及产品集成验收后才达到该阶段完成。既有构建前接口和source证据保留原范围，不能代替packaged调用链或重签为frozen PASS；验收范围按平台Requirement 12的候选必测、未变owner复用与变更触发重验划分。
 
 ## 需求
 
