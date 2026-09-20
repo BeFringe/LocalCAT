@@ -8,7 +8,7 @@ WA-02 source amendment按两个有序阶段交付。`1.3a`、`1.4a`、`3.2a` 是
 
 本计划保持 brief 的四个 Promotion Cluster，并在它们之前增加只做治理的 Cluster 0。`multi-document-project-workspace` 完整 C2A/C2B/C2C 提供真实 ProjectPackage 作为 Chunk C1 的上游输入。
 
-原 Chunk C0–C4 与 source 完成事实保留原范围；普通 frozen `1.4b/4.5b` 承担候选启动与业务验收。历史 Cluster 1 只拥有 identity/membership/topology/local metadata，不扩入相邻责任。
+原 Chunk C0–C4 与 source 完成事实保留原范围；普通 frozen `1.4b/4.5b` 的候选验收事实见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)。历史 Cluster 1 只拥有 identity/membership/topology/local metadata，不扩入相邻责任。
 
 固定顺序：
 

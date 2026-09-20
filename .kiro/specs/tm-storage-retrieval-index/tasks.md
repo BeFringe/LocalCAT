@@ -1,6 +1,6 @@
 # 实施计划
 
-> **普通 frozen 任务范围**：9.6e承担首条实际packaged Core/worker调用链，9.6b承担同候选本机资格与Core产品验收。9.6c/9.6d保留原W3构建前消费实现范围；实际Core/worker/Gate及未变owner证据复用分别按下列任务验证。
+> **普通 frozen 任务范围**：9.6e承担首条实际packaged Core/worker调用链，9.6b承担同候选本机资格与Core产品验收。9.6c/9.6d保留原W3构建前消费实现范围；各候选的实际Core/worker/Gate与未变owner证据复用统一见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)。
 
 > **WA-06 Windows compatibility amendment（current R4）**：R4继承R3的source合同并以9.6c/9.6d落实frozen pre-build消费；`R1`/`R2`只保留为已被取代的历史。以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
 

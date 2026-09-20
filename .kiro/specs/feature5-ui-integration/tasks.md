@@ -1,6 +1,6 @@
 # 实施计划
 
-> **普通frozen任务范围**：3.6b与6.6b/7.4b/7.6b/9.2a分别承担实际Host贯通、设备资格及同候选消费验收。3.6a保留source/R4历史范围，其native/source-only接线和原编号依赖不作为普通前置。
+> **普通frozen任务范围**：3.6b与6.6b/7.4b/7.6b/9.2a分别承担实际Host贯通、设备资格及同候选消费验收。3.6a保留source/R4历史范围，其native/source-only接线和原编号依赖不作为普通前置；各候选的验收事实见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)。
 
 > 本计划只拥有 Feature 5 Core 到当前段 TM suggestions 的跨层闭环与 macOS 入口。owner 指 Spec、task checkbox、代码边界与验收权威，不指 Agent 或 thread；同一 thread 可以依次执行不同簇，但必须重新载入 owning Spec。独立 Qt maintenance、原 Qt Requirement 3 单 JSON 搜索和 Requirement 7 术语 CRUD/管理入口分别在其 owning Spec 记账，不得用本计划的 checkbox 代替。
 

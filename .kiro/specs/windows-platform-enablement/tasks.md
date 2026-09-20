@@ -1,6 +1,6 @@
 # 实施计划
 
-> **验收范围**：Task 0–6、Core 9.6c/9.6d、Feature5 3.6a 与平台 7.0/7.1 保留原完成事实；这些历史条目的 Requirements 编号按 `6531b1e` 当时版本解释，不重签成新 Requirement 10–12 的验收。普通 frozen 按下列候选与owner任务验收；已勾选任务不自动覆盖后续候选。
+> **验收范围**：Task 0–6、Core 9.6c/9.6d、Feature5 3.6a 与平台 7.0/7.1 保留原完成事实；这些历史条目的 Requirements 编号按 `6531b1e` 当时版本解释，不重签成新 Requirement 10–12 的验收。普通 frozen 的候选、owner 任务及证据复用范围统一见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)；已勾选任务不自动覆盖后续候选。
 
 source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA-08 5.4a 与平台 6.6b 验收，状态为 `WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`；证据见 [launcher](../../../windows_user_managed_launcher_evidence.json) 和 [用户旅程](../../../qt_editor_windows_source_evidence.json)。本次文档同步不重签 runtime evidence。
 

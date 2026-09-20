@@ -8,7 +8,7 @@
 
 > **Q1 search-surface amendment 已批准（2026-08-19）**：根据 Requirement 3 实机冒烟反馈，新增 1.1c、2.6a、3.2c、4.3b、4.3c，将项目搜索收纳为顶栏可折叠入口，增加明确清除和“未填写 / 草稿 / 已翻译”筛选。该 amendment 不授权 status-only 伪 offset、Approved/Revise 状态或 Replace/Replace All，并必须在 Q2 累计评审前完成 Q1 fresh acceptance。
 
-> **WA-08普通frozen任务范围**：`a`后缀任务保留Windows source journey与原证据范围；5.2b/5.3b/5.4b承担普通候选的资源、窗口及完整产品消费。构建、候选入口与资源根仍归`windows-platform-enablement`。
+> **WA-08普通frozen任务范围**：`a`后缀任务保留Windows source journey与原证据范围；5.2b/5.3b/5.4b承担普通候选的资源、窗口及完整产品消费。构建、候选入口与资源根仍归`windows-platform-enablement`；各候选的验收事实见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)。
 
 - [x] 1. 建立冻结契约与能力边界
 
