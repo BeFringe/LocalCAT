@@ -5881,6 +5881,9 @@ class QtEditorWindow(QMainWindow):
         if status.state is FuzzyValidationState.RUNNING:
             self._fuzzy_validation_timer.start()
             self._refresh_tm_threshold_entry()
+            dialog = self.settings_dialog
+            if dialog is not None and dialog.isVisible():
+                dialog.status_label.setText("Fuzzy 性能验证中。")
             self.statusBar().showMessage("Fuzzy 性能验证中。", 5000)
             return
         self._fuzzy_validation_timer.stop()
@@ -5892,7 +5895,7 @@ class QtEditorWindow(QMainWindow):
         if dialog is not None and dialog.isVisible():
             dialog.refresh_resources()
             dialog.status_label.setText(
-                "Fuzzy 性能资格已验证并保存到本机。"
+                f"Fuzzy 性能验证已完成。{dialog.tm_threshold_state.text()}。"
                 if status.state is FuzzyValidationState.SUCCEEDED
                 else "Fuzzy 性能资格验证未通过。"
             )

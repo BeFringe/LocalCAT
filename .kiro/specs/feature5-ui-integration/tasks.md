@@ -325,7 +325,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.5a, 6.6, ADR-021_
 
-- [ ] 6.6b 在普通候选闭合Windows设备Fuzzy资格交互（已批准；待实施）
+- [ ] 6.6b 在普通候选闭合Windows设备Fuzzy资格交互（已批准；验收进行中）
   - 在完成7.2的真实候选消费Core 9.6b的正式C/D与资格owner，验证有效本机资格在进程重启后恢复；缺失、损坏、SID/ACL/MIC异常或检索兼容失配时仅关闭Fuzzy，Exact/Context保持各自Gate，启动不自动100k。
   - 用户显式重验经真实same-EXE worker、原publisher与queued generation刷新卡片；失败/取消不由`RUNNING/SUCCEEDED`或JSON自报结果授权。普通候选关联与持久兼容身份分开，纯UI/头像变更不无条件使检索资格失效，相关Core/runtime/计量变化必须重验。
   - 完成时，真实Qt操作、实际建议消费与Core receipt/资格事实一致，恢复、失配、显式重验和取消胜负均有同候选观察；该结果供平台7.3汇合，不等待平台7.3先通过。
@@ -470,6 +470,7 @@
 
 ## Implementation Notes
 
+- Task 6.6b：验证 lifecycle 的 `SUCCEEDED` 只表示结果已完成发布，合法否定结果也能到达该状态；完成提示复用 fresh Controller 检索安全投影，不由 lifecycle 宣称获得资格，重验开始时清除上次完成提示。Qt poll 回归覆盖这一边界；canonical 测试目录使用现有 Windows 长路径清理 helper。此修正不完成正式性能、资格恢复及同候选交互验收。
 - Task 3.6b：普通组合复用同一 Core owner 下的运行、持久化和发布窗口，以及既有 Host 引用提交和 queued 通知；Qt 关闭只请求撤销，后台 transport 承担等待与 child 回收。首条链的零安装/已提交 generation 和实际退出须分别观察，撤销标志不能代替退出事实。此完成范围不含 6.6b 的设备 Fuzzy 资格交互及后续完整产品旅程。
 - 3.6a：frozen consumer 的 close 必须撤销实际 Core input owner，再于短锁外唤醒 Qt 等待者；Host/通知/owner 的成功引用通过 Core 登记的普通 slot plan 与 snapshot 一起提交。Matcher/Gate C 的最终安装另开同 owner fresh window，不能复用结束窗口；source publication 的 terminal/退出异常仍须完整恢复 prior。合法生产 source issuer/receipt 正控、故障回滚与 Qt queued-terminal/close 已独立验证，但平台 native producer 和同候选 packaged/100k 资格仍分别归 7.2 与 post-build owner 任务，对应回归见 `tests.test_capability_host_frozen_inputs`、`tests.test_qt_owner_dispatch` 和 `tests.test_qt_frozen_composition`。
 - Task 2.1：新增唯一 application-facing `TMMigrationService.activate_initial(Path, str) -> MigrationOutcome`；合法首次激活仍只经 Core-owned build、`StageSealer`、coordinator prepare/journal/publish 链，非法 source/resource/coordinator、non-READY 与 already-active 在 build 前稳定 fail-closed 且零修改。独立评审 APPROVED；parent fresh completion 覆盖 252 个 migration/activation/sealer 测试（1 个明确 opt-in skip），changed-file basedpyright 0，四个用户 WIP hash 不变。publication tail、rollback/recovery、并发与 tamper 仍分别留给 2.2～2.5。
