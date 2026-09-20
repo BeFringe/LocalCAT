@@ -4,7 +4,7 @@
 
 source 已由 Task 6.6b 完成独立产品验收。下文 `SOURCE_MERGED_PASS` 是已交付 source 的事实；它不是 frozen 通过，也不因 frozen 仍未达到 `MERGED_PASS` 而变成 source 未完成。
 
-[ADR-028](../../steering/adr/adr-028.md) 部分取代原 W3 的完整 Boot TCB/native entry/source-only 前置；下方旧 W3 映射和 staged vocabulary 保留历史用途。WA-06 R3 source、R4 pre-build 与 WA-07/08 source 成果保留，不重签为 packaged 成果。本轮普通 frozen 合同已写入各 owning R/D/T，全部待审；旧 ACK 不授权本轮实施，原始 evidence 不变。
+[ADR-028](../../steering/adr/adr-028.md) 部分取代原 W3 的完整 Boot TCB/native entry/source-only 前置；下方旧 W3 映射和 staged vocabulary 保留历史用途。WA-06 R3 source、R4 pre-build 与 WA-07/08 source 成果保留，不重签为 packaged 成果。用户明确批准 `reassessment@3e41130` 的普通 frozen 活动 R/D/T 及已列明相邻 owner 修订，按现有依赖实施；旧 ACK 与原始 evidence 保持原范围，不重签候选或正式 Gate 验收。
 
 ## Purpose and Authority
 
@@ -33,7 +33,7 @@ W1/W2 的用户数据与本机资格保证继续适用。表中 W3 是 ADR-022 �
 
 source 的已批准分期、原 task 和 evidence 保留：`platform 6.6a launcher → WA-08 5.4a → platform 6.6b` 已闭合，不等待 W3。原 staging acknowledgement 与 WA request register 在下方保留其原批准范围。
 
-普通 frozen 的本轮活动依赖如下，全部新增/替换合同均待人工审批。它修订平台 Requirement 10–12 及受影响的 Core/Host/Qt 私有消费接缝，不新设业务 authority，不为组合实现增加一套 revision/profile 制度。R4 仍标识原已批准的 pre-build 合同；本轮待审内容不能借 R4 的 acknowledgement 自动获准，也不回写旧验收。若后续需要改变公开 codec、资格持久格式或业务合同，必须由原 owner 明确提案。
+普通 frozen 的本轮活动依赖如下，用户已明确批准 `reassessment@3e41130` 中全部已列明新增/替换合同。它修订平台 Requirement 10–12 及受影响的 Core/Host/Qt 私有消费接缝，不新设业务 authority，不为组合实现增加一套 revision/profile 制度。R4 仍标识原已批准的 pre-build 合同；本轮实施依据这次明确审批，不能借 R4 的 acknowledgement 改写旧验收。若后续需要改变公开 codec、资格持久格式或业务合同，必须由原 owner 明确提案。
 
 | Dispatch | 已完成基线 | 本轮普通 frozen 消费 / 验收依赖 |
 | --- | --- | --- |
@@ -48,13 +48,13 @@ source 的已批准分期、原 task 和 evidence 保留：`platform 6.6a launch
 
 平台 7.2 是首条生产链的集成完成项，不是 Core/Host 实现的先决完成项：`7.2a → Core 9.6e → Feature5 3.6b → 7.2b/7.2c → 7.2`。后续 `Core 9.6b → Feature5 6.6b → 7.3 → owning journeys → 7.4 → 8/9/10`。任何 owner 不以最终汇总 PASS 作为自身第一次运行的前提。
 
-| 待审范围 | 唯一 owning 文件 | 本轮状态 |
+| 已批准范围（`reassessment@3e41130`） | 唯一 owning 文件 | 本轮状态 |
 | --- | --- | --- |
-| 普通发行 Requirement 10–12、build/entry/transport、验收复用与任务图 | 本 Spec requirements/design/tasks/spec.json | Requirements / Design / Tasks 待人工审阅 |
-| 输入、compatibility、oracle/query、worker、publication | Core requirements/design/tasks/trusted-input-publication/spec.json | 待人工审阅；R4 原完成事实不变 |
-| composition、generation/notification、资格与取消投影 | Feature5 requirements/design/tasks/spec.json | 待人工审阅；source 与 3.6a 原范围不变 |
-| 普通资源/入口、最终产品 journey | Qt increment requirements/design/tasks/spec.json | 待人工审阅；source 不重签 |
-| WA-01/02/04/05 的普通候选前置及证据范围 | 各 owning tasks 和必要的原 frozen 来源条款 | 仅依赖/适用范围待审；业务保证不变 |
+| 普通发行 Requirement 10–12、build/entry/transport、验收复用与任务图 | 本 Spec requirements/design/tasks/spec.json | Requirements / Design / Tasks 已获用户明确批准；候选未验收 |
+| 输入、compatibility、oracle/query、worker、publication | Core requirements/design/tasks/trusted-input-publication/spec.json | 已获用户明确批准；R4 原完成事实不变 |
+| composition、generation/notification、资格与取消投影 | Feature5 requirements/design/tasks/spec.json | 已获用户明确批准；source 与 3.6a 原范围不变 |
+| 普通资源/入口、最终产品 journey | Qt increment requirements/design/tasks/spec.json | 已获用户明确批准；source 不重签 |
+| WA-01/02/04/05 的普通候选前置及证据范围 | 各 owning tasks 和必要的原 frozen 来源条款 | 仅依赖/适用范围获用户明确批准；业务保证不变 |
 
 这些是既有 ledger 的本轮审批范围，不是新治理文档。旧 register 的 ACKNOWLEDGED 不能覆盖本表；本表未批准时普通任务及发行保持阻塞，不能以 SKIP 消除。
 
@@ -75,7 +75,7 @@ source 的已批准分期、原 task 和 evidence 保留：`platform 6.6a launch
 
 ### Dispatch Authority Register（既有批准与实现范围）
 
-`dispatch_id` 是 task 使用的稳定 amendment 身份；`dispatch_request_revision` 在本 register 记录已形成的 R1–R4 合同沿革，不复制进每个 task 标签。同一 WA 跨 group 复用同一身份，既有批准和被取代请求保留原范围，不能原地改签。本轮普通消费拟稿按上方待审范围及各 owning `spec.json` 进入原 Requirements→Design→Tasks 审批流程；下表旧 ACK 即使未变，也不能覆盖当前未批准状态。不为没有公共合同变化的私有接线制造新 revision；若后续确实修改公共合同，则由原 owner 明确版本和取代范围。提交、artifact 和终态 disposition 均只在实际发生后登记。
+`dispatch_id` 是 task 使用的稳定 amendment 身份；`dispatch_request_revision` 在本 register 记录已形成的 R1–R4 合同沿革，不复制进每个 task 标签。同一 WA 跨 group 复用同一身份，既有批准和被取代请求保留原范围，不能原地改签。用户已明确批准 `reassessment@3e41130` 中上方范围的 Requirements→Design→Tasks 修订，各 owning `spec.json` 记录当前授权；下表旧 ACK 保留其原审批和完成范围，不代替本次审批或新的执行证据。不为没有公共合同变化的私有接线制造新 revision；若后续确实修改公共合同，则由原 owner 明确版本和取代范围。提交、artifact 和终态 disposition 均只在实际发生后登记。
 
 | dispatch_id | dispatch_request_revision | owning_spec | owner_acknowledgement | current_status |
 |---|---|---|---|---|
@@ -106,7 +106,7 @@ Superseded request history：WA-03 `R1`曾获acknowledgement，现由采用`Wind
 | WR-02 | `termbase-column-selection-import` | `REVALIDATION_ONLY` | 无 column selection/import contract delta | Termbase 路径通过 Resource/Parser 端口获得 Windows 能力；本 Spec 不改列映射行为 | 不追加 amendment task；在 WA-04/05 consumer regression 中引用 | WA-01/04 integration 后 | column selection/import success + hostile source zero mutation；无平台专属业务分支 |
 | WR-03 | `qt-editor-mvp` / completed baseline | `NO_AMENDMENT` | 无；旧横向 Qt baseline 不重新打开 | 当前 Windows UI 增量由 WA-07/08 拥有 | 不追加 task | WA-07/08 完成后只跑 baseline | offscreen/visible startup、keyboard/accessibility baseline |
 
-既有 ADR-025 publish port 的批准和实现保持原范围。本轮普通 frozen 由上方待审表及 owning R/D/T 单独记录审批范围；不把旧 R1/R4 acknowledgement 解释为普通入口、输入和 worker 已获批准。ADR-022 已被取代的来源要求不再是普通旅程的前置。
+既有 ADR-025 publish port 的批准和实现保持原范围。本轮普通 frozen 由上表及 owning R/D/T 单独记录 `reassessment@3e41130` 的用户明确审批；普通入口、输入和 worker 获准实施，但既有 R1/R4 acknowledgement 不被改签为普通候选验收。ADR-022 已被取代的来源要求不再是普通旅程的前置。
 
 ## Dispatch Groups
 
@@ -114,7 +114,7 @@ Superseded request history：WA-03 `R1`曾获acknowledgement，现由采用`Wind
 - **首先跑通 Qt source startup 的直接阻塞是 WA-02 Chunk**：`qt_editor.py` 启动组合必定加载协作分工模块，而其顶层 `fcntl` import 在 Windows 进入 composition 前即失败。WA-02 先消费 W1 lock/publisher contracts，移除该直接平台依赖并保持 chunk journal/LKG。
 - **WA-01 Parser 是紧随其后的 Source/Writer vertical slice**：它不负责消除最初的 `fcntl` import，但项目打开、TMX/resource import 与 canonical writer 都依赖其 Windows rooted authority，因此必须在 persistence amendments 前集成。
 - WA-01 与 WA-02 startup slice可以并行；启动验收顺序为 `Windows platform factory → WA-02 import/startup/独立metadata recovery → WA-01 rooted source/writer`。该阶段只将WA-02登记为`SOURCE_COMMITTED`，不声称真实ProjectPackage冷开已经完成。
-- WA-07 的 source composition 已完成；普通 frozen 由待审 `3.6b` 消费平台 7.2a 与 Core 9.6e，复用现有 Host 生命周期，不依赖 W3 custom spike。
+- WA-07 的 source composition 已完成；普通 frozen 由已批准的 `3.6b` 消费平台 7.2a 与 Core 9.6e，复用现有 Host 生命周期，不依赖 W3 custom spike。
 - 后续派发附实际涉及的 W1/W2、ADR-028 与 owning Design，以及用户数据禁止 path-only proof 的反例。
 
 ### Group B — Persistence / Recovery
