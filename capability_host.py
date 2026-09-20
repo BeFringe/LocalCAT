@@ -2533,10 +2533,19 @@ def _gate_d_input_session(anchor: _TrackedFileAnchor) -> Iterator[_GateInputSess
     if source is None:
         yield None
         return
+    body_error: BaseException | None = None
     try:
         with source.input_session() as session:
-            yield session
+            try:
+                yield session
+            except BaseException as error:
+                body_error = error
+                raise
     except (OSError, RuntimeError, TypeError) as error:
+        # Core refusals and programmer errors belong to the consumer. Only a
+        # distinct session open/terminal/close failure is an input failure.
+        if error is body_error:
+            raise
         raise _GateDOperationalError("GATE_D.INPUT_AUTHORITY_UNAVAILABLE") from error
 
 

@@ -73,6 +73,50 @@ def changed_attribute(target: Any, name: str, value: object) -> Iterator[None]:
 
 
 class FrozenHostInputTests(unittest.TestCase):
+    def test_gate_d_session_preserves_core_revalidation_and_programmer_errors(self) -> None:
+        from tm_benchmark_gate import BenchmarkGateDError
+
+        @contextmanager
+        def session():
+            yield object()
+
+        source = mock.Mock(input_session=session)
+        for error in (
+            BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED"),
+            BenchmarkGateDError("GATE_D.ATTESTATION_INVALID"),
+            RuntimeError("consumer programmer error"),
+            TypeError("consumer contract error"),
+        ):
+            with self.subTest(error=error), mock.patch.object(host, "_anchor_frozen_source", return_value=source):
+                with self.assertRaises(type(error)) as caught:
+                    with host._gate_d_input_session(mock.sentinel.anchor):
+                        raise error
+                self.assertIs(caught.exception, error)
+
+    def test_gate_d_session_maps_its_own_open_and_close_failures(self) -> None:
+        from tm_benchmark_gate import BenchmarkGateDError
+
+        for phase in ("open", "close", "close_after_core_denial"):
+            input_error = RuntimeError("input session no longer current")
+
+            @contextmanager
+            def session():
+                if phase == "open":
+                    raise input_error
+                try:
+                    yield object()
+                finally:
+                    raise input_error
+
+            source = mock.Mock(input_session=session)
+            with self.subTest(phase=phase), mock.patch.object(host, "_anchor_frozen_source", return_value=source):
+                with self.assertRaises(host._GateDOperationalError) as caught:
+                    with host._gate_d_input_session(mock.sentinel.anchor):
+                        if phase == "close_after_core_denial":
+                            raise BenchmarkGateDError("GATE_D.REVALIDATION_REQUIRED")
+                self.assertEqual(caught.exception.error_code, "GATE_D.INPUT_AUTHORITY_UNAVAILABLE")
+                self.assertIs(caught.exception.__cause__, input_error)
+
     def assert_no_input_reopen(self, observed: list[tuple[str, str, dict[str, Any]]]) -> None:
         reopened = [item["path"] for item in entries(observed, "audit", "open") if isinstance(item["path"], str) and Path(item["path"]).suffix.lower() in (".json", ".txt") and Path(item["path"]).is_relative_to(ROOT)]
         self.assertEqual(reopened, [], "frozen fixture/contract was reopened by pathname")
@@ -158,15 +202,15 @@ class FrozenHostInputTests(unittest.TestCase):
         execution = getattr(owner, "_RetrievalGateDOwner__execution")
         work = ROOT / "artifacts/windows/task36a-retry/never-created-gate-d"
         with execution.input_operation(), calls() as observed:
-            with self.assertRaisesRegex(host._GateDOperationalError, "GATE_D.INPUT_AUTHORITY_UNAVAILABLE"):
+            with self.assertRaisesRegex(TypeError, "production inputs require internal authority composition"):
                 execution.run(contract_path=execution.contract_path, work_root=work, evidence_path=work / "evidence.json", publication_owner_identity=object(), publication_graph_nonce=object())
-            with self.assertRaisesRegex(host._GateDOperationalError, "GATE_D.INPUT_AUTHORITY_UNAVAILABLE"):
+            with self.assertRaisesRegex(TypeError, "production inputs require internal authority composition"):
                 execution.restore(contract_path=execution.contract_path, state_root=work, base_manifest=None, publication_owner_identity=object(), publication_graph_nonce=object())
             binding = execution._capture_binding()
             # An exact but uninitialized result is deliberately malformed. It
             # must be rejected before any receipt/state/publisher is consulted.
             malformed = object.__new__(binding.run_result_type)
-            with self.assertRaisesRegex(host._GateDOperationalError, "GATE_D.INPUT_AUTHORITY_UNAVAILABLE"):
+            with self.assertRaisesRegex(TypeError, "production inputs require internal authority composition"):
                 binding.persist_attestation(run_result=malformed, contract_path=execution.contract_path, state_root=work, base_manifest=None, issued_at_utc=NOW)
         invoked = [entries(observed, "tm_benchmark_gate", name)[0] for name in ("_run_benchmark_gate_d_from_session", "_restore_gate_d_attestation", "_persist_gate_d_attestation")]
         sessions = [item.get("_input_session", item.get("session")) for item in invoked]
