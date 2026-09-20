@@ -603,6 +603,8 @@
 
 ## Implementation Notes
 
+- Task 9.6b：普通候选真实重验中关闭 Qt 后，oracle 全扫描和候选查询须观察同一输入 owner 的撤销。全扫描按小批次评分检查，候选路径在查询之间及同步建库前后检查；不改变评分、排序、fixture、门限或 worker 计量。此修正改变 Core fingerprint，旧资格必须失配，新候选须实际重跑正式 Gate；不把同步建库前后检查解释为建库内部即时中断，也不提前完成本任务。
+
 - Task 9.6e：逐输入摘要只进入原摘要聚合；fixture/contract 仍读取并校验实际内容。Gate 默认 oracle suite 与单 path 入口须沿当前 session 传递已解析的 contract 引用，不能重读默认 contract 而拒绝合法外部 source 合同。小样本 packaged 证据与复现入口见平台 Task 7.2；它不签发 9.6b 的正式 oracle、100k 资格，也不改签 9.6c/9.6d 历史。
 - 2026-09-19 / Task 9.6c publication消费：terminal/窗口退出完成不等于引用提交完成；最终安装须与真实owner撤销共享短内存边界，native/Qt工作先于该边界结束。`MemberDescriptorType`也包含只读或数值C字段，下游引用holder须采用Core固定构造的普通slot协议；原观察锁必须覆盖整套引用安装与失败恢复，布局登记不授予Gate资格。
 
