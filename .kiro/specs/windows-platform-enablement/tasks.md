@@ -436,14 +436,14 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Frozen Source Manifest_
   - _Depends: 7.0_
 
-- [ ] 7.2 贯通首条真实普通 packaged 生产调用链
+- [x] 7.2 贯通首条真实普通 packaged 生产调用链
   - 本项汇总 7.2a–7.2c 的同一实际候选：正常产品入口 → Matcher/Core 输入 → 两个独立 worker → 结果消费/取消/退出。构建和 smoke 不能单独关闭本项，小样本不签发正式 Gate D。
   - 完成时，真实链无 checkout/venv fallback、无伪装 authority、无过期安装与残留 child；独立累计评审能沿生产入口重放。
   - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.6, 11.1, 11.3_
   - _Boundary: Packaged Production Integration_
   - _Depends: 7.2c_
 
-- [ ] 7.2a 建立普通 EXE 与 owner 输入的可运行候选
+- [x] 7.2a 建立普通 EXE 与 owner 输入的可运行候选
   - 从已固定构建环境生成 stock onedir/windowed 配方与实际产物清单，复用 owner 声明；明确输入—产物对应及有限输入用途，不引入全部 PYZ 比较或源码镜像。
   - 提供正常首页/项目参数、用户目录、资源、两个限定内部 worker 分派及可调用的 parent transport：显式二进制管道、候选/请求关联、可中断等待、超时与进程/端点回收。必要环境/配方配置随本项交付，Core 9.6e 不等待后置 7.2b 才能取得这些接口。
   - 完成时，实际 EXE 到达产品组合入口，候选身份/必要输入/失败诊断可核查，真实 child 具备 Core 可接入的管道与生命周期端口；缺失输入/意外开发依赖被拒绝。尚未完成的 Core 消费如实留给 9.6e/7.2b，不以空窗口或 transport 单测判定 7.2 完成。
@@ -451,7 +451,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Windows Ordinary Packaging and Entry_
   - _Depends: 6.6b；本轮平台及 Core/Feature5/Qt R/D/T 人工批准_
 
-- [ ] 7.2b 集成真实 Core、Host 与同 EXE worker
+- [x] 7.2b 集成真实 Core、Host 与同 EXE worker
   - 汇合 Core 9.6e 与 Feature5 3.6b：真实 session 贯通 fingerprint/oracle/query；Host 只替换输入组合，复用 publisher、generation/通知及原子提交协议。
   - 将 7.2a 已提供的 parent transport 接入 Core/Host，验证二进制管道、候选/请求匹配、可中断等待、超时和进程回收；两个 fresh child 消费 Core codec 与原 RSS/计时口径，不回落 venv/进程内。
   - 完成时，小样本通过真实生产消费者走到严格结果校验和安全状态投影；不生成正式 100k 资格，不用测试 driver 或模拟 authority 代答。
@@ -459,7 +459,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Core Host Worker Integration_
   - _Depends: 7.2a, tm-storage-retrieval-index 9.6e, feature5-ui-integration 3.6b_
 
-- [ ] 7.2c 闭合首条调用链的失败、取消与退出
+- [x] 7.2c 闭合首条调用链的失败、取消与退出
   - 在实际 windowed child 验证标准流不可用、缺失/截断管道、畸形结果、错候选/错请求、超时、异常退出与正常关闭；分别观察发布状态和 child/端点回收。
   - 覆盖取消先赢零安装、合法 commit 先赢完整安装；Qt 不阻塞 join，不以撤销标志代替进程退出。
   - 完成时，故障有稳定诊断、既有数据/能力状态符合 owner 协议；无 orphan、死锁或晚到授权。分段计时仅定位成本，正式计量边界不变。
@@ -544,5 +544,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 ## Implementation Notes
 
+- Task 7.2：用 `requirements-frozen-build.txt` 固定构建依赖，在干净 checkout 执行 `python tools/build_windows_ordinary.py`；构建子进程须隔离开发工具 PATH，否则额外 ICU DLL 可能污染 Qt collection。将 `artifacts/windows/ordinary-build/dist/LocalCAT` 复制至仓库外，再执行 `python tools/check_windows_ordinary.py <副本中的 LocalCAT.exe> --report artifacts/windows/ordinary-entry-checks-complete.json`。该工具会在独立副本中临时撤下并恢复输入记录；输出绑定实际候选，过程材料留在已忽略的 `artifacts/windows/`。
+- Task 7.2c：标准流全为 None 的观察属于 detached 产品父进程；worker 使用实际 Win32 管道。畸形回复的依据是同 EXE child 正常执行后，在外部对实际响应副本注入故障，再由生产关联检查和 Core decoder 拒绝；另有 source pipe 故障注入，二者不混写。首条链只包含小样本 oracle/worker 与实际 Matcher/Gate C correctness，正式 oracle、100k 资格及完整产品验收仍归 7.3 以后任务。
 - Task 7.0：owner 声明引用 Core 的 Gate roots、benchmark inventory 和动态 import 常量；构建读取当前实现，不复用历史静态盘点清单。
 - Task 7.1：动态目标只接受可证明的有限 AST 常量；source 与 spec/helper 共用闭包规则。production 输入还须绑定实际 collection/TOC；接口见[构建输入](frozen-build-inputs.md)、[绑定](frozen-build-bindings.md)和[作用域](frozen-build-scopes.md)。这些 W3 工具不自动成为普通发行前置。

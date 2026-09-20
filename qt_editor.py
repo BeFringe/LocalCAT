@@ -590,7 +590,7 @@ def _start_capability_validation(
     from threading import Event, Thread
 
     from capability_host import CapabilityHostComposition
-    from PySide6.QtCore import QCoreApplication, QObject, Qt, Signal
+    from PySide6.QtCore import QCoreApplication, QObject, QThread, Qt, Signal, Slot
 
     if type(composition) is not CapabilityHostComposition:
         raise TypeError(
@@ -599,6 +599,13 @@ def _start_capability_validation(
 
     class CapabilityCompletionBridge(QObject):
         changed = Signal()
+        delivered_count = 0
+        delivered_on_owner = True
+
+        @Slot()
+        def observe_delivery(self) -> None:
+            self.delivered_count += 1
+            self.delivered_on_owner = self.delivered_on_owner and QThread.currentThread() == self.thread()
 
     cancelled = Event()
 
@@ -630,6 +637,7 @@ def _start_capability_validation(
             callback,
             Qt.ConnectionType.QueuedConnection,
         )
+        bridge.changed.connect(bridge.observe_delivery, Qt.ConnectionType.QueuedConnection)
         receiver.destroyed.connect(cancel)
         closing = getattr(receiver, "_capability_validation_closed", None)
         if closing is not None:
@@ -707,10 +715,11 @@ def _start_capability_validation(
                     raise
             super().join(timeout)
 
+    from capability_frozen_inputs import _OrdinaryCapabilityInputs
     worker = CapabilityValidationThread(
         target=validate,
         name="LocalCAT-capability-validation",
-        daemon=True,
+        daemon=type(composition._frozen_input_source) is not _OrdinaryCapabilityInputs,
     )
     setattr(worker, "_localcat_capability_completion_bridge", bridge)
     worker.start()
@@ -722,16 +731,17 @@ def _compose_editor_controller(
     *,
     source_authority: object | None = None,
     trusted_source_authority: object | None = None,
+    _ordinary: bool = False,
 ):
     """Build the one formal TM composition graph owned by this app run."""
 
     from typing import cast
 
-    if source_authority is not None and trusted_source_authority is not None:
+    if sum((source_authority is not None, trusted_source_authority is not None, _ordinary)) > 1:
         raise TypeError("editor composition cannot mix source and frozen authorities")
-    if trusted_source_authority is None and getattr(sys, "frozen", False):
+    if not _ordinary and trusted_source_authority is None and getattr(sys, "frozen", False):
         raise RuntimeError("frozen editor requires trusted source handoff")
-    if source_authority is None and trusted_source_authority is None:
+    if not _ordinary and source_authority is None and trusted_source_authority is None:
         # Legacy in-process callers still use the production platform factory;
         # only main() owns the stricter bootstrap-before-business-import route.
         from platform_source_authority import compose_rooted_source_authority
@@ -742,7 +752,7 @@ def _compose_editor_controller(
 
     from datetime import datetime, timezone
 
-    from capability_host import compose_capability_host, compose_frozen_capability_host
+    from capability_host import compose_capability_host, compose_frozen_capability_host, compose_ordinary_capability_host
     from editor_controller import compose_project_enabled_editor_controller
     from editor_tm_adapter import EditorTMAdapter
     from platform_source_authority import RootedSourceAuthority
@@ -751,14 +761,18 @@ def _compose_editor_controller(
 
     if type(repository) is not ResourceRepository:
         raise TypeError("editor composition requires ResourceRepository")
-    if trusted_source_authority is None and type(source_authority) is not RootedSourceAuthority:
+    if not _ordinary and trusted_source_authority is None and type(source_authority) is not RootedSourceAuthority:
         raise TypeError(
             "editor composition requires one rooted source authority"
         )
     startup_trace = _StartupTrace("capability_composition")
     owner_scheduler = None
     try:
-        if trusted_source_authority is None:
+        if _ordinary:
+            capability_composition = compose_ordinary_capability_host(
+                evaluated_at_utc=datetime.now(timezone.utc),
+                gate_d_attestation_root=repository.config_dir / "gate-d-qualification")
+        elif trusted_source_authority is None:
             capability_composition = compose_capability_host(
                 source_authority=cast(RootedSourceAuthority, source_authority),
                 evaluated_at_utc=datetime.now(timezone.utc),
@@ -883,6 +897,7 @@ def _run_empty_home_startup(
     source_authority: object,
     qt_resources: object,
     startup_trace: _StartupTrace,
+    *, _ordinary: bool = False,
 ) -> int:
     """Show the empty home before loading the global language resources."""
 
@@ -923,7 +938,7 @@ def _run_empty_home_startup(
         trace = _StartupTrace("background_resource_preload")
         try:
             controller, capabilities = _compose_editor_controller(
-                repository, source_authority=source_authority
+                repository, source_authority=source_authority, **({"_ordinary": True} if _ordinary else {})
             )
             chunks = _compose_chunk_controller(controller, repository)
             exports = _compose_tmx_export_service(controller, repository, chunks)
@@ -994,14 +1009,20 @@ def _run_empty_home_startup(
         loader.stop_publication()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, _ordinary: bool = False) -> int:
     launch_argv = tuple(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(launch_argv)
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) and not _ordinary:
         # This is the source launcher. Platform's post-TCB entry supplies the
         # explicit trusted composition; a frozen flag never grants a fallback.
         print(f"LocalCAT Qt editor could not start [{STARTUP_FAILURE_CODE}].", file=sys.stderr)
         return 1
+    if _ordinary:
+        from frozen_candidate import running_candidate
+        running_candidate()
+        if (args.install_desktop_launcher or args.install_macos_app or args.install_windows_launcher
+                or args.source_launch_smoke_marker is not None):
+            return 2
     if args.source_launch_smoke_marker is not None and not args.smoke_test:
         print(
             f"LocalCAT Qt editor could not start [{STARTUP_FAILURE_CODE}].",
@@ -1063,17 +1084,15 @@ def main(argv: list[str] | None = None) -> int:
 
         root = Path(__file__).absolute().parent
         platform_backend = compose_platform_file_backend(root)
-        source_authority = compose_rooted_source_authority(
-            root,
-            backend=platform_backend,
-        )
+        source_authority = None if _ordinary else compose_rooted_source_authority(root, backend=platform_backend)
         startup_trace.finish("qt_source_resources")
         from qt_source_resources import resolve_source_qt_resources
 
-        qt_resources = resolve_source_qt_resources(
-            source_authority,
-            logo_filename=APPLICATION_ICON_FILENAME,
-        )
+        if _ordinary:
+            from frozen_product_entry import ordinary_resources
+            qt_resources = ordinary_resources()
+        else:
+            qt_resources = resolve_source_qt_resources(source_authority, logo_filename=APPLICATION_ICON_FILENAME)
         startup_trace.finish("data_directory")
         data_dir = (args.data_dir or default_data_dir()).expanduser().resolve()
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -1086,11 +1105,17 @@ def main(argv: list[str] | None = None) -> int:
         startup_trace.finish("business_imports")
         from resource_repository import ResourceRepository
 
+        if _ordinary:
+            from frozen_product_entry import _seed_default_resources
+            candidate = running_candidate()
+            _seed_default_resources(platform_backend, data_dir,
+                                    {name: candidate.read_data(name) for name in ("tm.jsonl", "terms.csv")})
+
         startup_trace.finish("resource_repository")
         repository = ResourceRepository(
             data_dir,
-            default_tm_path=root / "tm.jsonl",
-            default_termbase_path=root / "terms.csv",
+            default_tm_path=(data_dir if _ordinary else root) / "tm.jsonl",
+            default_termbase_path=(data_dir if _ordinary else root) / "terms.csv",
             backend=platform_backend,
         )
         if (
@@ -1102,7 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             startup_trace.finish("startup_home")
             return _run_empty_home_startup(
-                repository, source_authority, qt_resources, startup_trace
+                repository, source_authority, qt_resources, startup_trace, **({"_ordinary": True} if _ordinary else {})
             )
         from qt_editor_window import QtEditorWindow
         from qt_speaker_avatar import SpeakerAvatarCatalog, resource_png_pixmap
@@ -1110,6 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
         controller, capability_composition = _compose_editor_controller(
             repository,
             source_authority=source_authority,
+            **({"_ordinary": True} if _ordinary else {}),
         )
         startup_trace.finish("chunk_and_export_composition")
         chunk_controller = _compose_chunk_controller(controller, repository)
@@ -1191,6 +1217,10 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if args.smoke_test:
+            if _ordinary and args.bundle_smoke_marker is not None:
+                from frozen_product_entry import finish_ordinary_smoke
+                finish_ordinary_smoke(app, capability_composition, validation_worker,
+                                      args.bundle_smoke_marker.expanduser().resolve())
             if (
                 not controller.has_active_project
                 or window.pages.currentWidget().objectName() != "editorPage"
@@ -1201,7 +1231,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             window.close()
             app.processEvents()
-            print("Qt editor smoke test passed.")
+            if sys.stdout is not None:
+                print("Qt editor smoke test passed.")
             return 0
         return app.exec()
     except Exception as exc:

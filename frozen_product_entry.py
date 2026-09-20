@@ -6,6 +6,127 @@ import sys
 from typing import Any
 
 
+def ordinary_resources():
+    from frozen_candidate import running_candidate
+    from qt_resource_contracts import QtResourceBytes, SourceQtResources
+    from qt_editor import APPLICATION_ICON_FILENAME
+    candidate = running_candidate()
+    from PySide6.QtCore import QCoreApplication
+    QCoreApplication.setLibraryPaths([str(candidate.bundle_root / "PySide6/plugins")])
+    return SourceQtResources(logo=QtResourceBytes(filename=APPLICATION_ICON_FILENAME,
+                             content=candidate.read_data(APPLICATION_ICON_FILENAME)), speaker_avatars=())
+
+
+def run_ordinary_core_smoke(composition, work_root: Path) -> dict:
+    """Small real consumer chain; never publishes a Gate D qualification."""
+    from tm_benchmark import _benchmark_implementation_fingerprint_from_session, _load_benchmark_contract_from_session
+    from tm_benchmark_latency import BenchmarkExecutionPath
+    from tm_benchmark_oracle import run_oracle_recall_evidence
+    from tm_benchmark_process import ProcessEvidenceError, run_process_migration_evidence
+    from tm_benchmark_query_process import run_query_process_probe
+
+    inputs = composition._frozen_input_source
+    work_root.mkdir()
+    report = {"candidate_id": inputs.candidate.candidate_id, "test_mode": True,
+              "final_evidence": False, "paths": [], "timeouts": [], "standard_streams_none":
+              [sys.stdin is None, sys.stdout is None, sys.stderr is None]}
+    with inputs.operation():
+        with inputs.input_session() as session:
+            report["implementation_fingerprint"] = _benchmark_implementation_fingerprint_from_session(session)
+            contract = _load_benchmark_contract_from_session(session)
+            for path in (BenchmarkExecutionPath.FTS5_TRIGRAM, BenchmarkExecutionPath.GRAM_FALLBACK):
+                migration_root = work_root / (path.value + "-migration")
+                migration_root.mkdir()
+                oracle_root = work_root / (path.value + "-oracle")
+                oracle_root.mkdir()
+                evidence = run_process_migration_evidence(
+                    contract_path=None, execution_path=path, run_root=migration_root,
+                    test_mode=True, test_record_count=40, timeout_seconds=120.0,
+                    _input_session=session, _contract_input=session.input("benchmark_tm_contract.json"))
+                query = run_query_process_probe(evidence, timeout_seconds=120.0, _input_session=session)
+                oracle = run_oracle_recall_evidence(
+                    contract=contract, execution_path=path, run_root=oracle_root,
+                    test_mode=True, test_record_count=40, test_query_count=4, _input_session=session)
+                if evidence.final_evidence or not evidence.test_mode or not oracle.test_mode or not oracle.recall_passed:
+                    raise RuntimeError("ordinary smoke must retain test-only evidence")
+                report["paths"].append({"path": path.value, "migration_pid": evidence.child_pid,
+                    "query_pid": query.query_child_pid, "oracle_queries": oracle.query_count,
+                    "process_evidence_digest": evidence.evidence_digest,
+                    "query_probe_digest": query.probe.probe_digest,
+                    "oracle_evidence_digest": oracle.evidence_digest})
+                timeout_root = work_root / (path.value + "-timeout")
+                timeout_root.mkdir()
+                try:
+                    run_process_migration_evidence(
+                        contract_path=None, execution_path=path, run_root=timeout_root,
+                        test_mode=True, test_record_count=40, timeout_seconds=0.000001,
+                        _input_session=session, _contract_input=session.input("benchmark_tm_contract.json"))
+                except ProcessEvidenceError as error:
+                    if error.error_code != "PROCESS.CHILD_TIMEOUT":
+                        raise
+                    report["timeouts"].append({"path": path.value, "error_code": error.error_code})
+                else:
+                    raise RuntimeError("expired child startup deadline was not enforced")
+            report["consumed_inputs"] = list(session.consumed_ids)
+    return report
+
+
+def finish_ordinary_smoke(app, composition, validation_worker, marker: Path) -> None:
+    """Keep processing Qt events while the same Host's Core consumers run."""
+    import json
+    import time
+    from threading import Thread
+    from uuid import uuid4
+    outcomes = {}
+
+    def observe():
+        try:
+            validation_worker.join(timeout=120.0)
+            if validation_worker.is_alive():
+                raise TimeoutError("ordinary startup validation timeout")
+            matcher = composition.host.matcher_snapshot()
+            retrieval = composition.host.retrieval_operation_snapshot()
+            if matcher.generation == 0 or matcher.matcher is None or retrieval.generation == 0:
+                raise RuntimeError("ordinary Host validation did not publish its real Core results")
+            outcomes["gate_c"] = composition.host._gate_c_diagnostics()
+            if (not outcomes["gate_c"]["context_available"] or not outcomes["gate_c"]["fuzzy_core_available"]
+                    or outcomes["gate_c"]["fuzzy_available"]):
+                raise RuntimeError("ordinary Gate C correctness or safe projection is unavailable")
+            outcomes.update(run_ordinary_core_smoke(composition, marker.parent / ("core-smoke-" + uuid4().hex)))
+            outcomes["matcher_generation"] = matcher.generation
+            outcomes["retrieval_generation"] = retrieval.generation
+        except Exception as error:
+            outcomes["error_type"] = type(error).__name__
+            outcomes["error_code"] = getattr(error, "error_code", "ORDINARY.SMOKE_FAILED")
+            outcomes["generations_after_failure"] = {
+                "matcher": composition.host.matcher_snapshot().generation,
+                "retrieval": composition.host.retrieval_snapshot().generation,
+            }
+
+    observer = Thread(target=observe, name="LocalCAT-ordinary-smoke", daemon=False)
+    observer.start()
+    deadline = time.monotonic() + 300.0
+    while observer.is_alive() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    if observer.is_alive():
+        composition._close_frozen_inputs()
+        raise TimeoutError("ordinary consumer chain timeout")
+    app.processEvents()
+    bridge = validation_worker._localcat_capability_completion_bridge
+    outcomes["queued_notification"] = {"count": bridge.delivered_count,
+                                        "on_owner_thread": bridge.delivered_on_owner}
+    if "error_type" not in outcomes and (bridge.delivered_count < 1 or not bridge.delivered_on_owner):
+        outcomes["error_type"] = "RuntimeError"
+        outcomes["error_code"] = "ORDINARY.QUEUED_NOTIFICATION_MISSING"
+    # Existing smoke marker plus its diagnostic facts, never a release verdict.
+    payload = json.loads(marker.read_bytes())
+    payload["ordinary_core"] = outcomes
+    marker.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    if "error_type" in outcomes:
+        raise RuntimeError("ordinary consumer chain failed")
+
+
 def _seed_default_resources(backend: Any, data_dir: Path, defaults: dict[str, bytes]) -> None:
     from platform_fs_contracts import PublishMode
     from uuid import uuid4

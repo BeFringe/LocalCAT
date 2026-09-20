@@ -72,7 +72,7 @@
         "reason": "7.1 从 Core 的原 tuple 解析 Gate D fingerprint 输入，不维护手抄第二清单。"
       },
       "dynamic_imports": [
-        {"source": "tm_sqlite_store.py", "modules": ["tm_stage_sealer"], "phase": "post-authority", "reason": "Store 的既有 late-bound sealer 导入。"}
+        {"source": "tm_sqlite_store.py", "modules": ["tm_gate_b", "tm_stage_sealer"], "phase": "post-authority", "reason": "Store 在迁移封存时延迟导入既有 Gate B evaluator 与 sealer。"}
       ],
       "worker_dispatch": {
         "source": "tm_benchmark_worker.py",

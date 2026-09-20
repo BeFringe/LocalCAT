@@ -141,7 +141,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.6, ADR-022, windows-platform-enablement 1.6, tm-storage-retrieval-index 9.6c, tm-storage-retrieval-index 9.6d_
 
-- [ ] 3.6b 贯通普通packaged Host与后台生命周期（已批准；待实施）
+- [x] 3.6b 贯通普通packaged Host与后台生命周期
   - 在既有Host composition/Core binding入口消费平台候选关联与Core 9.6e输入session，固定真实Matcher/Gate C/Gate D端口；只解除source AST/原始`.py`/native authority接缝，不复制Host、publisher或新建profile体系。
   - 复用原Gate runner、publisher、lifecycle reservation、generation/通知和Core引用提交计划；oracle/Gate D始终贯通当前session，DTO不携authority或回读ambient source。UI只见原Controller安全投影，候选id不成为资格或持久key。
   - close/取消先按原publication短锁决定胜负，再在锁外安排parent transport有界停止/回收child与端点；Qt只请求/接收异步结果，等待/异常/重入无死锁。取消先赢零安装，合法commit先赢完整记录完成，过期通知不得授权新generation。
@@ -470,6 +470,7 @@
 
 ## Implementation Notes
 
+- Task 3.6b：普通组合复用同一 Core owner 下的运行、持久化和发布窗口，以及既有 Host 引用提交和 queued 通知；Qt 关闭只请求撤销，后台 transport 承担等待与 child 回收。首条链的零安装/已提交 generation 和实际退出须分别观察，撤销标志不能代替退出事实。此完成范围不含 6.6b 的设备 Fuzzy 资格交互及后续完整产品旅程。
 - 3.6a：frozen consumer 的 close 必须撤销实际 Core input owner，再于短锁外唤醒 Qt 等待者；Host/通知/owner 的成功引用通过 Core 登记的普通 slot plan 与 snapshot 一起提交。Matcher/Gate C 的最终安装另开同 owner fresh window，不能复用结束窗口；source publication 的 terminal/退出异常仍须完整恢复 prior。合法生产 source issuer/receipt 正控、故障回滚与 Qt queued-terminal/close 已独立验证，但平台 native producer 和同候选 packaged/100k 资格仍分别归 7.2 与 post-build owner 任务，对应回归见 `tests.test_capability_host_frozen_inputs`、`tests.test_qt_owner_dispatch` 和 `tests.test_qt_frozen_composition`。
 - Task 2.1：新增唯一 application-facing `TMMigrationService.activate_initial(Path, str) -> MigrationOutcome`；合法首次激活仍只经 Core-owned build、`StageSealer`、coordinator prepare/journal/publish 链，非法 source/resource/coordinator、non-READY 与 already-active 在 build 前稳定 fail-closed 且零修改。独立评审 APPROVED；parent fresh completion 覆盖 252 个 migration/activation/sealer 测试（1 个明确 opt-in skip），changed-file basedpyright 0，四个用户 WIP hash 不变。publication tail、rollback/recovery、并发与 tamper 仍分别留给 2.2～2.5。
 - Task 2.2：首次激活仅在 generation 0 durable publication、sealed source-binding canonical digest、正式 `SQLiteTMStore` health/revision/query-view 重开全部一致后返回成功；FTS5/fallback 均经默认 fail-closed `TMRetrievalService` 证明 canonical EXACT，同 source variants 保留而 context/fuzzy 继续关闭。独立评审两次拒绝并闭合 ledger 路径一致改绑反例与测试 connection 泄漏后 APPROVED；parent fresh completion 聚焦 4/4（强制 ResourceWarning 无告警）、相关 264/264、changed-file basedpyright 0，四个 WIP hash 不变。published-tail recovery 仍归 2.4。
