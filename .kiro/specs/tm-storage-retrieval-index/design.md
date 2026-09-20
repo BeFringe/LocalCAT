@@ -49,23 +49,64 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 
 ### Windows Compatibility Amendment WA-06（current R4）
 
-- **ADR mapping**：follow adopted ADR-020/021 as supplemented by ADR-023/024/025。WA-06 `R3`取代`R2`时保持V2 security profile、采用provider-agnostic current-primary-token与`WindowsDocumentedPublishV1`；2026-09-19获批的`R4`继续保留这些语义，并按ADR-009/022/023补齐frozen输入与fresh worker消费。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
+- **ADR mapping**：follow adopted ADR-020/021 as supplemented by ADR-023/024/025。WA-06 `R3`取代`R2`时保持V2 security profile、采用provider-agnostic current-primary-token与`WindowsDocumentedPublishV1`；2026-09-19获批的`R4`补齐原W3输入与fresh worker消费。下述普通frozen增量按ADR-028拟稿，尚待人工审批；不重签R4或source验收。TM Core继续独占 SQLite authority、generation/reservation、activation/snapshot/schema journals、LKG、receipt与恢复状态机；platform adapter不解释这些业务事实。
 - **Platform composition**：activation/snapshot/schema/attestation modules消费`ProcessFileLock`、`RootedFileSystem`、`ExistingFileDurability`、`BoundDirectoryAuthority.begin_publish()`产生的`PendingPublication`与`PrivateStorageProof`；不在Core复制`fcntl`/dirfd或裸Win32调用。未发布stage的POSIX实现保持file fsync与parent fsync；Windows实现通过同一retained synchronization handle完成`FlushFileBuffers`和exact content/live identity复证，并对parent/root执行live reproof，不把它表述为Windows directory fsync。任一同步或复证缺失/漂移都不得登记sealed registry，冷重开只能重建该stage或保持unavailable；canonical publication仍只走5.7a的`PendingPublication`协议。
 - **Private proof**：owner envelope嵌套`WindowsPrivateProof`，以`security_profile_id=WindowsPrivateSecurityV2`及descriptor digest绑定exact TokenUser owner+DACL+medium/high MIC projection；handle-bound label读取使用`LABEL_SECURITY_INFORMATION`而非完整SACL权限。资格来自实际current process primary token，standard/elevated正向及same-SID low/restricted负向分别验证；local/domain/Entra等provider origin不进入proof。FileId只作live observation，recreate/reuse与security profile/token变化进入re-attestation或fail-stop，不改store id/generation；V1/unknown profile不兼容读取。
-- **Publication/FTS5**：activation、snapshot与export在local fixed NTFS上按`WindowsDocumentedPublishV1`完成write-through/flush、handle-bound naming、retained exact readback；owner在`PendingPublication`存活时提交自身journal/receipt并复证业务state，再调用platform terminal reproof。不确定时platform返回`RECOVERY_REQUIRED`，owner在故障注入、two-process/process kill、app restart与正常OS reboot后只接受完整old、完整new或recovery-only；source/frozen均不加载硬件durability registry，frozen manifest只移除该输入而保留其他ADR-022 strict closure。FTS5/fallback create-query-reopen仍分别验收并服从Gate C/D与benchmark owner。
+- **Publication/FTS5**：activation、snapshot与export在local fixed NTFS上按`WindowsDocumentedPublishV1`完成write-through/flush、handle-bound naming、retained exact readback；owner在`PendingPublication`存活时提交自身journal/receipt并复证业务state，再调用platform terminal reproof。不确定时platform返回`RECOVERY_REQUIRED`，owner在故障注入、two-process/process kill、app restart与正常OS reboot后只接受完整old、完整new或recovery-only；source/frozen均不加载硬件durability registry。普通frozen的程序来源按下节合同，不继承W3 strict closure；用户数据端口与FTS5/fallback create-query-reopen的保证不变，候选必测和未改变owner证据复用按平台Requirement 12与本Spec 9.6b执行。
 - **Explicit replacement**：Windows显式import/rebuild从source rooted preflight取得同一resource-scoped reservation与caller-held root/lock，构建fresh portable stage并沿replacement activation envelope把prior `N`切换为candidate `N+1`；DB/manifest publication继续消费`PendingPublication`，只有terminal `READY`可以更新binding并清除divergence。replacement使用独立的版本化discriminator绑定prior store/generation、active attestation与backup proof、candidate store和next generation，并将私有namespace限制为current completed chain加至多一个pending replacement；不得放宽或重解释现有first-activation v3/generation-zero codec。schema upgrade保持其独立后续边界。
 
-#### R4：frozen pre-build受信输入与fresh worker
+#### R4已完成范围与普通packaged消费修订（待人工审批）
 
-本增量依据[已批准的Task 7前置修订](../windows-platform-enablement/task7-prebuild-consumption-amendment.md)。Core拥有Gate A/C approved roots grammar、fixture parsing、relative-id集合、digest算法、Gate D implementation fingerprint、benchmark contract及Gate判定；平台只提供source/frozen authority绑定的读取与复证能力，Feature5负责组合并验证消费它们的runtime ports。
+[Task 7前置修订](../windows-platform-enablement/task7-prebuild-consumption-amendment.md)与9.6c/9.6d保留原W3构建前接口、source回归和发布协调的完成事实。普通packaged的活动合同为下文；R4的native producer、retained-source、E10和原线程native调度不再是此路径的前置，也不被重新标为已通过。Core仍拥有Gate A/C approved roots grammar、fixture解析、relative-id集合、digest、Gate D fingerprint、benchmark contract及所有Gate判定。平台拥有候选构建/入口/传输，Feature5拥有Host组合和UI调度。
 
-Core validation/benchmark边界使用内部受信输入session，以owner roots声明的规范bundle-relative id请求本次有效proof window内的exact bytes。生产session只能从组合根验证的真实authority建立；任意read callback、bytes字典、自报digest或test seam不能铸造Gate/publication authority。source route保留既有公开Path入口与行为，由组合入口建立source session；frozen route只消费`TrustedSourceAuthority`背后的manifest-bound retained reads。JSON/TXT、源码摘要、contract都经该session读取，禁止pathname reopen、临时复制fixture、checkout fallback或全局替换Path；业务临时资产继续使用既有rooted platform合同。
+**输入与执行关联。** 平台受控构建记录提供owner输入清单、各输入摘要、对应产物位置/摘要、相关构建转换及固定依赖；入口与child检查其当前候选关联，实际候选必须消费这些owner模块与数据。该关联依靠受控构建加真实候选执行，不要求所有PYZ code object逐字段比较或运行时源码自证。Core不从`sys.frozen`、任意bytes字典、callback、自报digest或PASS JSON推导production资格，也不把普通输入伪装成source或native authority。
 
-source inventory、fingerprint与执行模块必须属于同一implementation epoch。Gate C/D的开始、执行、结果构造和发布前terminal reproof仍绑定同一epoch；关闭、身份/内容漂移、loader/code anchor不符或过期均fail closed，启动时缓存不能成为长期authority或为旧evidence重新盖章。native take/read/reproof/close仍由平台在原owner thread/interpreter串行执行；后台消费的bytes/attestation继续受session撤销与terminal reproof约束，Core不依赖Qt。
+Core在现有`tm_gate_inputs`组合入口增加普通packaged的有限输入提供分支，复用`_GateInputOwner`、session、epoch及撤销/发布协议；不建立可扩展profile框架或第二套capability issuer。输入owner接收平台已核验的候选关联事实、Core审核的兼容信息及当前候选内的只读数据。JSON/TXT fixture、approved roots与benchmark contract由明确relative-id读取，检查缺失、重复、未声明id及摘要失配；取得的不可变快照仅在本owner epoch内复用。开始、结果构造、terminal与commit仍检查当前owner/session及撤销状态；terminal不因此要求重扫全包、重建AST或调用旧native reproof。fixture数据不从checkout、CWD或外部venv回补；业务临时资产继续走已有rooted数据端口。
 
-Core继续拥有migration/query request/result codec、独立fresh child、RSS从启动到完成的口径、timeout及错误分类。source使用现有Python模块入口；frozen launch只选择同一候选EXE的两个固定worker模式。每个child独立经过W3 entry、Boot TCB与E10 handoff并取得自己的authority；参数只选工作模式，父进程不得传递authority或把自报release digest作为授权。平台trusted bootstrap在E10后固定映射至`tm_benchmark_process`或`tm_benchmark_query_process`，拒绝未知/重复/多余模式及任意`-m`。
+输入用途在既有owner清单中区分，不另造`proof-inputs`必备目录：
 
-windowed child在E10后将父进程创建、定向继承的request/result pipes接到Core严格codec；pipe和模式不构成authority，不能依赖GUI控制台stream存在。错误句柄、畸形/截断结果、非零退出和超时按既有Core失败语义处理；禁止venv Python fallback或进程内worker替代。Task 9.6c/9.6d只交付pre-build消费实现与测试，真实同候选运行及100k双路径硬门仍归依赖平台7.4的9.6b。
+| 实际消费者 | 普通packaged输入 | 限制 |
+| --- | --- | --- |
+| Matcher validation与`tm_retrieval_validation` | approved roots、黄金向量/Unicode数据及其内容；构建记录中的artifact/build/evaluator输入摘要 | 语义transcript必须由实际执行模块重算；输入摘要不能代替Matcher或Gate C执行 |
+| `tm_benchmark`的fingerprint与contract读取 | Core审核的实现输入摘要、相关构建转换和runtime事实；`benchmark_tm_contract.json`原内容 | fingerprint表达检索兼容性，不是发行候选摘要或执行授权 |
+| Gate D oracle、migration/query、publication | 当前session中的contract/fixture/兼容事实和真实运行证据 | 不恢复ambient checkout locator，不为旧bundle重签 |
+
+普通路径默认不携带仅供源码重读的副本；现有源文件路径可作为构建输入id而非运行时文件位置。若首条真实调用链发现某个既有消费者确需只读源码字节且保留副本比改其窄接口更小，须先在本表与owner清单列明文件、消费者、用途和有限读取范围并评审该delta。副本只能是构建关联的兼容数据，不进入import、不充当执行authority，也不能重新启动完整AST/native证明；未经列明不得扩大收集整个checkout。
+
+#### 检索兼容身份与单次运行身份
+
+三种作用域通过现有字段与owner接口配合，不新增身份Spec、持久化run-attestation或平台资格发布者。
+
+| 作用域 | 生成/核验与传播 | 失效行为 |
+| --- | --- | --- |
+| 发行候选关联事实 | 唯一定义见Windows Design的候选身份合同；平台入口和same-EXE transport核验，Core只接收当前候选关联用于本次session和worker结果配对 | 不匹配拒绝该次运行；不进入持久Fuzzy key，不因候选变动自动否认检索兼容性 |
+| 检索兼容身份 | Core按下述输入生成现有`implementation_fingerprint`并组成ADR-013 compatibility key；parent/child各自从自己的候选输入与runtime取得，request/result与Gate发布交叉比对 | 任一依赖变化或缺失使旧资格不可恢复；Exact/Context按各自Gate继续，Fuzzy需显式重验 |
+| 单次运行/session | Core创建当前owner/epoch/window；Host保留自己的generation，Core保留现有request protocol digest、独立child PID与process-pair绑定；一请求一组pipe的transport将候选关联与该请求绑定 | foreign、已完成重放、过期epoch、旧generation或撤销胜出的结果不可发布；不持久化为资格 |
+
+检索兼容输入沿既有fingerprint与ADR-013资格owner收束：
+
+- 实现依赖从`BENCHMARK_IMPLEMENTATION_SOURCE_PATHS`及Gate C的approved roots取出，使用受控构建所记录的规范input-id/摘要；纳入实际影响检索的构建转换、migration/query worker执行与测量机制。改为数据摘要消费只改变输入来源，不改变Gate算法、cohort或门限；普通组合的编码与依赖范围必须由Core审核，不能由平台随意删项。
+- compatibility key仍覆盖device、implementation fingerprint、benchmark/proof、Gate C build/semantics/fixture/evaluator、Python/SQLite/Unicode/platform与intended path。运行时事实由当前进程观测并与构建声明核对。打包转换与transport机制有影响时通过其受影响输入/配方进入fingerprint，保持既有摘要形状和资格envelope；本轮不批准新持久schema或通用profile登记制度。
+- 完整EXE/PYZ/发行manifest摘要仅作候选关联。纯UI、头像和无关资源变化不能无条件改变检索兼容身份；也不能借“缩小key”遗漏Core、索引、Gate、fixture、相关runtime或计量依赖。source/W3/普通packaged不因源码摘要相同就自动互认，只有Core能验证全部兼容字段与本机provenance；不能证明则保持Fuzzy关闭。
+- 恢复继续使用现有私有SID/ACL/MIC、设备密钥/HMAC、strict bundle与Core receipt重铸；有效资格自动恢复，无资格或失配时启动不跑100k，只有用户显式请求才运行正式Gate D。数据/项目交换不携带本机资格。
+
+**实际调用链贯通。** `tm_benchmark_gate`调用oracle suite与其`_build_recall_evidence`时显式传递本次`_input_session`，oracle真值计算开始到两条path证据构造结束均在同一有效epoch。query parent、child与Gate D在持有session的执行owner内核验当前fingerprint；`_adjudicate_evidence_against_process_evidence`只比较传入证据、request和process关联事实。`QueryProcessRunResult`等结果DTO不持有活authority，不在构造时读取ambient source fingerprint、路径或其他进程全局身份。构建记录仅提供输入关联，真实Matcher、oracle、migration/query与发布仍由原Core owner执行。
+
+#### same-EXE worker与取消
+
+Core继续拥有严格request/result codec、独立fresh migration/query child、从进程启动到完成的RSS、timeout、错误分类与原计量边界。source保留既有Python模块入口；普通packaged由同一候选EXE的两个固定模式进入既有`tm_benchmark_process`、`tm_benchmark_query_process`，每个child独立组合自己的输入session。平台拒绝未知/重复/多余模式和通用`-m`，提供显式定向继承的二进制pipes及候选一致性检查；不传父进程authority或capability，不依赖GUI标准流/`.buffer`，不回落venv或进程内worker。
+
+现有request protocol digest、expected implementation/path/contract、独立PID与process-pair核验覆盖Core执行配对；平台候选关联在传输层附着于本次专属pipe，不能替代这些字段。无缺口不新增run-id；若实际并发/重试显示既有关联不足，只在现有request/result严格codec补齐最小关联并由Core评审，不产生持久格式或新authority。
+
+取消沿Host当前generation→Core execution context→`tm_benchmark_worker`→平台parent transport传递。Core先依既有publication短锁决定撤销/提交胜负，transport负责只停止自己创建的未完成child、限时等待其退出并回收pipe/句柄；Qt只请求取消、消费异步结束通知，不阻塞join。输入owner撤销和child回收是两项独立义务；child未退出时不可报告清理完成。取消先赢则零安装，合法commit先赢则保留完整安装和完成事实，随后取消不追溯否定已完成提交。所有等待、I/O、terminate/close都在publication短锁外，详见[既有publication合同](trusted-input-publication.md)。
+
+真实候选须覆盖windowed标准流不可用、缺失/错误pipe、截断或畸形result、超时、child异常退出、取消/关闭以及合法commit先赢的反例。首条小样本贯通只证明集成与生命周期，不签发正式100k资格；随后同候选的正式C/D与设备资格闭环归9.6b。9.6e与平台7.2同步交付首条生产链，不等待平台7.3/7.4的后置资格或产品验收。
+
+#### 本轮治理与待验证范围
+
+本轮依据ADR-009/013/020/021及其已采纳修订、ADR-028调整现有owning合同，不修改Steering、不新增ADR或public capability/持久schema。Requirements WA-06第5条、上述Design和9.6b/9.6e共同拟稿待人工审批；旧审批只覆盖原source/R4成果。相邻平台与Feature5须同步候选关联、Host组合和取消消费，但不能变成第二个Core owner。
+
+尚未证明的是普通入口能否在无checkout的真实候选中完整消费上述有限输入，以及现有fingerprint/Gate C汇总能否仅靠构建输入摘要保持既定grammar。下一次经批准的7.2/9.6e实验先跑实际Matcher、Gate C输入与小样本migration→query→oracle/结果消费，记录发生路径读取的具体消费者、子进程退出和各阶段成本；缺输入、ambient source读取、跨候选结果、取消后未回收或正式消费者被test seam替代均为失败。若需要超出本节的副本、字段或组合边界，先归属本owner并修订该delta，不扩大为全包证明。
 
 ### Revalidation Triggers
 
@@ -1179,13 +1220,17 @@ portable cancellation owner在PENDING、stage pair、terminal candidate与termin
 
 query child 中的 latency executor 必须调用生产 exact 和 `fold-v1 → bounded real seed + bound-proof batches ↔ scorer-v1 → threshold → stable top-k` 链路，并由实际 store health/candidate/proof metadata 回显 execution path；不得以 synthetic callback、仅候选身份、oracle identity 或调用方自报 path 代替。两条路径可以共享 proof closure 算法，但必须分别执行各自 seed/index path 并发布独立报告。迁移 child 与 query child 分别采样峰值 RSS，路径报告使用两个独立进程的较大值；迁移耗时仍只取 Task 8.3 已冻结的全生命周期口径。
 
-最终 machine-readable `tm-benchmark-bundle-v2` evidence bundle 保留 latency 的全部原始样本、process/query/oracle 的不可变事实与 digest、当前 proof-query version，以及对实际迁移/query/oracle/capability 生产闭集逐文件 no-follow 稳定读取所得的 implementation fingerprint。一次 fingerprint candidate capture 必须连续读取完整 source inventory 两遍并要求逐路径 digest 完全一致；但顺序扫描不是 writer serialization，不得单独授权 final evidence。最终 Gate/matrix/release 只能在同一个 read-only、content-addressed implementation epoch 内执行和发布；活动可写 checkout 的 pre/post 重扫无法排除最后一次读取后的 late drift，不得冒充该 epoch。process child 的请求/响应、query child 对 process evidence 的重绑定以及 oracle owner 的真实 proof 观察都必须各自在自己的执行窗口前后绑定同一个 proof/source 值；oracle 的窗口从 full-scan 真值计算之前开始，贯穿两个 candidate execution path 的最终证据构造。Gate 只能从三类 nested evidence 派生顶层绑定并交叉核对两条路径，禁止为旧 evidence 重新盖上当前常量或 fingerprint。
+最终machine-readable `tm-benchmark-bundle-v2`保留latency全部原始样本、process/query/oracle不可变事实与digest、当前proof-query version和Core拥有的implementation fingerprint。source既有路径继续对生产闭集逐文件no-follow稳定读取，candidate capture连续两遍比对完整source inventory；最终source Gate/matrix/release仍在原read-only、content-addressed epoch执行与发布，不能以可写checkout的pre/post扫描冒充writer serialization。普通packaged改用上文「检索兼容身份与单次运行身份」中的构建输入摘要、相关转换/runtime及当前候选session，不要求可访问外置`.py`或重复完整source capture；这只替换来源消费形式，不降低运行与证据要求。
 
-Gate runner 只有在 locked real ports 完成、bundle 原子落盘且 strict durable readback 成功后，才可为该 exact bundle object 生成 module-private、immutable、facts-bound run receipt；公开 `BenchmarkGateDRunResult` 字段、调用方 `test_mode=False` 或可重算 SHA-256 均不能自行铸造 publication authority，test seam 的 receipt 始终携带 test-mode 并被发布边界拒绝。runner 在重型运行前后以及 evidence 严格回读后复核同一 implementation fingerprint；漂移时只按 exact inode 删除自己刚发布的 final，删除或 parent fsync 无法证明时提升为 `GATE_D.CLEANUP_PENDING`，不得只报告原始 drift。capability owner 在 manifest 完整构造后、紧邻唯一一次 `publisher.refresh` 前重新取得同一 checkout 的 terminal fingerprint；不一致时 refresh 调用次数必须为零。
+两种组合均要求process request/result、query对process evidence重绑定与oracle真实执行，在各自窗口前后匹配同一兼容身份；oracle窗口从full-scan真值计算之前开始，贯穿两条candidate path的最终证据构造。Gate只从nested evidence派生顶层绑定并交叉核对两条path，禁止为旧evidence重新盖上当前常量或fingerprint。纯证据DTO只比较传入值；需要读取当前session的检查归执行owner。
 
-release owner 必须从自己的 exact checkout 重算 benchmark fingerprint，另行闭合 validator/registry/全部直接 unittest module 的 source inventory，并重新执行 acceptance/fault registry 的全部 exact test IDs 与 release 独有的 12 个 direct test IDs；matrix JSON 的自报 `PASS` 和当前 source hash 组合不能单独授权 release。acceptance、fault 与 release 三个 evidence owner 都必须在测试后、临时文件 fsync 后且 replace 前、final no-follow exact-inode/bytes readback 后复核各自完整 source/input snapshot；release snapshot 包括 requirements、两份 matrix evidence 及其当前 sources、benchmark bytes/bundle/current implementation 和 release owner sources。任一窗口漂移均不得打印成功结论。旧 proof/source bytes 的 bundle 即使内部自洽也不得授权当前发布。本地 child protocol 可以使用经严格验证的绝对路径定位本次临时资产，但可移植 bundle 只发布 implementation digest、由 contract/corpus/path/artifact/evidence digest 构成的稳定 artifact key 与必要环境事实，不发布实现 source path/bytes、run-root/fixture 绝对路径、PID 或可跨机器误用的句柄。专用 root 只在 bundle 原子落盘并严格回读后由调用方在测量外整体回收；Gate D 只消费已回读的 bundle，不直接信任临时路径或运行中对象。
+Gate runner只有在locked real ports完成、bundle原子落盘且strict durable readback成功后，才可为该exact bundle object生成module-private、immutable、facts-bound run receipt；公开`BenchmarkGateDRunResult`字段、调用方`test_mode=False`或可重算SHA-256均不能铸造publication authority，test seam的receipt始终带test-mode且被发布边界拒绝。runner在重型运行前后与evidence严格回读后复核当前session的同一implementation fingerprint及存活状态；source沿原source终端复证，普通packaged沿当前候选关联和兼容输入快照复证，不能回读ambient checkout。漂移后的final处置继续服从既有平台数据发布/清理合同，无法证明自己发布的对象已安全清理时保留`GATE_D.CLEANUP_PENDING`；不借程序来源简化放宽用户数据保护。capability owner在manifest完整构造后、紧邻唯一一次`publisher.refresh`前完成同一session的terminal与publication准备，不一致或取消先赢时refresh调用次数为零；合法commit先赢仍按原竞态合同完整记录完成。
 
-Windows Task 9.6a 是 current-source 产品发布证据入口：它严格绑定当前 Windows/CPython 3.14 Gate D bundle、C3B source snapshot handoff，以及覆盖 activation/recovery/private/schema/snapshot/retrieval 的 Windows 产品测试清单；合法的 benchmark 或 C3B `NO_GO` 必须形成可审计阻断结论，不能冒充运行器故障，也不能被跳过。该入口不重解释 Windows v3 的 portable identity/recovery 决策，不要求 Windows 重放依赖历史 POSIX inode 的通用 acceptance/fault/release 断言；后三类跨平台证据在 windows-platform-enablement Task 9.2 于同一实现提交上由 macOS/Linux owner 重签。
+既有source release owner继续从自己的exact checkout重算benchmark fingerprint，闭合validator/registry/直接unittest inventory，运行原acceptance/fault与release direct test IDs；其evidence仍须在测试后、临时文件同步后且replace前、final exact readback后复核原完整source/input snapshot。该source矩阵的原完成事实不改签，也不成为普通packaged逐次重跑全部历史矩阵的隐含前置。普通候选的必测、未变owner证据复用及变更触发重验由Windows Requirement 12与Core 9.6b明确；source PASS、自洽matrix JSON或当前source hash不能代替实际候选的Core/worker/Gate运行。
+
+任一当前执行窗口失配都不得打印成功结论。child protocol可用严格验证的绝对路径定位本次临时资产，但可移植bundle仍只发布implementation digest、contract/corpus/path/artifact/evidence构成的稳定artifact key与必要环境事实，不发布实现source path/bytes、run-root/fixture绝对路径、PID或跨机器句柄。候选/request/PID关联只服务本次本地传输和验收，不写入设备资格作为永久run身份。专用root在bundle原子落盘、严格回读且child退出后由owner在测量外按已有数据端口回收；Gate D只消费已回读bundle，不直接信任临时路径或运行中对象。
+
+Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CPython 3.14 Gate D bundle、C3B source snapshot handoff与activation/recovery/private/schema/snapshot/retrieval清单。合法benchmark/C3B `NO_GO`仍是阻断而非运行器故障，不得跳过；它不重解释Windows v3 portable identity/recovery，也不要求Windows重放历史POSIX inode断言。普通packaged只在共享代码、依赖或消费合同变化时触发受影响source/macOS/Linux owner回归；不要求每个候选无条件在同提交重签全部跨平台矩阵，亦不借此将9.6a升格为frozen验收。
 
 - machine-readable `benchmark_tm_contract.json` 必须与 `BenchmarkContract` 一致；`benchmark-v1` 固定 generator/seed/digests、100,000 records、exact ≥1,000 queries、fuzzy ≥200 queries。
 - deterministic corpus 包括 multilingual/CJK/short/duplicate/multi-target/context/near-edit/miss cohorts；query cohort 由 digest 固定，不允许运行时挑选有利样本。
