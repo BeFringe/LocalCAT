@@ -3,6 +3,8 @@
 > Agent 对 LocalCAT 治理模型的理解快照。本文件记录 Agent "如何理解治理"，而非治理规则本身。
 > 治理规则见 governance-baseline.md。
 
+> 2026-09-20 校准：以下是历史理解快照。“红线”指当前获批范围，不代表产品边界永久不可改变；项目 owner 已批准的简化与 ADR 取代按 `delivery-boundaries.md` 和现行 ADR 执行，旧快照不构成额外前置门。
+
 ---
 
 ## 1. 治理模型理解

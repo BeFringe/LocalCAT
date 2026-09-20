@@ -1,12 +1,24 @@
-# LocalCAT 后 MVP 路线图
+# LocalCAT 产品与交付路线图
 
 ## Overview
 
-LocalCAT 当前已有可运行的 PySide6 编辑闭环、单文件 JSON/TXT 项目、精确 TM、Trie 术语、Feature 5 canonical retrieval，以及完成重新基线的单输入 Parser Foundation。Parser 已用 purpose-aware registry、rooted sealed snapshot、verified terminal 与八个内建用途/格式组合统一 JSON/TXT、PO/POT、TMX、normalized TM JSON、CSV/XLSX 的语法权威；Application 继续拥有项目会话、batch policy 与资源事务。
+LocalCAT 已有 PySide6 编辑闭环、单文件与多文档项目、ProjectPackage、协作分工、ResourcePackage、TMX 导入/导出、Trie 术语和 Feature 5 canonical retrieval。Parser 已统一 JSON/TXT、PO/POT、TMX、normalized TM JSON、CSV/XLSX 的单输入语法权威；Application 继续拥有项目会话、batch policy 与资源事务。
+
+Windows source 已完成 CPython 3.14 x64 专用 venv、源码与轻量 launcher 的用户旅程（Task 6.6b）。当前 0.5.2 交付 Windows 首次普通 frozen：PyInstaller onedir/windowed 打包与同一候选上的真实 Qt、Project、TM、TMX、FTS5 用户旅程、数据保护及 Core Gate C/D 构成一个完整验收目标。烟测与可行性检查是实施步骤，不单独作为发行里程碑。W3 不再阻塞平台迁移或 source 演进；普通 frozen 按 ADR-028 收窄启动来源证明，尚未完成发行验收。长期边界见 [交付与验证边界](delivery-boundaries.md)。
 
 Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage portability 已经闭合。RPY 作为 portability 的首个下游消费者优先于跨设备同步推进：单个 Ren'Py translation script 由可配置 format-codec plugin 在仓库边界形成 DDD 防腐层，负责格式映射、token/sidecar 与可选回填/导出；多个 RPY 文件继续以相对路径身份、顺序和项目级调和消费既有多文档模型。单个 XLSX 内由多个 Sheet 分别承载章节仍属于特殊 workbook origin，并接入同一多文档模型。
 
-## Approach Decision
+## 版本里程碑
+
+0.1/0.2 的术语与 JSONL TM → 0.3 Excel 工作流 → 0.4/0.4.1 Qt 编辑与增量 → 0.5 SQLite TM Core 与 UI 集成 → 0.5.1 Parser/多文档，构成已有演进脉络；根目录 README 保留 Feature 名称和真实发布标签。下一步为：
+
+| 版本 | 范围 | 状态 |
+| --- | --- | --- |
+| 0.5.2 | Windows source 基础上的首次普通 frozen 完整用户交付 | 实施中，未发布 |
+| 0.5.3 | `rpy-project-codec`，随后 `cross-device-sync-plugin` | 规划，仍需各 owning Spec 的阶段审批 |
+| 可能的 0.5.4 | macOS frozen | 尚未立项，版本未定 |
+
+## 早期双线决策（历史）
 
 - **Chosen**: 同一干净基线上的双垂直线。
   - **Qt JSON line**：单 JSON 的 speaker 显示、基础搜索、文字预处理、术语 CRUD、图标/布局维护。
@@ -24,52 +36,53 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 
 | Lane | 活动分支 | 当前范围 | 明确不做 |
 |------|---------------|----------|----------|
-| Qt JSON | `ui-mvp` | 单 JSON、raw speaker、基础搜索/预处理/术语 CRUD、silver logo、紧凑“…” | 新项目格式、SQLite、fuzzy；合并前不启用 Match Case / Whole Word |
+| Qt JSON | `ui-mvp` | 已有 speaker、搜索/预处理/术语 CRUD；消费 Core matcher 与 retrieval | 不在 Qt 复制匹配或存储权威 |
 | Feature 5 | `feature5` | canonical TM、SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher、exact/context/fuzzy query | Qt 控件、Parser codec、Glossary 管理 UI、Docker/协作 |
 | Feature 5 UI Integration | `ui-mvp`（独立 Spec） | 精确 Feature 5 merge、composition root、Controller adapter、TM suggestion/阈值/状态、macOS bundle | 重写 Core、接管 Qt Req3 搜索或 Req7 术语 CRUD |
 | Parser Foundation | `parser-rebaseline` | 中立 contracts/source/registry/composition、八个单输入组合、唯一 Application surface | 不拥有多文档、RPY 实现、chunk、sync 或 TM storage |
-| Windows Platform Enablement | `codex/windows-platform-enablement` | 共享平台文件/锁/发布/private-proof contracts 与 backends、Windows frozen bootstrap/build、amendment ledger、release evidence | 不接管 consumer 业务状态机、receipt/journal/LKG、UI 产品语义或 `--onefile`/installer/signing |
-| Multi-document | 后续规格分支 | Project/Document/Segment、章节导航、保存与 reconciliation | 不改写 Parser 单输入局部身份 |
+| Windows source | `codex/windows-platform-enablement` | 已完成平台文件/锁/发布/private-proof、业务适配、轻量 launcher 与用户旅程 | 不依赖 W3 完成，不声称自带 Python |
+| Windows frozen | `codex/windows-frozen-reassessment` | 0.5.2 普通自包含产品闭环；continuation 独立保留 W3 强证明实现及验收事实 | 不把旧强证明任务自动继承为普通发行前置，不接管业务 owner |
+| Multi-document / Chunk / Resource | 各 owning Spec | 已完成 workspace、ProjectPackage、分工与资源交换；继续维护 | 不改写 Parser 单输入局部身份，不提供在线同步 |
 
 `governance/kiro-steering` 不是产品 Delivery Lane；它只是 `.kiro/steering/**`、ADR、`.kiro/settings/**`、SDD Skills 与 `AGENTS.md` 的单一治理发布 worktree，避免在正交产品线重复生成 patch-equivalent 治理提交。Windows Platform Enablement 是平台/发行适配线，也不取得相邻产品 Feature 的业务实现权。`parser-rebaseline` 已按批准的 `parser-subsystem-extraction` Requirements/Design/Tasks 完成契约、Foundation、codec、facade 迁移与 current-source evidence 重验；它没有取得相邻 Feature 的实现权。
 
-两条活动线使用单一、可追踪的继承链：共享 SDD/Steering 与已验收 Qt 基线先在 `ui-mvp` 提交一次，`feature5` 再通过 rebase/merge 继承该历史，并只追加 Feature 5 自身规格与实现。不得在两个 worktree 中分别重建等价补丁；共享治理或跨线契约也必须只提交一次，再由活动分支继承。分支 tip 无需长期相同，但共同改动必须拥有同一提交祖先。
+各活动线使用可追踪的继承链。共享治理按 `repository-safety.md` 的治理 tip 规则继承；其他跨线变更只提交一次，再由相关开发分支 merge/rebase 继承，不在不同 worktree 重建等价补丁。
 
 每个 worktree 都会看到完整仓库；Feature 5 看到 Qt、Parser 或未来规格属于正常只读上下文。实际可写范围以 `spec-ownership.md` 为准，禁止通过删除相邻规格来“清理”工作树。
 
-## Scope
+## 已有范围与后续方向
 
-- **Now — Qt JSON increment**:
+- **已实现 — Qt JSON increment**:
   - 从单 JSON 既有 `speaker` 字段只读盘点 raw speaker，并在编辑/浏览中独立显示；
   - 单 JSON 项目的基础关键词搜索；
   - 有顺序、可预览、显式应用的 target-only 文字替换预处理；
   - 译文框使用平台原生主修饰键执行本地撤销/重做：macOS 为 `Command+Z`、`Command+Y`/`Command+Shift+Z`，其他平台为 `Ctrl+Z`、`Ctrl+Y`/`Ctrl+Shift+Z`；
   - 术语列表、新增、编辑、删除和 Trie 热重载；
-  - Match Case / Whole Word 控件占位、禁用和第二阶段说明；
+  - Match Case / Whole Word 消费已接入的 Core matcher；
   - `LocalCAT-logo-silver.png` 与竖版“…”宽度维护。
-- **Now — Feature 5**:
+- **已实现 — Feature 5**:
   - SQLite TM、版本化记录、多译文/context/provenance；
   - JSONL 安全迁移、兼容导出与可崩溃恢复的快照发布；
   - Levenshtein 和 Dice scorer；
   - exact → context → fuzzy 的确定性排序；
   - 供 TM、项目搜索和术语搜索消费的 Match Case / Whole Word 兼容内核。
-- **Now — Feature 5 UI Integration**:
+- **已实现 — Feature 5 UI Integration**:
   - 从精确 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 可追踪 merge；
   - canonical/legacy resource composition、正式 capability publisher 与 Controller adapter；
   - exact/context/fuzzy suggestion、双 source、device-local 60% 阈值、显式/stale apply；
   - mixed resources 的确定性全局 top-10、诚实降级与 resource-local failure；
   - `TextMatcher` 向原 Qt Requirement 3/7 的正式 handoff，以及独立 macOS `LocalCAT.app` 入口。
-- **Now — Parser Foundation**:
+- **已实现 — Parser Foundation**:
   - stdlib-only 中立 contracts、rooted/sealed source、guarded terminal、用途感知 registry 与唯一内建 composition；
   - LocalCAT JSON/TXT、PO/POT、TMX Level 1、normalized TM JSON、CSV/XLSX 八个 reader 组合；
   - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
   - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
-- **Now — Windows Platform Enablement governance**:
-  - ADR-020～025 已采纳，批准 `windows-platform-enablement` 只拥有共享平台 contracts/backends、Windows private-proof 物理表示、frozen bootstrap/build composition、amendment ledger 与 release evidence；ADR-024移除身份提供方强制环境，ADR-025以documented publish替代runtime硬件掉电profile；
+- **当前 — Windows source 交付与 frozen 分线**:
+  - source 平台和业务适配、轻量入口与用户旅程已完成；frozen 按 ADR-028 重估，不撤销 source 结果。ADR-024/025/027 已分别收窄身份提供方环境、硬断电资格和导出锁收尾；
   - Parser、Chunk、Project、Resource、TMX、TM Core、Feature5/UI 与 Qt 继续拥有各自业务不变量，并只通过 owning branch amendment 接入；`tmx-context-interchange` 的唯一 owner branch 为 `ui-mvp`；
   - Qt speaker avatar 只作为 Windows catalog 索引/解码与无匹配 fallback 回归，不改变资源语义、ignore 规则或打包 ownership；
-  - Task 0 governance/design gate 闭合前不进入 runtime，最终平台线只集成一次。
-- **Now — Termbase column selection import**:
+  - 旧 W3 Task 7.2 尚未通过；7.0/7.1 与 Core R4 成果保留，按新的普通发行边界择需复用，不能当作 packaged E2E。
+- **已实现 — Termbase column selection import**:
   - CSV/XLSX 术语导入在 Qt 非阻塞取得 codec-owned 有界列 preview，用户显式选择 source/target 物理列和首行用途；
   - preview 与正式导入绑定完整 source identity，并在同一新 sealed snapshot 上复核可见列数后才允许 stream/Store transaction；
   - 不提供显式选择的调用继续 0/1 + legacy header allowlist；不增加语言列猜测、Sheet 选择、多 Sheet 聚合或资源导出。
@@ -80,7 +93,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
   - TMX context profile 和未来 TM Resource Editor。
   - 若产品需要明确的突然断电存活声明，另立Windows硬件耐久资格Spec/ADR与实验室支持矩阵；不反向阻断普通source或EXE。
 - **Out of the two active lanes**:
-  - 机器翻译、云端、账号、多人协作、Docker 部署和共享资源；
+  - 机器翻译、云端、账号、实时多人协作、Docker 部署和公共共享资源；
   - 无确认批量改写、语义向量和在线模型；
   - 任意 Ren'Py 程序源码解析；
   - 把 TMX 注册为 `purpose=project_document`。
@@ -99,12 +112,12 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 - 活动 worktree 必须位于持久文件系统；不得把 `/tmp`、tmpfs 或其他会被系统清理的目录作为唯一工作副本。
 - `.kiro/` 是项目事实来源，必须由 Git 跟踪；生成或批准新的 Spec 阶段后应及时形成可恢复提交。
 - Windows consumer 不得直接增加 POSIX/Win32 primitive 分支；共享平台能力只能由 `windows-platform-enablement` 提供，业务 authority 与 recovery 决策仍由 owning Spec 保留。
-- Windows 首版发行 profile 固定为 CPython 3.14 x64 + PyInstaller `--onedir --windowed`；`--onefile`、installer、signing、remote/UNC 与未获证明的 filesystem 不在当前 scope。
+- Windows source 使用用户自管 CPython 3.14 x64；普通 frozen 优先探索 PyInstaller `--onedir --windowed`，不再强制旧 W3 Boot TCB/source-only 证明。`--onefile`、installer、signing、remote/UNC 与未获证明的 filesystem 不在当前 scope。
 
 ## Boundary Strategy
 
 - **Feature 5 shared seam**: `SearchOptions(match_case, whole_word)`、文本规范化/词界判断和稳定 hit offsets；UI/Glossary/TM 只消费，不复制实现。
-- **Durable snapshot seam**: export/refresh/recovery 以 durable receipt/handoff 为状态权威，文件变更必须绑定完整 parent chain 与 exact inode identity，在最后一次 mutation 前复证 source/destination，并以 post-mutation fsync/身份复核和冷恢复共同闭合；任何调用方不得以相同字节代替该命名空间证明。
+- **Durable snapshot seam**: export/refresh/recovery 以 owner receipt/handoff 为状态权威，平台提供 rooted 活对象绑定、锁、发布、读回与冷恢复所需事实；POSIX 和 Windows 各用本机原语，不要求 Windows 模拟 inode 或目录 fsync。
 - **CJK Whole Word**: 对纯 CJK 查询不施加额外词界过滤，结果与未勾选 Whole Word 的连续文本匹配相同；该退化必须是明示、版本化且有 golden cases 的兼容语义。
 - **Qt Stage A**: 搜索 UI、结果模型和导航可以先实施，但基础搜索只有在 Feature 5 legacy matcher 达到 `BASIC_VALIDATED` 后才能完成验收；两个高级选项保持 disabled，且不得写入持久记录。
 - **Qt Stage B**: 合并 Feature 5 后启用 Match Case / Whole Word，并用跨 source/target/speaker/术语 fixture 验证一致结果。
@@ -127,11 +140,11 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 ## Specs (dependency order)
 
 - [x] `parser-subsystem-extraction` -- 单输入 Parser contracts/source/registry/composition、八个内建用途/格式组合与兼容 facade 迁移。Dependencies: ADR-015
-- [ ] `windows-platform-enablement` -- ADR-020～025 约束的共享平台 contracts/backends、Windows frozen bootstrap/build、consumer amendment ledger 与 source/packaged release matrix；只集成一次，不拥有相邻业务语义。Dependencies: approved ADR-020～025, approved owning scope, required WA-01～08 owner amendments
+- [ ] `windows-platform-enablement` -- source Task 1–6 已完成；frozen Task 7–10 待按 ADR-028 重新设计并独立验收，不反向阻塞 source。
 - [x] `termbase-column-selection-import` -- CSV/XLSX codec-owned 有界列 preview、显式物理列/表头选择、source identity与可见列复核、Qt 非阻塞消费。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
-- [ ] `qt-editor-json-mvp-increment` -- 单 JSON 的 speaker、基础搜索/预处理/术语 CRUD 与第二阶段选项入口。Dependencies: `qt-editor-mvp`
-- [ ] `tm-storage-retrieval-index` -- SQLite、JSONL 迁移、Levenshtein/Dice、兼容文本 matcher 和 exact/context/fuzzy。Dependencies: current exact/JSONL behavior baseline
-- [ ] `feature5-ui-integration` -- 精确 merge Feature 5，建立 canonical/legacy composition、Controller adapter、TM suggestion/阈值/状态和 macOS 入口。Dependencies: `tm-storage-retrieval-index@dd7c9fdb...` 与已批准的 Qt frozen contracts；不依赖原 Qt 增量全部完成
+- [x] `qt-editor-json-mvp-increment` 基础产品 -- speaker、搜索/预处理/术语 CRUD 与正式 matcher 入口；Windows source 旅程已完成，frozen amendment 另行验收。
+- [x] `tm-storage-retrieval-index` 基础产品 -- SQLite、JSONL 迁移、Levenshtein/Dice、统一 matcher 与 exact/context/fuzzy；Windows source 和 R4 pre-build 已完成，packaged 资格另行验收。
+- [x] `feature5-ui-integration` 基础产品 -- canonical/legacy composition、Controller adapter、TM suggestion/阈值/状态与 macOS 入口；Windows source 已完成，packaged 集成另行验收。
 - [ ] `glossary-management` -- 启用每术语 Match Case / Whole Word、版本化记录与导入迁移。Dependencies: `qt-editor-json-mvp-increment`, `tm-storage-retrieval-index`
 - [ ] `editor-search-preprocessing` -- 启用项目搜索 Match Case / Whole Word、扩展结果语义与大项目优化。Dependencies: `qt-editor-json-mvp-increment`, `tm-storage-retrieval-index`
 - [ ] `speaker-display-profiles` -- 每项目 speaker 显示名/留空/头像。Dependencies: `qt-editor-json-mvp-increment`
@@ -140,12 +153,12 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 - [x] `collaborative-job-chunks` -- 已在不改变 Document 身份的前提下落地 exact segment membership、动态拆分/合并、单 assignee、Controller 权限、progress/rebase、namespaced metadata 与 Project 菜单分工切面。Dependencies: `multi-document-project-workspace`
 - [ ] `rpy-project-codec` -- 单个 Ren'Py translation script 的可配置 format-codec plugin / DDD repository ACL；plugin 独立拥有解析映射、token/sidecar、占位符保护与可选回填/导出，LocalCAT Core 不直接写 `.rpy`；多文件集合消费既有 workspace 的相对路径身份与顺序，不以 basename 充当身份。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`, `language-resource-portability`
 - [ ] `cross-device-sync-plugin` -- RPY 闭合后推进的本地优先可选同步插件边界、远程 provider、base-aware 冲突保护与凭据安全；项目与资源分别消费已批准的 ProjectPackage/ResourcePackage。Dependencies: `multi-document-project-workspace`, `language-resource-portability`; sequencing gate: `rpy-project-codec`
-- [ ] `tmx-context-interchange` -- ResourcePackage 未来可增加的 TMX export profile、context/provenance 与有损取舍；不拥有 ResourcePackage container/apply authority。Dependencies: `tm-storage-retrieval-index`, `language-resource-portability`
+- [x] `tmx-context-interchange` 基础产品 -- TMX context/provenance 导入、资源/项目/分工导出与资源范围的 export-only TMX ResourcePackage；Windows source 已完成，frozen amendment 另行验收。
 - [ ] `xliff-project-codec` -- XLIFF 2.x Core 最小项目 codec。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`
 
 ## Deferred Format Backlog
 
-- **常规多文件源**：同一项目通常包含多个 TXT、JSON 或 XLSX 文件，并以一个文件对应一章 / Document；项目容器、稳定身份、排序、逐文档保存与失败恢复留给 `multi-document-project-workspace` 正式规格裁决。
+- **常规多文件源**：显式选择 JSON/TXT/PO/POT 的 workspace 与 ProjectPackage 已完成；XLSX 项目、目录发现与其他 origin profile 仍为后续范围。
 - **特殊多 Sheet XLSX**：单个 workbook 可作为复合 origin，由每个受支持 Sheet 对应一章 / Document。`File_ID` 是候选稳定身份，Sheet 名只作显示。2026-08-20 复核的 `CAT_Working_File.xlsx` 样本有 33 个 Sheet、17,221 条数据行，全部使用 `File_ID/Location/Speaker/Source_Text/Target_Text` 五列；它是 RPY 工作任务表参考，不改变术语表仅消费前两列的现行合同。
 - **RPY plugin / folder**：单个 translation script 的 tokenization、段落映射、token/sidecar、占位符保护与可选回填/导出属于独立 `rpy-project-codec` plugin/ACL，只依赖 Parser Foundation 的格式中立端口；LocalCAT Core 不解释 RPY token、不直接写 `.rpy`。当多个 script 组成 folder project 时，每个 script 才作为 Document 接入 multi-document workspace。
 - **XLIFF**：通过真实 fixture、inline-code 和 Writer capability gate 后实施。
@@ -160,13 +173,13 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 3. **Merge direction**：只从精确 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 形成可追踪 merge；不得 squash 或 cherry-pick 重建等价历史。
 4. **Integration gate**：merge 后由 integration Spec 完成 composition root、Controller adapter、canonical activation、mixed resource 与 TM suggestion 验收；原 Qt 的正交功能继续按自身 Spec 完成。
 5. **Integration anchor**：legacy source-LWW 与当前 100% 卡片只证明 legacy exact compatibility；多候选、非 100%、阈值、fuzzy 与全局 top-10 必须由真实 canonical SQLite + production `TMRetrievalService` 证明。
-6. **Windows platform gate**：`windows-platform-enablement` 在 owning amendments、完整 Windows source/packaged E2E、Mac/Linux parity 与累计评审闭合后只形成一次最终集成；治理同步只由 `governance/kiro-steering` 提交，禁止在平台或 consumer worktree 重建等价 Steering commit。
+6. **Windows 交付门**：source 与 frozen 分别验收；已完成 source 不等待 packaged E2E。frozen 需按 ADR-028 收束后续设计并在真实包内验证业务与 Core Gate；共享治理仍只提交一次，再由活动线继承。
 
 ## Confirmed Requirements Decisions
 
 1. Qt JSON 首批预处理只修改 target；source 更新、重新导入差异和段落重关联属于后续 Parser / multi-document project reconciliation。
 2. target 内容变化撤销 `confirmed`，沿用当前编辑会话行为；译文框必须使用平台原生主修饰键提供撤销/重做，macOS 为 `Command`，其他平台为 `Ctrl`。
-3. raw speaker inventory 先行；本轮头像只用于 inventory 的只读展示。alias、显式留空、speaker profile 以及编辑/浏览中的头像继续后置。
+3. raw speaker 保持匹配身份；已有头像 catalog/解码与无匹配回退不改写该身份，完整 speaker profile 的后续范围仍由 owning Spec 定义。
 4. 新术语记录默认 `Match Case=false`、`Whole Word=true`；旧两列记录不静默改变。
 5. 纯 CJK 查询在 Whole Word 下退化为连续文本匹配，因此与未勾选 Whole Word 的结果相同。
 6. `.kiro` 必须保持 Git 可跟踪；此前“完成 Qt JSON 与 Feature 5 后再解除忽略”的决定因可能丢失唯一 Spec 副本而撤销。
