@@ -176,7 +176,7 @@ W3 packaging implementation可在 consumer amendments 期间继续，但 release
 
 ### Current Integration Facts
 
-下表列出共享治理基线后的当前可达集成锚。提交整理保留实现、测试、批准合同及原验收范围；过程材料另存本地归档。当前定位不表示重新运行 source 验收，也不提升为 frozen PASS；历史表与原始 evidence 中的锚不改签。
+下表列出当前继承的 source 与构建前消费基线。代码、有效测试和批准合同继续保留；原 W3 验收报告归强证明路线，不作为普通发行的当前验收。表中状态不表示重新运行 source，也不授予普通 frozen 资格。
 
 | dispatch_id | revision | owning_spec | integration_anchor | current_status | disposition |
 |---|---|---|---|---|---|
@@ -193,9 +193,9 @@ WA-06原R3事实的当前可达tree为`db7e7ef0024d297264fbc7434b28ec7f77adf96c`
 
 #### Task 7.0 pre-build 集成范围
 
-以上两个`FROZEN_PREBUILD_COMMITTED`锚只声明各自tree中已接受的consumer实现与owner验收：Core锚包含9.6c publication修复、9.6d worker消费及其fresh重验，独立 worker 与输入发布作为同一 Core 消费能力整合；Feature5锚包含3.6a、独立APPROVED与父代理VERIFIED。批准来源仍为各owner获批R/D/T、current request acknowledgement，以及R4的已批准[前置修订](task7-prebuild-consumption-amendment.md)。Core [9.6c验收](../tm-storage-retrieval-index/task96c-validation.md)、[9.6d验收](../tm-storage-retrieval-index/task96d-validation.md)与Feature5 [3.6a验收](../feature5-ui-integration/task36a-validation.md)保留其真实source/测试接缝、skip与非性能证据限制。
+以上两个 `FROZEN_PREBUILD_COMMITTED` 锚只声明 Core 9.6c/9.6d 与 Feature5 3.6a 已实现的构建前消费范围。批准依据仍为各 owner 的 Requirements/Design/Tasks、current request acknowledgement 和 R4 的[前置消费修订](task7-prebuild-consumption-amendment.md)。Core 私有发布接口见[受信输入与发布合同](../tm-storage-retrieval-index/trusted-input-publication.md)；普通发行须重新绑定实际执行产物、worker 与输入来源。
 
-本阶段的长期 owner 声明位于 [`packaging/windows/frozen_roots.json`](../../../packaging/windows/frozen_roots.json)，包含 owner 入口、Gate roots/benchmark inventory、动态 import/worker 映射和默认资源。它由平台 7.0 新增，验收见 [Task 7.0](task70-validation.md)，原运行过程另存本地归档。7.1 已实现旧 W3 清单生成，完整 producer 与正式 frozen admission 尚未完成；普通发行的替代接线按 ADR-028 重新设计。
+owner 声明位于 [`packaging/windows/frozen_roots.json`](../../../packaging/windows/frozen_roots.json)，包含 Gate roots、benchmark inventory、动态 import、worker 映射及默认资源。7.0/7.1 的代码与[构建接口](frozen-build-inputs.md)作为现有工具保留；完整 producer 与正式 frozen admission 尚未完成，普通发行的替代接线按 ADR-028 重新设计。
 
 WA-01/02/03/04/05/08原source证据及历史锚保持不变，新声明不把这些source验收提升为frozen运行事实。WA-01 `5.12b`、WA-02 `1.4b/4.5b`、WA-04 `5.5a`、WA-05 `5.4a`、WA-06 `9.6b`、WA-07 `6.6b/7.4b/7.6b/9.2a`以及WA-08 `5.2b/5.3b/5.4b`全部仍pending；WA-03由同候选packaged Project journey消费复验。只有7.4/7.4a及WA-08 journey实际闭合后才能推进各自下一状态，当前没有`FROZEN_REVALIDATED_PASS`或terminal `MERGED_PASS`。
 

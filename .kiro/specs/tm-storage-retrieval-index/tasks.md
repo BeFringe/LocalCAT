@@ -1,5 +1,7 @@
 # 实施计划
 
+> **普通 frozen 继承范围**：下列 W3 构建前任务保留已实现事实及完成标记；其 native/source-only 接线是原合同范围，不自动成为普通发行前置。按 ADR-028 重新设计后，仍须对实际产物验证本 Spec 的业务语义和运行资格，历史验收不代替新候选验证。
+
 > **WA-06 Windows compatibility amendment（current R4）**：R4继承R3的source合同并以9.6c/9.6d落实frozen pre-build消费；`R1`/`R2`只保留为已被取代的历史。以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
 
 - [x] 1. 冻结版本化基础契约与验证夹具

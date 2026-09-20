@@ -1,5 +1,7 @@
 # 实施计划
 
+> **普通 frozen 继承范围**：下列 W3 构建前任务保留已实现事实及完成标记；其 native/source-only 接线是原合同范围，不自动成为普通发行前置。按 ADR-028 重新设计后，仍须对实际产物验证本 Spec 的业务语义和运行资格，历史验收不代替新候选验证。
+
 > 本计划只拥有 Feature 5 Core 到当前段 TM suggestions 的跨层闭环与 macOS 入口。owner 指 Spec、task checkbox、代码边界与验收权威，不指 Agent 或 thread；同一 thread 可以依次执行不同簇，但必须重新载入 owning Spec。独立 Qt maintenance、原 Qt Requirement 3 单 JSON 搜索和 Requirement 7 术语 CRUD/管理入口分别在其 owning Spec 记账，不得用本计划的 checkbox 代替。
 
 > **WA-07 Windows compatibility amendment**：以下 `a` 后缀任务承接 ADR-020/021/022 的 composition、device qualification、canonical re-attestation 与 frozen-source 消费；Core/Integration/Qt 三方 authority 不变。
@@ -451,7 +453,7 @@
 
 ## Implementation Notes
 
-- 3.6a：frozen consumer 的 close 必须撤销实际 Core input owner，再于短锁外唤醒 Qt 等待者；Host/通知/owner 的成功引用通过 Core 登记的普通 slot plan 与 snapshot 一起提交。Matcher/Gate C 的最终安装另开同 owner fresh window，不能复用结束窗口；source publication 的 terminal/退出异常仍须完整恢复 prior。合法生产 source issuer/receipt 正控、故障回滚与 Qt queued-terminal/close 已独立验证，但平台 native producer 和同候选 packaged/100k 资格仍分别归 7.2 与 post-build owner 任务，见 task36a-validation.md。
+- 3.6a：frozen consumer 的 close 必须撤销实际 Core input owner，再于短锁外唤醒 Qt 等待者；Host/通知/owner 的成功引用通过 Core 登记的普通 slot plan 与 snapshot 一起提交。Matcher/Gate C 的最终安装另开同 owner fresh window，不能复用结束窗口；source publication 的 terminal/退出异常仍须完整恢复 prior。合法生产 source issuer/receipt 正控、故障回滚与 Qt queued-terminal/close 已独立验证，但平台 native producer 和同候选 packaged/100k 资格仍分别归 7.2 与 post-build owner 任务，对应回归见 `tests.test_capability_host_frozen_inputs`、`tests.test_qt_owner_dispatch` 和 `tests.test_qt_frozen_composition`。
 - Task 2.1：新增唯一 application-facing `TMMigrationService.activate_initial(Path, str) -> MigrationOutcome`；合法首次激活仍只经 Core-owned build、`StageSealer`、coordinator prepare/journal/publish 链，非法 source/resource/coordinator、non-READY 与 already-active 在 build 前稳定 fail-closed 且零修改。独立评审 APPROVED；parent fresh completion 覆盖 252 个 migration/activation/sealer 测试（1 个明确 opt-in skip），changed-file basedpyright 0，四个用户 WIP hash 不变。publication tail、rollback/recovery、并发与 tamper 仍分别留给 2.2～2.5。
 - Task 2.2：首次激活仅在 generation 0 durable publication、sealed source-binding canonical digest、正式 `SQLiteTMStore` health/revision/query-view 重开全部一致后返回成功；FTS5/fallback 均经默认 fail-closed `TMRetrievalService` 证明 canonical EXACT，同 source variants 保留而 context/fuzzy 继续关闭。独立评审两次拒绝并闭合 ledger 路径一致改绑反例与测试 connection 泄漏后 APPROVED；parent fresh completion 聚焦 4/4（强制 ResourceWarning 无告警）、相关 264/264、changed-file basedpyright 0，四个 WIP hash 不变。published-tail recovery 仍归 2.4。
 - Task 2.3：仅在 Core 证明从未发布或 PREPARED/DB_REPLACED/MANIFEST_PUBLISHED 已完整回滚、fresh coordinator 冷复证 legacy authority 后返回 preservation-backed `MigrationFailure`；普通 I/O 完整回滚稳定为 `MIGRATION.INITIAL_IO_FAILED` 且可重试。独立评审三轮拒绝并闭合 source/target basename 置换、builder residue、terminal/quarantine 篡改、primary-error masking；unpublished pair 采用 Darwin `renameatx_np(RENAME_EXCL)` / Linux `renameat2(RENAME_NOREPLACE)` 的 dirfd-relative exclusive quarantine，无普通 rename 回退。最终评审 APPROVED；parent fresh completion mutation-negative 19/19、相关 336/336（1 个明确 opt-in skip）、changed-file basedpyright 0，四个 WIP hash 不变；ambiguous 与 GENERATION_PUBLISHED 仍归 2.4。

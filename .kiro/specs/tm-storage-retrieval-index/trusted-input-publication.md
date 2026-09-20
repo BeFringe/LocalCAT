@@ -1,6 +1,6 @@
 # Core 受信输入的私有 publication 消费合同
 
-本合同记录 Task 9.6c 最终接受的私有接口，供 Feature5 消费。实现验收见 [Task 9.6c](task96c-validation.md)，对应回归位于 `tests/test_tm_gate_inputs.py`、`tests/test_tm_gate_input_composition.py` 和 `tests/test_tm_gate_publication.py`。接口合同本身不授予真实 frozen 或 100k 性能资格。
+本合同记录 Task 9.6c 已实现的私有接口，供 Feature5 消费；对应回归位于 `tests/test_tm_gate_inputs.py`、`tests/test_tm_gate_input_composition.py` 和 `tests/test_tm_gate_publication.py`。普通 frozen 可复用发布与取消语义，输入来源及其与实际执行产物的绑定按 ADR-028 重新设计。接口合同本身不授予真实 frozen 或 100k 性能资格。
 
 ## 普通引用槽的来源
 
