@@ -2,9 +2,9 @@
 
 ## 当前适用范围
 
-source 的平台与业务设计已完成 Task 6.6b 验收，安装/维护入口见 README。本线保留完整 Boot TCB、定制 native entry、retained-source-only loader 的 W3 强证明设计及其实现依据；完整 producer 和产品发行尚未验收。[ADR-028](../../steering/adr/adr-028.md) 已解除普通 frozen 对这些证明的强制依赖，强证明研究不反向阻塞 source 或普通发行。
+source 的平台与业务设计已完成 Task 6.6b 验收，安装/维护入口见 README。普通 frozen 按已采纳 [ADR-028](../../steering/adr/adr-028.md) 重新设计；以下完整 Boot TCB、定制 native entry、retained-source-only loader 仍记录 W3 的实现依据，已不作为本路线的强制合同，也不反向阻塞 source。
 
-两条发行路线均保留平台数据/私有权限端口、Core Gate C/D、可追溯构建和包内业务验收。普通发行独立设计执行产物与 Core/Host 输入的绑定、入口/加载检查、worker 生命周期和用户旅程；不从本线继承完整 Boot TCB 前置。本线的构建前单测或中间 producer 也不授予最终发行资格。
+保留平台数据/私有权限端口、Core Gate C/D、可追溯构建和包内业务验收。已修复的 Core/Qt 消费与构建工具可按需复用；后续需明确实际执行产物与 Core/Host 输入的绑定、普通 windowed worker 通道、生命周期和用户旅程。替代消费设计尚未完成，继承代码或旧验收不能视为新路线已实现。
 
 ## Overview
 本设计把 LocalCAT 现有 POSIX 文件 authority/lock/publish 语义提炼成一个共享平台能力边界，并新增 fail-closed Windows backend。Windows backend 使用文档化 Win32 handle API 固定 rooted ancestor、拒绝 reparse、比较 volume/file identity、执行跨进程锁和 handle-bound publish；上层 Parser、项目、资源、TM 和协作分工继续拥有各自业务状态机与稳定错误映射。

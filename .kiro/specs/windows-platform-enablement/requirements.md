@@ -4,7 +4,7 @@
 
 Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 launcher 已完成 Task 6.6b 用户旅程。后置 frozen 追求最终用户无需另装 Python/Qt，独立验收，不阻塞 source。
 
-[ADR-028](../../steering/adr/adr-028.md) 已取代普通 frozen 的完整 Boot TCB、定制 native entry 与 retained-source-only 强证明前置。本线保留 Requirement 10 的 W3 专用证明及 Requirement 11/12 对它的引用，用于强证明路线的独立续接，不直接驱动普通发行实现；自包含、可追溯构建、必要数据保护、Core Gate 与真实 packaged E2E 目标继续保留。新的输入身份/消费设计尚待收束，旧 W3 失败不改记为通过。Requirement 1–9 的 source 数据与业务合同保持有效。
+[ADR-028](../../steering/adr/adr-028.md) 已取代普通 frozen 的完整 Boot TCB、定制 native entry 与 retained-source-only 强证明前置。下文 Requirement 10 的旧 W3 专用证明及 Requirement 11/12 对它的引用保留为历史映射输入，不再直接驱动普通发行实现；自包含、可追溯构建、必要数据保护、Core Gate 与真实 packaged E2E 目标继续保留。新的输入身份/消费设计尚待收束，旧 W3 失败不改记为通过。Requirement 1–9 的 source 数据与业务合同保持有效。
 
 ## 简介
 立项时，`ui-mvp@b925b80` 因直接导入 `fcntl` 而无法在 Windows 运行。本 Spec 已通过平台端口与 consumer 适配闭合 source 的 Qt、项目持久化、TM 生命周期、TMX 和 FTS5；frozen 是下一条独立交付线。Windows 与 POSIX 使用各自的文件系统原语，保护相同的用户数据与业务结果。

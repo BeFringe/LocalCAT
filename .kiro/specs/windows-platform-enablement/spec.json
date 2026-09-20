@@ -21,7 +21,7 @@
   "ready_for_implementation": false,
   "delivery_status": {
     "source": "WINDOWS_USER_MANAGED_RUNTIME_VERIFIED",
-    "frozen": "W3_CONTINUATION_NOT_VERIFIED",
-    "approval_scope": "保留已批准 source 与 W3 强证明合同；构建前消费已实现，完整 producer 和发行尚未验收。普通 frozen 的替代消费设计按 ADR-028 独立收束。"
+    "frozen": "ADR-028_REDESIGN_PENDING",
+    "approval_scope": "保留已批准 source 与旧 W3 的历史审批及已修复实现；ADR-028 产品边界已批准，普通 frozen 的替代消费设计尚未完成。"
   }
 }

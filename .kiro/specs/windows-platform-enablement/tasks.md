@@ -1,6 +1,6 @@
 # 实施计划
 
-> **SOURCE COMPLETE / W3 CONTINUATION NOT VERIFIED**：Task 1–6 的 Windows source 已交付。本线保留 W3 强证明路线的批准合同与实现；Core 9.6c/9.6d、Feature5 3.6a 和平台 7.0/7.1 已完成各自构建前范围，7.2 及后续发行任务仍未完成。下方 Task 7–10 是强证明路线的任务图；producer 中间实现及后续未验收增量不能视为任务完成。[ADR-028](../../steering/adr/adr-028.md) 已解除普通 frozen 对完整 Boot TCB 的强制依赖，强证明研究不阻塞 source 或普通发行。
+> **SOURCE COMPLETE / FROZEN REASSESSMENT**：Task 1–6 的 Windows source 已交付。Core 9.6c/9.6d、Feature5 3.6a 和平台 7.0/7.1 的已修复实现、有效测试与必要合同作为继承基线保留；完成标记只描述原构建前范围，不表示普通 PyInstaller 路线已验收。7.2 及后续发行任务仍未完成。按 [ADR-028](../../steering/adr/adr-028.md) 独立设计普通 frozen；下方旧 W3 Task 7–10 仅供映射，不自动继承完整 Boot TCB、定制 native entry 或 source-only 前置。
 
 source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA-08 5.4a 与平台 6.6b 验收，状态为 `WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`；证据见 [launcher](../../../windows_user_managed_launcher_evidence.json) 和 [用户旅程](../../../qt_editor_windows_source_evidence.json)。本次文档同步不重签 runtime evidence。
 
