@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 from contextlib import ExitStack
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -272,6 +272,35 @@ class SourceSessionIntegrationTests(unittest.TestCase):
     @staticmethod
     def _migrate(root: Path, **kwargs: Any):
         return migration.run_process_migration_evidence(contract_path=_ROOT / "benchmark_tm_contract.json", execution_path=BenchmarkExecutionPath.GRAM_FALLBACK, run_root=root, test_mode=True, test_record_count=12, **kwargs)
+
+    def test_retained_activation_lock_is_proved_and_drift_rejected(self) -> None:
+        with worker_temporary_directory() as directory:
+            root = Path(directory)
+            evidence = self._migrate(root)
+            sidecar = Path(evidence.fixture_path + ".sqlite3")
+            lock_path = root / f".{sidecar.name}.localcat-initial-activation.lock"
+            original = lock_path.read_bytes()
+            self.assertTrue(original)
+            result = query.run_query_process_probe(evidence)
+            self.assertEqual(lock_path.read_bytes(), original)
+            self.assertEqual(asdict(result.artifact_pre), asdict(evidence.artifact_snapshot))
+            self.assertEqual(asdict(result.artifact_post), asdict(evidence.artifact_snapshot))
+
+            lock_path.write_bytes(original + b"tampered")
+            with self.assertRaises(query.QueryProcessError) as caught:
+                query.run_query_process_probe(evidence)
+            self.assertEqual(caught.exception.error_code, "QUERY.ARTIFACT_BASELINE_DRIFT")
+
+    def test_foreign_lock_is_not_accepted_as_activation_artifact(self) -> None:
+        with worker_temporary_directory() as directory:
+            root = Path(directory)
+            evidence = self._migrate(root)
+            foreign = root / "foreign.lock"
+            foreign.write_bytes(b"unrelated")
+            with self.assertRaises(query.QueryProcessError) as caught:
+                query.run_query_process_probe(evidence)
+            self.assertEqual(caught.exception.error_code, "QUERY.ARTIFACT_INVALID")
+            self.assertEqual(foreign.read_bytes(), b"unrelated")
 
     def test_source_public_runner_closes_owned_window_before_return(self) -> None:
         observed = []
