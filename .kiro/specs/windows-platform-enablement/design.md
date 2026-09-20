@@ -541,12 +541,6 @@ flowchart TD
 
 只读资源相对发行目录解析；可写配置与托管数据继续使用现有用户目录 owner，项目仍在用户选择的位置。默认 tm/terms 只在目标不存在时播种，不能覆盖用户修改。logo/icon/metadata/qwindows/必要 plugins 和 Gate 输入缺失为候选失败；avatar catalog 可选，声明后检查索引/解码，无匹配保留 fallback。清除 PYTHONPATH 与 Qt 开发路径，在非仓库 CWD、无 Python/Qt 安装的环境验收实际首页和项目参数。
 
-### 首条调用链的待验证范围
-
-平台7.2a–c、Core 9.6e与Feature5 3.6b承担尚未取得的执行证据：构建摘要与实际fixture/contract内容的消费、windowed管道，以及取消与child回收须通过真实生产调用链验证。输入—产物绑定、Core兼容投影、publication及证据复用遵循本节合同；不预判候选或正式Gate结果。
-
-首个实验属于 Task 7.2 的实际生产链：从干净配方构建普通 EXE，经正常入口/用户目录进入真实 Matcher 和 Core session，启动两个真实 worker，以小样本观察 oracle/query 结果、取消和退出。它要消除的未知是：构建输入摘要能否直接贯通既有 fingerprint/Gate C 汇总接口；去掉 native/source-only 后还有哪些隐含源码读取；windowed 管道在标准流不可用时是否可靠；关闭能否回收 child 且保持正确提交胜负。任一需 mock、venv fallback、晚到授权、child 遗留或计量口径改变即失败；按实际归属修正，若需增加来源数据或合同字段先由对应 owner 审阅，不扩展为全第三方 TCB 实验。性能是否满足正式 100k 仍由后续 Task 7.3 确认，本轮不预判 PASS。
-
 ## Error Handling
 
 ### Platform Error Family（ADR-020/W1 已采纳）
