@@ -603,6 +603,8 @@
 
 ## Implementation Notes
 
+- Task 9.6b：macOS回归暴露migration/query的POSIX工件闭集遗漏activation owner保留的确定名锁。两端须纳入该成员并完整核验身份及内容，继续拒绝字节漂移、外来锁和链接；不删除锁或泛化放行。worker输入改变后由Core判定兼容性并重验资格。
+
 - Task 9.6b：Windows测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。观察与清理须保留原恢复、字节和阶段断言。
 
 - Task 9.6b：普通候选真实重验中关闭 Qt 后，oracle 全扫描和候选查询须观察同一输入 owner 的撤销。全扫描按小批次评分检查，候选路径在查询之间及同步建库前后检查；不改变评分、排序、fixture、门限或 worker 计量。此修正改变 Core fingerprint，旧资格必须失配，新候选须实际重跑正式 Gate；不把同步建库前后检查解释为建库内部即时中断，也不提前完成本任务。
