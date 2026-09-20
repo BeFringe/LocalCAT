@@ -8,7 +8,7 @@
 
 > **Q1 search-surface amendment 已批准（2026-08-19）**：根据 Requirement 3 实机冒烟反馈，新增 1.1c、2.6a、3.2c、4.3b、4.3c，将项目搜索收纳为顶栏可折叠入口，增加明确清除和“未填写 / 草稿 / 已翻译”筛选。该 amendment 不授权 status-only 伪 offset、Approved/Revise 状态或 Replace/Replace All，并必须在 Q2 累计评审前完成 Q1 fresh acceptance。
 
-> **WA-08普通frozen修订待人工审批**：已完成`a`后缀任务保留Windows source journey与证据原范围；待办5.2b/5.3b/5.4b拟在ADR-028普通候选执行资源、窗口及完整产品消费，不授权实现或预填PASS。构建、候选入口与资源根仍归`windows-platform-enablement`，相邻owner合同和本轮审批就绪后才实施，既有[x]正文不重签。
+> **WA-08普通frozen任务范围**：`a`后缀任务保留Windows source journey与原证据范围；5.2b/5.3b/5.4b承担普通候选的资源、窗口及完整产品消费。构建、候选入口与资源根仍归`windows-platform-enablement`。
 
 - [x] 1. 建立冻结契约与能力边界
 
@@ -366,7 +366,7 @@
   - _Amendment: WA-08_
   - _Depends: 4.2a, 4.8_
 
-- [ ] 5.2b 验证普通候选的Qt资源与头像退化（待人工审批）
+- [ ] 5.2b 验证普通候选的Qt资源与头像退化
   - 在平台7.2产物从non-repo CWD实际消费候选资源根中的声明logo/icon/catalog，覆盖唯一命中、大小写、解码失败、歧义与无catalog/无匹配fallback；不访问checkout或额外扩大构建输入。
   - 验证只读程序资源与用户目录分离，默认资源只缺失时播种，已有workspace/资源配置字节不被覆盖。完成时，当前候选资源表面与既有语义一致，纯头像变化不触发Core资格失效。
   - _Amendment: WA-08_
@@ -387,7 +387,7 @@
   - _Amendment: WA-08_
   - _Depends: 4.8a, 5.3_
 
-- [ ] 5.3b 验证普通windowed候选的真实窗口与入口（待人工审批）
+- [ ] 5.3b 验证普通windowed候选的真实窗口与入口
   - 从实际EXE确认候选内`qwindows.dll`/plugin加载、非offscreen主窗口、dialog/icon/keyboard及无console；分别从首页和显式项目参数进入正常产品流程，用户目录不随CWD变化，关闭不遗留本应用创建的worker。
   - 缺失/错误plugin、窗口不可见或错误项目参数不得假报成功；完成时真实窗口与失败诊断有当前候选观察，source venv、offscreen或空窗口探针不得代答。
   - _Amendment: WA-08_
@@ -407,7 +407,7 @@
   - _Amendment: WA-08_
   - _Depends: 5.2a, 5.3a, WA-03 source phase, WA-04 source phase, WA-05 source phase, WA-07 source phase, windows-platform-enablement 6.6a_
 
-- [ ] 5.4b 执行同候选clean-user Windows完整产品journey（待人工审批）
+- [ ] 5.4b 执行同候选clean-user Windows完整产品journey
   - 从non-repo CWD、无需用户安装Python/Qt的干净用户环境启动普通onedir/windowed EXE，完成正常首页/项目参数、编辑保存重开、Project/ResourcePackage消费、TM激活/重启恢复、TMX直接导入、FTS5创建查询重开与真实建议消费；同时验证已有Qt工具、资源与头像行为。相邻业务能力只从其owner入口消费，不在Qt补造授权。
   - 在该最终候选实际覆盖默认资源不覆盖已有数据、资源迁移不携带Fuzzy资格、TMX ResourcePackage import/apply负向拒绝、失败保留原项目/资源，以及取消/关闭/退出；Core正式资格与数据端口证据按WA-06/07关联，不从UI成功状态推断Gate PASS。
   - 完成时，平台Requirement 12候选必测项与复用前提均有明确来源；若修复改变候选，更新关联并按影响范围重验，最终不能拼接不同EXE成功片段。不借环境变量、复制checkout或现场patch修复测试中的产物；本任务贡献同一0.5.2验收，不把烟测另算交付。

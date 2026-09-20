@@ -28,7 +28,7 @@ cluster review不能替代task-focused validation，多个局部scout也不能�
 
 ## 审计簇地图
 
-C0–C6S 及 C1F 保留历史实施/证据范围；C1F 是原 W3 路线的已完成 spike，不是普通 frozen 前置。下方 C7–C10 随本轮普通 R/D/T 待审修订，不表示批准实施。Task 8 的实施与审查均保持 `xhigh`。
+C0–C6S 及 C1F 保留历史实施/证据范围；C1F 是原 W3 路线的已完成 spike，不是普通 frozen 前置。C7–C10 按下列依赖和退出条件组织实施与评审。Task 8 的实施与审查均保持 `xhigh`。
 
 | Cluster | Tasks | 共享心智模型 / 验证目标 | impl | review |
 |---|---|---|---|---|

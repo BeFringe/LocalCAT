@@ -1,9 +1,9 @@
 {
   "feature_name": "collaborative-job-chunks",
   "created_at": "2026-08-22T17:50:27+08:00",
-  "updated_at": "2026-09-20T14:14:44Z",
+  "updated_at": "2026-09-20T14:55:15Z",
   "language": "zh-CN",
-  "phase": "tasks-generated",
+  "phase": "tasks-approved",
   "approvals": {
     "requirements": {
       "generated": true,
@@ -11,13 +11,13 @@
     },
     "design": {
       "generated": true,
-      "approved": false
+      "approved": true
     },
     "tasks": {
       "generated": true,
-      "approved": false
+      "approved": true
     }
   },
-  "ready_for_implementation": false,
-  "approval_scope": "本轮普通 frozen Design 适用范围与 Tasks 依赖/验收修订待人工批准。未修改的业务合同及 8890813 以前已完成 source/实现成果保留原审批和证据范围；历史批准不授权本轮实施，不重签验收。"
+  "ready_for_implementation": true,
+  "approval_scope": "用户明确批准 reassessment@3e41130 中本 Spec 普通 frozen Design 适用范围与 Tasks 依赖/验收修订，按已列明 owner 依赖实施。未修改的业务合同及 8890813 以前已完成 source/实现成果保留原审批和证据范围；本批准不重签验收，不预填候选或正式 Gate PASS。"
 }

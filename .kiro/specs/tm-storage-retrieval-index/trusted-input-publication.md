@@ -1,6 +1,6 @@
 # Core 受信输入的私有 publication 消费合同
 
-本合同记录Task 9.6c已实现的私有接口，供Feature5消费；对应回归位于`tests/test_tm_gate_inputs.py`、`tests/test_tm_gate_input_composition.py`和`tests/test_tm_gate_publication.py`。下列既有提交/取消竞态语义不变；末节普通packaged消费修订为**待人工审批草案**，不代表9.6e已实现。接口合同本身不授予真实frozen或100k性能资格。
+本合同记录Task 9.6c的私有接口，供Feature5消费；对应回归位于`tests/test_tm_gate_inputs.py`、`tests/test_tm_gate_input_composition.py`和`tests/test_tm_gate_publication.py`。末节定义Task 9.6e的普通packaged消费分工，保留既有提交/取消竞态语义。接口合同本身不授予真实frozen或100k性能资格。
 
 ## 普通引用槽的来源
 
@@ -45,7 +45,7 @@ class References(metaclass=_publication_reference_type):
 
 `tm_gate_inputs` 实际调用纯 publication 模块，因此此前已补齐 Matcher build inventory 的 `tm_retrieval_capability.py` 仍保留。整改只按原 path/SHA 聚合算法重算受影响摘要，未再增加 paths、修改 cohort/阈值或 benchmark contract。
 
-## 普通packaged的消费分工（待人工审批）
+## 普通packaged的消费分工
 
 来源与身份的唯一定义见[Core Design](design.md)的「R4已完成范围与普通packaged消费修订」「检索兼容身份与单次运行身份」，平台候选身份只作当前运行关联；本合同不另定义profile、candidate格式或qualification key。普通输入由现有组合入口建立有限owner/session，使用受控构建所关联的owner输入与当前候选实际执行；不是旧source/native authority的别名。
 
