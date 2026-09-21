@@ -31,6 +31,7 @@ from platform_fs_contracts import (
 )
 from tm_contracts import (
     ActivationCapabilityState,
+    AssetPreservationState,
     CanonicalResourceIdentity,
     MigrationReport,
     MigrationFailure,
@@ -243,6 +244,54 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
         identity: CanonicalResourceIdentity,
     ) -> tuple[object, object, object]:
         return _portable_sealed_stage(service, coordinator, identity)
+
+    def test_first_record_seal_failure_retires_unread_cursor_and_preserves_legacy(
+        self,
+    ) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        self.addCleanup(_remove_long_quarantine, root)
+        identity = _identity(root)
+        before = identity.configured_jsonl_path.read_bytes()
+        service = _service(identity)
+        real_validate = tm_stage_sealer._validate_record_row
+        checked_records: list[int] = []
+
+        def validate_tampered_row(record: tuple, **kwargs: object) -> None:
+            checked_records.append(record[0])
+            tampered = record[:9] + ('[["source","tampered"]]',) + record[10:]
+            real_validate(tampered, **kwargs)
+
+        with mock.patch.object(
+            tm_stage_sealer, "_validate_record_row", side_effect=validate_tampered_row,
+        ):
+            outcome = service.activate_initial(
+                identity.configured_jsonl_path, identity.resource_id,
+            )
+        self.assertIs(type(outcome), MigrationFailure, repr(outcome))
+        self.assertEqual(checked_records, [1])
+        self.assertEqual(outcome.error_code, "SEALER.PROVENANCE_MISMATCH")
+        self.assertEqual(outcome.stage, "SEAL")
+        self.assertFalse(outcome.canonical_authority_ambiguous)
+        self.assertEqual(
+            outcome.original_source_preservation.state,
+            AssetPreservationState.VERIFIED_UNCHANGED,
+        )
+        self.assertEqual(
+            outcome.active_store_preservation.state,
+            AssetPreservationState.NOT_APPLICABLE,
+        )
+        self.assertEqual(identity.configured_jsonl_path.read_bytes(), before)
+        self.assertFalse(identity.canonical_sidecar_path.exists())
+        self.assertEqual(list(root.glob(".localcat-migration.initial-*")), [])
+        reopened = TMEngine(
+            str(identity.configured_jsonl_path), update=False,
+            expected_resource_id=identity.resource_id,
+        )
+        self.assertFalse(reopened.canonical_active)
+        self.assertEqual(reopened.query_exact("same").target, "first")
+        self.assertEqual(reopened.query_exact("other").target, "value")
 
     def test_fts5_write_unavailable_is_stable_nonretryable_and_unpublished(
         self,

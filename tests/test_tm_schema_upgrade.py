@@ -133,6 +133,7 @@ def _legacy_fixture(
     *,
     fts5_available: bool,
     store_id: str = "store.primary",
+    provenance_by_record: dict[int, str] | None = None,
 ) -> tuple[
     CanonicalResourceIdentity,
     MutableStageRef,
@@ -253,7 +254,7 @@ def _legacy_fixture(
                         context_prev_raw,
                         context_next_raw,
                         file_source,
-                        _LEGACY_PROVENANCE_JSON,
+                        (provenance_by_record or {}).get(record_id, _LEGACY_PROVENANCE_JSON),
                         record_id if kind in {"migration", "import"} else None,
                         usage_count,
                         last_used,
@@ -496,6 +497,22 @@ def _assert_legacy_reopenable(
 
 
 class SchemaUpgradeHappyPathTests(unittest.TestCase):
+    def test_upgrade_preserves_nonlegacy_empty_and_repeated_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            identity, prior, coordinator, _digest = _legacy_fixture(
+                Path(temporary), fts5_available=False,
+                provenance_by_record={
+                    3: '[["source","local-write"],["batch","one"],["source","local-write"]]',
+                    4: '[]',
+                    5: '[["source","tmx"]]',
+                },
+            )
+            before = _record_rows(prior.staged_db_path)
+            with patch("tm_sqlite_store._probe_fts5", return_value=False):
+                outcome = _service(coordinator, identity).upgrade_schema(prior.staged_db_path)
+            self.assertIs(type(outcome), SchemaUpgradeReport, repr(outcome))
+            self.assertEqual(_record_rows(prior.staged_db_path), before)
+
     def test_upgrade_publishes_equivalent_generation_with_digest_evidence(
         self,
     ) -> None:

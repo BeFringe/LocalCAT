@@ -1,7 +1,7 @@
 {
   "status": "IN_PROGRESS",
   "release_status": "NOT_VERIFIED",
-  "scope": "candidate/formal_gate/evidence及既有owner验收保留原3c20范围；successor_candidate保留3628真实失败及当时诊断，e948_repair_candidate单列后续修复、正式Gate通过与尚未完成的候选验收。旧节中的后续实验描述不覆盖新节现状，不拼接不同产物为同一候选通过。不是0.5.2发行裁决；原始材料继续保留在忽略的artifacts/windows目录。",
+  "scope": "candidate/formal_gate/evidence及既有owner验收保留原3c20范围；successor_candidate保留3628真实失败，e948_repair_candidate保留正式Gate通过；d1_theme_candidate记录后续主题候选消费与JSONL激活失败，transfer_activation_repair仅记录source修复。旧节的待办不覆盖后续现状，不拼接不同产物为同一候选通过。不是0.5.2发行裁决；原始材料继续留在忽略的artifacts/windows目录。",
   "observed_at_utc": "2026-09-21T05:01:47+00:00",
   "reviewed_source_head": "ec480ff88258fe297700af600d7f66aff31046a7",
   "candidate": {
@@ -578,7 +578,7 @@
     "全部当前Windows业务实验在现有用户下使用独立合成数据与清理后的进程环境；不能据此声称已在未安装Python/Qt的另一Windows环境验收。"
   ],
   "remaining": [
-    "e948已实际完成C/oracle/100k双路径D并通过原门限，基本资格恢复和负向已取得事实；3628失败与未知根因保持原样。当前阻塞转为TM自身snapshot/锁/发布/权限/reparse、数据迁移不带资格及精确复用映射，见e948_repair_candidate；Core9.6b/Feature5 6.6b/平台7.3仍未勾选。",
+    "d1主题候选补齐TM snapshot、锁与目标占用的实际消费，但导出JSONL在新目录的canonical激活失败。source修复已获独立有限批准，Mac受影响回归、新EXE消费及改变Core输入后的正式资格待验证；权限/reparse等候选必测缺口继续按原任务收束。旧候选正式通过或失败均保留原范围；Core9.6b/Feature5 6.6b/平台7.3仍未勾选。",
     "无Python/Qt的独立Windows环境启动与短保存/冷重开尚未取得；用户确认暂缺该环境，先完成其余验证并保留缺口。清理PATH与Python/Qt环境变量的同机观察不代答此项。",
     "指定8个owner候选子项保留原3c20上的独立验收事实，不自动改签给后续候选；最终候选须完成12.1–12.2必测，并关联未改变owner的原锚点、不变前提及当前消费。其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
   ],
@@ -827,6 +827,45 @@
       "release": "平台 7.3/Core 9.6b/Feature5 6.6b 及其余待验任务保持未勾选。独立无 Python/Qt Windows 环境缺口属于最终发行，不新增为 Core 9.6b 前置；整体 release_status 仍为 NOT_VERIFIED。",
       "audit": {"path": "artifacts/windows/ordinary-qualification/core-96b-completion-audit.md", "sha256": "43f04e076f32e656d27f5d87376f5b37d236496e76124dcd72b4ff4c640a0b8b"}
     }
+  },
+  "d1_theme_candidate": {
+    "candidate_id": "d1d84906502d3dfbf03e8242b2087ef24e31016bd71df7dac55062600b8d9f3b",
+    "built_from": "c377816b3da4fda7b7dcf00a4a3ae6ce39b6d261",
+    "status": "CANDIDATE_ACCEPTANCE_INCOMPLETE",
+    "qualification": "相对e948仅qt_editor_window.py主题输出改变，Core执行依赖与fingerprint不变；正常冷启动接受原真实资格，实际Fuzzy建议应用及保存成功。本候选没有另跑正式100k，引用e948原执行范围。",
+    "ui": "实际ProjectPackage导入预览显示深色主题。卷二多文档样本只作补充，不新增功能门或要求重复完整GUI验收；Mac系统外观跟随另待frozen收束后处理。",
+    "tm_export": "正常产品导出2929条，外部只读核对与canonical投影及顺序一致。有效的第二次TM自身锁竞争返回RESOURCE.PORTABILITY.OPERATION_FAILED，源、已有snapshot/manifest、业务表、receipts和资格保持；首次holder提前到期的尝试不计入负向。",
+    "target_open": "实际持有目标句柄时导出返回RESOURCE.EXPORT.SNAPSHOT_UNAVAILABLE；源、旧snapshot/manifest、业务数据、原receipts及资格不变，仅新增一条cancelled receipt。未把全部SQLite字节或所有receipts声称为不变，也未声称已释放重试。",
+    "transfer_failure": "新目录仅复制导出JSONL，没有canonical DB或资格；正常EXE的legacy Exact成功且Fuzzy关闭，但显式canonical激活返回TM.ACTIVATION.RUNTIME_REFRESH_FAILED。根因是sealer固定要求legacy provenance，且异常保留未读SQLite cursor使Windows retirement失败。本次失败不是数据迁移验收PASS。",
+    "evidence": [
+      {"path": "artifacts/windows/ordinary-qualification/project-import-theme/candidate-facts.json", "sha256": "bafc217540dbab0dca8a3344bcff097778eddc2064d19c710ae1dc51379f6fe2"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1d849-project-import-dark.json", "sha256": "75d6f7a99ff62c2c9e07d36fd001d64af3d29b02b825cf881cc395d3d2f1a4a2"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1d849-vol2-cold.json", "sha256": "7ec3559d67e20b259bd59404d52b42d9d8f520dc32b36d7d09162a9e67a46f12"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1d849-vol2-fuzzy-applied.json", "sha256": "050939e568ebc52ff315820e79a4ba32bac34878f23e45f40cae8f976d8125e8"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1d849-vol2-saved.json", "sha256": "7b19e4214e49593455fa9b3c472856b30fc03dbac4b7209483420d2c12c9c106"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1d849-vol2-snapshot-result.json", "sha256": "cbcd53870864307fb7ef8d52bc32a65962503880b003491849a5c362b1dde842"},
+      {"path": "artifacts/windows/ordinary-qualification/project-import-theme/vol2-snapshot-success.json", "sha256": "0cc53c60dd9390007eaf6ba67684d305f93f53fe4dc7f9e3c604b358117cc314"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1d849-tm-lock2-rejected.json", "sha256": "576dfea443cf89a61a1c209712607a0036799fbe6e5de047b38f4900a3558b75"},
+      {"path": "artifacts/windows/ordinary-qualification/project-import-theme/vol2-snapshot-locked2-failed.json", "sha256": "35317dcc1ee0d6b62a3ef9070d2eddeff5aae0f3434624517bf36f9e0944537c"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1d849-tm-target-open-rejected-visible.json", "sha256": "70097ec088d8b2ba3381d9f83d110b12c87829ec3dd619248fa65d387477e4b1"},
+      {"path": "artifacts/windows/ordinary-qualification/project-import-theme/vol2-snapshot-target-open-publication-failed.json", "sha256": "51e1191ff4973f8d717800201a912d7dbd0247901c871d68356a3b90004ec022"},
+      {"path": "artifacts/windows/ordinary-qualification/project-import-theme/transfer-setup.json", "sha256": "ae7d46a05cb64f7120fcec7df7316891ce4a891c91671089aafb598d85ec32a9"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1-transfer-exact-no-qualification.json", "sha256": "82186c6edf9fe8655b0109e325cc514b01f94d760192a714303f96e7240fdf9f"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-d1-transfer-canonical-no-qualification.json", "sha256": "bd9fa7ca35df6e200297ca9c28dcbdc78baf843e3e426bbed4fceb795bce58ee"}
+    ],
+    "reuse_mapping": {"path": "artifacts/windows/ordinary-qualification/project-import-theme/core-host-reuse.json", "sha256": "2154c0544ebf02aeca3dc704de510beee7485b6fd91848c5ba64cc1f26c5575c", "scope": "e948至d1未变依赖映射及4项发布/撤销source复验；不是后续sealer修复的复用结论或累计验收。"}
+  },
+  "transfer_activation_repair": {
+    "status": "SOURCE_SLICE_REVIEW_APPROVED_PACKAGED_PENDING",
+    "sealer_sha256": "ebb62ab7109a07227da2c28ceef82f9bd2212cfdc6b6b535f9aba08bc3a40790",
+    "change": "按源JSONL逐行核对兼容provenance，保留合法空集合、重复及顺序，schema upgrade沿用同一业务形状；在正常/异常退出时显式关闭流式cursor，保持Controller原有失败投影。未改变来源格式、owner或权限边界。",
+    "validation": "独立评审18项通过，原HEAD重跑新增回归确实失败；真实隔离2929条source调用链完成初始激活、canonical冷开及Exact，逐条source/target/provenance保真且Fuzzy仍关闭。Windows较广74项中73过，唯一旧recovery调用断言在HEAD同样失败；原始失败日志保留，不宣称全套通过。",
+    "pending": "Mac原生sealer/export/schema-upgrade受影响回归因SSH暂不可达尚未执行。新EXE须重放导出后激活接缝；本次修改属于Core输入，须核对实际fingerprint失配并真实运行新候选正式C/oracle/D，不能用source成功或e948资格代答。9.6b仍未完成。",
+    "evidence": [
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/implementation-report.md", "sha256": "30467d8374a35fb757f4b242f5b2191be676ce0e3ad33697f5bf114216922ff4"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/review-report.md", "sha256": "b2f855427dd29f45c186d8bfe21c05104332a3e823e568d0fb6676b1b6cf3221"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/run-20260921T094106953502/result.json", "sha256": "a9c06bbcf99ef4598e179b2cc1906f8dab1dadf6d1a4ba0b2959b8c8c26955a9"}
+    ]
   },
   "review_candidate_archive": {
     "status": "CANDIDATE_NOT_RELEASE_VERIFIED",
