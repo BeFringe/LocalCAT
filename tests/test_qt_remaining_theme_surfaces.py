@@ -9,12 +9,12 @@ from unittest.mock import patch
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLabel, QLineEdit, QMenu, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QFileDialog, QFrame, QLabel, QLineEdit, QMenu, QVBoxLayout, QWidget
 
 from editor_contracts import ResourceKind, WorkspaceMode
 from editor_controller import EditorController
 from qt_control_styles import configure_combo_popup, configure_menu
-from qt_editor_window import _InlineMenuButton
+from qt_editor_window import QtWorkspacePackageImportDialog, _InlineMenuButton
 from qt_settings_dialog import (
     QtSettingsDialog,
     ResourcePackageApplyDialog,
@@ -54,6 +54,145 @@ class RemainingThemeSurfaceTests(unittest.TestCase):
         self.app.styleHints().colorSchemeChanged.emit(
             Qt.ColorScheme.Dark if dark else Qt.ColorScheme.Light,
         )
+
+    def _assert_readable(self, foreground, background, minimum=4.5):
+        def luminance(color):
+            channels = (color.redF(), color.greenF(), color.blueF())
+            linear = [value / 12.92 if value <= .04045 else
+                      ((value + .055) / 1.055) ** 2.4 for value in channels]
+            return sum(value * weight for value, weight in
+                       zip(linear, (.2126, .7152, .0722)))
+
+        values = sorted((luminance(foreground), luminance(background)))
+        self.assertGreaterEqual((values[1] + .05) / (values[0] + .05), minimum,
+                                f"{foreground.name()} on {background.name()}")
+
+    def _assert_project_package_colors(self, dialog, dark):
+        summary = dialog.findChild(QFrame, "packageImportSummary")
+        safety = dialog.findChild(QFrame, "packageImportSafety")
+        surfaces = (
+            (dialog, QPalette.Window), (summary, QPalette.Window),
+            (dialog.project_id_input, QPalette.Base),
+            (dialog.mode_label, QPalette.Window),
+            (dialog.reconciliation_label, QPalette.Window),
+            (safety, QPalette.Window),
+            (dialog.apply_button, QPalette.Button),
+            (dialog.cancel_button, QPalette.Button),
+        )
+        for widget, role in surfaces:
+            # The enabled light Apply button is the existing cyan brand action.
+            if widget is not dialog.apply_button or not widget.isEnabled():
+                self.assertEqual(widget.palette().color(role).lightnessF() < .5,
+                                 dark, widget.objectName())
+        for label in dialog.findChildren(QLabel):
+            name = label.objectName()
+            if name in ("packageImportMode", "packageImportDocumentCount",
+                        "packageImportSegmentCount", "packageImportReconciliation"):
+                background = label.palette().color(QPalette.Window)
+                self.assertEqual(background.lightnessF() < .5, dark, name)
+            else:
+                # Transparent labels are painted over their actual parent frame.
+                background = label.parentWidget().palette().color(QPalette.Window)
+            self._assert_readable(label.palette().color(QPalette.WindowText),
+                                  background, 4.5 if dark else 3)
+        field_palette = dialog.project_id_input.palette()
+        self._assert_readable(field_palette.color(QPalette.Text),
+                              field_palette.color(QPalette.Base))
+        self._assert_readable(field_palette.color(QPalette.HighlightedText),
+                              field_palette.color(QPalette.Highlight), 3)
+        for button in (dialog.apply_button, dialog.cancel_button):
+            if button.isEnabled() or dark:
+                self._assert_readable(button.palette().color(QPalette.ButtonText),
+                                      button.palette().color(QPalette.Button), 3)
+
+    def test_project_package_dialogs_retheme_all_modes_and_safety_states(self):
+        case = workspace_fixture.Cluster4QtAcceptanceTests()
+        case.setUpClass()
+        case.setUp()
+        try:
+            for mode in ("new", "replace", "update_same_project"):
+                for state in ("ready", "warning", "blocked"):
+                    case.window._apply_system_theme(Qt.ColorScheme.Dark)
+                    dialog = QtWorkspacePackageImportDialog(
+                        mode=mode, current_project_name="Current synthetic",
+                        incoming_project_name="Incoming synthetic",
+                        incoming_project_id="prj-synthetic-theme-identity",
+                        document_count=2, segment_count=27,
+                        reconciliation_counts=(1, 2, 3, 4, 5, 6),
+                        warnings=("Synthetic warning",) if state == "warning" else (),
+                        blocking_reasons=("Synthetic blocker",) if state == "blocked" else (),
+                        required_decision_count=1 if state == "blocked" else 0,
+                        can_apply=state != "blocked", parent=case.window,
+                    )
+                    dialog.show()
+                    dialog.project_id_input.setSelection(4, 9)
+                    original_text = tuple(label.text() for label in dialog.findChildren(QLabel))
+                    try:
+                        for index, dark in enumerate((True, False, True)):
+                            if index:
+                                self._signal(dark)
+                            # An explicitly signaled scheme must survive delayed
+                            # events even while the OS/application palette is stale.
+                            with patch("qt_theme.system_uses_dark_theme", return_value=not dark):
+                                QApplication.sendEvent(case.window, QEvent(QEvent.PaletteChange))
+                                QApplication.sendEvent(dialog, QEvent(QEvent.PaletteChange))
+                                QTest.qWait(20)
+                            with self.subTest(mode=mode, safety=state, dark=dark, step=index):
+                                self._assert_project_package_colors(dialog, dark)
+                                self.assertEqual(dialog.project_id_input.text(), "prj-synthetic-theme-identity")
+                                self.assertEqual(dialog.project_id_input.selectionStart(), 4)
+                                self.assertEqual(dialog.project_id_input.selectedText(), "synthetic")
+                                self.assertTrue(dialog.project_id_input.isReadOnly())
+                                self.assertTrue(dialog.cancel_button.isDefault())
+                                self.assertFalse(dialog.apply_button.isDefault())
+                                self.assertFalse(dialog.apply_button.autoDefault())
+                                self.assertEqual(dialog.apply_button.isEnabled(), state != "blocked")
+                                self.assertEqual(dialog.mode_label.property("mode"), mode)
+                                self.assertEqual(tuple(label.text() for label in dialog.findChildren(QLabel)), original_text)
+                                self.assertEqual(dialog.result(), QDialog.DialogCode.Rejected)
+                    finally:
+                        dialog.close()
+                        dialog.deleteLater()
+                        QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        finally:
+            case.tearDown()
+
+    def test_project_package_theme_switch_keeps_controller_issued_preview(self):
+        case = workspace_fixture.Cluster4QtAcceptanceTests()
+        case.setUpClass()
+        case.setUp()
+        try:
+            case._open_workspace()
+            case.window._apply_system_theme(Qt.ColorScheme.Dark)
+            session = case.controller.project_session_id
+            view = case.controller.workspace_view
+
+            def inspect(dialog):
+                preview = case.window._workspace_package_import_preview
+                self.assertIsNotNone(preview)
+                dialog.show()
+                dialog.project_id_input.selectAll()
+                for dark in (True, False, True):
+                    self._signal(dark)
+                    QApplication.sendEvent(case.window, QEvent(QEvent.PaletteChange))
+                    QTest.qWait(20)
+                    self._assert_project_package_colors(dialog, dark)
+                    self.assertIs(case.window._workspace_package_import_preview, preview)
+                    self.assertEqual(dialog.project_id_input.selectedText(), preview.project_id)
+                    self.assertTrue(dialog.cancel_button.isDefault())
+                    self.assertEqual(dialog.apply_button.isEnabled(), case.window._workspace_package_import_can_apply)
+                    self.assertEqual(case.controller.project_session_id, session)
+                    self.assertIs(case.controller.workspace_view, view)
+                dialog.close()
+                return QDialog.DialogCode.Rejected
+
+            with (patch.object(QFileDialog, "getOpenFileName", return_value=(str(case.foreign_package_path), "")),
+                  patch.object(QtWorkspacePackageImportDialog, "exec", inspect),
+                  patch.object(case.controller, "apply_workspace_package_import") as apply):
+                self.assertFalse(case.window._choose_import_workspace_package())
+                apply.assert_not_called()
+        finally:
+            case.tearDown()
 
     def test_package_dialogs_switch_real_colors_without_losing_import_selection(self):
         with tempfile.TemporaryDirectory() as raw:
