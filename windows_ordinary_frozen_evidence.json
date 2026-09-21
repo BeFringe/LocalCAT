@@ -867,6 +867,23 @@
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/run-20260921T094106953502/result.json", "sha256": "a9c06bbcf99ef4598e179b2cc1906f8dab1dadf6d1a4ba0b2959b8c8c26955a9"}
     ]
   },
+  "transfer_repair_candidate": {
+    "candidate_id": "8faeee03e1dd31d1162ce1d3447602a7af09fd1b20ac3313fa19bb321f51f5ad",
+    "built_from": "4d8276f90417927bf329b879239cb9722238b131",
+    "status": "SMOKE_AND_WORKER_VERIFIED_PRODUCT_ACCEPTANCE_PENDING",
+    "implementation_fingerprint": "4912f458ddf5c009683d319dd97bec959cc6f1b6ec4a4ae3367b102d93c836ab",
+    "build": "固定依赖的普通PyInstaller构建exit 0，独立安装目录的实际payload复核通过；相对d1唯一改变的declared owner输出为tm_stage_sealer.py。Core实际消费的新fingerprint与旧资格不同，未复制、重签或宣称恢复旧资格。",
+    "smoke": "detached实际EXE exit 0；产品父进程标准流均为None，FTS5/fallback各自执行migration/query独立child和4-query诊断oracle。实际Gate C correctness消费成立，但test_mode=true、final_evidence=false，不代答正式oracle/100k双路径D或真实数据重新激活。",
+    "transport": "复用既有check_real_child_reply_faults及同一请求/管道负向集：migration/query真实child正常结果均由生产消费者接受、exit 0、retained handle已终止且pipe endpoints已关闭；外部响应副本的错candidate/request、畸形和截断被拒。两类worker共16个错误请求/管道入口检查均按既有错误合同拒绝。没有向窗口发送消息；不把这些结果算作Qt关闭、取消胜负或正式Gate。",
+    "pending": "桌面当前不可交互，导出JSONL→新目录激活→canonical冷开尚未在本EXE重放；正式资格及最终产品/数据反例仍待完成。Mac受影响回归暂缺连接。沿用既定7.3–9.2退出条件，旧候选只保留原证据范围。",
+    "evidence": [
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/build.log", "sha256": "6d29b855cdab343e39b6e56f0ce1e644fda9469e274756bd83805c4fcb36903a"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/candidate-facts.json", "sha256": "44cdf8d704ea8eb6512abf3d1cb344938c17cadc2885a1ac29117a53fde8f4d9"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/candidate-smoke.json", "sha256": "51b33d7c6092fadcf701d4df916b1d67385aba0983610d9a2b89d28336bf2a4c"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/worker-transport.json", "sha256": "42e57ca78e0f0c1be9870816dc5131b4bd6caaa8fee592c850dc5aeb15a41a42"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/worker-transport.log", "sha256": "7d09ffba031f62a5393b1aa292b9a41013e8f16fa98dc382cb15d49648b19702"}
+    ]
+  },
   "review_candidate_archive": {
     "status": "CANDIDATE_NOT_RELEASE_VERIFIED",
     "artifact": {
