@@ -1,7 +1,7 @@
 {
   "status": "IN_PROGRESS",
   "release_status": "NOT_VERIFIED",
-  "scope": "同一普通候选已执行的 Windows Core、设备资格及用户旅程事实；只按各 owner 已完成范围消费，不是0.5.2发行裁决。原始日志、截图、试验脚本保留在忽略的artifacts/windows目录。",
+  "scope": "candidate/formal_gate及既有owner验收保留原3c20候选事实；successor_candidate单列修复后3628候选的实际失败与安全投影，不拼接为同一产物通过。不是0.5.2发行裁决；原始日志、截图、试验脚本保留在忽略的artifacts/windows目录。",
   "observed_at_utc": "2026-09-20T22:48:33.417131+00:00",
   "reviewed_source_head": "ec480ff88258fe297700af600d7f66aff31046a7",
   "candidate": {
@@ -578,7 +578,7 @@
     "全部当前Windows业务实验在现有用户下使用独立合成数据与清理后的进程环境；不能据此声称已在未安装Python/Qt的另一Windows环境验收。"
   ],
   "remaining": [
-    "真实Mac回归及POSIX锁清单修复见source_regression_followup。修复改变Core fingerprint，须构建新候选并重跑正式C/oracle/100k双路径D及最终候选必测消费；Core9.6b/Feature5 6.6b/平台7.3保持未勾选，原3c20候选未包含此修复。",
+    "修复后3628候选已重建并实际执行C/oracle/100k双路径D；两路仅FUZZY_P95失败，根因仍未确定，见successor_candidate。Core9.6b/Feature5 6.6b/平台7.3保持未勾选；最终候选必测消费仍须闭合，原3c20资格不能改签。",
     "无Python/Qt的独立Windows环境启动与短保存/冷重开尚未取得；用户确认暂缺该环境，先完成其余验证并保留缺口。清理PATH与Python/Qt环境变量的同机观察不代答此项。",
     "指定8个owner候选子项保留原3c20上的独立验收事实，不自动改签给后续候选；其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
   ],
@@ -602,7 +602,7 @@
     "feature5_7_4b": "错owner候选拒绝、资格缺失/损坏/兼容/ACL/MIC拒绝、局部TM不可用、实际worker异常退出与关闭取消均保留安全投影；实际transport矩阵与Core/Host分类测试按层关联，不把每个transport异常说成逐项GUI全量100k重跑。",
     "qt_5_2b_5_3b": "正常首页/显式项目、候选logo/icon、默认资源播种/保留、无catalog fallback及实际windowed窗口；缺失/损坏qwindows插件显示Qt错误并非零退出，错误项目参数稳定失败。对已观察的设置对话框发送Escape后主窗口仍可用，正常关闭无worker遗留。",
     "qt_tools": "实际搜索与导航、raw speaker盘点/browse、预处理preview/确认/apply/undo及规则保存冷读、术语create/update/冷读/delete；原项目内容和confirmed经撤销恢复，术语删除保留原五条记录，资格字节未变。",
-    "dependency_limits": "Core9.6b、Feature5 6.6b/7.6b/9.2a、平台7.3/7.4及Qt5.4b仍等待修复后候选重验、干净Windows环境与累计验收；这些原候选实际观察不越过依赖完成整项。",
+    "dependency_limits": "Core9.6b、Feature5 6.6b/7.6b/9.2a、平台7.3/7.4及Qt5.4b仍等待修复后候选的性能失败定位、其余必测消费、干净Windows环境与累计验收；这些原候选实际观察不越过依赖完成整项。",
     "focused_review_validation": {
       "observer": "ordinary_owner_completion_review",
       "command": "python -m unittest -v tests.test_qt_source_resources tests.test_windows_ordinary_transport",
@@ -644,6 +644,45 @@
       "scope": "原Windows运行记录中的33项persistence与17项Qt/source矩阵，仅复用本轮未变owner深入范围。source_records只作实现比对索引，不当运行证据；改变的Windows端口与普通入口使用当前候选/定向结果，原source Gate与UI成功不改签。"
     },
     "avatar_conditions": "96613f3至当前qt_speaker_avatar.py、qt_resource_contracts.py、tests/test_qt_source_resources.py及requirements-ui.txt均无diff；原Python3.14.7/PySide6 6.11.1与候选一致，完整候选inventory无avatar声明。当前source_resources三项定向复验通过，本候选实测fallback，未把无catalog写成实际catalog命中。"
+  },
+  "successor_candidate": {
+    "candidate_id": "3628fde4e2a4b67e006114ca8cc129494c5ecda0266b9e3a3f3d3249831236b8",
+    "built_from": "2bdaa62231134a5def438a5174393c607ec2209b",
+    "implementation_fingerprint": "c20acd1c2df6c62501d3a4685444444eaeba7bce93994cc5a6cd30fc10453774",
+    "bundle_digest": "240157f58488cf995fbc54cf5d6e351015da5242e8d47a62b5897dd9cf5c98cb",
+    "build": "固定CPython3.14.7/Qt6.11.1/PyInstaller6.22.2；普通onedir/windowed构建exit0。",
+    "entry_checks": "实际EXE入口/同EXE worker及生命周期24项检查完成，exit0；其中小样本诊断不代替正式Gate D。",
+    "formal_gate": {
+      "status": "FAILED",
+      "gate_c": "实际Matcher/Context/Fuzzy-core correctness消费见entry-checks-posix-lock.json；持久记录的两项Gate C cohort均通过。",
+      "contract": "与原formal_gate.contract相同的正式100k合同、两路oracle、warmup、计量和门限；完整原始报告由strict codec复读。",
+      "metrics": [
+        {"execution_path": "FTS5_TRIGRAM", "candidate_recall": 1.0, "exact_p95_ms": 1.004, "fuzzy_top10_p95_ms": 1093.1976, "migration_seconds": 86.0693454, "peak_rss_mib": 414.14453125, "passed": false, "failed_gates": ["FUZZY_P95"]},
+        {"execution_path": "GRAM_FALLBACK", "candidate_recall": 1.0, "exact_p95_ms": 2.5623, "fuzzy_top10_p95_ms": 1086.3512, "migration_seconds": 117.9595838, "peak_rss_mib": 420.14453125, "passed": false, "failed_gates": ["FUZZY_P95"]}
+      ],
+      "qualification_sha256": "559984c182a7bf10a3e9340bbe6be4f5c2de8984b051d9822dc6dca1ad4f5723"
+    },
+    "host_consumption": "原Host持久发布失败结果；实际UI显示Fuzzy未通过，Exact/Context保留。正常关闭exit0后冷启动仍关闭Fuzzy、保留同一失败记录及真实Exact建议，未自动100k。原3c20正向记录仅保留为历史备份，不恢复为新候选资格。",
+    "diagnosis": "新FTS5在q103–104出现持续时延抬升。实际候选仅两处POSIX worker清单代码改变，未进入Windows热路径；oracle候选集合相同，100k样本非计时字段相同，但没有100k内部候选计数。失败时缺少调度/功耗观测，前后台影响仍是假设，根因未确定。",
+    "diagnostic_experiment": "已完成65秒GUI前置oracle A/B/A观测，按实际窗口状态分段且排除跨界delta。CPU秒/墙秒为1.0840→0.9463→1.1108，支持可逆运行条件影响，但未测query child吞吐或证明三倍Fuzzy根因。正常关闭请求后无LocalCAT进程、原失败资格摘要未变；退出码未取得，前后快照不证明全程无worker。",
+    "next_experiment": "其余具体阻塞处理后，至多一次同候选正式复验：接AC、原功耗方案/优先级不变，连续记录GUI窗口状态及真实query child资源计量，完整保留本次失败。若仍失败从该记录定位，不盲重跑；若通过只记已观测条件下结果，不反推旧失败根因。",
+    "limits": "本节记录新增运行事实与待定位失败，不完成Core9.6b/平台7.3或重签原owner验收；新候选完整产品旅程与最终发行仍未完成。",
+    "evidence": [
+      {"path": "artifacts/windows/ordinary-build-posix-lock/dist/LocalCAT/localcat-candidate.json", "sha256": "13c643569c7c326f3567df9333a94c7e809ae7e2e74c6da4cf974509cbcf8c76"},
+      {"path": "artifacts/windows/ordinary-qualification/build-posix-lock-vf.log", "sha256": "86eb6a5479c57f1abf230d8630a15fda90f94a77a8332a70dac33b10cee1e26f"},
+      {"path": "artifacts/windows/ordinary-qualification/entry-checks-posix-lock.json", "sha256": "6756c9ff9dd130fcf3cffaeab2e3c37aa0adc7176c16c3aa8805e9e464e4274b"},
+      {"path": "artifacts/windows/ordinary-qualification/benchmark-candidate-3628fde4e2a4.json", "sha256": "16e6a761d7f7a57897943200e3fc25512637bbcac716fdb383b41ead07a6efa4"},
+      {"path": "artifacts/windows/ordinary-qualification/benchmark-candidate-3628fde4e2a4.summary.json", "sha256": "b9f6bc10312c76a32fce0ef29cc34d1fda223d68c131a969d78f46a9b95a128d"},
+      {"path": "artifacts/windows/ordinary-qualification/qualification-negative-3628.json", "sha256": "559984c182a7bf10a3e9340bbe6be4f5c2de8984b051d9822dc6dca1ad4f5723"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-posix-lock-formal-result.png", "sha256": "7e355eebaa9fbb0f5cf0b10ec253c8a4567dd8374b86d55875005d0a8b2747cc"},
+      {"path": "artifacts/windows/ordinary-qualification/ui-posix-lock-failed-cold.png", "sha256": "0e5ed359505f376dfd150266f1341a250d1ef2d5065a8d91369cec9aa90d2b47"},
+      {"path": "artifacts/windows/ordinary-qualification/posix-lock-failed-qualification-cold.json", "sha256": "a2a9cd21b52344261a88ef122cb8eb791f50fdc912e9735d0a05f61288bf086f"},
+      {"path": "artifacts/windows/ordinary-qualification/close-posix-lock-failed.json", "sha256": "18b16772bf05021d9be8525312cc4b13ec840ea28f12e53f39e9996aae7414a1"},
+      {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/comparison.json", "sha256": "1643fb2e5c938ee6cac2db58824bfaa973c73ae7cff892199c3b43873d3ff062"},
+      {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/report.md", "sha256": "833356773c6d2183755b83f6bc62956cd2dfe5a11185b602faaa9644e5a440e2"},
+      {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/aba-analysis.md", "sha256": "39b0c1b8f3f4f0e19c93b21cf67856f83aa5aae0ed389bbe10ac19c62b0556d5"},
+      {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/aba-analysis.json", "sha256": "6350d767af7d083505731fa226cb46bb722e8c36318d917f28877a2141349fd1"}
+    ]
   },
   "source_regression_followup": {
     "scope": "macOS 26.2 arm64 / CPython3.14.7 / Qt6.11.1真实source回归。612a3ca源码包加五个明确文件overlay；原result.json的source_commit仅标识archive基线，未把修复后结果归给未修改的612a3ca或Windows候选。",
