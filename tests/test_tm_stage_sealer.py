@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -219,6 +220,54 @@ class _FakeRegistry:
 
 
 class StageSealerHappyPathTests(unittest.TestCase):
+    def test_source_provenance_uses_builder_compatibility_without_losing_pairs(self) -> None:
+        cases = (
+            ({}, [["source", "legacy-jsonl"]]),
+            ({"provenance": None}, [["source", "legacy-jsonl"]]),
+            ({"provenance": [["source", 1]]}, [["source", "legacy-jsonl"]]),
+            ({"provenance": [["source", "tmx"], ["broken"]]}, [["source", "legacy-jsonl"]]),
+            ({"provenance": []}, []),
+            ({"provenance": [["source", "local-write"]]}, [["source", "local-write"]]),
+            ({"provenance": [["z", "值"], ["a", ""], ["z", "值"]]}, [["z", "值"], ["a", ""], ["z", "值"]]),
+        )
+        for supplied, expected in cases:
+            with self.subTest(supplied=supplied), tempfile.TemporaryDirectory() as temporary:
+                identity = _identity(Path(temporary))
+                identity.configured_jsonl_path.write_text(
+                    json.dumps({"source": "same", "target": "value", **supplied}) + "\n",
+                    encoding="utf-8",
+                )
+                build = _service(identity).build_mutable_stage(identity.configured_jsonl_path)
+                assert build.mutable_stage is not None
+                facts = tm_stage_sealer._validate_stage_facts(
+                    build.mutable_stage, canonical_store_id="store.primary",
+                )
+                self.assertEqual(facts.record_count, 1)
+                with sqlite3.connect(build.mutable_stage.staged_db_path) as connection:
+                    observed = connection.execute("SELECT provenance_json FROM tm_record").fetchone()[0]
+                connection.close()
+                self.assertEqual(json.loads(observed), expected)
+
+    def test_exported_source_provenance_tamper_is_rejected_exactly(self) -> None:
+        original = [["z", "first"], ["a", "second"], ["z", "first"]]
+        for tampered in ([], original[:2], list(reversed(original[:2])) + original[2:], [["source", "legacy-jsonl"]]):
+            with self.subTest(tampered=tampered), tempfile.TemporaryDirectory() as temporary:
+                identity = _identity(Path(temporary))
+                identity.configured_jsonl_path.write_text(
+                    json.dumps({"source": "same", "target": "value", "provenance": original}) + "\n",
+                    encoding="utf-8",
+                )
+                build = _service(identity).build_mutable_stage(identity.configured_jsonl_path)
+                assert build.mutable_stage is not None
+                with sqlite3.connect(build.mutable_stage.staged_db_path) as connection:
+                    connection.execute("UPDATE tm_record SET provenance_json = ?", (json.dumps(tampered, separators=(",", ":")),))
+                connection.close()
+                _expect_seal_code(
+                    self,
+                    lambda: tm_stage_sealer._validate_stage_facts(build.mutable_stage, canonical_store_id="store.primary"),
+                    "SEALER.PROVENANCE_MISMATCH",
+                )
+
     @unittest.skipUnless(os.name == "nt", "Windows platform route")
     def test_portable_missing_caller_borrow_fails_before_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

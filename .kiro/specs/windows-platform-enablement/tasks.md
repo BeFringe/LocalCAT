@@ -544,6 +544,8 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 ## Implementation Notes
 
+- Task 7.3–9.2 执行收束：卷二与模拟数据只作既有合同的测试样本，不新增多文档或滚动条门。以正式资格及恢复、最小Project/TM/TMX/FTS5旅程、规定的数据保护反例、独立累计评审为退出条件；Computer Use只验证正常产品入口与必要交互，其余使用现有生产API/owner回归，未变深入机制按Requirement 12复用。当前只修导出JSONL再激活的具体Core接缝；Mac系统深浅色适配后置，不扩为Windows frozen前置。
+
 - Task 7.4：`3628fde4e2a4` 的 ProjectPackage 导入已到达正常编辑会话，但应用真实 TM 建议使主线程重复等待 runtime generation 锁；强制结束这个验证进程后，已保存项目、源文件与否定资格记录未变。修复归 Feature5 Controller 的建议消费接缝；须在重建候选中重放应用、保存和冷重开，不能以 source 回归关闭本项，既有性能失败仍独立保留。
 
 - Task 7.3：POSIX 锁修复后的 `3628fde4e2a4` 已实际重跑 C/oracle/100k 双路径 D；两路仅 Fuzzy p95 超过原 500 ms 门限，根因尚未定位。Host 正常发布失败结果，冷启动仍关闭 Fuzzy 并保留 Exact；该事实不完成本项或继承旧资格。先限定诊断运行期时延抬升，再决定修复或正式复验，不反复运行取最好值；新候选及失败原报见既有证据索引的 `successor_candidate`。
