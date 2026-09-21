@@ -116,11 +116,10 @@ class EditorControllerTMQuerySessionTests(unittest.TestCase):
         import tm_engine
         from editor_controller import _initial_tm_activation_service
         from tm_contracts import MigrationReport
+        from tests.benchmark_worker_test_support import worker_temporary_directory
 
-        # Windows activation quarantine handles can outlive the fixture scope.
-        # Do not turn cleanup of disposable files into a query-contract failure.
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
-            root = Path(temporary)
+        with worker_temporary_directory() as temporary:
+            root = Path(temporary).resolve()
             repository = ResourceRepository(root / "data")
             resource = repository.create_resource("Canonical", ResourceKind.TRANSLATION_MEMORY)
             path = resource.path

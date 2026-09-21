@@ -32,6 +32,7 @@ from editor_tm_adapter import EditorTMAdapter
 from resource_repository import ResourceRepository
 from tm_application_composition import TMResourceResolver, TMRuntimeHost
 from tm_contracts import TMMatchType
+from tests.benchmark_worker_test_support import worker_temporary_directory
 from tests.test_capability_host_gate_d import (
     _FakeGateDExecution,
     _composition as _gate_d_composition,
@@ -214,7 +215,7 @@ class EditorControllerTMSuggestionApplyTests(unittest.TestCase):
             self.assertFalse(project.segments[0].confirmed)
 
     def test_authentic_exact_context_and_fuzzy_require_explicit_apply(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             controller, _runtime, _composition = _canonical_controller(
                 self,
@@ -248,7 +249,7 @@ class EditorControllerTMSuggestionApplyTests(unittest.TestCase):
                 self.assertEqual(_regular_file_snapshot(root), file_snapshot)
 
     def test_legal_field_substitutions_are_rejected_with_zero_mutation(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             root = Path(temporary)
             controller, _runtime, _composition = _canonical_controller(
                 self,
