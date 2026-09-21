@@ -7026,6 +7026,86 @@ QMainWindow#editorWindow, QWidget#windowShell, QWidget#emptyPage {
     background: #17191c;
     color: #e7edf3;
 }
+QDialog#workspacePackageImportDialog {
+    background: #17191c;
+    color: #e7edf3;
+}
+QLabel#packageImportTitle {
+    color: #f1f5f9;
+}
+QLabel#packageImportMode {
+    color: #9be0b8;
+    background: #234032;
+    border-color: #426b53;
+}
+QLabel#packageImportMode[mode="replace"] {
+    color: #ffd58d;
+    background: #493a22;
+    border-color: #846633;
+}
+QLabel#packageImportTransition {
+    color: #66c3df;
+}
+QLabel#packageImportExplanation,
+QLabel#packageImportNote,
+QLabel#packageImportIdLabel {
+    color: #aab4bf;
+}
+QFrame#packageImportSummary {
+    background: #1f2328;
+    border-color: #363d45;
+}
+QLineEdit#packageImportProjectId {
+    color: #e7edf3;
+    background: #20242a;
+    border-color: #48515b;
+    selection-color: #f7fbff;
+    selection-background-color: #35667a;
+}
+QLabel#packageImportDocumentCount,
+QLabel#packageImportSegmentCount {
+    color: #89d9ef;
+    background: #233942;
+}
+QLabel#packageImportReconciliation {
+    color: #c5d0da;
+    background: #252b31;
+}
+QFrame#packageImportSafety {
+    background: #234032;
+    border-color: #426b53;
+}
+QFrame#packageImportSafety[state="warning"] {
+    background: #493a22;
+    border-color: #846633;
+}
+QFrame#packageImportSafety[state="blocked"] {
+    background: #292e34;
+    border-color: #f2a1a1;
+}
+QLabel#packageImportSafetyText {
+    color: #9be0b8;
+}
+QFrame#packageImportSafety[state="warning"] QLabel#packageImportSafetyText {
+    color: #ffd58d;
+}
+QFrame#packageImportSafety[state="blocked"] QLabel#packageImportSafetyText {
+    color: #f2a1a1;
+}
+QPushButton#packageImportApply {
+    color: #ffffff;
+    background: #087f9f;
+    border-color: #28a8c8;
+}
+QPushButton#packageImportApply:hover {
+    background: #0787ad;
+    border-color: #37add0;
+}
+QPushButton#packageImportApply:disabled {
+    color: #a3afba;
+    background: #292e34;
+    border-color: #48515b;
+}
 QWidget#emptyPage[dragActive="true"] {
     background: #1d2c33;
 }
