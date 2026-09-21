@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
     ExportFailure,
     ExportReport,
+    MigrationReport,
     SNAPSHOT_MANIFEST_VERSION,
     AssetKind,
     AssetPreservationState,
@@ -50,7 +52,9 @@ from tm_migration import (
     TMMigrationService,
     _export_artifact_paths,
 )
+from tm_engine import TMEngine
 from tm_sqlite_store import (
+    ResourceStoreCoordinator,
     SQLiteStoreLifecycleError,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
@@ -155,6 +159,7 @@ def _prepared_store(
                 provenance=(
                     ("batch", "seed"),
                     ("source", "legacy-jsonl"),
+                    ("batch", "seed"),
                 ),
             ),
             _draft("minimal", "target only", provenance=()),
@@ -664,7 +669,7 @@ class TMExportSuccessTests(unittest.TestCase):
 
 class TMExportRoundTripTests(unittest.TestCase):
     def test_round_trip_preserves_fields_provenance_and_exact_winner(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as cleanup:
             root = Path(temporary)
             stage, store = _prepared_store(root)
             destination = _destination(root)
@@ -677,6 +682,9 @@ class TMExportRoundTripTests(unittest.TestCase):
 
             parity_directory = (root / "parity").resolve()
             parity_directory.mkdir()
+            if os.name == "nt":
+                from tests.test_tm_initial_activation_windows import _remove_long_quarantine
+                cleanup.callback(_remove_long_quarantine, parity_directory)
             parity_source = parity_directory / "source.jsonl"
             parity_source.write_bytes(destination.read_bytes())
             migrated_identity = CanonicalResourceIdentity.from_configured_jsonl(
@@ -686,15 +694,30 @@ class TMExportRoundTripTests(unittest.TestCase):
             migrated_service = TMMigrationService(
                 resource_identity=migrated_identity,
                 canonical_store_id="store.parity",
-            )
-            with patch("tm_sqlite_store._probe_fts5", return_value=False):
-                build = migrated_service.build_mutable_stage(parity_source)
-                self.assertIsNotNone(build.mutable_stage)
-                assert build.mutable_stage is not None
-                migrated_store = SQLiteTMStore(
-                    build.mutable_stage,
+                coordinator=ResourceStoreCoordinator(
+                    resource_identity=migrated_identity,
                     canonical_store_id="store.parity",
-                )
+                ),
+            )
+            outcome = migrated_service.activate_initial(
+                parity_source, migrated_identity.resource_id,
+            )
+            self.assertIs(type(outcome), MigrationReport, repr(outcome))
+            self.assertEqual(outcome.migrated_count, 6)
+            self.assertEqual(outcome.skipped_count, 0)
+            self.assertEqual(outcome.variant_count, 1)
+            self.assertFalse(outcome.fuzzy_available)
+            reopened = TMEngine(
+                str(parity_source), update=False,
+                expected_resource_id=migrated_identity.resource_id,
+            )
+            self.assertTrue(reopened.canonical_active)
+            migrated_store = reopened.canonical_store
+            assert migrated_store is not None
+            exact = reopened.query_exact("same")
+            self.assertIsNotNone(exact)
+            assert exact is not None
+            self.assertEqual(exact.target, "second")
 
             self.assertEqual(
                 tuple(
@@ -725,6 +748,7 @@ class TMExportRoundTripTests(unittest.TestCase):
                 ((
                     ("batch", "seed"),
                     ("source", "legacy-jsonl"),
+                    ("batch", "seed"),
                 ),),
             )
 

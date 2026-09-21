@@ -603,6 +603,8 @@
 
 ## Implementation Notes
 
+- Task 9.6b：合法非legacy provenance经导出后仍须按实际source逐项保真核对，不能硬编码为legacy来源。SQLite流式游标须在成功和异常路径都关闭，否则异常引用持有的游标会阻止Windows清理。
+
 - Task 9.6b：macOS回归暴露migration/query的POSIX工件闭集遗漏activation owner保留的确定名锁。两端须纳入该成员并完整核验身份及内容，继续拒绝字节漂移、外来锁和链接；不删除锁或泛化放行。worker输入改变后由Core判定兼容性并重验资格。
 
 - Task 9.6b：Windows测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。观察与清理须保留原恢复、字节和阶段断言。

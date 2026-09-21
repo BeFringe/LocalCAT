@@ -84,9 +84,6 @@ _NATIVE_PATH_TYPE = type(Path())
 _READ_CHUNK_BYTES = 1024 * 1024
 _STAGE_CLOSURE_FETCH_ROWS = 2_048
 _PORTABLE_PUBLICATION_ASSETS = frozenset({"database", "manifest"})
-_EXPECTED_PROVENANCE_JSON = (
-    '[["source","legacy-jsonl"]]'
-)
 
 
 class StageSealError(RuntimeError):
@@ -1462,6 +1459,26 @@ def _accepted_jsonl_row(
     )
 
 
+def _provenance_json(value: object) -> str | None:
+    """Keep the builder's valid ordered pairs; invalid JSONL uses its default."""
+
+    if type(value) is not list:
+        return None
+    if any(
+        type(pair) is not list
+        or len(pair) != 2
+        or type(pair[0]) is not str
+        or type(pair[1]) is not str
+        for pair in value
+    ):
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _source_provenance_json(row: dict[str, object]) -> str:
+    return _provenance_json(row.get("provenance")) or '[["source","legacy-jsonl"]]'
+
+
 def _open_stage_read_connection(database_path: Path) -> sqlite3.Connection:
     database, uri = _sqlite_uri_connection_target(
         database_path,
@@ -2004,60 +2021,59 @@ def _validate_stage_facts(
                 duplicate_source_count = 0
                 source_counts: dict[str, int] = {}
                 ordinal = 0
-                record = record_cursor.fetchone()
-                with identity.configured_jsonl_path.open("rb") as stream:
-                    for line_number, raw_line in enumerate(
-                        stream,
-                        start=1,
-                    ):
-                        scan_digest.update(raw_line)
-                        try:
-                            decoded_line = raw_line.decode("utf-8")
-                            payload = json.loads(
-                                decoded_line,
-                                parse_constant=_reject_json_constant,
-                            )
-                        except (
-                            UnicodeDecodeError,
-                            json.JSONDecodeError,
-                            ValueError,
+                # An exception traceback can retain this cursor. End its
+                # statement before rollback/close and Windows stage retirement.
+                with closing(record_cursor):
+                    record = record_cursor.fetchone()
+                    with identity.configured_jsonl_path.open("rb") as stream:
+                        for line_number, raw_line in enumerate(
+                            stream,
+                            start=1,
                         ):
-                            invalid_count += 1
-                            continue
-                        accepted = _accepted_jsonl_row(payload)
-                        if accepted is None:
-                            invalid_count += 1
-                            continue
-                        (
-                            source_raw,
-                            target_raw,
-                            speaker_raw,
-                            context_prev_raw,
-                            context_next_raw,
-                            file_source,
-                        ) = accepted
-                        prior_count = source_counts.get(source_raw, 0)
-                        source_counts[source_raw] = prior_count + 1
-                        if prior_count == 1:
-                            duplicate_source_count += 1
-                        jsonl_winners[source_raw] = target_raw
-                        valid_count += 1
-                        if record is None:
-                            raise StageSealError(
-                                "SEALER.RECORD_COUNT_MISMATCH"
+                            scan_digest.update(raw_line)
+                            try:
+                                decoded_line = raw_line.decode("utf-8")
+                                payload = json.loads(
+                                    decoded_line,
+                                    parse_constant=_reject_json_constant,
+                                )
+                            except (
+                                UnicodeDecodeError,
+                                json.JSONDecodeError,
+                                ValueError,
+                            ):
+                                invalid_count += 1
+                                continue
+                            accepted = _accepted_jsonl_row(payload)
+                            if accepted is None:
+                                invalid_count += 1
+                                continue
+                            source_raw, target_raw = accepted[:2]
+                            prior_count = source_counts.get(source_raw, 0)
+                            source_counts[source_raw] = prior_count + 1
+                            if prior_count == 1:
+                                duplicate_source_count += 1
+                            jsonl_winners[source_raw] = target_raw
+                            valid_count += 1
+                            if record is None:
+                                raise StageSealError(
+                                    "SEALER.RECORD_COUNT_MISMATCH"
+                                )
+                            _validate_record_row(
+                                record,
+                                ordinal=ordinal,
+                                line_number=line_number,
+                                batch_id=batch_id,
+                                accepted=accepted,
+                                expected_provenance_json=_source_provenance_json(
+                                    cast(dict[str, object], payload),
+                                ),
                             )
-                        _validate_record_row(
-                            record,
-                            ordinal=ordinal,
-                            line_number=line_number,
-                            batch_id=batch_id,
-                            accepted=accepted,
-                        )
-                        stage_winners[source_raw] = target_raw
-                        ordinal += 1
-                        record = record_cursor.fetchone()
-                if record is not None:
-                    raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
+                            stage_winners[source_raw] = target_raw
+                            ordinal += 1
+                            record = record_cursor.fetchone()
+                    if record is not None:
+                        raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
                 source_digest = scan_digest.hexdigest()
                 if batch_kind == "migration":
                     if batch_id != f"migration.{source_digest}":
@@ -2358,52 +2374,57 @@ def _validate_schema_upgrade_stage_facts(
     )
     stage_winners: dict[str, str] = {}
     ordinal = 0
-    for record in record_cursor:
-        record_id = _int_row(record[0], "record_id")
-        if record_id != ordinal + 1:
-            raise StageSealError("SEALER.RECORD_IDENTITY_INVALID")
-        source_raw = _text_row(record[1], "record source_raw")
-        target_raw = _text_row(record[2], "record target_raw")
-        stored_fold = _text_row(record[3], "record source_fold_v1")
-        stored_fold_length = _int_row(record[4], "record source_fold_length")
-        provenance_json = _text_row(record[9], "record provenance_json")
-        legacy_line_no = record[10]
-        if legacy_line_no is not None:
-            legacy_line_no = _int_row(
-                legacy_line_no,
-                "record legacy_line_no",
-            )
-            if legacy_line_no < 1:
+    with closing(record_cursor):
+        for record in record_cursor:
+            record_id = _int_row(record[0], "record_id")
+            if record_id != ordinal + 1:
+                raise StageSealError("SEALER.RECORD_IDENTITY_INVALID")
+            source_raw = _text_row(record[1], "record source_raw")
+            target_raw = _text_row(record[2], "record target_raw")
+            stored_fold = _text_row(record[3], "record source_fold_v1")
+            stored_fold_length = _int_row(record[4], "record source_fold_length")
+            provenance_json = _text_row(record[9], "record provenance_json")
+            legacy_line_no = record[10]
+            if legacy_line_no is not None:
+                legacy_line_no = _int_row(
+                    legacy_line_no,
+                    "record legacy_line_no",
+                )
+                if legacy_line_no < 1:
+                    raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+            usage_count = _int_row(record[11], "record usage_count")
+            if usage_count < 0:
+                raise StageSealError("SEALER.RECORD_INVALID")
+            last_used = record[12]
+            if last_used is not None and type(last_used) is not str:
+                raise StageSealError("SEALER.RECORD_INVALID")
+            origin_batch_id = _text_row(record[13], "record origin_batch_id")
+            origin_ordinal = _int_row(record[14], "record origin_ordinal")
+            if origin_ordinal < 0:
                 raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-        usage_count = _int_row(record[11], "record usage_count")
-        if usage_count < 0:
-            raise StageSealError("SEALER.RECORD_INVALID")
-        last_used = record[12]
-        if last_used is not None and type(last_used) is not str:
-            raise StageSealError("SEALER.RECORD_INVALID")
-        origin_batch_id = _text_row(record[13], "record origin_batch_id")
-        origin_ordinal = _int_row(record[14], "record origin_ordinal")
-        if origin_ordinal < 0:
-            raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-        batch_kind = kind_by_batch.get(origin_batch_id)
-        if batch_kind is None:
-            raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-        if batch_kind in {"migration", "import"}:
-            if legacy_line_no is None:
+            batch_kind = kind_by_batch.get(origin_batch_id)
+            if batch_kind is None:
                 raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-        elif legacy_line_no is not None:
-            raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
-        folded_source = fold_text_value_v1(source_raw)
-        if (
-            type(folded_source) is not str
-            or folded_source != stored_fold
-            or stored_fold_length != len(stored_fold)
-        ):
-            raise StageSealError("SEALER.FOLD_MISMATCH")
-        if provenance_json != _EXPECTED_PROVENANCE_JSON:
-            raise StageSealError("SEALER.PROVENANCE_MISMATCH")
-        stage_winners[source_raw] = target_raw
-        ordinal += 1
+            if batch_kind in {"migration", "import"}:
+                if legacy_line_no is None:
+                    raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+            elif legacy_line_no is not None:
+                raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
+            folded_source = fold_text_value_v1(source_raw)
+            if (
+                type(folded_source) is not str
+                or folded_source != stored_fold
+                or stored_fold_length != len(stored_fold)
+            ):
+                raise StageSealError("SEALER.FOLD_MISMATCH")
+            try:
+                provenance = json.loads(provenance_json)
+            except ValueError as error:
+                raise StageSealError("SEALER.PROVENANCE_MISMATCH") from error
+            if _provenance_json(provenance) is None:
+                raise StageSealError("SEALER.PROVENANCE_MISMATCH")
+            stage_winners[source_raw] = target_raw
+            ordinal += 1
     if ordinal != record_count:
         raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
 
@@ -2467,58 +2488,63 @@ def _validate_schema_upgrade_stage_facts(
     matched_count = 0
     boundary_cursor = connection.execute(
         "SELECT record_id, source_raw, target_raw, speaker_raw, "
-        "context_prev_raw, context_next_raw, file_source "
+        "context_prev_raw, context_next_raw, file_source, provenance_json "
         "FROM tm_record WHERE record_id <= ? ORDER BY record_id",
         (receipt_boundary,),
     )
-    record = boundary_cursor.fetchone()
-    with identity.configured_jsonl_path.open("rb") as stream:
-        for _line_number, raw_line in enumerate(stream, start=1):
-            scan_digest.update(raw_line)
-            try:
-                decoded_line = raw_line.decode("utf-8")
-                payload = json.loads(
-                    decoded_line,
-                    parse_constant=_reject_json_constant,
-                )
-            except (
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                ValueError,
-            ):
-                continue
-            accepted = _accepted_jsonl_row(payload)
-            if accepted is None:
-                continue
-            (
-                source_raw,
-                target_raw,
-                speaker_raw,
-                context_prev_raw,
-                context_next_raw,
-                file_source,
-            ) = accepted
-            jsonl_winners[source_raw] = target_raw
-            valid_count += 1
-            if record is None:
-                raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
-            if (
-                _text_row(record[1], "record source_raw") != source_raw
-                or _text_row(record[2], "record target_raw") != target_raw
-                or _optional_text_row(record[3], "record speaker_raw")
-                != speaker_raw
-                or _optional_text_row(record[4], "record context_prev_raw")
-                != context_prev_raw
-                or _optional_text_row(record[5], "record context_next_raw")
-                != context_next_raw
-                or _optional_text_row(record[6], "record file_source")
-                != file_source
-            ):
-                raise StageSealError("SEALER.RECORD_MISMATCH")
-            matched_count += 1
-            record = boundary_cursor.fetchone()
-    if record is not None:
-        raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
+    with closing(boundary_cursor):
+        record = boundary_cursor.fetchone()
+        with identity.configured_jsonl_path.open("rb") as stream:
+            for _line_number, raw_line in enumerate(stream, start=1):
+                scan_digest.update(raw_line)
+                try:
+                    decoded_line = raw_line.decode("utf-8")
+                    payload = json.loads(
+                        decoded_line,
+                        parse_constant=_reject_json_constant,
+                    )
+                except (
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    ValueError,
+                ):
+                    continue
+                accepted = _accepted_jsonl_row(payload)
+                if accepted is None:
+                    continue
+                (
+                    source_raw,
+                    target_raw,
+                    speaker_raw,
+                    context_prev_raw,
+                    context_next_raw,
+                    file_source,
+                ) = accepted
+                jsonl_winners[source_raw] = target_raw
+                valid_count += 1
+                if record is None:
+                    raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
+                if (
+                    _text_row(record[1], "record source_raw") != source_raw
+                    or _text_row(record[2], "record target_raw") != target_raw
+                    or _optional_text_row(record[3], "record speaker_raw")
+                    != speaker_raw
+                    or _optional_text_row(record[4], "record context_prev_raw")
+                    != context_prev_raw
+                    or _optional_text_row(record[5], "record context_next_raw")
+                    != context_next_raw
+                    or _optional_text_row(record[6], "record file_source")
+                    != file_source
+                ):
+                    raise StageSealError("SEALER.RECORD_MISMATCH")
+                if _text_row(record[7], "record provenance_json") != _source_provenance_json(
+                    cast(dict[str, object], payload),
+                ):
+                    raise StageSealError("SEALER.PROVENANCE_MISMATCH")
+                matched_count += 1
+                record = boundary_cursor.fetchone()
+        if record is not None:
+            raise StageSealError("SEALER.RECORD_COUNT_MISMATCH")
     source_digest = scan_digest.hexdigest()
     if (
         source_digest != receipt.jsonl_digest
@@ -2684,6 +2710,7 @@ def _validate_record_row(
         str | None,
         str | None,
     ],
+    expected_provenance_json: str,
 ) -> None:
     record_id = _int_row(record[0], "record_id")
     if record_id != ordinal + 1:
@@ -2715,7 +2742,7 @@ def _validate_record_row(
         or file_source != accepted[5]
     ):
         raise StageSealError("SEALER.RECORD_MISMATCH")
-    if provenance_json != _EXPECTED_PROVENANCE_JSON:
+    if provenance_json != expected_provenance_json:
         raise StageSealError("SEALER.PROVENANCE_MISMATCH")
     if legacy_line_no != line_number or origin_ordinal != ordinal:
         raise StageSealError("SEALER.RECORD_LINEAGE_INVALID")
