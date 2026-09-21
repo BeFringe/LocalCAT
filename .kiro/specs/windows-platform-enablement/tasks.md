@@ -544,6 +544,8 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 ## Implementation Notes
 
+- Task 7.4：`3628fde4e2a4` 的 ProjectPackage 导入已到达正常编辑会话，但应用真实 TM 建议使主线程重复等待 runtime generation 锁；强制结束这个验证进程后，已保存项目、源文件与否定资格记录未变。修复归 Feature5 Controller 的建议消费接缝；须在重建候选中重放应用、保存和冷重开，不能以 source 回归关闭本项，既有性能失败仍独立保留。
+
 - Task 9.1：对实际变化的最终路径、内容捕获、W1、输出锁和 SOURCE 窗口补验时，激活用例须复用既有 Windows 长路径清理 helper；不吞清理失败。SOURCE 用例分别证明 Windows 活句柄以 sharing violation 阻断写入、POSIX 在发生变化后终端拒绝，不能用任意 PermissionError 跳过或将两种机制混写。测试修正不改变普通候选或 Core 兼容身份；跨平台和最终候选验收范围继续分别记账。
 
 - Task 7.2：用 `requirements-frozen-build.txt` 固定构建依赖，在干净 checkout 执行 `python tools/build_windows_ordinary.py`；构建子进程须隔离开发工具 PATH，否则额外 ICU DLL 可能污染 Qt collection。将 `artifacts/windows/ordinary-build/dist/LocalCAT` 复制至仓库外，再执行 `python tools/check_windows_ordinary.py <副本中的 LocalCAT.exe> --report artifacts/windows/ordinary-entry-checks-complete.json`。该工具会在独立副本中临时撤下并恢复输入记录；输出绑定实际候选，过程材料留在已忽略的 `artifacts/windows/`。
