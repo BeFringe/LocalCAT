@@ -1,8 +1,8 @@
 {
   "status": "IN_PROGRESS",
   "release_status": "NOT_VERIFIED",
-  "scope": "candidate/formal_gate及既有owner验收保留原3c20候选事实；successor_candidate单列修复后3628候选的实际失败与安全投影，不拼接为同一产物通过。不是0.5.2发行裁决；原始日志、截图、试验脚本保留在忽略的artifacts/windows目录。",
-  "observed_at_utc": "2026-09-20T22:48:33.417131+00:00",
+  "scope": "candidate/formal_gate/evidence及既有owner验收保留原3c20范围；successor_candidate保留3628真实失败及当时诊断，e948_repair_candidate单列后续修复、正式Gate通过与尚未完成的候选验收。旧节中的后续实验描述不覆盖新节现状，不拼接不同产物为同一候选通过。不是0.5.2发行裁决；原始材料继续保留在忽略的artifacts/windows目录。",
+  "observed_at_utc": "2026-09-21T05:01:47+00:00",
   "reviewed_source_head": "ec480ff88258fe297700af600d7f66aff31046a7",
   "candidate": {
     "candidate_id": "3c20cf46a8a4b6ddbbcaa2adbcf75fc970896619fbadcb26e69b3c42b68714df",
@@ -578,9 +578,9 @@
     "全部当前Windows业务实验在现有用户下使用独立合成数据与清理后的进程环境；不能据此声称已在未安装Python/Qt的另一Windows环境验收。"
   ],
   "remaining": [
-    "修复后3628候选已重建并实际执行C/oracle/100k双路径D；两路仅FUZZY_P95失败，根因仍未确定，见successor_candidate。Core9.6b/Feature5 6.6b/平台7.3保持未勾选；最终候选必测消费仍须闭合，原3c20资格不能改签。",
+    "e948已实际完成C/oracle/100k双路径D并通过原门限，基本资格恢复和负向已取得事实；3628失败与未知根因保持原样。当前阻塞转为TM自身snapshot/锁/发布/权限/reparse、数据迁移不带资格及精确复用映射，见e948_repair_candidate；Core9.6b/Feature5 6.6b/平台7.3仍未勾选。",
     "无Python/Qt的独立Windows环境启动与短保存/冷重开尚未取得；用户确认暂缺该环境，先完成其余验证并保留缺口。清理PATH与Python/Qt环境变量的同机观察不代答此项。",
-    "指定8个owner候选子项保留原3c20上的独立验收事实，不自动改签给后续候选；其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
+    "指定8个owner候选子项保留原3c20上的独立验收事实，不自动改签给后续候选；最终候选须完成12.1–12.2必测，并关联未改变owner的原锚点、不变前提及当前消费。其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
   ],
   "owner_journeys": {
     "review_status": "APPROVED",
@@ -602,7 +602,7 @@
     "feature5_7_4b": "错owner候选拒绝、资格缺失/损坏/兼容/ACL/MIC拒绝、局部TM不可用、实际worker异常退出与关闭取消均保留安全投影；实际transport矩阵与Core/Host分类测试按层关联，不把每个transport异常说成逐项GUI全量100k重跑。",
     "qt_5_2b_5_3b": "正常首页/显式项目、候选logo/icon、默认资源播种/保留、无catalog fallback及实际windowed窗口；缺失/损坏qwindows插件显示Qt错误并非零退出，错误项目参数稳定失败。对已观察的设置对话框发送Escape后主窗口仍可用，正常关闭无worker遗留。",
     "qt_tools": "实际搜索与导航、raw speaker盘点/browse、预处理preview/确认/apply/undo及规则保存冷读、术语create/update/冷读/delete；原项目内容和confirmed经撤销恢复，术语删除保留原五条记录，资格字节未变。",
-    "dependency_limits": "Core9.6b、Feature5 6.6b/7.6b/9.2a、平台7.3/7.4及Qt5.4b仍等待修复后候选的性能失败定位、其余必测消费、干净Windows环境与累计验收；这些原候选实际观察不越过依赖完成整项。",
+    "dependency_limits": "本节8项保留原3c20独立验收；后续e948的正式性能通过与剩余Core产品证据缺口见e948_repair_candidate。Core9.6b、Feature5 6.6b/7.6b/9.2a、平台7.3/7.4及Qt5.4b仍须各自闭合依赖和当前候选消费；独立无Python/Qt环境继续作为最终发行缺口，不额外阻塞Core9.6b。",
     "focused_review_validation": {
       "observer": "ordinary_owner_completion_review",
       "command": "python -m unittest -v tests.test_qt_source_resources tests.test_windows_ordinary_transport",
@@ -704,6 +704,129 @@
       {"path": "artifacts/windows/ordinary-qualification/posix-lock-independent-review.log", "sha256": "b3b1ef995b508a75de4fc85ae80351c31b41ee1cfde480d7e885e9836b124c53"}
     ],
     "candidate_impact": "两处worker属于Core fingerprint输入。新候选须真实重跑正式Gate并重闭合平台12.1–12.2；未改变的深入owner矩阵依12.5复用。本节不修改原candidate/formal_gate事实，不签发资格或发行PASS。"
+  },
+  "e948_repair_candidate": {
+    "candidate_id": "e948aa23bc4ef104fd0005b253f6d4878a623bf60e2d3216f17c38262bcb3330",
+    "built_from": "a2e1fec60e5014456b47089bd03c108cae77912d",
+    "evidence_index_source_head": "c377816b3da4fda7b7dcf00a4a3ae6ce39b6d261",
+    "implementation_fingerprint": "c20acd1c2df6c62501d3a4685444444eaeba7bce93994cc5a6cd30fc10453774",
+    "status": "FORMAL_GATE_PASSED_CANDIDATE_ACCEPTANCE_INCOMPLETE",
+    "scope": "本节仅归属 e948 的真实执行、修复后产品消费及限定评审；不改签原 3c20 验收，不覆盖 3628 失败，也不把后续主题候选或 0.5.2 发行标为通过。",
+    "repair_and_build": {
+      "repair": "ProjectPackage 应用 TM 建议后刷新 workspace 时重入同一非重入锁；a2e1fec 改为推进 query epoch 并失效旧观察签名，保持既有 generation 检查。相对 3628 唯一改变的 declared owner 输入为 editor_controller.py，Core fingerprint 未变。",
+      "validation": "修复有真实 RED、Windows/Mac 各 67 项受影响回归 exit 0，以及独立评审和 guard 反证；详见 repair-scope 中原始锚。普通 PyInstaller 构建完成，clean tracked a2e1fec 构建记录与安装记录一致，188 个实际 payload 已复核。",
+      "evidence": [
+        {"path": "artifacts/windows/ordinary-qualification/project-apply-hang/repair-scope.json", "sha256": "7789a25005a7234f045838c5064ea5a6822bd21ee44efb22591c193061ff162d"},
+        {"path": "artifacts/windows/ordinary-build-workspace-apply/dist/LocalCAT/localcat-candidate.json", "sha256": "5f21cbbb74060e4af6505deef7244b0a56187cad95ad27561102f6af02189273"},
+        {"path": "artifacts/windows/ordinary-qualification/project-apply-hang/build.log", "sha256": "d9e9b7f36dc2ebbdb4ee1392c6795d77ebb009689ee6b7d8ad0b825fe11fc102"},
+        {"path": "artifacts/windows/ordinary-qualification/project-apply-hang/entry-checks.json", "sha256": "ae9546851ddd443d4158d9b56a44a861edffd6b361c9b3fe3391c33d14d18af4"}
+      ]
+    },
+    "formal_gate": {
+      "status": "PASSED",
+      "execution": "正常产品设置页显式重验；实际 Gate C 的 Context/fuzzy-core cohort 通过，Core 执行正式 oracle 与 100k 双路径 D，原 Host 生命周期持久发布本机资格。entry checks 的小样本不代答正式 D。",
+      "contract": "与顶层 formal_gate.contract 相同的 100000 records、1200 Exact/240 Fuzzy、5000-record/200-query oracle、每 cohort 100 warmup、单次测量、nearest-rank 与原 50 ms/500 ms/120 s/512 MiB/recall 1 门限；strict codec 重建报告并核对候选内真实 contract。",
+      "bundle_digest": "e69cfdedf637a70201e1b370dfcdfb89d43ed6d4e41b2ee97d6ce7dfafc9f4b4",
+      "metrics": [
+        {
+          "execution_path": "FTS5_TRIGRAM",
+          "candidate_recall": 1,
+          "exact_p95_ms": 0.7341,
+          "fuzzy_top10_p95_ms": 383.0087,
+          "migration_seconds": 79.8790151,
+          "peak_rss_mib": 413.87109375,
+          "passed": true,
+          "failed_gates": []
+        },
+        {
+          "execution_path": "GRAM_FALLBACK",
+          "candidate_recall": 1,
+          "exact_p95_ms": 1.2013,
+          "fuzzy_top10_p95_ms": 394.6923,
+          "migration_seconds": 117.3274111,
+          "peak_rss_mib": 419.84765625,
+          "passed": true,
+          "failed_gates": []
+        }
+      ],
+      "qualification_sha256": "bcbb7af8af97159ecf64b5169c21d3ba0c7d834571e33cc6ff87393c5fdb4a88",
+      "conditions": "正式 observer 1376 个一秒采样；四个 same-EXE worker 出现的 339 个采样点均为父 GUI 前台、AC=1、battery saver=0。父进程及四个 child 的 retained handle 均记录 exit 0。完整过程另有 53 个非前台采样，不声称全程前台；PowerThrottling 0/0 仅表示 system-managed，不证明自动 QoS 关闭。",
+      "diagnosis_limit": "本次在已观测条件下通过原门限。3628 两路约 1.09 秒的真实失败仍保留；旧记录缺少同级调度/功耗观察，不能由本次通过反推唯一根因或声称修复 Windows QoS。没有为择优重复正式 100k；后续只按 Core 兼容性变化触发重验。",
+      "independent_review": {
+        "verdict": "APPROVED",
+        "reviewer": "e948_formal_evidence_review",
+        "scope": "仅正式执行与运行条件结论；不完成平台 7.3/Core 9.6b/Feature5 6.6b。独立 strict codec、188 payload 和资格内 bundle 核对，BundleCodecTests 19 项 exit 0。"
+      },
+      "evidence": [
+        {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/e948-formal-start.json", "sha256": "ee941565dccb1413cbb09246f3ea83ba75f8764268b5a7d9346e900cd8c46934"},
+        {"path": "artifacts/windows/ordinary-qualification/benchmark-candidate-e948aa23bc4e.json", "sha256": "9497dbe171cbffbfb9e5444e5031334a2b5f0b561f278ced4a8a97cba1648efc"},
+        {"path": "artifacts/windows/ordinary-qualification/benchmark-candidate-e948aa23bc4e.summary.json", "sha256": "372814dc6b8a148d49a855ad752cecc437b909972cfc809f181f7503113c9677"},
+        {"path": "artifacts/windows/ordinary-qualification/qualification-positive-e948.json", "sha256": "bcbb7af8af97159ecf64b5169c21d3ba0c7d834571e33cc6ff87393c5fdb4a88"},
+        {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/e948-formal-observer.jsonl", "sha256": "0d996121a3d8176797a78788f9bd900e16306bcea1a9f76da30dd1e05a7ef6e7"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-formal-result.json", "sha256": "f205687f35da3d8402f300ab86c0750996dfbb61b1b1da40717c1d9d9b2bd33f"},
+        {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/e948-independent-review.md", "sha256": "a623cec396b04328f9dfe4f2f1a18e6a91d6139f59bfd6d489bcd1445042c685"}
+      ]
+    },
+    "lifecycle": {
+      "transport": "project-apply-hang/entry-checks.json 的 24 项属于实际 EXE：migration/query 缺失或错 pipe、坏请求、真实 child 响应副本的畸形/截断/错候选拒绝；actual_child_response_faults 两端均记录 child_exit=0、retained_handle_signaled=true、pipe_endpoints_closed=true。",
+      "close_before_commit": "early_close_before_gate_c_install 记录 matcher/retrieval generation 均为 0；close_with_running_worker 与 worker_abnormal_exit 分别记录自己创建的 child 已退出、失败通知进入 owner thread。这里不是新的正式 Gate PASS。",
+      "commit_before_close": "正式资格已发布后，PID 37768 正常关闭 exit 0；随后正常冷启动接受同一资格并恢复 Fuzzy。未改变的窄并发 commit/revoke owner 测试仍须按 12.5 补齐精确复用映射，不把先后观察冒充穷尽并发胜负。",
+      "timeout_limit": "小样本 entry checks 的两项 timeout 是 migration 的 FTS5/fallback 两路；不写成 migration/query 分别超时，不为每类 transport 错误重跑 100k。",
+      "evidence": [
+        {"path": "artifacts/windows/ordinary-qualification/project-apply-hang/formal-normal-close-final.json", "sha256": "6f7512fd28ec34173f0bdb375cc33a552afb61f7c3c9db908f05c77eb59f8eaa"}
+      ]
+    },
+    "qualification_consumption": {
+      "positive": "正常冷启动恢复 Fuzzy 可用及 93% 建议；60 秒 observer 共 61 个采样仅发现父 PID 13052，无测量 child。这是有界采样，不声称任何时刻绝无短命进程。",
+      "negative": "正常产品启动分别消费缺失、损坏、旧 3c20 不兼容资格与 Everyone 可写 ACL，均显示 Fuzzy 需重新验证，并保留两个健康资源的 Exact 和原项目译文；四次正常关闭均 exit 0、关闭前 child 列表为空。缺失仍缺失，损坏/失配记录摘要不变。",
+      "private_restoration": "撤去 Everyone 写 ACE 后仍有 AUTO_INHERITED，严格 private profile 继续拒绝。随后通过原私有发布端口恢复备份的同一真实资格字节，正常 EXE 再次显示 Fuzzy 可用；没有生成签名、读取设备密钥或签发新资格。名字含 cold-qualification-restored 的中间记录不是正向证据。",
+      "evidence": [
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-positive-cold.json", "sha256": "465c884c97bd4babd55cb2fd4e7971525236bf38af7d247e1ab73bdb301fc806"},
+        {"path": "artifacts/windows/ordinary-qualification/fuzzy-timing-diagnosis/e948-positive-cold-observer.jsonl", "sha256": "60904159a6195297fdf80dd4bbef930255c35c66fb5dc823c71c8a11f306bcf9"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-qualification-missing.json", "sha256": "0d5a6df92464343a23505333ef4261778600008891d5f6db3952a9a3d5672f94"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-qualification-missing-close.json", "sha256": "47de2f6d1af9215190a28f379b0fe268523325568aca510229b33d7f2ecfb41b"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-qualification-corrupt.json", "sha256": "5abfeec63fb116c3134e3170dba0f33a48873bd30228736d0b89e9d42c379b37"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-qualification-corrupt-close.json", "sha256": "6f6960f5b51e54703f61283aa8d40d6652ef88e993c8dd4cf0a017e143b500b1"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-qualification-incompatible.json", "sha256": "79b3f026337203a0cd7d55c38ae600a1d9359218d43360ef86aa454eb720ab80"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-qualification-incompatible-close.json", "sha256": "2a2258ebd42901b329c78b0f8b6c776638c3a5634dcb516edb0c05ff56df011f"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-qualification-acl-preparation.json", "sha256": "2fe08426cdc8aaf6e678e364b4c26a7f1d8c54f38d9fa6c357bf45c1b658b5a4"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-qualification-acl.json", "sha256": "54adf048717f472dce9a21efa051779250960938ba2818f9ddc8c07d9fe0bef6"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-qualification-acl-close.json", "sha256": "5c997ffa0be7c47a45e6626d10a149c1c0c103ceca8789844f151e8bf3868b79"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-qualification-acl-restored.json", "sha256": "8691720848b28af30f2fc8b141f8ad2d3b747d81d5395ee5f09fccfb9d653e68"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-qualification-private-restored.json", "sha256": "8a7527824fd575e8fe72da14fc15dbcc510e602914cdf7cb87bb683090999e8d"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-vol2-private-restored.json", "sha256": "171cce13cba0e3a86f2140a6a02191c3b95d951c5b0c23f2f056ab6166e5eb5a"}
+      ]
+    },
+    "product_consumption": {
+      "project_and_suggestions": "修复后的正常 --project 入口完成 Exact apply、保存、退出及冷重开，源成员不变。正式资格通过后，编辑目标使旧 93% Fuzzy 建议 stale，旧卡未覆盖目标；刷新建议后显式 apply 成功，保存并冷重开仍为该译文且待确认。",
+      "tmx_and_sqlite": "新建独立 E948 TMX Journey，经正常 UI 直接导入 2 条（跳过/覆盖/错误均 0），预览有效 2 条后激活 canonical，实际建议检索、apply、保存与冷开成功。外部只读 quick_check/FTS5 trigram schema/MATCH 仅核对产物，不代答候选消费者或正式 Gate。",
+      "project_publication_failure": "持有 ProjectPackage 目标占用时，正常保存返回 PROJECT.SAVE.COMMIT_FAILED，原包 SHA-256 不变；释放后保存成功。该检查不代答 TM snapshot/export publication。",
+      "interruption": "只中止无活动发布/worker时的未保存编辑进程；正常冷开恢复先前保存译文及资格，前后 11 个业务文件与两个源成员摘要相同。证据仅约束所记录的前后时点，不宣称此后用户测试期间文件始终未变，也不代答 durable-phase kill 或 OS reboot。",
+      "evidence": [
+        {"path": "artifacts/windows/ordinary-qualification/project-apply-hang/e948-journey-facts.json", "sha256": "3a869c553c20d0897d3a69eb0471e83bc3a12c59990ca066f5cc1683984d0a75"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-fuzzy-stale-rejected.json", "sha256": "ffc3d5cc17ee1ec979fb73b90a3ba17b519d1853c6e70095c9fa9adb34efa4c1"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-fuzzy-applied.json", "sha256": "4f1d22cd884aa2bb3f70fd3a91d0a949deebbc1c42bb1720000c831a8f547d79"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-fuzzy-saved-localcat.json", "sha256": "946a6fc1a474551abb3f9f1fb7fc57121225b62f4abb43a7302cd3675476f871"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-tmx-imported.json", "sha256": "9d21f045a3e51f32a7b945cbd84f9cca3d1c679c25107500981439e2bc556084"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-tm-activation-preview.json", "sha256": "cfb39096e6b5a94c37fdd7efb81be831bd0681e4a5d327d7ce3d912c60459424"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-tm-activated.json", "sha256": "7980c973182d30b29fdf9c734724575dcd49297a8f0a2f5dc8edd88d5b8cb801"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-tmx-live-query.json", "sha256": "831894a1f741a93fd3c8af0f6522f34a97a67c5278982a0caefa463e41ccee93"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-tmx-interruption-cold.json", "sha256": "698cc72d1ced74ff9b15720860721b5974e1f1adba40892fdae01c2c4fe2e748"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-tmx-sqlite-cold.json", "sha256": "ba6d7d6575b944999d59e558161740cad16e78f02fc71a5d484b13a3981598de"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-project-target-open-result.json", "sha256": "b60dc54eb9f71ee04a823a9d000700197fe53a8571e9e5bf62c7cda7bd43d7fa"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-project-target-open-rejected.json", "sha256": "2f6f9b8d50bc2f49b69cb3cc08a7625272e655e60339324fece602981c1041cc"},
+        {"path": "artifacts/windows/ordinary-qualification/ui-e948-project-save-retry.json", "sha256": "8add479c54a779ef598f0ec7ec2e369965d9a89a86e5f244d1ee7a6ad11b11f3"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-before-interruption.json", "sha256": "14976b6bed14d002526a8eb3cca1ac09d8b056e84aefa011ba3e22b7da5247cc"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-interruption-exit.json", "sha256": "1b669a2b89880e31102ce068e00d2955faa124a0b934572b232ea2b7ef3a0cae"},
+        {"path": "artifacts/windows/ordinary-qualification/e948-after-interruption-cold.json", "sha256": "2e8a34d83789942315926267f78168a8a4d46bcc92845d01ec39c787fb524b76"}
+      ]
+    },
+    "remaining": {
+      "core_9_6b": "正式 Gate 与基本资格恢复事实已成立；当前候选 TM 自身 snapshot/export、锁竞争/发布失败、权限/reparse 拒绝及数据迁移不带资格仍待汇合，不能用旧 3c20 事实或 Project 保存失败代答。",
+      "qualification_reuse": "后续纯 UI 候选应按 12.1 实际恢复兼容资格，引用本节原正式证据；还须把未变 Core/Host 并发和深入恢复矩阵按原锚点、实现/依赖/合同/关键条件及当前消费者逐条关联。不得为补 e948 标签倒退构建或重跑无关 100k。",
+      "release": "平台 7.3/Core 9.6b/Feature5 6.6b 及其余待验任务保持未勾选。独立无 Python/Qt Windows 环境缺口属于最终发行，不新增为 Core 9.6b 前置；整体 release_status 仍为 NOT_VERIFIED。",
+      "audit": {"path": "artifacts/windows/ordinary-qualification/core-96b-completion-audit.md", "sha256": "43f04e076f32e656d27f5d87376f5b37d236496e76124dcd72b4ff4c640a0b8b"}
+    }
   },
   "review_candidate_archive": {
     "status": "CANDIDATE_NOT_RELEASE_VERIFIED",
