@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from editor_contracts import EditorProject, EditorSegment
 from qt_editor_window import QtEditorWindow
+from tests.benchmark_worker_test_support import worker_temporary_directory
 from tests.test_editor_controller_tm_apply import (
     _canonical_controller,
     _legacy_fixture,
@@ -34,7 +35,7 @@ class QtTMSuggestionSurfaceTests(unittest.TestCase):
     def test_authentic_cards_show_three_match_types_without_repeating_query_source(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             controller, _runtime, _composition = _canonical_controller(
                 self,
                 Path(temporary),
@@ -94,7 +95,7 @@ class QtTMSuggestionSurfaceTests(unittest.TestCase):
             window.close()
 
     def test_each_card_applies_explicitly_and_rejection_stays_non_blocking(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             controller, _runtime, _composition = _canonical_controller(
                 self,
                 Path(temporary),
@@ -136,7 +137,7 @@ class QtTMSuggestionSurfaceTests(unittest.TestCase):
             window.close()
 
     def test_no_match_capability_closed_and_resource_failure_are_distinct(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with worker_temporary_directory() as temporary:
             no_match_root = Path(temporary) / "no-match"
             no_match_root.mkdir()
             no_match_controller, _runtime, _composition = _canonical_controller(
