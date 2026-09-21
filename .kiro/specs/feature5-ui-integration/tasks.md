@@ -470,6 +470,8 @@
 
 ## Implementation Notes
 
+- Task 9.2a：实际 ProjectPackage 应用建议暴露了 Controller 在 runtime generation 提交锁内重新读取同一代次的死锁。workspace target 提交仍在原 reservation 内完成，并立即递增 query epoch、清除旧建议；仅将新基线捕获延至下一次查询同步，保留过期拒绝与并发换代保护。局部修复及 source 回归不代答同候选产品验收，任务继续未完成。
+
 - Task 6.6b：真实普通候选恢复缺失资格、消费不兼容资格时发现 Host 的输入窗口包装器误把 Core 业务拒绝归为输入失败。窗口仅归一自身进入、terminal 与关闭异常；正文异常原对象交回既有 Core binding／Host 生命周期分类，不按错误字符串放行。资格、计量与发布 authority 不变；任务继续等待同候选恢复、负向与产品验收。
 
 - Task 6.6b：验证 lifecycle 的 `SUCCEEDED` 只表示结果已完成发布，合法否定结果也能到达该状态；完成提示复用 fresh Controller 检索安全投影，不由 lifecycle 宣称获得资格，重验开始时清除上次完成提示。Qt poll 回归覆盖这一边界；canonical 测试目录使用现有 Windows 长路径清理 helper。此修正不完成正式性能、资格恢复及同候选交互验收。
