@@ -471,6 +471,8 @@
 
 ## Implementation Notes
 
+- Task 9.2a：实际 ProjectPackage 应用建议暴露了 Controller 在 runtime generation 提交锁内重新读取同一代次的死锁。workspace target 提交仍在原 reservation 内完成，并立即递增 query epoch、清除旧建议；仅将新基线捕获延至下一次查询同步，保留过期拒绝与并发换代保护。局部修复及 source 回归不代答同候选产品验收，任务继续未完成。
+
 - Task 6.6b/7.6b：同一 `3c20cf46a8a4` 候选的实际资格恢复、缺失/损坏/ACL/MIC/兼容拒绝、资源局部不可用及健康结果保留已核对；fresh 目录从导出 JSONL 提供 legacy Exact，TXT 应用译文并保存冷开后 Fuzzy 仍需本机验证。Windows Core/资格交互功能阶段经独立有限批准，证据与原范围见[当前候选证据](../../../windows_ordinary_frozen_evidence.json)。尚未完成的错误投影、共享 POSIX 回归及相邻 owner 验收不由该批准代答，任务保持未勾选。
 
 - Task 6.6b：真实普通候选恢复缺失资格、消费不兼容资格时发现 Host 的输入窗口包装器误把 Core 业务拒绝归为输入失败。窗口仅归一自身进入、terminal 与关闭异常；正文异常原对象交回既有 Core binding／Host 生命周期分类，不按错误字符串放行。资格、计量与发布 authority 不变；任务继续等待同候选恢复、负向与产品验收。

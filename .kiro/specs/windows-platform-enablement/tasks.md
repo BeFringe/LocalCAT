@@ -544,6 +544,8 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 ## Implementation Notes
 
+- Task 7.4：`3628fde4e2a4` 的 ProjectPackage 导入已到达正常编辑会话，但应用真实 TM 建议使主线程重复等待 runtime generation 锁；强制结束这个验证进程后，已保存项目、源文件与否定资格记录未变。修复归 Feature5 Controller 的建议消费接缝；须在重建候选中重放应用、保存和冷重开，不能以 source 回归关闭本项，既有性能失败仍独立保留。
+
 - Task 7.3：POSIX 锁修复后的 `3628fde4e2a4` 已实际重跑 C/oracle/100k 双路径 D；两路仅 Fuzzy p95 超过原 500 ms 门限，根因尚未定位。Host 正常发布失败结果，冷启动仍关闭 Fuzzy 并保留 Exact；该事实不完成本项或继承旧资格。先限定诊断运行期时延抬升，再决定修复或正式复验，不反复运行取最好值；新候选及失败原报见既有证据索引的 `successor_candidate`。
 
 - Task 7.3–9.1：`3c20cf46a8a4` 的本机资格、已执行产品旅程与数据保护结果统一记录在[候选与后续回归证据](../../../windows_ordinary_frozen_evidence.json)，原始输出、待验收 ZIP 和试验材料仍留在忽略的 `artifacts/windows/`。独立评审已关闭 Parser 5.12b、Chunk 1.4b/4.5b、Resource 5.5a、TMX 5.4a、Feature5 7.4b、Qt 5.2b/5.3b 的限定候选范围；后续真实 Mac 回归定位并修复了 Core worker 的 POSIX activation 锁清单遗漏，Windows/source 受影响回归已取得。该修复改变 Core fingerprint，已重建为 `3628fde4e2a4`，仍须解决其性能失败并完成其余必测消费；原候选验收事实保留，不拼接为新候选通过。用户确认暂缺无 Python/Qt 的独立 Windows 环境，先完成其余验证并保留此缺口；整体验收与发行继续未完成。
