@@ -2217,7 +2217,9 @@ class EditorController:
                 self._project_revision = receipt.resulting_revision
                 self._refresh_workspace_projection(current_identity)
                 self._advance_tm_query_epoch()
-                self._record_current_tm_baseline()
+                # Suggestion apply holds the runtime generation lock here.
+                # Capture the new baseline on the next query, outside that lock.
+                self._observed_tm_signature = None
             return self.workspace_view
 
     def search_workspace(
