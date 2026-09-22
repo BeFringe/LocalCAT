@@ -71,7 +71,7 @@
 
 ### Windows Compatibility Amendment WA-08
 
-- **审批与ADR mapping**：用户明确批准 `reassessment@3e41130` 中本节普通frozen消费与对应R/D/T改动，follow ADR-028并消费WA-03/04/05/07；前述Feature GO/既有审批只覆盖原Qt/source范围。Qt increment保留原项目journey、silver logo与inventory-only avatar presentation；Windows Spec拥有普通onedir/windowed构建、候选关联、入口与资源根，不新增Qt authority或Steering层。
+- **ADR mapping与ownership**：follow ADR-028并消费WA-03/04/05/07；前述Feature GO保留原Qt/source范围。Qt increment保留原项目journey、silver logo与inventory-only avatar presentation；Windows Spec拥有普通onedir/windowed构建、候选关联、入口与资源根，不新增Qt authority或Steering层。
 - **Source resources/entry**：source journey从rooted source resource resolver取得logo/avatar catalog；轻量Windows GUI入口只启动用户专用venv的绝对`pythonw.exe`与source bootstrap，提供图标/版本/诊断但不携带runtime或取得packaging authority。
 - **Bundle resources**：普通frozen Qt消费平台入口提供的当前候选资源根和构建声明中的logo、Windows icon、可选avatar catalog；标准PyInstaller资源位置由平台resolver解释，Qt不从CWD、checkout或任意`_MEIPASS`值推导authority。catalog存在时沿用casefold索引、歧义/解码失败语义，未声明或无匹配时保持无头像fallback；不为头像启用source loader、PYZ逐项比较或Core资格重验。
 - **产品入口与用户状态**：普通入口复用`qt_editor`正常首页/显式项目参数处理、同一用户目录resolver及Controller组合，不以W3空编辑器入口代替产品启动。资源播种只写缺失默认项，现有workspace、资源配置、项目与TM数据不被覆盖；安装目录承载只读程序资源，用户可变状态仍归原owner和数据端口。Qt不处理候选/session/资格字段，只消费Controller的安全状态与操作结果。

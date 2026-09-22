@@ -393,9 +393,8 @@
   - _Depends: 2.12a, 5.2a, windows-platform-enablement 3.7_
 
 - [x] 5.12b 在普通 frozen 候选验证 Windows reader/writer
-  - 本轮已批准（`reassessment@3e41130`）：从 7.2 的实际 EXE、non-repository CWD 调用 Parser reader/canonical writer，完成读取、保存、冷重开及 rooted 拒绝/零目标 mutation 反例；模块和必要数据来自普通 bundle，无 checkout 或外部 Python 回退。
+  - 从 7.2 的实际 EXE、non-repository CWD 调用 Parser reader/canonical writer，完成读取、保存、冷重开及 rooted 拒绝/零目标 mutation 反例；模块和必要数据来自普通 bundle，无 checkout 或外部 Python 回退。
   - 按平台 Requirement 12 区分候选必测、未变 Parser/平台深入矩阵复用及变更触发重验；保留原数据保护，移除 W3/.py 源码证明前置。退出时向 Qt 旅程提供可用 owner port 和实际候选证据。
   - _Amendment: WA-01_
   - _Delivery phase: frozen post-build_
   - _Depends: 5.12a, ADR-028, windows-platform-enablement 7.2_
-  - _Evidence: [同候选证据](../../../windows_ordinary_frozen_evidence.json)中的 TXT/JSON 保存冷重开、rooted 拒绝及原 owner 复用范围；不改签旧 source 验收。_

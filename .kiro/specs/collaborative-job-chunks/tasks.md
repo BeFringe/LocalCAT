@@ -8,7 +8,7 @@ WA-02 source amendment按两个有序阶段交付。`1.3a`、`1.4a`、`3.2a` 是
 
 本计划保持 brief 的四个 Promotion Cluster，并在它们之前增加只做治理的 Cluster 0。`multi-document-project-workspace` 完整 C2A/C2B/C2C 提供真实 ProjectPackage 作为 Chunk C1 的上游输入。
 
-原 Chunk C0–C4 与 source 的 R/D/T 审批及完成事实保留；用户明确批准 `reassessment@3e41130` 中普通 frozen `1.4b/4.5b` 与 Design 适用范围，当前 `spec.json` 已记录批准与依赖就绪；候选尚未验收。历史 Cluster 1 只拥有 identity/membership/topology/local metadata，不因本轮修订扩入相邻责任。
+原 Chunk C0–C4 与 source 完成事实保留原范围；普通 frozen `1.4b/4.5b` 的候选验收事实见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)。历史 Cluster 1 只拥有 identity/membership/topology/local metadata，不扩入相邻责任。
 
 固定顺序：
 
@@ -102,7 +102,7 @@ Multi-Document C2 complete
   - _Depends: 1.3a, ADR-020, windows-platform-enablement 3.7_
 
 - [x] 1.4b 闭合Windows frozen import与启动组合
-  - 本轮已批准（`reassessment@3e41130`）：从普通 EXE 进入既有 chunk composition，证明实际业务 import/startup 无 POSIX-only 依赖，使用真实 Windows 端口且不从 checkout 补载模块；退出时同候选可进入 4.5b 的业务验收。
+  - 从普通 EXE 进入既有 chunk composition，证明实际业务 import/startup 无 POSIX-only 依赖，使用真实 Windows 端口且不从 checkout 补载模块；退出时同候选可进入 4.5b 的业务验收。
   - _Amendment: WA-02_
   - _Delivery phase: frozen post-build_
   - _Depends: 1.4a, ADR-028, windows-platform-enablement 7.2_
@@ -229,12 +229,11 @@ Multi-Document C2 complete
   - _Depends: 1.4a, 4.4a, multi-document-project-workspace 2.8a and 4.4a, windows-platform-enablement C5S_
 
 - [x] 4.5b 在普通 frozen 候选完成 Chunk/Project 组合验收
-  - 本轮已批准（`reassessment@3e41130`）：对真实 ProjectPackage、chunk metadata 与 Controller 执行保存/冷重开、锁竞争和中断恢复，保持 identity/membership/permission 与原发布保证；失败不得禁用 store 或回退 checkout。
+  - 对真实 ProjectPackage、chunk metadata 与 Controller 执行保存/冷重开、锁竞争和中断恢复，保持 identity/membership/permission 与原发布保证；失败不得禁用 store 或回退 checkout。
   - 按平台 Requirement 12 引用未变 owner 深入证据并重验变更触发范围；候选业务调用与失败反例实际执行后，向平台 7.4 交付结果，不用旧 source PASS 代答。
   - _Amendment: WA-02_
   - _Delivery phase: frozen post-build_
   - _Depends: 1.4b, 4.5a, ADR-028, windows-platform-enablement 7.2_
-  - _Evidence: [同候选证据](../../../windows_ordinary_frozen_evidence.json)覆盖 1.4b/4.5b 的实际 composition、保存冷重开、锁竞争及中断后 identity/membership 保持；候选中止时无活动发布，深入发布故障按所列 owner 范围复用。_
 
 ### Cluster 4 完成门
 

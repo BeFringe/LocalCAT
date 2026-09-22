@@ -16,7 +16,7 @@ LocalCAT 面向个人译者提供完全本地的翻译记忆库。当前能力�
 
 WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿用既有Requirements语义并补齐frozen受信输入与fresh worker pre-build消费合同。`R1`～`R3`保留为dispatch ledger的`SUPERSEDED`历史；既有source evidence保持原始签署锚，不自动成为R4 frozen证据。
 
-**本轮范围修订已获用户按 `reassessment@3e41130` 批准**：仅替换下列第5条中普通frozen的来源约束，并同步本Spec的输入、worker、qualification Design/Tasks；Requirements 1–9的业务语义、正式门限及数据保护不变。本次明确批准具体消费合同及已列明依赖，不代表实现或候选/Gate验收完成；R4的原审批与9.6c/9.6d完成事实仍只覆盖原合同。
+**普通frozen修订范围**：下列第5条定义普通frozen的来源约束，并由本Spec的输入、worker、qualification Design/Tasks承载消费；Requirements 1–9的业务语义、正式门限及数据保护不变。R4与9.6c/9.6d完成事实保留原合同范围。
 
 1. Windows canonical TM 首次激活、generation 切换、snapshot publication、schema upgrade 与 recovery 必须消费 ADR-020/025 的 process lock、rooted authority与正常`PendingPublication`端口，并保持 SQLite authority、reservation、journal、LKG、generation 与业务 error envelope不变；已激活资源的显式import/rebuild必须在同一resource W1 owner内完成portable full replacement，pre-arm不改变canonical命名状态，post-arm只产生完整prior、完整new或recovery-only，且只有new `READY`清除divergence。实现仍服从`windows-platform-enablement`的前置platform capability与merge依赖。
 2. Windows 私有存储资格必须按 ADR-021经ADR-023/024接管后的`WindowsPrivateSecurityV2`使用provider-agnostic current process primary token事实：exact TokenUser owner、DACL、medium或high mandatory-integrity、`NO_WRITE_UP`、OS access行为与嵌套`WindowsPrivateProof`。local/domain/Entra等provider来源不是mandatory事实且不得进入persistent proof；proof的`security_profile_id`和authority descriptor digest仍绑定V2 canonical owner+DACL+MIC projection。它只替代POSIX物理表示谓词，Gate D/canonical owner envelope、content/phase/generation proof不得由此省略或重铸；V1/unknown profile不得兼容读取或自动迁移。

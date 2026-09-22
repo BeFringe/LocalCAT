@@ -1,6 +1,6 @@
 # 实施计划
 
-> **SOURCE COMPLETE / ORDINARY FROZEN 规格已批准、候选未验收**：用户明确批准 `reassessment@3e41130` 的普通 frozen 活动 Requirements / Design / Tasks 与已列明相邻 owner 修订，先进入 7.2a 与 Core 9.6e，再按原依赖贯通 Host 和生命周期。Task 0–6、Core 9.6c/9.6d、Feature5 3.6a 与平台 7.0/7.1 的完成事实保留；这些历史条目的 Requirements 编号按 `6531b1e` 当时版本解释，不重签成新 Requirement 10–12 的验收。新任务在实际验证前保持未完成，不预填候选或正式 Gate PASS。
+> **验收范围**：Task 0–6、Core 9.6c/9.6d、Feature5 3.6a 与平台 7.0/7.1 保留原完成事实；这些历史条目的 Requirements 编号按 `6531b1e` 当时版本解释，不重签成新 Requirement 10–12 的验收。普通 frozen 的候选、owner 任务及证据复用范围统一见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)；已勾选任务不自动覆盖后续候选。
 
 source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA-08 5.4a 与平台 6.6b 验收，状态为 `WINDOWS_USER_MANAGED_RUNTIME_VERIFIED`；证据见 [launcher](../../../windows_user_managed_launcher_evidence.json) 和 [用户旅程](../../../qt_editor_windows_source_evidence.json)。本次文档同步不重签 runtime evidence。
 
@@ -414,9 +414,9 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Windows User-managed Source Runtime Milestone_
   - _Depends: 5.5, 6.5, qt-editor-json-mvp-increment 5.4a_
 
-## 后置普通 frozen：已批准实施计划
+## 后置普通 frozen
 
-7.0/7.1 只保留原 W3 构建前完成事实，其历史 Depends 不再是新普通任务的执行门；普通任务从已完成 source 和本轮批准合同进入。旧未完成任务已由下列活动正文替换，原内容可追溯 Git，不另建档案。构建摘要/实际内容接缝及 windowed 管道、取消回收的不确定性已归入 7.2a–c、Core 9.6e 和 Feature5 3.6b；规格收束不改变原 Git 历史。
+7.0/7.1 只保留原 W3 构建前完成事实，其历史 Depends 不再是普通任务的执行门；普通任务从已完成 source 进入。构建摘要/实际内容接缝及 windowed 管道、取消回收分别由 7.2a–c、Core 9.6e 和 Feature5 3.6b 承担。
 
 - [ ] 7. 从普通候选贯通 Core、资格与产品旅程
 
@@ -544,13 +544,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 ## Implementation Notes
 
-- Task 7.3–9.2 执行收束：卷二与模拟数据只作既有合同的测试样本，不新增多文档或滚动条门。以正式资格及恢复、最小Project/TM/TMX/FTS5旅程、规定的数据保护反例、独立累计评审为退出条件；Computer Use只验证正常产品入口与必要交互，其余使用现有生产API/owner回归，未变深入机制按Requirement 12复用。当前只修导出JSONL再激活的具体Core接缝；Mac系统深浅色适配后置，不扩为Windows frozen前置。
-
 - Task 7.4：`3628fde4e2a4` 的 ProjectPackage 导入已到达正常编辑会话，但应用真实 TM 建议使主线程重复等待 runtime generation 锁；强制结束这个验证进程后，已保存项目、源文件与否定资格记录未变。修复归 Feature5 Controller 的建议消费接缝；须在重建候选中重放应用、保存和冷重开，不能以 source 回归关闭本项，既有性能失败仍独立保留。
-
-- Task 7.3：POSIX 锁修复后的 `3628fde4e2a4` 已实际重跑 C/oracle/100k 双路径 D；两路仅 Fuzzy p95 超过原 500 ms 门限，根因尚未定位。Host 正常发布失败结果，冷启动仍关闭 Fuzzy 并保留 Exact；该事实不完成本项或继承旧资格。先限定诊断运行期时延抬升，再决定修复或正式复验，不反复运行取最好值；新候选及失败原报见既有证据索引的 `successor_candidate`。
-
-- Task 7.3–9.1：`3c20cf46a8a4` 的本机资格、已执行产品旅程与数据保护结果统一记录在[候选与后续回归证据](../../../windows_ordinary_frozen_evidence.json)，原始输出、待验收 ZIP 和试验材料仍留在忽略的 `artifacts/windows/`。独立评审已关闭 Parser 5.12b、Chunk 1.4b/4.5b、Resource 5.5a、TMX 5.4a、Feature5 7.4b、Qt 5.2b/5.3b 的限定候选范围；后续真实 Mac 回归定位并修复了 Core worker 的 POSIX activation 锁清单遗漏，Windows/source 受影响回归已取得。该修复改变 Core fingerprint，已重建为 `3628fde4e2a4`，仍须解决其性能失败并完成其余必测消费；原候选验收事实保留，不拼接为新候选通过。用户确认暂缺无 Python/Qt 的独立 Windows 环境，先完成其余验证并保留此缺口；整体验收与发行继续未完成。
 
 - Task 9.1：对实际变化的最终路径、内容捕获、W1、输出锁和 SOURCE 窗口补验时，激活用例须复用既有 Windows 长路径清理 helper；不吞清理失败。SOURCE 用例分别证明 Windows 活句柄以 sharing violation 阻断写入、POSIX 在发生变化后终端拒绝，不能用任意 PermissionError 跳过或将两种机制混写。测试修正不改变普通候选或 Core 兼容身份；跨平台和最终候选验收范围继续分别记账。
 

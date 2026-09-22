@@ -1,6 +1,6 @@
 # 实施计划
 
-> **普通 frozen 修订已获用户按 `reassessment@3e41130` 批准**：9.6e承担首条实际packaged Core/worker调用链，9.6b改为同候选本机资格与Core产品验收；本轮按既定依赖授权实施，优先验证逐输入摘要和实际fixture/contract内容的消费接缝，构建记录不替代真实Gate执行。既有[x]、Implementation Notes与source/R4审批保留原事实和证据范围，尤其9.6c/9.6d仅为W3构建前消费实现；不得解读为普通候选已经通过。未改变owner深入证据可按明确不变前提复用，候选上的实际Core/worker/Gate仍需验证。
+> **普通 frozen 任务范围**：9.6e承担首条实际packaged Core/worker调用链，9.6b承担同候选本机资格与Core产品验收。9.6c/9.6d保留原W3构建前消费实现范围；各候选的实际Core/worker/Gate与未变owner证据复用统一见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)。
 
 > **WA-06 Windows compatibility amendment（current R4）**：R4继承R3的source合同并以9.6c/9.6d落实frozen pre-build消费；`R1`/`R2`只保留为已被取代的历史。以下`a`后缀任务按ADR-020/021经ADR-023/024/025补充/修订后的合同，把canonical TM的identity、provider-agnostic V2 private proof、锁、正常publication与恢复接到平台端口；SQLite、FTS5、generation与Gate authority不变。实施仍须服从`windows-platform-enablement`前置platform capability与merge依赖。
 
@@ -557,7 +557,7 @@
   - _Amendment: WA-06_
   - _Depends: 5.11a, 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
 
-- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收（已批准；验收进行中）
+- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收
   - 在7.2真实调用链产物上运行实际Gate C、oracle与100k双路径Gate D，保留原算法、门限、warmup、计时/RSS口径及strict evidence/publication；由Core真实运行铸造设备资格，不能复用source PASS或小样本诊断签发资格。本任务供平台7.3资格闭环与7.4最终验收消费，不等待它们先通过。
   - 同一候选验证有效资格在进程重启后自动恢复、失配/损坏/权限异常只关闭Fuzzy、启动不自动100k、用户显式重验与原子替换；纯UI/头像候选变化不应无条件撤销检索资格，Core/fixture/runtime/worker计量依赖改变必须使相关身份失配。资格不可随JSONL/ResourcePackage或项目迁移。
   - 在实际候选完成canonical激活与重启恢复、exact/context/fuzzy、FTS5与fallback创建/查询/重开、snapshot/export以及实际消费路径的锁竞争、发布失败、中断恢复、权限/reparse拒绝；失败只接受完整prior、完整new或recovery-only，不损坏既有数据。已完成9.6a的深层状态机/故障矩阵只在实现、依赖、调用合同与关键运行条件均未改变且候选已实际消费时引用；不能以旧source证据覆盖新入口、worker、runtime或改变的数据端口。
@@ -603,13 +603,11 @@
 
 ## Implementation Notes
 
-- Task 9.6b：普通候选导出的合法非legacy provenance在新目录初始激活时被sealer误拒；异常持有未读SQLite cursor又使Windows清理失败。修复逐源保真核对及游标释放，独立source切片评审通过；真实2929条隔离激活、canonical冷开Exact和不携带Fuzzy资格已验证。Mac受影响回归、新EXE消费及Core输入改变后的正式Gate仍待完成，本项不勾选。范围与原失败见[候选证据](../../../windows_ordinary_frozen_evidence.json)的`d1_theme_candidate`和`transfer_activation_repair`。
+- Task 9.6b：合法非legacy provenance经导出后仍须按实际source逐项保真核对，不能硬编码为legacy来源。SQLite流式游标须在成功和异常路径都关闭，否则异常引用持有的游标会阻止Windows清理。
 
-- Task 9.6b：候选 `3c20cf46a8a4` 已实际执行原正式 oracle、100k FTS5/fallback Gate D，取得本机资格并由原 Host owner 持久发布；canonical 激活/冷开、TM 自身 W1 竞争、snapshot 发布失败/释放重试及 fresh 目录不携带资格的消费证据经独立有限批准。见[候选与后续回归证据](../../../windows_ordinary_frozen_evidence.json)。这些事实仍只属于原候选；整项继续未勾选，不重签旧 owner 或发行验收。
+- Task 9.6b：macOS回归暴露migration/query的POSIX工件闭集遗漏activation owner保留的确定名锁。两端须纳入该成员并完整核验身份及内容，继续拒绝字节漂移、外来锁和链接；不删除锁或泛化放行。worker输入改变后由Core判定兼容性并重验资格。
 
-- Task 9.6b：真实 macOS 回归发现 migration/query 的 POSIX 工件闭集遗漏原 activation owner 必须保留的确定名锁。两端纳入该成员后继续完整核验身份及内容，拒绝字节漂移、外来锁和链接；不删除锁或泛化放行。修复后的 source 回归已取得；worker 源码变化改变 Core fingerprint，不能继承 `3c20cf46a8a4` 的资格。新候选 `3628fde4e2a4` 实际 C/oracle/100k 双路径 D 中仅 Fuzzy p95 失败，Host 负向发布和冷恢复保持 Fuzzy 关闭、Exact 可用。查询中途的持续时延抬升尚无唯一根因，先做限定运行条件诊断，不放宽门限或凭未变热路径撤销失败事实；本项及最终候选消费仍未完成。
-
-- Task 9.6b：受影响 Windows 冷开与恢复补验中，测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。仅修正测试观察与清理，保留原恢复/字节/阶段断言。原定向运行 86 项中 81 项通过、5 项受该问题影响；修后 5 项在原长路径全部通过（50.523 秒、exit 0、无 skip），经独立评审。原失败日志保留，产品候选与 Core fingerprint 不变；本任务仍待完整候选验收。
+- Task 9.6b：Windows测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。观察与清理须保留原恢复、字节和阶段断言。
 
 - Task 9.6b：普通候选真实重验中关闭 Qt 后，oracle 全扫描和候选查询须观察同一输入 owner 的撤销。全扫描按小批次评分检查，候选路径在查询之间及同步建库前后检查；不改变评分、排序、fixture、门限或 worker 计量。此修正改变 Core fingerprint，旧资格必须失配，新候选须实际重跑正式 Gate；不把同步建库前后检查解释为建库内部即时中断，也不提前完成本任务。
 

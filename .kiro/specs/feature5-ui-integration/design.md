@@ -71,7 +71,7 @@
 
 ### Windows Compatibility Amendment WA-07
 
-- **审批与ownership**：用户明确批准 `reassessment@3e41130` 的本节普通packaged合同及对应待办，遵循ADR-009/011/013/020/021及其已采纳修订、ADR-028。Feature5/UI继续拥有Controller、CapabilityHost、resource/runtime projection与safe diagnostic；Windows Spec拥有构建、入口、候选关联与transport，TM Core拥有输入/session、资格及activation/private proof。无需新ADR、Steering层或public capability schema。
+- **ADR mapping与ownership**：遵循ADR-009/011/013/020/021及其已采纳修订、ADR-028。Feature5/UI继续拥有Controller、CapabilityHost、resource/runtime projection与safe diagnostic；Windows Spec拥有构建、入口、候选关联与transport，TM Core拥有输入/session、资格及activation/private proof；使用既有public capability schema。
 - **Early composition**：source继续由platform factory构造既有Windows ports再组合Host/Controller。普通packaged入口先取得Windows Design定义的当前候选及有限owner输入，再建立数据端口并进入同一Host/Controller图；允许标准PyInstaller模块装载，不要求native entry、E10或完整Boot TCB。来源不符或输入缺失时明确失败，不回落checkout、外部venv或旧native/source伪装。
 - **有限Host接缝**：在`capability_host.py`现有composition与Core binding构造入口选择source或普通packaged输入；`_SourceAnchorGraph`、完整AST/`_ModuleSourceCodeAnchor`与source `co_filename`证明留给既有source/W3路径。普通组合固定真实Core owner端口，检查其模块与受控构建声明/候选加载路径的关联；不从任意caller factory/callback构造授权，不复制整个Host，不把`capability_frozen_inputs.py`的native wrapper换名作为普通输入。Core负责解析有限输入与真实Gate执行，平台记录只关联输入和实际产物，不铸造capability。
 - **既有R4范围**：3.6a及Core 9.6c/9.6d的完成只涵盖原W3构建前consumer；其native/原线程调度事实与独立review保留原范围。已批准的新增3.6b复用已经闭合的publisher、lifecycle reservation、generation/通知及Core publication计划，替换普通输入与组合接缝；不重开算法或数据状态机。
