@@ -1,7 +1,7 @@
 {
   "status": "IN_PROGRESS",
   "release_status": "NOT_VERIFIED",
-  "scope": "candidate/formal_gate/evidence及既有owner验收保留原3c20范围；successor_candidate保留3628真实失败，e948_repair_candidate保留正式Gate通过；d1_theme_candidate记录后续主题候选消费与JSONL激活失败，transfer_activation_repair仅记录source修复。旧节的待办不覆盖后续现状，不拼接不同产物为同一候选通过。不是0.5.2发行裁决；原始材料继续留在忽略的artifacts/windows目录。",
+  "scope": "candidate/formal_gate/evidence及既有owner验收保留原3c20范围；successor_candidate保留3628真实失败，e948_repair_candidate保留正式Gate通过；d1_theme_candidate保留主题消费与JSONL激活失败，transfer_activation_repair记录source修复与受影响回归，transfer_repair_candidate记录8fae自身激活、正式计量及资格冷恢复。旧节的待办不覆盖后续现状，不拼接不同产物为同一候选通过。不是0.5.2发行裁决；原始材料继续留在忽略的artifacts/windows目录。",
   "observed_at_utc": "2026-09-21T05:01:47+00:00",
   "reviewed_source_head": "ec480ff88258fe297700af600d7f66aff31046a7",
   "candidate": {
@@ -856,32 +856,63 @@
     "reuse_mapping": {"path": "artifacts/windows/ordinary-qualification/project-import-theme/core-host-reuse.json", "sha256": "2154c0544ebf02aeca3dc704de510beee7485b6fd91848c5ba64cc1f26c5575c", "scope": "e948至d1未变依赖映射及4项发布/撤销source复验；不是后续sealer修复的复用结论或累计验收。"}
   },
   "transfer_activation_repair": {
-    "status": "SOURCE_SLICE_REVIEW_APPROVED_PACKAGED_PENDING",
+    "status": "SOURCE_SLICE_REVIEW_APPROVED_MAC_REGRESSION_PENDING",
     "sealer_sha256": "ebb62ab7109a07227da2c28ceef82f9bd2212cfdc6b6b535f9aba08bc3a40790",
     "change": "按源JSONL逐行核对兼容provenance，保留合法空集合、重复及顺序，schema upgrade沿用同一业务形状；在正常/异常退出时显式关闭流式cursor，保持Controller原有失败投影。未改变来源格式、owner或权限边界。",
     "validation": "独立评审18项通过，原HEAD重跑新增回归确实失败；真实隔离2929条source调用链完成初始激活、canonical冷开及Exact，逐条source/target/provenance保真且Fuzzy仍关闭。Windows较广74项中73过，唯一旧recovery调用断言在HEAD同样失败；原始失败日志保留，不宣称全套通过。",
-    "pending": "Mac原生sealer/export/schema-upgrade受影响回归因SSH暂不可达尚未执行。新EXE须重放导出后激活接缝；本次修改属于Core输入，须核对实际fingerprint失配并真实运行新候选正式C/oracle/D，不能用source成功或e948资格代答。9.6b仍未完成。",
+    "regression": "旧NO_FACTS测试仍mock已替换的rehydrate_completed_portable_activation入口；仅移除陈旧观察点，真实portable分类执行，保留generic/refresh各一次与数据不变检查。修正后指定Windows74项全部通过、无skip，独立复核NO_FACTS/corrupt/partial三项通过；原73过1失败日志保留。测试文件不属于当前候选输入，没有改变生产代码或重建候选。",
+    "pending": "Mac原生sealer/export/schema-upgrade受影响回归尚未执行，已转交Codex连接任务准备同一源码基线。8fae已重放激活并实际运行新fingerprint的正式计量，范围见transfer_repair_candidate；9.6b仍未完成。",
     "evidence": [
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/implementation-report.md", "sha256": "30467d8374a35fb757f4b242f5b2191be676ce0e3ad33697f5bf114216922ff4"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/review-report.md", "sha256": "b2f855427dd29f45c186d8bfe21c05104332a3e823e568d0fb6676b1b6cf3221"},
-      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/run-20260921T094106953502/result.json", "sha256": "a9c06bbcf99ef4598e179b2cc1906f8dab1dadf6d1a4ba0b2959b8c8c26955a9"}
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/run-20260921T094106953502/result.json", "sha256": "a9c06bbcf99ef4598e179b2cc1906f8dab1dadf6d1a4ba0b2959b8c8c26955a9"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/no-facts-red-20260922-2150.log", "sha256": "818c0fa176db0be579f77d1d265c0f0a12c36f70a586bdeedae6eef46e6a47d7"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/no-facts-regression-74-20260922-2150.log", "sha256": "f86bc595635f2204c13b8733a8cab675dee761cae96ba8b82acf6deffa060276"}
     ]
   },
   "transfer_repair_candidate": {
     "candidate_id": "8faeee03e1dd31d1162ce1d3447602a7af09fd1b20ac3313fa19bb321f51f5ad",
     "built_from": "4d8276f90417927bf329b879239cb9722238b131",
-    "status": "SMOKE_AND_WORKER_VERIFIED_PRODUCT_ACCEPTANCE_PENDING",
+    "status": "ACTIVATION_FORMAL_RUN_AND_RESTORE_OBSERVED_ACCEPTANCE_PENDING",
     "implementation_fingerprint": "4912f458ddf5c009683d319dd97bec959cc6f1b6ec4a4ae3367b102d93c836ab",
     "build": "固定依赖的普通PyInstaller构建exit 0，独立安装目录的实际payload复核通过；相对d1唯一改变的declared owner输出为tm_stage_sealer.py。Core实际消费的新fingerprint与旧资格不同，未复制、重签或宣称恢复旧资格。",
     "smoke": "detached实际EXE exit 0；产品父进程标准流均为None，FTS5/fallback各自执行migration/query独立child和4-query诊断oracle。实际Gate C correctness消费成立，但test_mode=true、final_evidence=false，不代答正式oracle/100k双路径D或真实数据重新激活。",
     "transport": "复用既有check_real_child_reply_faults及同一请求/管道负向集：migration/query真实child正常结果均由生产消费者接受、exit 0、retained handle已终止且pipe endpoints已关闭；外部响应副本的错candidate/request、畸形和截断被拒。两类worker共16个错误请求/管道入口检查均按既有错误合同拒绝。没有向窗口发送消息；不把这些结果算作Qt关闭、取消胜负或正式Gate。",
-    "pending": "桌面当前不可交互，导出JSONL→新目录激活→canonical冷开尚未在本EXE重放；正式资格及最终产品/数据反例仍待完成。Mac受影响回归暂缺连接。沿用既定7.3–9.2退出条件，旧候选只保留原证据范围。",
+    "transfer": "新数据目录仅复制2929条导出JSONL，没有canonical DB、device.key或资格。实际EXE预览有效2929/无效0/变体2，显式激活成功，canonical冷开Exact可用而Fuzzy仍待验证；只读逐条比较source/target/provenance保留内容、重复与顺序，源JSONL不变。",
+    "formal_run": {
+      "trigger": "正常设置中的重新验证Fuzzy；真实parent oracle及same-EXE migration/query worker完成后，Host发布本机资格并显示Fuzzy可用。原始bundle由严格codec读取，未以摘要或smoke代答执行。",
+      "bundle_digest": "5bfc2483d3ac83d21ed8b3ce9aca24d6e760a298533bc09aff493ff353b5d630",
+      "record_count": 100000,
+      "oracle_record_count": 5000,
+      "oracle_query_count": 200,
+      "exact_sample_count_per_path": 1200,
+      "fuzzy_sample_count_per_path": 240,
+      "paths": [
+        {"execution_path": "FTS5_TRIGRAM", "candidate_recall": 1.0, "exact_p95_ms": 1.0833, "fuzzy_top10_p95_ms": 381.7538, "migration_seconds": 75.2318222, "peak_rss_mib": 414.71484375, "failed_gates": []},
+        {"execution_path": "GRAM_FALLBACK", "candidate_recall": 1.0, "exact_p95_ms": 1.078, "fuzzy_top10_p95_ms": 386.9323, "migration_seconds": 115.4620153, "peak_rss_mib": 418.5546875, "failed_gates": []}
+      ],
+      "qualification_sha256": "c93679c01ee0470d4d1f07b713d4a1801875c6bac6bca491e9af120491404267"
+    },
+    "cold_restore": "正常退出0后，同一EXE与data-dir的新进程恢复Fuzzy可用并返回92%真实建议；应用建议、保存JSON项目、再次冷开后译文与建议保持。两次冷开均正常退出0，资格和源JSONL字节不变，没有新增benchmark工作目录。此处覆盖JSON项目，不代答ProjectPackage全部旅程。",
+    "pending": "当前候选的剩余ProjectPackage/TMX消费、必要数据反例和未变owner证据复用仍须按既有退出条件汇合及独立评审；Mac受影响回归与无Python/Qt独立Windows环境仍缺。平台7.3/Core9.6b/Feature5 6.6b保持未勾选，不把本次计量结果扩大为任务或发行PASS。",
     "evidence": [
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/build.log", "sha256": "6d29b855cdab343e39b6e56f0ce1e644fda9469e274756bd83805c4fcb36903a"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/candidate-facts.json", "sha256": "44cdf8d704ea8eb6512abf3d1cb344938c17cadc2885a1ac29117a53fde8f4d9"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/candidate-smoke.json", "sha256": "51b33d7c6092fadcf701d4df916b1d67385aba0983610d9a2b89d28336bf2a4c"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/worker-transport.json", "sha256": "42e57ca78e0f0c1be9870816dc5131b4bd6caaa8fee592c850dc5aeb15a41a42"},
-      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/worker-transport.log", "sha256": "7d09ffba031f62a5393b1aa292b9a41013e8f16fa98dc382cb15d49648b19702"}
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/worker-transport.log", "sha256": "7d09ffba031f62a5393b1aa292b9a41013e8f16fa98dc382cb15d49648b19702"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/packaged-transfer-cold-facts.json", "sha256": "1d80b1b85de7bd7db607a45c6544733f6ac4cbf158f485bbad2ad2a2b84ec12d"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/ui-transfer-activation-result.json", "sha256": "5f8280d19b700daea5f2a82aa6e0c1e4608adcf1b39e279f4050646e76594202"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/ui-transfer-cold-canonical.json", "sha256": "04bdbc3210d619db47e21ce4640ee3f2c4c6da35cc47b65460d6ebdc011ebd46"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/formal-8faeee03/process.json", "sha256": "4c7a5f2748eeba0a523b61a0f638c0d52afd1aea45c1daa9d2fccc2eaa2d3b7a"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/formal-8faeee03/benchmark.json", "sha256": "638a76f61564e882c8c26d2a7c1b356d0c6ce86624324fdcf35ade531e98f4ad"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/formal-8faeee03/benchmark.summary.json", "sha256": "ce63f55835de91fb410f617f03f58c1fac644804ef1dac6ddb7f1811ab98cd43"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/formal-8faeee03/qualification.json", "sha256": "c93679c01ee0470d4d1f07b713d4a1801875c6bac6bca491e9af120491404267"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/formal-8faeee03/cold-facts.json", "sha256": "e9bcb8019a2601b293b9b6450086036569926cf579fee51f12f95fd0431a5109"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/formal-8faeee03/saved-project-cold-facts.json", "sha256": "eb9134fbc9655733d7883391051ef1386db7ad00b15ad29a017013259cdc3a48"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/ui-formal-8faeee03-result.json", "sha256": "8ee0c2f845ff2a136837a14405a492ac22bff413c3576e91f2a25248cb69255c"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/ui-formal-8faeee03-cold-fuzzy.json", "sha256": "4580602a510f376ddc6fef3499cd4dd21427767f3717093faf21470a43615058"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/ui-formal-8faeee03-project-cold.json", "sha256": "1dbe94b48574007c3b1e67f9a082aa8d94fd663ab0aac1f1ad75a84b7de13208"}
     ]
   },
   "review_candidate_archive": {
