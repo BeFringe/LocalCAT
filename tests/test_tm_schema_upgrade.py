@@ -821,7 +821,7 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
             with (
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
                 patch(
-                    "tm_migration.StageSealer.seal",
+                    "tm_stage_sealer.StageSealer.seal",
                     side_effect=MigrationPreflightError(
                         "SCHEMA.SEAL_FAILED"
                     ),
@@ -1881,7 +1881,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
             with (
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
                 patch(
-                    "tm_migration.StageSealer.seal",
+                    "tm_stage_sealer.StageSealer.seal",
                     side_effect=MigrationPreflightError(
                         "SCHEMA.SEAL_FAILED"
                     ),
@@ -2316,7 +2316,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                 with (
                     patch("tm_sqlite_store._probe_fts5", return_value=False),
                     patch(
-                        "tm_migration.StageSealer.seal",
+                        "tm_stage_sealer.StageSealer.seal",
                         side_effect=MigrationPreflightError(
                             "SCHEMA.SEAL_FAILED"
                         ),
