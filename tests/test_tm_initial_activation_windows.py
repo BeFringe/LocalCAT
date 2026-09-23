@@ -613,16 +613,17 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
             root = Path(directory).resolve()
             identity = _identity(root)
             identity.canonical_sidecar_path.write_bytes(b"generic-v2-locator")
+            journal_path = tm_activation_journal._activation_journal_path(identity)
+            private_root = root / (
+                tm_activation_journal._portable_activation_private_directory_name(
+                    identity
+                )
+            )
             report = mock.Mock(action="COMPLETED", generation=0)
             store = mock.Mock()
             store.canonical_revision.return_value = mock.Mock(generation=0)
 
             with (
-                mock.patch.object(
-                    TMMigrationService,
-                    "rehydrate_completed_portable_activation",
-                    return_value=None,
-                ) as portable,
                 mock.patch(
                     "tm_engine._sidecar_activation_facts",
                     return_value=(identity.resource_id, "store.primary"),
@@ -657,9 +658,15 @@ class WindowsInitialActivationReservationSeamTests(unittest.TestCase):
 
             self.assertTrue(engine.canonical_active)
             self.assertIs(engine.canonical_store, store)
-            portable.assert_called_once_with()
             generic.assert_called_once_with()
             refresh.assert_called_once_with(store)
+            self.assertEqual(identity.configured_jsonl_path.read_bytes(), SOURCE_BYTES)
+            self.assertEqual(
+                identity.canonical_sidecar_path.read_bytes(),
+                b"generic-v2-locator",
+            )
+            self.assertFalse(journal_path.exists())
+            self.assertFalse(private_root.exists())
 
     def test_corrupt_portable_cold_open_never_uses_generic_fallback(self) -> None:
         temporary = tempfile.TemporaryDirectory()
