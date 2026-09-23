@@ -639,6 +639,13 @@ class StageSealerHappyPathTests(unittest.TestCase):
                             "WHERE key = 'target_identity'",
                             ("0" * 64,),
                         )
+                        # Runtime metadata is part of this golden's input.
+                        # Hash the fixed fixture directly; do not seal it.
+                        connection.execute(
+                            "UPDATE tm_meta SET value = ? "
+                            "WHERE key = 'sqlite_runtime_version'",
+                            ("3.50.4",),
+                        )
                         connection.execute(
                             "UPDATE tm_origin_batch SET source_path = ?, "
                             "created_at = ?",
