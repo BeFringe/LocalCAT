@@ -557,7 +557,7 @@
   - _Amendment: WA-06_
   - _Depends: 5.11a, 8.8a, 9.1a, 9.2a, WA-01 source phase, WA-02 source phase, ADR-023, ADR-024, ADR-025, windows-platform-enablement 3.7_
 
-- [ ] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收
+- [x] 9.6b 完成普通候选的本机Fuzzy资格与Core产品验收
   - 在7.2真实调用链产物上运行实际Gate C、oracle与100k双路径Gate D，保留原算法、门限、warmup、计时/RSS口径及strict evidence/publication；由Core真实运行铸造设备资格，不能复用source PASS或小样本诊断签发资格。本任务供平台7.3资格闭环与7.4最终验收消费，不等待它们先通过。
   - 同一候选验证有效资格在进程重启后自动恢复、失配/损坏/权限异常只关闭Fuzzy、启动不自动100k、用户显式重验与原子替换；纯UI/头像候选变化不应无条件撤销检索资格，Core/fixture/runtime/worker计量依赖改变必须使相关身份失配。资格不可随JSONL/ResourcePackage或项目迁移。
   - 在实际候选完成canonical激活与重启恢复、exact/context/fuzzy、FTS5与fallback创建/查询/重开、snapshot/export以及实际消费路径的锁竞争、发布失败、中断恢复、权限/reparse拒绝；失败只接受完整prior、完整new或recovery-only，不损坏既有数据。已完成9.6a的深层状态机/故障矩阵只在实现、依赖、调用合同与关键运行条件均未改变且候选已实际消费时引用；不能以旧source证据覆盖新入口、worker、runtime或改变的数据端口。
@@ -609,7 +609,7 @@
 
 - Task 9.6b：Windows测试观察器须以扩展路径读取深层 publication journal、枚举 retirement/quarantine；普通路径的 `is_file=False` 不能充当产物缺失事实。观察与清理须保留原恢复、字节和阶段断言。
 
-- Task 9.6b：普通候选真实重验中关闭 Qt 后，oracle 全扫描和候选查询须观察同一输入 owner 的撤销。全扫描按小批次评分检查，候选路径在查询之间及同步建库前后检查；不改变评分、排序、fixture、门限或 worker 计量。此修正改变 Core fingerprint，旧资格必须失配，新候选须实际重跑正式 Gate；不把同步建库前后检查解释为建库内部即时中断，也不提前完成本任务。
+- Task 9.6b：普通候选真实重验中关闭 Qt 后，oracle 全扫描和候选查询须观察同一输入 owner 的撤销。全扫描按小批次评分检查，候选路径在查询之间及同步建库前后检查；不改变评分、排序、fixture、门限或 worker 计量。此修正改变 Core fingerprint，旧资格必须失配，新候选须实际重跑正式 Gate；不把同步建库前后检查解释为建库内部即时中断。
 
 - Task 9.6e：逐输入摘要只进入原摘要聚合；fixture/contract 仍读取并校验实际内容。Gate 默认 oracle suite 与单 path 入口须沿当前 session 传递已解析的 contract 引用，不能重读默认 contract 而拒绝合法外部 source 合同。小样本 packaged 证据与复现入口见平台 Task 7.2；它不签发 9.6b 的正式 oracle、100k 资格，也不改签 9.6c/9.6d 历史。
 - 2026-09-19 / Task 9.6c publication消费：terminal/窗口退出完成不等于引用提交完成；最终安装须与真实owner撤销共享短内存边界，native/Qt工作先于该边界结束。`MemberDescriptorType`也包含只读或数值C字段，下游引用holder须采用Core固定构造的普通slot协议；原观察锁必须覆盖整套引用安装与失败恢复，布局登记不授予Gate资格。
