@@ -909,6 +909,17 @@
       "cleanup_basis": "本次实际进程终态、候选摘要匹配的Qt撤销/非daemon Gate线程/transport finally等待与关管道实现，结合既有同候选transport直接观察，共同支持child无遗留和进程端点释放；后者属于实现与OS生命周期的判断，不冒称本次collector逐端点读取.closed。",
       "limit": "collector遇WinError 5，未取得query最终退出码或精确退出时刻；exit_code_valid=false的值不解释为worker失败。本项不代答异常退出、超时或publication全部竞态，也不将外部collector保留句柄退出码增设为产品门。"
     },
+    "abnormal_worker_reuse": {
+      "candidate_execution": "当前8fae的worker-transport.json实际执行migration/query共16项非零child退出与协议/管道拒绝；不是正常GUI的kill实验。",
+      "prior_product_execution": "3c20正常产品入口的child46792异常退出124且句柄终止；Qt显示验证未通过，Exact100%保留，device-b未产生资格，父正常退出且无child。原始事实见既有worker-ui-interruption、ui-worker-interrupted-state、ui-worker-failure-exact、worker-ui-failure-persistence及close-worker-ui-failure引用。",
+      "reuse_basis": "直接核对3c20到8fae：Host、Gate/session/publisher、ordinary inputs、transport、worker launcher、Qt启动与设置页及固定运行依赖未变；五个owner变更分别是ProjectPackage深色样式、应用建议锁修复、两worker的POSIX工件名单及sealer，不改变异常分类、失败投影或资格安装边界。结合当前真实transport拒绝和运行中关窗零安装，有限复用原异常投影及commit/revoke机制。",
+      "scope": "闭合对应非零退出、失败投影和旧session不发布范围；不声称8fae GUI重做了kill或完整竞态矩阵。错误消费、生命周期、pipes或相关运行条件变化时重验受影响范围。"
+    },
+    "resource_permission": {
+      "activation": "当前EXE正常设置页真实激活两份单条TM并分别查询到100% Exact，没有复制SQLite或运行Fuzzy重验。",
+      "acl_rejection_and_recovery": "probe canonical读权限被拒时，该资源显示Unavailable且无Exact/无JSONL回退，healthy仍有100% Exact；恢复原DACL后，两份Exact均恢复。三个正常进程exit0，公开文件、两个canonical各五张业务表及原DB身份和bytes均保持。",
+      "reparse_gap": "文件symlink准备仅尝试一次即WinError1314，未进入当前候选产品消费；原DB已按同一身份与bytes恢复，未提高权限或替换反例类型。当前候选这项观察仍缺，不能计为拒绝通过。"
+    },
     "later_measured_failure": {
       "scope": "同一8fae在device-a显式重验；本轮在关窗前已完成，不能计为运行中关闭。旧formal_run双路径通过保留原范围，不冲销本次真实失败。",
       "bundle_digest": "9cb8c7066dbb41d14d0cc67716954675893a8a6321e3a2dd6bae451cccf86beb",
@@ -934,7 +945,7 @@
       "scope": "当前8fae候选原样封装；ZIP CRC与逐文件bytes已核对，不含设备资格或device.key。无Python/Qt独立Windows环境验收仍缺，未取得发行PASS。"
     },
     "reuse_mapping": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/core-host-reuse-8fae.json", "sha256": "b1afe7ca305079ea1db426ea5c06b27764a62e1f49d05473fef9b710c34f8381", "scope": "d1到8fae未变Core/Host发布、worker transport与平台深入恢复机制的有限复用；sealer变更、当前正常产品旅程及新fingerprint正式资格仍由本候选自身证据承担。映射中的产品进度是形成时点快照，本节记录后续实际消费，不重签原验收。"},
-    "pending": "fallback迁移超限尚未解决；当前候选的剩余ProjectPackage/TMX消费、异常worker退出及必要数据反例仍须按既有退出条件汇合及独立评审。正常运行中关窗范围见running_close；无Python/Qt独立Windows环境仍缺。Mac三个受影响模块结果见transfer_activation_repair，未变owner的有限复用范围见reuse_mapping。平台7.3/Core9.6b/Feature5 6.6b保持未勾选，不把计量或局部生命周期结果扩大为任务或发行PASS。",
+    "pending": "fallback迁移超限尚未解决；当前候选的剩余ProjectPackage/TMX消费、中断恢复及reparse实际消费缺口仍须闭合。正常运行中关窗、资源ACL和异常处理的限定范围见对应字段；无Python/Qt独立Windows环境仍缺。Mac三个受影响模块结果见transfer_activation_repair，未变owner的其他有限复用范围见reuse_mapping。平台7.3/Core9.6b/Feature5 6.6b保持未勾选，不把计量或局部结果扩大为任务或发行PASS。",
     "evidence": [
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/build.log", "sha256": "6d29b855cdab343e39b6e56f0ce1e644fda9469e274756bd83805c4fcb36903a"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/candidate-facts.json", "sha256": "44cdf8d704ea8eb6512abf3d1cb344938c17cadc2885a1ac29117a53fde8f4d9"},
@@ -973,7 +984,9 @@
       {"path": "artifacts/windows/ordinary-qualification/active-8fae-qualification-incompatible.json", "sha256": "a5cf10484531913a7c18bc09075b7b0c7c6cfc9bad680182e259c6b39aaa9007"},
       {"path": "artifacts/windows/ordinary-qualification/active-8fae-lifecycle-early-cancel.json", "sha256": "2cb1ea840f61371fa975e38b6419ef1cf14bbc6392940c2350611e8b039356ec"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/lifecycle-8fae/running-close-once-20260924t1658-restoration-and-limit.json", "sha256": "cd977806c9fe1a3f1fb8002b349e5a6f15a9bc6f426cdf5349ef5169c1bb19b0"},
-      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/lifecycle-8fae/device-a-completed-before-close-result.json", "sha256": "b80ec0c0ca143164ff7fffe3b3908fbffc6c9c171f6a2839d9de3087e5ce9b1b"}
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/lifecycle-8fae/device-a-completed-before-close-result.json", "sha256": "b80ec0c0ca143164ff7fffe3b3908fbffc6c9c171f6a2839d9de3087e5ce9b1b"},
+      {"path": "artifacts/windows/ordinary-qualification/active-worker-ui-failure-fresh.json", "sha256": "e7fbe8e882d96e17a62d7ad2a16ad309cca1898a1f36e57cf9bfb8ef15b7ccb2"},
+      {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/resource-negative-8fae/resource-negative-result.json", "sha256": "db84c083fe8c00a93cfcead8fa55cdaaa6fd2652eee4950c39151088c2c8c2da"}
     ]
   },
   "review_candidate_archive": {
