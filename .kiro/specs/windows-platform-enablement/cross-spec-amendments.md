@@ -84,7 +84,7 @@ source 的已批准分期、原 task 和 evidence 保留：`platform 6.6a launch
 | WA-03 | `R2` | `multi-document-project-workspace` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-04 | `R1` | `language-resource-portability` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 | WA-05 | `R1` | `tmx-context-interchange` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
-| WA-06 | `R4` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `FROZEN_PREBUILD_COMMITTED` |
+| WA-06 | `R4` | `tm-storage-retrieval-index` | `ACKNOWLEDGED` | `FROZEN_REVALIDATED_PASS` |
 | WA-07 | `R1` | `feature5-ui-integration` | `ACKNOWLEDGED` | `FROZEN_PREBUILD_COMMITTED` |
 | WA-08 | `R1` | `qt-editor-json-mvp-increment` | `ACKNOWLEDGED` | `SOURCE_MERGED_PASS` |
 
@@ -201,6 +201,14 @@ WA-06原R3事实的当前可达tree为`db7e7ef0024d297264fbc7434b28ec7f77adf96c`
 
 历史 owner 声明位于 [`packaging/windows/frozen_roots.json`](../../../packaging/windows/frozen_roots.json)，包含 Gate roots、benchmark inventory、动态 import、worker 映射及默认资源。7.0/7.1 的代码与[构建接口](frozen-build-inputs.md)保留原用途；普通发行只复用有实际消费者的输入，其活动接线以当前 Design 和 Core owning 合同为准，不默认携带该声明的完整源码闭包。
 
-WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c/7.2、Core 9.6e 与 Feature5 3.6b 已完成首条实际普通生产链，复现入口与证据范围见各 owning Tasks；其小样本结果不授予正式资格。后续仍按 `7.3 → owner journeys → 7.4 → 8/9/10` 形成对应范围的实际事实，不等待最终汇总才允许首次消费。WA-03 由同候选 Project journey 复验；当前没有普通 `FROZEN_REVALIDATED_PASS` 或 terminal `MERGED_PASS`。
+WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c/7.2、Core 9.6e 与 Feature5 3.6b 的首条实际普通生产链保留原范围，其小样本结果不授予正式资格。正式本机资格与 Core 产品消费由下方 WA-06 当前候选事实登记；其余 owner 的 clean-user 汇合及平台 `7.4 → 8/9/10` 仍待闭合，没有 terminal `MERGED_PASS`。
+
+### 普通候选集成事实
+
+| dispatch_id | revision | owning_spec | integration_anchor | current_status | disposition |
+|---|---|---|---|---|---|
+| WA-06 | `R4` | `tm-storage-retrieval-index` | `e9e9942d55b8c9f1bef8c8572c92c29fc5b04b55` | `FROZEN_REVALIDATED_PASS` | — |
+
+该锚包含普通候选 `8faeee03e1dd` 的 Core 9.6b、Feature5 6.6b/7.6b 与平台 7.3 本机验收，实际结果及未变 owner 的有限复用见[候选证据索引](../../../windows_ordinary_frozen_evidence.json)。本行只推进 WA-06；WA-07/08 的 clean-user 与独立无 Python/Qt 环境仍缺，source/pre-build 原锚及失败事实保留，不将本机验收扩大为发行通过。
 
 `WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
