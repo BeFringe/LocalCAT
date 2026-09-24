@@ -1,7 +1,7 @@
 {
   "status": "IN_PROGRESS",
   "release_status": "NOT_VERIFIED",
-  "scope": "candidate/formal_gate/evidence及既有owner验收保留原3c20范围；successor_candidate保留3628真实失败，e948_repair_candidate保留正式Gate通过；d1_theme_candidate保留主题消费与JSONL激活失败，transfer_activation_repair记录source修复与受影响回归，transfer_repair_candidate记录8fae自身激活、正式计量及资格冷恢复。旧节的待办不覆盖后续现状，不拼接不同产物为同一候选通过。不是0.5.2发行裁决；原始材料继续留在忽略的artifacts/windows目录。",
+  "scope": "candidate/formal_gate/evidence及既有owner验收保留原3c20范围；successor_candidate保留3628真实失败，e948_repair_candidate保留正式Gate通过；d1_theme_candidate保留主题消费与JSONL激活失败，transfer_activation_repair记录source修复与受影响回归，transfer_repair_candidate记录8fae自身激活、正式计量、资格冷恢复及Core/Host本机验收。旧节的待办不覆盖后续现状，不拼接不同产物为同一候选通过。不是0.5.2发行裁决；原始材料继续留在忽略的artifacts/windows目录。",
   "observed_at_utc": "2026-09-21T05:01:47+00:00",
   "reviewed_source_head": "ec480ff88258fe297700af600d7f66aff31046a7",
   "candidate": {
@@ -578,9 +578,8 @@
     "全部当前Windows业务实验在现有用户下使用独立合成数据与清理后的进程环境；不能据此声称已在未安装Python/Qt的另一Windows环境验收。"
   ],
   "remaining": [
-    "d1主题候选补齐TM snapshot、锁与目标占用的实际消费，但导出JSONL在新目录的canonical激活失败。source修复已获独立有限批准，Mac受影响回归、新EXE消费及改变Core输入后的正式资格待验证；权限/reparse等候选必测缺口继续按原任务收束。旧候选正式通过或失败均保留原范围；Core9.6b/Feature5 6.6b/平台7.3仍未勾选。",
     "无Python/Qt的独立Windows环境启动与短保存/冷重开尚未取得；用户确认暂缺该环境，先完成其余验证并保留缺口。清理PATH与Python/Qt环境变量的同机观察不代答此项。",
-    "指定8个owner候选子项保留原3c20上的独立验收事实，不自动改签给后续候选；最终候选须完成12.1–12.2必测，并关联未改变owner的原锚点、不变前提及当前消费。其余依赖及平台7.4/8/9的累计验收、最终发行裁决仍待闭合。"
+    "指定8个owner候选子项保留原3c20上的独立验收事实，不自动改签给8fae；8fae本机实际消费及未变owner复用关联见当前候选节。Feature5 9.2a、Qt 5.4b及平台7.4/8/9/10仍等待干净环境结果和对应累计验收、发行裁决。"
   ],
   "owner_journeys": {
     "review_status": "APPROVED",
@@ -862,7 +861,7 @@
     "validation": "独立评审18项通过，原HEAD重跑新增回归确实失败；真实隔离2929条source调用链完成初始激活、canonical冷开及Exact，逐条source/target/provenance保真且Fuzzy仍关闭。Windows较广74项中73过，唯一旧recovery调用断言在HEAD同样失败；原始失败日志保留，不宣称全套通过。",
     "regression": "旧NO_FACTS测试仍mock已替换的rehydrate_completed_portable_activation入口；仅移除陈旧观察点，真实portable分类执行，保留generic/refresh各一次与数据不变检查。修正后指定Windows74项全部通过、无skip，独立复核NO_FACTS/corrupt/partial三项通过；原73过1失败日志保留。测试文件不属于当前候选输入，没有改变生产代码或重建候选。",
     "mac_regression": "90287fb在macOS 26.2 arm64、CPython 3.14.7、SQLite 3.53.1上原样执行sealer/export/schema-upgrade三个模块，exit 0：154个方法中148通过、6个原Windows专用skip，零方法或subtest失败。修正golden合成夹具随宿主SQLite版本漂移及三个陈旧seal注入路径；两个测试文件不属于候选输入，生产sealer摘要未变。ed3b92c原失败日志保留，原始新日志与result已按远端SHA核对接收；不据此推导全仓、Linux或候选验收通过。",
-    "pending": "8fae已重放激活并实际运行新fingerprint的正式计量，范围见transfer_repair_candidate；当前候选的其余Core产品和生命周期验收仍待闭合，9.6b保持未完成。",
+    "candidate_validation": "8fae已重放激活、实际运行新fingerprint正式计量并完成Core产品及生命周期验收，范围见transfer_repair_candidate；本节保留source修复与受影响回归的原始范围。",
     "evidence": [
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/implementation-report.md", "sha256": "30467d8374a35fb757f4b242f5b2191be676ce0e3ad33697f5bf114216922ff4"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/review-report.md", "sha256": "b2f855427dd29f45c186d8bfe21c05104332a3e823e568d0fb6676b1b6cf3221"},
@@ -876,7 +875,7 @@
   "transfer_repair_candidate": {
     "candidate_id": "8faeee03e1dd31d1162ce1d3447602a7af09fd1b20ac3313fa19bb321f51f5ad",
     "built_from": "4d8276f90417927bf329b879239cb9722238b131",
-    "status": "ACTIVATION_FORMAL_RUN_AND_RESTORE_OBSERVED_ACCEPTANCE_PENDING",
+    "status": "CORE_HOST_LOCAL_ACCEPTANCE_VERIFIED",
     "implementation_fingerprint": "4912f458ddf5c009683d319dd97bec959cc6f1b6ec4a4ae3367b102d93c836ab",
     "build": "固定依赖的普通PyInstaller构建exit 0，独立安装目录的实际payload复核通过；相对d1唯一改变的declared owner输出为tm_stage_sealer.py。Core实际消费的新fingerprint与旧资格不同，未复制、重签或宣称恢复旧资格。",
     "smoke": "detached实际EXE exit 0；产品父进程标准流均为None，FTS5/fallback各自执行migration/query独立child和4-query诊断oracle。实际Gate C correctness消费成立，但test_mode=true、final_evidence=false，不代答正式oracle/100k双路径D或真实数据重新激活。",
@@ -918,7 +917,10 @@
     "resource_permission": {
       "activation": "当前EXE正常设置页真实激活两份单条TM并分别查询到100% Exact，没有复制SQLite或运行Fuzzy重验。",
       "acl_rejection_and_recovery": "probe canonical读权限被拒时，该资源显示Unavailable且无Exact/无JSONL回退，healthy仍有100% Exact；恢复原DACL后，两份Exact均恢复。三个正常进程exit0，公开文件、两个canonical各五张业务表及原DB身份和bytes均保持。",
-      "reparse_gap": "文件symlink准备仅尝试一次即WinError1314，未进入当前候选产品消费；原DB已按同一身份与bytes恢复，未提高权限或替换反例类型。当前候选这项观察仍缺，不能计为拒绝通过。"
+      "file_symlink_preparation": "文件symlink准备仅尝试一次即WinError1314，未进入当前候选产品消费；原DB已按同一身份与bytes恢复，未提高权限。该文件symlink未执行，不能改签为拒绝通过；后续目录junction消费单独记录。",
+      "directory_junction": "在原activation-private词法名称放置指向保留原目录对象的junction后，正常8fae显示probe Unavailable/Canonical权威无法验证且不回落JSONL，healthy仍100% Exact。正常关闭后仅移除junction自身并恢复原目录，冷开probe恢复100% Exact；两次正常exit0，公开文件、两canonical的指定表及DB bytes、私有资产元数据均不变。只证明该目录junction，不代答完整reparse矩阵。",
+      "junction_preparation": "New-Item的深路径准备失败已恢复并保留原报告；随后在等长空测试目录确认既有mklink /J准备器可用，再执行同一业务用例。创建工具失败未计为产品拒绝，私有资产未读取内容。",
+      "junction_report": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/resource-negative-8fae/private-junction-consumer-result.json", "sha256": "87867ce5f7e5b0671174060e109589e85b19166195788dc9aaf11493ffc9ed76"}
     },
     "later_measured_failure": {
       "scope": "同一8fae在device-a显式重验；本轮在关窗前已完成，不能计为运行中关闭。旧formal_run双路径通过保留原范围，不冲销本次真实失败。",
@@ -954,6 +956,18 @@
       "resource_lock": "另一进程持有当前资源的既有W1锁时，实际导出返回RESOURCE.PORTABILITY.OPERATION_FAILED；源、目标、manifest、资格及全部受核对的表不变，未新增receipt。持锁进程已正常释放并退出0。",
       "resource_lock_retry": "资源锁释放并人工确认原生覆盖框后，同一正常EXE显示兼容快照已导出2929条；只读逐条核对内容与顺序一致，新completed receipt为snapshot.export.fab380926aa443678c9282079f7a2c04，与先前target-open重试的e8e68b8ebbfb4730a71d010bcab8c3ab不同。正常关闭设置和应用后exit 0。"
     },
+    "product_journey": {
+      "legacy_tm": "原2929条data-only迁移实例在尚未激活SQLite时，同8fae正常界面已显示100% EXACT真实译文；setup仅含JSONL且未复制数据库或资格，UI观察早于激活预览/结果。与本节canonical、术语匹配、raw-speaker、JSON及既有TXT消费分别关联，不从canonical的legacy-jsonl来源反推legacy运行时。",
+      "project_and_tm": "正常首页从两个原JSON创建2文档/6段ProjectPackage；正常激活canonical并导入2 TU TMX，实际显示100% EXACT最新变体和CONTEXT旧变体。短data实例应用CONTEXT、清除确认状态并保存项目；同候选冷开保留译文、状态及两类建议，原输入JSON不变。",
+      "resource_exchange": "正常managed TMX导出5条记录；TMX ResourcePackage由正常入口明确拒绝import，公开文件与业务表不变。正常导出5条术语ResourcePackage，再经预览、CREATE及apply建立Imported termbase，冷开真实术语建议保留该来源。",
+      "idle_interruption": "已完成保存/发布且无child时，核对EXE与创建时间后仅中断测试父进程26200；同EXE新进程12200冷开并最终正常退出0。中断前、冷开后与正常退出后10个公开文件、14张SQLite表及ProjectPackage各entry内容相同；仅证明空闲中断恢复，不冒称发布中断或断电实验。",
+      "avatar": "另经正常入口打开原单JSON，只读speaker盘点显示4段、2个非空raw speaker及1段无speaker；ToolAlice/ToolBob保留，无catalog时头像列为空，原JSON未保存修改。",
+      "fixture_boundary": "深层自定义data使Chunk子目录达到249字符，本机LongPathsEnabled=0时普通mkdir返回WinError206，界面诚实拒绝编辑。实际候选已有longPathAware；换短且全新的data后同EXE/原项目恢复正常，资源通过产品入口重建，未搬canonical、私钥或资格。两data实例分别记账，原失败保留为夹具CONFIG_GAP，不宣称任意长路径支持。",
+      "legacy_setup": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/packaged-transfer-setup.json", "sha256": "afa226c9b964f8cda5cadeaaf72e899aa8f21e13f1800381983f1969ce722ca0"},
+      "legacy_ui": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/ui-transfer-legacy.json", "sha256": "f72fa63388837f6b03307c1848260d0d6a4bf273de95cb6e04f27e10dbd3300a"},
+      "report": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/product-journey-8fae-01/product-journey-result.json", "sha256": "c8f07f7034b59a7a53409d576579bb06d4940764b533f5cea5da601190b3fe61"},
+      "fixture_diagnosis": {"path": "artifacts/windows/ordinary-qualification/chunk-init-diagnosis-20260925/probe-result.json", "sha256": "ba031e4fe018c1b9d25d6270980ef3566469172d4277c08f4c923e32a67f5de7"}
+    },
     "archive": {
       "status": "CANDIDATE_NOT_RELEASE_VERIFIED",
       "artifact": {"path": "artifacts/windows/LocalCAT-0.5.2-candidate-8faeee03e1dd-windows-x64.zip", "sha256": "8080c25542e60617788a02e06258ed6ddae18af181f61dabaf39210449bb8951"},
@@ -963,7 +977,12 @@
       "scope": "当前8fae候选原样封装；ZIP CRC与逐文件bytes已核对，不含设备资格或device.key。无Python/Qt独立Windows环境验收仍缺，未取得发行PASS。"
     },
     "reuse_mapping": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/core-host-reuse-8fae.json", "sha256": "b1afe7ca305079ea1db426ea5c06b27764a62e1f49d05473fef9b710c34f8381", "scope": "d1到8fae未变Core/Host发布、worker transport与平台深入恢复机制的有限复用；sealer变更、当前正常产品旅程及新fingerprint正式资格仍由本候选自身证据承担。映射中的产品进度是形成时点快照，本节记录后续实际消费，不重签原验收。"},
-    "pending": "无observer单次复核两路径通过，先前fallback失败及当前较小裕量保留；当前候选的剩余ProjectPackage/TMX消费、中断恢复及reparse实际消费缺口仍须闭合。正常运行中关窗、资源ACL、异常处理和入口失败的限定范围见对应字段；无Python/Qt独立Windows环境仍缺。Mac三个受影响模块结果见transfer_activation_repair，未变owner的其他有限复用范围见reuse_mapping。平台7.3/Core9.6b/Feature5 6.6b保持未勾选，不把计量或局部结果扩大为任务或发行PASS。",
+    "local_acceptance": {
+      "tasks": ["tm-storage-retrieval-index 9.6b", "feature5-ui-integration 6.6b", "feature5-ui-integration 7.6b", "windows-platform-enablement 7.3"],
+      "scope": "真实Core C/D、本机资格与恢复、Core产品保护及Host本地集成已独立累计审阅；正常EXE/仓库外CWD、净化环境及same-EXE worker支持无开发环境依赖，不宣称本机未安装Python/Qt。原性能失败、较小裕量、长data夹具限制与各项有限复用保持原范围。",
+      "review": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/acceptance-review-8fae.json", "sha256": "feba193c85731f4189e6af9196e98a0ebf31213a5e97cb4c75e9acf2d6a95250"}
+    },
+    "pending": "独立无Python/Qt干净Windows环境尚缺；Feature5 9.2a、Qt5.4b及平台7.4/8/9/10继续未完成，release_status保持NOT_VERIFIED。本机已完成范围不再留下泛化全量UI/性能待办；后续复验只针对缺失环境或实际变更触发项。",
     "evidence": [
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/build.log", "sha256": "6d29b855cdab343e39b6e56f0ce1e644fda9469e274756bd83805c4fcb36903a"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/candidate-facts.json", "sha256": "44cdf8d704ea8eb6512abf3d1cb344938c17cadc2885a1ac29117a53fde8f4d9"},

@@ -467,7 +467,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Packaged Lifecycle Integration_
   - _Depends: 7.2b_
 
-- [ ] 7.3 闭合普通候选的本机 Fuzzy 资格
+- [x] 7.3 闭合普通候选的本机 Fuzzy 资格
   - Core 9.6b 对实际候选执行正式 Matcher/Gate C、oracle 和 100k FTS5/fallback intended paths；Feature5 6.6b 消费唯一 owner 的发布/恢复结果。
   - 验证本机私有存储、重启恢复、相关实现/运行时/测量改变导致资格失效、显式重验；无资格仅关闭 Fuzzy，启动不自动 100k。纯 UI/头像变化不应无条件改变 Core 兼容身份。
   - 完成时，算法、门限和计量口径不变的真实资格与恢复/失配证据闭合；失败如实维持关闭，不以成功 JSON 或候选摘要铸造能力。
