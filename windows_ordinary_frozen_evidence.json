@@ -928,7 +928,25 @@
         {"execution_path": "GRAM_FALLBACK", "candidate_recall": 1.0, "exact_p95_ms": 1.1933, "fuzzy_top10_p95_ms": 398.8152, "migration_seconds": 137.0997523, "peak_rss_mib": 418.671875, "failed_gates": ["MIGRATION"]}
       ],
       "qualification_sha256": "b69b9a092b73db17514f9ac9a72505b6df8972358490da33a4dd025359d75e7e",
-      "disposition": "原120秒迁移门限未变；按路径开放FTS5而关闭失败fallback符合运行时合同，但该实测失败仍阻断9.6b验收。候选、合同和已记录环境一致，历史负载/频率/I/O不足，不能归因于collector或以降级豁免。下一实验仅一次关闭observer的同条件原入口验证。"
+      "disposition": "原120秒迁移门限未变；该次fallback实际失败，按路径开放FTS5而关闭fallback符合运行时合同，原失败保留。候选、合同和已记录环境一致，但历史负载/频率/I/O不足，不能归因于collector。随后仅执行一次无observer原入口复核，结果独立记录，不改签本次失败。"
+    },
+    "no_observer_recheck": {
+      "trigger": "同一8fae正常设置入口显式重验，未运行外部进程观察器，未改变门限、计时口径或电源设置；实际Core执行及Host发布后，Qt显示Fuzzy可用，父进程17404正常退出0。",
+      "bundle_digest": "b8b10ad8d5f539033eb4f8b570a3e5bc0a36d53ce374aa54c4e42fcf6398f05e",
+      "paths": [
+        {"execution_path": "FTS5_TRIGRAM", "candidate_recall": 1.0, "exact_p95_ms": 1.1351, "fuzzy_top10_p95_ms": 397.509, "migration_seconds": 90.0511577, "peak_rss_mib": 410.015625, "failed_gates": []},
+        {"execution_path": "GRAM_FALLBACK", "candidate_recall": 1.0, "exact_p95_ms": 1.155, "fuzzy_top10_p95_ms": 399.7494, "migration_seconds": 119.2563215, "peak_rss_mib": 419.21484375, "failed_gates": []}
+      ],
+      "qualification_sha256": "9513d55dbe9fa3cbeb42e27aa0b8841032b8f8a52081f15c4333c7a908afbff2",
+      "scope": "strict codec复读三次实际bundle，合同、Core指纹及已记录运行环境一致。本次双路径通过；fallback仅余0.7436785秒迁移裕量，不能证明前次137.10秒失败由observer导致，也不承诺所有负载下都通过。after环境快照晚于正常退出及另一GUI旅程开始，不代表计量期或即时终点负载；不自动重复Gate。",
+      "report": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/performance-recheck-8fae/result.json", "sha256": "96b6e59f7077ab7e2060349b31ab83d3de190c4d4f538187620a39c6e0486e37"}
+    },
+    "entry_resources": {
+      "declared_resource_failure": "在完整校验为同一8fae的独立字节副本中，分别缺失和损坏声明terms.csv；正常产品入口均自行退出1，记录CandidateError及ORDINARY.PRODUCT_START_FAILED，三个既有用户数据文件不变。逐例恢复后完整payload校验通过，原候选从未修改。",
+      "existing_defaults": "本候选qualification-negative的corrupt及incompatible正常冷开已核对原有tm.jsonl、terms.csv、resources.json保持；引用其已有before/result，不重复创建专项旅程。",
+      "qt_plugin_reuse": "3c20至8fae的qwindows/Qt DLL、入口与资源resolver、依赖锁未变，生成配方差异未改变Qt收集或加载；8fae实际可见窗口已消费同DLL。原entry-missing-plugin/entry-corrupt-plugin只复用Qt原生失败机制，不声称在8fae重跑。",
+      "scope": "不代答独立无Python/Qt用户环境；头像当前消费及其余业务旅程另行记录。",
+      "report": {"path": "artifacts/windows/ordinary-entry-8fae/result.json", "sha256": "ed91b7de7f1e84fc424ef0445472e3708c848af39f58c2630643ba03b4ab3ed6"}
     },
     "snapshot_export": {
       "success": "正常设置页导出2929条兼容JSONL，内容与顺序和canonical逐条相等，数据库completed receipt与manifest一致。",
@@ -945,7 +963,7 @@
       "scope": "当前8fae候选原样封装；ZIP CRC与逐文件bytes已核对，不含设备资格或device.key。无Python/Qt独立Windows环境验收仍缺，未取得发行PASS。"
     },
     "reuse_mapping": {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/core-host-reuse-8fae.json", "sha256": "b1afe7ca305079ea1db426ea5c06b27764a62e1f49d05473fef9b710c34f8381", "scope": "d1到8fae未变Core/Host发布、worker transport与平台深入恢复机制的有限复用；sealer变更、当前正常产品旅程及新fingerprint正式资格仍由本候选自身证据承担。映射中的产品进度是形成时点快照，本节记录后续实际消费，不重签原验收。"},
-    "pending": "fallback迁移超限尚未解决；当前候选的剩余ProjectPackage/TMX消费、中断恢复及reparse实际消费缺口仍须闭合。正常运行中关窗、资源ACL和异常处理的限定范围见对应字段；无Python/Qt独立Windows环境仍缺。Mac三个受影响模块结果见transfer_activation_repair，未变owner的其他有限复用范围见reuse_mapping。平台7.3/Core9.6b/Feature5 6.6b保持未勾选，不把计量或局部结果扩大为任务或发行PASS。",
+    "pending": "无observer单次复核两路径通过，先前fallback失败及当前较小裕量保留；当前候选的剩余ProjectPackage/TMX消费、中断恢复及reparse实际消费缺口仍须闭合。正常运行中关窗、资源ACL、异常处理和入口失败的限定范围见对应字段；无Python/Qt独立Windows环境仍缺。Mac三个受影响模块结果见transfer_activation_repair，未变owner的其他有限复用范围见reuse_mapping。平台7.3/Core9.6b/Feature5 6.6b保持未勾选，不把计量或局部结果扩大为任务或发行PASS。",
     "evidence": [
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/build.log", "sha256": "6d29b855cdab343e39b6e56f0ce1e644fda9469e274756bd83805c4fcb36903a"},
       {"path": "artifacts/windows/ordinary-qualification/transfer-activation-repair/candidate-facts.json", "sha256": "44cdf8d704ea8eb6512abf3d1cb344938c17cadc2885a1ac29117a53fde8f4d9"},
