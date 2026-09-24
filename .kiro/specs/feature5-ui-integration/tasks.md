@@ -72,7 +72,7 @@
   - _Requirements: 5.9, 5.10, 6.4_
   - _Boundary: Feature 5 Activation Tamper and Update Regression_
 
-- [ ] 3. 建立冻结 UI 合同、偏好与 capability composition
+- [x] 3. 建立冻结 UI 合同、偏好与 capability composition
 
 - [x] 3.1 升级 TM suggestion、状态与查询身份的冻结合同
   - 建议投影保留 resource/record identity、query source、matched source、target、Core match type、final similarity 与安全 provenance
@@ -172,7 +172,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.5a, 3.8, WA-06, windows-platform-enablement 3.7_
 
-- [ ] 4. 实现 current-segment mixed retrieval adapter
+- [x] 4. 实现 current-segment mixed retrieval adapter
 
 - [x] 4.1 映射 canonical current-segment 查询并消费 production retrieval
   - 使用 raw 当前 source 作为 query source、raw speaker 作为 speaker identity；没有正式 context 时传 `None`，不擅自把相邻 UI 段当 Core context
@@ -206,7 +206,7 @@
   - _Requirements: 4.6, 4.7, 9.1_
   - _Boundary: EditorTMAdapter Confirmed Append_
 
-- [ ] 5. 在 EditorController 闭合查询、应用、确认与激活
+- [x] 5. 在 EditorController 闭合查询、应用、确认与激活
 
 - [x] 5.1 建立 current query epoch 与 issued suggestion membership
   - project/session、segment/source、resource snapshot、capability snapshot 或 threshold 变化时递增 epoch 并清空旧建议集合
@@ -325,7 +325,7 @@
   - _Amendment: WA-07_
   - _Depends: 3.5a, 6.6, ADR-021_
 
-- [ ] 6.6b 在普通候选闭合Windows设备Fuzzy资格交互
+- [x] 6.6b 在普通候选闭合Windows设备Fuzzy资格交互
   - 在完成7.2的真实候选消费Core 9.6b的正式C/D与资格owner，验证有效本机资格在进程重启后恢复；缺失、损坏、SID/ACL/MIC异常或检索兼容失配时仅关闭Fuzzy，Exact/Context保持各自Gate，启动不自动100k。
   - 用户显式重验经真实same-EXE worker、原publisher与queued generation刷新卡片；失败/取消不由`RUNNING/SUCCEEDED`或JSON自报结果授权。普通候选关联与持久兼容身份分开，纯UI/头像变更不无条件使检索资格失效，相关Core/runtime/计量变化必须重验。
   - 完成时，真实Qt操作、实际建议消费与Core receipt/资格事实一致，恢复、失配、显式重验和取消胜负均有同候选观察；该结果供平台7.3汇合，不等待平台7.3先通过。
@@ -422,7 +422,7 @@
   - _Amendment: WA-07_
   - _Depends: 7.2a, 7.4a, windows-platform-enablement 3.7_
 
-- [ ] 7.6b 执行普通Windows候选的集成本地回归
+- [x] 7.6b 执行普通Windows候选的集成本地回归
   - 在同一普通`--onedir --windowed`候选、非仓库CWD与无开发环境依赖的用户环境，实际运行canonical/legacy/Trie/raw-speaker、TM表面、JSON/TXT与资源消费；Qt不因未装Excel/xlwings失败，旧Excel adapter条件依赖不扩大为frozen首发承诺。
   - source或构建烟测不代替真实Host/Qt/worker；未改变的底层owner深入单测可按实现、依赖、调用合同和关键运行条件不变且候选已消费的前提引用。共享代码变化触发受影响source/macOS/Linux回归，纯UI资源变化重验对应界面/加载路径，不自动重跑全部历史矩阵。
   - 完成时，实际能力与失败投影不回归、数据不离开本机，证据绑定当前候选并明列复用前提；不签发相邻Project/TMX owner或完整0.5.2结论。
@@ -472,9 +472,9 @@
 
 - Task 9.2a：实际 ProjectPackage 应用建议暴露了 Controller 在 runtime generation 提交锁内重新读取同一代次的死锁。workspace target 提交仍在原 reservation 内完成，并立即递增 query epoch、清除旧建议；仅将新基线捕获延至下一次查询同步，保留过期拒绝与并发换代保护。局部修复及 source 回归不代答同候选产品验收，任务继续未完成。
 
-- Task 6.6b：真实普通候选恢复缺失资格、消费不兼容资格时发现 Host 的输入窗口包装器误把 Core 业务拒绝归为输入失败。窗口仅归一自身进入、terminal 与关闭异常；正文异常原对象交回既有 Core binding／Host 生命周期分类，不按错误字符串放行。资格、计量与发布 authority 不变；任务继续等待同候选恢复、负向与产品验收。
+- Task 6.6b：真实普通候选恢复缺失资格、消费不兼容资格时发现 Host 的输入窗口包装器误把 Core 业务拒绝归为输入失败。窗口仅归一自身进入、terminal 与关闭异常；正文异常原对象交回既有 Core binding／Host 生命周期分类，不按错误字符串放行。资格、计量与发布 authority 不变。
 
-- Task 6.6b：验证 lifecycle 的 `SUCCEEDED` 只表示结果已完成发布，合法否定结果也能到达该状态；完成提示复用 fresh Controller 检索安全投影，不由 lifecycle 宣称获得资格，重验开始时清除上次完成提示。Qt poll 回归覆盖这一边界；canonical 测试目录使用现有 Windows 长路径清理 helper。此修正不完成正式性能、资格恢复及同候选交互验收。
+- Task 6.6b：验证 lifecycle 的 `SUCCEEDED` 只表示结果已完成发布，合法否定结果也能到达该状态；完成提示复用 fresh Controller 检索安全投影，不由 lifecycle 宣称获得资格，重验开始时清除上次完成提示。Qt poll 回归覆盖这一边界；canonical 测试目录使用现有 Windows 长路径清理 helper。
 - Task 3.6b：普通组合复用同一 Core owner 下的运行、持久化和发布窗口，以及既有 Host 引用提交和 queued 通知；Qt 关闭只请求撤销，后台 transport 承担等待与 child 回收。首条链的零安装/已提交 generation 和实际退出须分别观察，撤销标志不能代替退出事实。此完成范围不含 6.6b 的设备 Fuzzy 资格交互及后续完整产品旅程。
 - 3.6a：frozen consumer 的 close 必须撤销实际 Core input owner，再于短锁外唤醒 Qt 等待者；Host/通知/owner 的成功引用通过 Core 登记的普通 slot plan 与 snapshot 一起提交。Matcher/Gate C 的最终安装另开同 owner fresh window，不能复用结束窗口；source publication 的 terminal/退出异常仍须完整恢复 prior。合法生产 source issuer/receipt 正控、故障回滚与 Qt queued-terminal/close 已独立验证，但平台 native producer 和同候选 packaged/100k 资格仍分别归 7.2 与 post-build owner 任务，对应回归见 `tests.test_capability_host_frozen_inputs`、`tests.test_qt_owner_dispatch` 和 `tests.test_qt_frozen_composition`。
 - Task 2.1：新增唯一 application-facing `TMMigrationService.activate_initial(Path, str) -> MigrationOutcome`；合法首次激活仍只经 Core-owned build、`StageSealer`、coordinator prepare/journal/publish 链，非法 source/resource/coordinator、non-READY 与 already-active 在 build 前稳定 fail-closed 且零修改。独立评审 APPROVED；parent fresh completion 覆盖 252 个 migration/activation/sealer 测试（1 个明确 opt-in skip），changed-file basedpyright 0，四个用户 WIP hash 不变。publication tail、rollback/recovery、并发与 tamper 仍分别留给 2.2～2.5。

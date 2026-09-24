@@ -224,4 +224,36 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 未变 owner 的 source 复用限定在原 Windows 持久化及 Qt 深入矩阵；前提、变更接缝与摘要见原 `owner-reuse-audit.json`（SHA-256 `eb6ddb688841c20fbe88afdfe9da13522ce654104e63471a7d487cd304c111b2`）。原始任务、source 锚和失败记录不变，后续 Core/worker 改动须重验受影响消费；本次不声明最终发行通过。
 
+#### 当前候选 8fae
+
+候选 `8faeee03e1dd31d1162ce1d3447602a7af09fd1b20ac3313fa19bb321f51f5ad` 来自原构建提交 `4d8276f90417927bf329b879239cb9722238b131`；Core fingerprint 为 `4912f458ddf5c009683d319dd97bec959cc6f1b6ec4a4ae3367b102d93c836ab`。后续测试与文档修订未改变产物。原构建血缘由保留标签追溯，不以整理后的提交重签构建或资格。
+
+交付候选为 `LocalCAT-0.5.2-candidate-8faeee03e1dd-windows-x64.zip`（55,606,410 bytes、189 files），SHA-256 `8080c25542e60617788a02e06258ed6ddae18af181f61dabaf39210449bb8951`；EXE SHA-256 `7a60477e75aa9e1295d650382e7147abb89090559691e310fd0e8ea12a0e0de6`。ZIP 与原 payload 逐文件一致，不携带设备密钥或资格。
+
+| 实际能力 | 当前候选结果与边界 |
+| --- | --- |
+| Core 与 Host 正式资格 | 正常设置入口实际执行 Gate C、5000/200 oracle 与 100k FTS5/fallback Gate D，经 same-EXE fresh worker 和既有 Host 发布；冷开恢复、Fuzzy 建议应用及保存真实完成。 |
+| TM 导出→激活→查询 | 2929 条 JSONL 搬运后按原顺序、内容和 provenance 激活、冷开查询；不复制数据库、设备密钥或资格。导出目标占用与 W1 锁拒绝保持旧数据，解除后重试成功。 |
+| 资格与资源隔离 | 缺失、损坏、不兼容及 ACL 异常资格只关闭 Fuzzy，Exact 保持；canonical ACL 拒绝及 private junction 均不回落 activated JSONL，健康资源可用，恢复后 Exact 可用且数据不变。 |
+| 后台工作与关闭 | 实际运行中关闭窗口，父进程 exit 0、子进程回收、无资格安装、数据不变；采集器 WinError 5 与缺少最终 query exit code 的观察限制保留。当前 worker 的 16 个协议/异常反例与未变旧候选 GUI 异常投影有限复用，未声称新跑完整 GUI kill 矩阵。 |
+| Project/TMX/Resource 用户旅程 | 两文档六段 Project、两条 TMX 的 Exact/Context 消费、应用保存与中断后冷开；Termbase package 导出/预览/创建/应用/冷开；TMX package import 拒绝且零变更。 |
+| 普通入口与资源 | 仓库外 CWD 正常 EXE 启动；候选副本中声明的 terms.csv 缺失/损坏导致稳定失败、exit 1 且用户数据不变。qwindows 负向矩阵仅复用未变 DLL/入口机制；当前候选实际加载窗口。 |
+
+最新一次完整计量为单次 `measured_repeats=1`，沿用原 warmup、计时与 child-lifetime RSS 口径；不是稳定裕量保证：
+
+| 路径 | Recall | Exact P95 ms | Fuzzy P95 ms | 迁移 s | RSS MiB |
+| --- | --- | --- | --- | --- | --- |
+| FTS5 | 1 | 1.1351 | 397.5090 | 90.0511577 | 410.015625 |
+| fallback | 1 | 1.1550 | 399.7494 | 119.2563215 | 419.21484375 |
+
+原门限为 50 ms / 500 ms / 120 s / 512 MiB。该次实际通过并发布 qualification `9513d55dbe9fa3cbeb42e27aa0b8841032b8f8a52081f15c4333c7a908afbff2`、bundle `b8b10ad8d5f539033eb4f8b570a3e5bc0a36d53ce374aa54c4e42fcf6398f05e`。同候选此前 fallback 迁移 **137.0997523 s 失败**仍有效；后一次通过不证明波动原因，也不抹去失败。119.2563215 s 距门限仅约 0.744 s。
+
+未变数据端口、SID/MIC 深层矩阵和 Qt 资源算法按 Requirement 12 有限复用；候选入口、Core fingerprint、worker、导出/激活接缝已实际重验。长自定义 data 路径在 `LongPathsEnabled=0` 时曾触发 WinError 206 并进入 `CHUNK.RECOVERY_REQUIRED`；短路径同候选成功只收束测试配置，不承诺任意长路径可用。
+
+受影响 sealer 验证 18 项通过并有 RED 基线；Windows 相关回归修正陈旧 NO_FACTS 观察点后 74 项通过、无 skip，原 73 过/1 失败保留。实际 Mac 回归在 CPython 3.14.7、macOS 26.2 arm64、SQLite 3.53.1 上为 148 过、6 项 Windows-only skip、0 失败（154 methods）；不外推 Linux 或全仓库 PASS。
+
+原验收记录中可复核的关键报告及 SHA-256：`performance-recheck-8fae/result.json` → `96b6e59f7077ab7e2060349b31ab83d3de190c4d4f538187620a39c6e0486e37`；`product-journey-8fae-01/product-journey-result.json` → `c8f07f7034b59a7a53409d576579bb06d4940764b533f5cea5da601190b3fe61`；`core-host-reuse-8fae.json` → `b1afe7ca305079ea1db426ea5c06b27764a62e1f49d05473fef9b710c34f8381`；`acceptance-review-8fae.json` → `feba193c85731f4189e6af9196e98a0ebf31213a5e97cb4c75e9acf2d6a95250`。完整路径、其余报告和历史失败按上方保留 Git 记录追溯，不再维护另一份滚动汇总文件。
+
+已完成范围为 Core `9.6b`、Feature5 `6.6b/7.6b` 与平台 `7.3`，独立累计评审支持此范围。本机净化环境不等同独立未安装 Python/Qt 的 Windows 环境；Feature5 `9.2a`、Qt `5.4b` 与平台 `7.4/8/9/10` 仍待收束，发行状态保持 `NOT_VERIFIED`。后续只补缺失环境及实际变更触发项，不机械重跑已完成矩阵。
+
 `WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
