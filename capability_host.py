@@ -4850,9 +4850,14 @@ class _RetrievalGateDOwner(metaclass=_publication_reference_type):
                 )
 
                 try:
-                    work_root = create_windows_private_work_root(
-                        "localcat-gate-d-",
-                    )
+                    if self.__attestation_root is None:
+                        work_root = create_windows_private_work_root(
+                            "localcat-gate-d-",
+                        )
+                    else:
+                        work_root = create_windows_private_work_root(
+                            "localcat-gate-d-", parent=self.__attestation_root.parent,
+                        )
                 except PlatformFileError as error:
                     raise _GateDOperationalError(
                         "GATE_D.WORK_ROOT_UNAVAILABLE"
