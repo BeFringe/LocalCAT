@@ -17,7 +17,7 @@ from pathlib import Path
 INSTALL_HINT = "python -m pip install -r requirements-ui.txt"
 APPLICATION_ICON_FILENAME = "LocalCAT-logo-silver.png"
 APPLICATION_ICNS_FILENAME = "LocalCAT-logo-silver.icns"
-APPLICATION_VERSION = "1.0"
+APPLICATION_VERSION = "0.5.2"
 APPLICATION_ICON_NAME = "localcat"
 # hicolor's freedesktop theme index declares apps directories only through
 # 512x512; resources installed into an undeclared 1024x1024/apps directory are

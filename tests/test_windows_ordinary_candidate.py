@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import hashlib
+import ast
+import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from frozen_candidate import (
     CandidateError, canonical_json, load_candidate, write_candidate_record,
@@ -24,6 +29,97 @@ class OrdinaryBuildEnvironmentTests(unittest.TestCase):
         self.assertNotIn("PYTHONPATH", environment)
         self.assertNotIn("QT_PLUGIN_PATH", environment)
         self.assertEqual(environment["TEMP"], "C:/Temp")
+
+
+@unittest.skipUnless(sys.platform == "win32" and importlib.util.find_spec("PyInstaller"),
+                     "Windows frozen build dependencies")
+class OrdinaryVersionMetadataTests(unittest.TestCase):
+    def test_version_resource_is_parseable_and_matches_qt(self):
+        from PyInstaller.utils.win32.versioninfo import StringFileInfo, load_version_info_from_text_file
+        from tools.build_windows_ordinary import ROOT, assignment, version_resource
+
+        info = load_version_info_from_text_file(version_resource(ROOT))
+        strings = {item.name: item.val for group in info.kids if isinstance(group, StringFileInfo)
+                   for table in group.kids for item in table.kids}
+        self.assertEqual(assignment(ROOT / "qt_editor.py", "APPLICATION_VERSION"), "0.5.2")
+        self.assertEqual(strings["FileVersion"], "0.5.2")
+        self.assertEqual(strings["ProductVersion"], "0.5.2")
+        self.assertEqual(strings["ProductName"], "LocalCAT")
+        self.assertEqual(strings["FileDescription"], "LocalCAT")
+        self.assertEqual((info.ffi.fileVersionMS, info.ffi.fileVersionLS), (5, 2 << 16))
+        self.assertEqual((info.ffi.productVersionMS, info.ffi.productVersionLS), (5, 2 << 16))
+
+    def test_version_drift_is_rejected_before_collection(self):
+        from tools.build_windows_ordinary import ROOT, version_resource
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            resource = root / "packaging/windows/version_info.txt"
+            resource.parent.mkdir(parents=True)
+            shutil.copyfile(ROOT / "packaging/windows/version_info.txt", resource)
+            (root / "qt_editor.py").write_text('APPLICATION_VERSION = "0.5.3"\n')
+            with self.assertRaisesRegex(ValueError, "version metadata"):
+                version_resource(root)
+
+    def test_recipe_consumes_version_resource_and_build_record_tracks_it(self):
+        from tools import build_windows_ordinary as builder
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+
+            def collect(_command, **_options):
+                # Exercise the real recipe/record producer without running a full build.
+                dist = output / "dist/LocalCAT"
+                (dist / "_internal").mkdir(parents=True)
+                (dist / "LocalCAT.exe").write_bytes(b"test executable")
+                (output / "analysis-inputs.json").write_text(json.dumps(
+                    {"pure": [], "scripts": [], "binaries": [], "datas": []}))
+
+            archive = Mock(toc={"PYZ.pyz": ()})
+            archive.open_embedded_archive.return_value.toc = {}
+            with patch.object(builder, "collect_inputs", return_value=({}, set(), set())), \
+                    patch.object(builder.subprocess, "check_output", side_effect=lambda command, **kw:
+                                 "a" * 40 if command[1] == "rev-parse" else b""), \
+                    patch.object(builder.subprocess, "run", side_effect=collect), \
+                    patch("PyInstaller.archive.readers.CArchiveReader", return_value=archive):
+                executable = builder.build(output)
+
+            tree = ast.parse((output / "LocalCAT.spec").read_text())
+            exe_call = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Name) and node.func.id == "EXE")
+            options = {item.arg: item.value for item in exe_call.keywords}
+            resource = builder.ROOT / "packaging/windows/version_info.txt"
+            self.assertIn("version", options)
+            self.assertEqual(Path(ast.literal_eval(options["version"])), resource)
+            record = json.loads((executable.parent / "localcat-candidate.json").read_bytes())
+            self.assertEqual(record["build"]["build_input_digests"]["packaging/windows/version_info.txt"],
+                             hashlib.sha256(resource.read_bytes()).hexdigest())
+            runtime_inputs = json.loads((executable.parent / "_internal/localcat-owner-inputs.json").read_bytes())
+            self.assertNotIn("packaging/windows/version_info.txt", runtime_inputs["input_digests"])
+            self.assertNotIn("packaging/windows/version_info.txt", runtime_inputs["data_ids"])
+
+    def test_candidate_check_reads_actual_pe_version_resource_and_rejects_wrong_version(self):
+        import PyInstaller
+        from PyInstaller.utils.win32.versioninfo import (
+            load_version_info_from_text_file, write_version_info_to_executable,
+        )
+        from tools.build_windows_ordinary import ROOT, version_resource
+        from tools.check_windows_ordinary import check_executable_metadata
+
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "LocalCAT.exe"
+            bootloader = Path(PyInstaller.__file__).parent / "bootloader" / PyInstaller.PLATFORM / "runw.exe"
+            shutil.copyfile(bootloader, executable)
+            info = load_version_info_from_text_file(version_resource(ROOT))
+            write_version_info_to_executable(str(executable), info)
+            facts = check_executable_metadata(executable)
+            self.assertEqual(facts["file_version"], [0, 5, 2, 0])
+            self.assertEqual(facts["product_version"], [0, 5, 2, 0])
+            self.assertEqual(facts["strings"]["ProductName"], "LocalCAT")
+            info.ffi.productVersionLS = 3 << 16
+            write_version_info_to_executable(str(executable), info)
+            with self.assertRaisesRegex(AssertionError, "version metadata"):
+                check_executable_metadata(executable)
 
 
 class OrdinaryCandidateTests(unittest.TestCase):

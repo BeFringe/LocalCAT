@@ -121,6 +121,7 @@ class MacOSAppLauncherTests(unittest.TestCase):
             self.assertEqual(info["CFBundleName"], "LocalCAT")
             self.assertEqual(info["CFBundleDisplayName"], "LocalCAT")
             self.assertEqual(info["CFBundleExecutable"], "LocalCAT")
+            self.assertEqual(info["CFBundleShortVersionString"], qt_editor.APPLICATION_VERSION)
             self.assertEqual(
                 info["CFBundleIdentifier"],
                 LOCALCAT_BUNDLE_IDENTIFIER,
