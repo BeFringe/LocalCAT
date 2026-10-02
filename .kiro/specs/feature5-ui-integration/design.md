@@ -296,14 +296,16 @@ sequenceDiagram
         Ctrl-->>Qt: applied
     end
     Qt->>Ctrl: confirm_current()
-    Ctrl->>Runtime: append to each Active+Update TM port
-    Runtime-->>Ctrl: per-resource write report
+    opt target 含非空白内容
+        Ctrl->>Runtime: append to each Active+Update TM port
+        Runtime-->>Ctrl: per-resource write report
+    end
     Ctrl->>Ctrl: confirm and navigate only if required writes succeed
 ```
 
 - Apply 对 EXACT/CONTEXT/FUZZY 一律显式，不写 TM、不确认、不跳段。
 - `query_epoch` 在 project/session、segment/source、resource snapshot、capability snapshot 或 threshold 变化时递增；旧 identity 必须拒绝。
-- 确认写回由 runtime port 分派：legacy append 保持 JSONL 行为，canonical append 使用 Core `TMRecordDraft`/store port。
+- 非空译文的确认写回由 runtime port 分派：legacy append 保持 JSONL 行为，canonical append 使用 Core `TMRecordDraft`/store port。空或仅含空白的译文由 Controller 跳过全部 TM 写入，沿 Qt 确认合同提交项目状态、导航和保存；不把空记录送入 Core，也不绕过 workspace/Chunk 编辑校验。
 - `Update=false` 资源可参与 Active+Lookup query，但 apply/confirm 不得改变其 bytes。资源导入权限沿用其既有 owner，不在本 Requirement 上扩张。
 
 ### macOS lightweight app

@@ -414,6 +414,81 @@ class CollaborativeChunkCluster3ControllerSearchTests(unittest.TestCase):
             self.controller.workspace_view.segments[0].confirmed
         )
 
+    def test_blank_confirmation_commits_workspace_and_survives_package_cold_open(self) -> None:
+        self.adapter.select_current_chunk(self.chunk_a)
+        target = " \t\n\u3000"
+        self.controller.update_workspace_target(target)
+        before_revision = self.controller.project_revision
+        tm_adapter = self.controller._tm_adapter
+        assert tm_adapter is not None
+
+        with mock.patch.object(type(tm_adapter), "append_confirmed") as append:
+            result = self.controller.confirm_current()
+
+        append.assert_not_called()
+        self.assertTrue(result.write_report.succeeded)
+        self.assertEqual(result.write_report.written_resource_ids, ())
+        self.assertEqual(self.controller.project_revision, before_revision + 1)
+        self.assertTrue(self.controller.workspace_view.segments[0].confirmed)
+        self.assertEqual(self.controller.workspace_view.segments[0].target, target)
+        self.assertEqual(self.controller.workspace_global_index, 1)
+        self.controller.save_workspace_package()
+
+        reopened, adapter = self._fresh_adapter(self.metadata_root, "blank-cold-open")
+        self.assertTrue(reopened.workspace_view.segments[0].confirmed)
+        self.assertEqual(reopened.workspace_view.segments[0].target, target)
+        adapter.select_current_chunk(self.chunk_a)
+        reopened.go_to_workspace_segment(reopened.workspace_view.segments[0].identity)
+        reopened.update_workspace_target("后续编辑")
+        self.assertFalse(reopened.current_segment.confirmed)
+
+    def test_blank_confirmation_outside_current_chunk_is_rejected_without_mutation(self) -> None:
+        self.adapter.select_current_chunk(self.chunk_a)
+        outside = self.controller.workspace_view.segments[1].identity
+        self.controller.go_to_workspace_segment(outside)
+        before = (
+            self.controller.project_revision,
+            self.controller.current_segment,
+            self.controller.workspace_global_index,
+        )
+
+        with self.assertRaisesRegex(EditorControllerError, "CHUNK.OUTSIDE_CURRENT"):
+            self.controller.confirm_current()
+
+        self.assertEqual(
+            (
+                self.controller.project_revision,
+                self.controller.current_segment,
+                self.controller.workspace_global_index,
+            ),
+            before,
+        )
+
+    def test_blank_confirmation_revalidates_chunk_permission_at_commit(self) -> None:
+        self.adapter.select_current_chunk(self.chunk_a)
+        original_prepare = self.controller._prepare_workspace_chunk_edit
+        before_revision = self.controller.project_revision
+
+        def prepare_then_lose_actor(*args, **kwargs):
+            prepared = original_prepare(*args, **kwargs)
+            self.actor.set_available(False)
+            return prepared
+
+        try:
+            with mock.patch.object(
+                self.controller,
+                "_prepare_workspace_chunk_edit",
+                side_effect=prepare_then_lose_actor,
+            ), self.assertRaisesRegex(EditorControllerError, "CHUNK.ACTOR_UNAVAILABLE"):
+                self.controller.confirm_current()
+        finally:
+            self.actor.set_available(True)
+
+        self.assertFalse(self.controller.current_segment.confirmed)
+        self.assertEqual(self.controller.current_segment.target, "")
+        self.assertEqual(self.controller.project_revision, before_revision)
+        self.assertEqual(self.controller.workspace_global_index, 0)
+
     def test_outside_current_fails_before_workspace_mutation(self) -> None:
         self.adapter.select_current_chunk(self.chunk_a)
         outside = self.controller.workspace_view.segments[1].identity

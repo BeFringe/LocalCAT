@@ -7,12 +7,14 @@ import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from editor_contracts import (
     EditorProject,
     EditorSegment,
     ResourceKind,
     TermSuggestion,
+    WriteReport,
 )
 from editor_controller import EditorController, EditorControllerError
 from resource_repository import ResourceRepository
@@ -85,16 +87,45 @@ class EditorControllerWritesTest(unittest.TestCase):
         self.assertEqual(result.write_report.written_resource_ids, (tm_resources[0].id,))
         self.assertTrue(result.write_report.errors)
 
-    def test_confirm_rejects_empty_target(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            controller, _ = self._session(Path(temp_dir))
-            controller.update_target("  ")
+    def test_confirm_blank_preserves_target_skips_tm_and_survives_save(self) -> None:
+        for target in ("", " \t\n\u3000"):
+            with self.subTest(target=repr(target)), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                controller, repository = self._session(root, second_tm=True)
+                controller.update_target(target)
+                before = {
+                    resource.path: resource.path.read_bytes()
+                    for resource in repository.list_resources()
+                }
 
-            with self.assertRaises(EditorControllerError):
-                controller.confirm_current()
+                with patch.object(TMEngine, "save_record") as save_record:
+                    result = controller.confirm_current()
 
-        self.assertFalse(controller.project.segments[0].confirmed)
-        self.assertEqual(controller.current_index, 0)
+                save_record.assert_not_called()
+                self.assertEqual(result.write_report, WriteReport())
+                self.assertTrue(result.write_report.succeeded)
+                self.assertEqual(result.project.segments[0].target, target)
+                self.assertTrue(result.project.segments[0].confirmed)
+                self.assertEqual(controller.confirmed_count, 2)
+                self.assertEqual(controller.current_index, 2)
+                self.assertTrue(controller.dirty)
+                self.assertEqual(
+                    {path: path.read_bytes() for path in before}, before
+                )
+
+                project_path = root / "confirmed.json"
+                controller.save_project(project_path)
+                self.assertFalse(controller.dirty)
+                reopened = EditorController(ResourceRepository(repository.config_dir))
+                reopened.open_project(project_path)
+                # LocalCAT JSON reading retains its existing whitespace normalization.
+                self.assertEqual(reopened.project.segments[0].target, "")
+                self.assertTrue(reopened.project.segments[0].confirmed)
+                self.assertEqual(reopened.confirmed_count, 2)
+                reopened.go_to(0)
+                reopened.update_target("修改后的译文")
+                self.assertFalse(reopened.current_segment.confirmed)
+                self.assertTrue(reopened.dirty)
 
     def test_apply_tm_and_insert_term_never_auto_confirm(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

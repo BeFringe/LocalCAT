@@ -46,11 +46,11 @@ LocalCAT Qt 专业编辑器 MVP 为个人译者提供一个完全本地的桌面
 #### 验收标准
 
 1. When 用户修改当前译文, the LocalCAT Qt 编辑器 shall 立即在项目模型中保留更改并将项目标记为未保存
-2. When 用户确认当前段, the LocalCAT Qt 编辑器 shall 将段落标记为已确认、更新完成进度并移动到下一个未确认段落
+2. When 用户确认当前段，包括主动留空或仅含空白的译文, the LocalCAT Qt 编辑器 shall 在确认动作中不改写当前译文，并将段落标记为已确认、更新完成进度并移动到下一个未确认段落；保存后重新打开仍保留该确认状态
 3. When 用户使用确认快捷键, the LocalCAT Qt 编辑器 shall 执行与确认按钮相同的行为
 4. When 用户在段落导航中选择上一段、下一段或未确认过滤器, the LocalCAT Qt 编辑器 shall 保留当前编辑并显示正确的目标段落
 5. While 段落已确认, when 用户再次修改其译文, the LocalCAT Qt 编辑器 shall 将其恢复为待确认状态
-6. When 用户确认非空译文, the LocalCAT Qt 编辑器 shall 将源文和译文写入所有启用 Update 的翻译记忆资源
+6. When 用户确认非空译文, the LocalCAT Qt 编辑器 shall 将源文和译文写入所有启用 Active 与 Update 的翻译记忆资源；空或仅含空白的译文 shall 跳过全部 TM 写入，并显示“已确认留空，未写入记忆库”
 
 ### Requirement 4：翻译记忆建议
 
