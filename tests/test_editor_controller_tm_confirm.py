@@ -65,6 +65,48 @@ def _controller(
 
 
 class EditorControllerTMConfirmTests(unittest.TestCase):
+    def test_blank_confirmation_skips_active_legacy_and_canonical_write_ports(self) -> None:
+        for target in ("", " \t\n\u3000"):
+            with self.subTest(target=repr(target)), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                configs = (
+                    _config(root, "legacy.write"),
+                    _config(root, "canonical.write"),
+                )
+                for config in configs:
+                    config.path.write_bytes(b"seed\n")
+                before = {config.id: _digest(config.path) for config in configs}
+                call_log: list[str] = []
+                legacy = _RecordingLegacyBackend(
+                    configs[0].id, call_log=call_log, backing_path=configs[0].path
+                )
+                canonical = _RecordingStore(
+                    configs[1].id, call_log=call_log, backing_path=configs[1].path
+                )
+                controller, _adapter_instance = _controller(
+                    root,
+                    configs,
+                    {
+                        configs[0].path: _binding(legacy),
+                        configs[1].path: _canonical_binding(canonical),
+                    },
+                )
+                controller.update_target(target)
+
+                with patch.object(EditorTMAdapter, "append_confirmed") as append:
+                    result = controller.confirm_current()
+
+                append.assert_not_called()
+                self.assertEqual(call_log, [])
+                self.assertEqual(result.write_report, WriteReport())
+                self.assertTrue(result.project.segments[0].confirmed)
+                self.assertEqual(result.project.segments[0].target, target)
+                self.assertEqual(result.current_index, 2)
+                self.assertTrue(controller.dirty)
+                self.assertEqual(
+                    {config.id: _digest(config.path) for config in configs}, before
+                )
+
     def test_success_uses_adapter_report_then_confirms_and_navigates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
