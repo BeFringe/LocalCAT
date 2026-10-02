@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from tests.test_capability_host_gate_d import (
     _EVALUATED_AT,
     _gate_c,
     _gate_d_binding,
+    _private_service,
 )
 from tests.test_tm_benchmark_gate import _combined_bundle
 
@@ -24,6 +26,77 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CapabilityHostGateDAttestationTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows work root selection")
+    def test_configured_attestation_uses_fresh_sibling_work_roots_for_each_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            state_root = base / "gate-d"
+            composition = capability_host.compose_capability_host(
+                source_authority=current_source_authority(),
+                evaluated_at_utc=_EVALUATED_AT,
+                gate_d_attestation_root=state_root,
+            )
+            _gate_c(composition)
+            owner = cast(Any, composition.retrieval_gate_d_owner)
+            roots: list[Path] = []
+
+            def execute(**kwargs: object):
+                work_root = cast(Path, kwargs["work_root"])
+                evidence_path = cast(Path, kwargs["evidence_path"])
+                self.assertEqual(work_root.parent, state_root.parent)
+                self.assertNotEqual(work_root, state_root)
+                self.assertEqual(tuple(work_root.iterdir()), ())
+                self.assertEqual(evidence_path.parent, work_root)
+                self.assertFalse(evidence_path.exists())
+                roots.append(work_root)
+                raise cast(Any, capability_host)._GateDOperationalError("GATE_D.BENCHMARK_FAILED")
+
+            with (
+                patch.object(owner, "_RetrievalGateDOwner__execute", side_effect=execute) as runner,
+                patch("tm_benchmark_platform_io.tempfile.gettempdir", return_value=str(base / "missing-temp")) as get_temp,
+            ):
+                for epoch in (1, 2):
+                    started = owner.start_gate_d(evaluated_at_utc=_EVALUATED_AT)
+                    completed = owner.wait(timeout=10.0)
+                    self.assertEqual(started.epoch, epoch)
+                    self.assertEqual(completed.safe_code, "GATE_D.BENCHMARK_FAILED")
+                self.assertEqual(runner.call_count, 2)
+                get_temp.assert_not_called()
+            self.assertEqual(len(set(roots)), 2)
+            self.assertFalse(state_root.exists())
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows work root selection")
+    def test_invalid_configured_parent_keeps_gate_c_without_running_or_publishing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "not-a-directory"
+            parent.write_bytes(b"keep")
+            composition = capability_host.compose_capability_host(
+                source_authority=current_source_authority(),
+                evaluated_at_utc=_EVALUATED_AT,
+                gate_d_attestation_root=parent / "gate-d",
+            )
+            handoff = _gate_c(composition)
+            service = _private_service(handoff)
+            publisher = cast(Any, service)._capability_publisher
+            capability = publisher.snapshot()
+            owner = cast(Any, composition.retrieval_gate_d_owner)
+            with patch.object(
+                owner, "_RetrievalGateDOwner__execute",
+                side_effect=cast(Any, capability_host)._GateDOperationalError("GATE_D.BENCHMARK_FAILED"),
+            ) as runner:
+                owner.start_gate_d(evaluated_at_utc=_EVALUATED_AT)
+                completed = owner.wait(timeout=10.0)
+                runner.assert_not_called()
+            self.assertIs(completed.state, GateDRunState.FAILED)
+            self.assertEqual(completed.safe_code, "GATE_D.WORK_ROOT_UNAVAILABLE")
+            self.assertIs(composition.host.retrieval_snapshot(), handoff)
+            self.assertIs(_private_service(composition.host.retrieval_snapshot()), service)
+            self.assertIs(publisher.snapshot(), capability)
+            self.assertTrue(handoff.display.context_available)
+            self.assertFalse(handoff.display.fuzzy_available)
+            self.assertEqual(composition.host.retrieval_generation_notifications().current(), handoff.generation)
+            self.assertEqual(parent.read_bytes(), b"keep")
+
     @staticmethod
     def _run_result():
         bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)

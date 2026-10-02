@@ -284,23 +284,28 @@ def create_new_rooted_file(
             root.close()
 
 
-def create_windows_private_work_root(prefix: str) -> Path:
+def create_windows_private_work_root(prefix: str, *, parent: Path | None = None) -> Path:
     """Create and freshly prove one Windows private benchmark directory."""
 
     if sys.platform != "win32":
         raise RuntimeError("Windows private work roots require win32")
     if type(prefix) is not str or not prefix:
         raise ValueError("prefix must be a non-empty exact str")
-    base = Path(tempfile.gettempdir()).resolve(strict=True)
+    if parent is None:
+        base = Path(tempfile.gettempdir()).resolve(strict=True)
+    else:
+        if type(parent) is not type(Path()) or not parent.is_absolute():
+            raise ValueError("parent must be an absolute native path")
+        base = parent
     backend = compose_platform_file_backend(base)
-    root = parent = private = evidence = fresh_root = fresh = fresh_evidence = None
+    root = parent_authority = private = evidence = fresh_root = fresh = fresh_evidence = None
     name = f"{prefix}{uuid.uuid4().hex}"
     try:
         root = backend.bind_root(base)
-        parent = backend.bind_parent(root, PurePath(name))
-        if parent.inspect_entry(name) is not None:
+        parent_authority = backend.bind_parent(root, PurePath(name))
+        if parent_authority.inspect_entry(name) is not None:
             raise FileExistsError(name)
-        private = backend.create_private_directory(parent, name)
+        private = backend.create_private_directory(parent_authority, name)
         evidence = backend.prove_private(private)
         private.reprove()
         work_root = base / name
@@ -310,8 +315,8 @@ def create_windows_private_work_root(prefix: str) -> Path:
         evidence = None
         private.close()
         private = None
-        parent.close()
-        parent = None
+        parent_authority.close()
+        parent_authority = None
         root.close()
         root = None
 
@@ -334,8 +339,8 @@ def create_windows_private_work_root(prefix: str) -> Path:
             evidence.close()
         if private is not None:
             private.close()
-        if parent is not None:
-            parent.close()
+        if parent_authority is not None:
+            parent_authority.close()
         if root is not None:
             root.close()
 
