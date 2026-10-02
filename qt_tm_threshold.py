@@ -83,8 +83,10 @@ def configure_tm_threshold_entry(
             "GATE_D.REVALIDATION_UNAVAILABLE",
         }:
             state_text = "Fuzzy 需重新验证"
-        else:
+        elif fuzzy_validation.safe_code == "GATE_D.BENCHMARK_FAILED":
             state_text = "Fuzzy 不可用：Fuzzy 性能验证未通过"
+        else:
+            state_text = "Fuzzy 不可用：Fuzzy 资格验证未完成"
         tooltip = state_text
     else:
         reason = _fuzzy_disabled_reason(retrieval_status)
