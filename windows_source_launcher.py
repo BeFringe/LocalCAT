@@ -24,7 +24,7 @@ import uuid
 
 
 APPLICATION_NAME: Final = "LocalCAT"
-APPLICATION_VERSION: Final = "1.0"
+APPLICATION_VERSION: Final = "0.5.2"
 SHORTCUT_DESCRIPTION: Final = "LocalCAT user-managed source editor"
 SHORTCUT_FILENAME: Final = "LocalCAT Source.lnk"
 SHORTCUT_SCRIPT: Final = Path("packaging/windows/source_shortcut.ps1")
