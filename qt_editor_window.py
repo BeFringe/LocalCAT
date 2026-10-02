@@ -5508,6 +5508,7 @@ class QtEditorWindow(QMainWindow):
             return False
         previous_index = self._active_index()
         try:
+            confirmed_blank = not self.controller.current_segment.target.strip()
             result = self.controller.confirm_current()
         except EditorControllerError as exc:
             self._show_error("无法确认译文", str(exc))
@@ -5530,7 +5531,11 @@ class QtEditorWindow(QMainWindow):
         self._refresh_chunk_view()
         self._update_title()
         self.statusBar().showMessage(
-            f"译文已确认 · 已写入 {len(result.write_report.written_resource_ids)} 个记忆库",
+            (
+                "已确认留空，未写入记忆库"
+                if confirmed_blank
+                else f"译文已确认 · 已写入 {len(result.write_report.written_resource_ids)} 个记忆库"
+            ),
             6000,
         )
         return True

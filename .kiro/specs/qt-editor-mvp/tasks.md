@@ -353,6 +353,14 @@
   - _Scope: 用户明确追加首页先显示、后台预加载；不取代 Task 16_
   - _Boundary: Windows SOURCE Startup Presentation and Owner Handoff_
 
+- [x] 18. 允许主动确认空白译文并保持正常项目流程
+  - 空字符串和仅含空白的 target 均可主动确认，确认动作不改写原值，更新进度与导航；保存冷开后恢复确认状态，后续修改撤销确认
+  - 空白确认跳过 legacy/canonical TM 写入，非空确认继续遵守 Active+Update 及写入失败不确认规则
+  - 保留 workspace/Chunk 权限与身份校验，按钮和快捷键显示“已确认留空，未写入记忆库”
+  - 用针对性 Controller、Qt 及项目保存冷开测试覆盖上述行为，复核 Feature 5 确认写回消费合同
+  - _Requirements: 2.3, 3.1–3.6；Feature 5 4.6–4.7_
+  - _Boundary: EditorController Confirmation, Qt Confirmation Feedback；Core TM 记录合同不变_
+
 ## 维护实施记录
 
 ### Checkpoint M
