@@ -23,6 +23,102 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class QtBootstrapTest(unittest.TestCase):
+    def test_fuzzy_immediate_rejection_is_diagnosed_once_per_request(self) -> None:
+        from editor_contracts import FuzzyValidationState
+        from resource_repository import ResourceRepository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller, _composition = qt_editor._compose_editor_controller(
+                ResourceRepository(Path(temp_dir)),
+            )
+            with patch.object(qt_editor, "_startup_diagnostic") as diagnostic:
+                self.assertIs(
+                    controller.tm_fuzzy_validation_status().state,
+                    FuzzyValidationState.IDLE,
+                )
+                diagnostic.assert_not_called()
+                for request in range(2):
+                    result = controller.revalidate_tm_fuzzy()
+                    self.assertIs(result.state, FuzzyValidationState.FAILED)
+                    self.assertEqual(result.safe_code, "GATE_D.GATE_C_REQUIRED")
+                    for _ in range(3):
+                        self.assertEqual(controller.tm_fuzzy_validation_status(), result)
+                    self.assertEqual(diagnostic.call_count, request + 1)
+                    diagnostic.assert_called_with({
+                        "stage": "fuzzy_validation",
+                        "status": "failed",
+                        "code": "GATE_D.GATE_C_REQUIRED",
+                    })
+                self.assertFalse(controller.tm_retrieval_status().fuzzy_available)
+
+    def test_fuzzy_polled_failure_diagnostics_are_safe_and_non_authoritative(self) -> None:
+        from capability_host import GateDRunState, GateDRunStatus
+        from editor_contracts import FuzzyValidationState
+        from resource_repository import ResourceRepository
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller, composition = qt_editor._compose_editor_controller(
+                ResourceRepository(Path(temp_dir)),
+            )
+            owner = composition.retrieval_gate_d_owner
+            assert owner is not None
+            with (
+                patch.object(type(owner), "status") as status,
+                patch.object(qt_editor, "_startup_diagnostic") as diagnostic,
+            ):
+                for epoch in (1, 2):
+                    status.return_value = GateDRunStatus(
+                        epoch=epoch, state=GateDRunState.RUNNING, safe_code=None,
+                    )
+                    self.assertIs(
+                        controller.tm_fuzzy_validation_status().state,
+                        FuzzyValidationState.RUNNING,
+                    )
+                    self.assertEqual(diagnostic.call_count, epoch - 1)
+                    status.return_value = GateDRunStatus(
+                        epoch=epoch, state=GateDRunState.FAILED,
+                        safe_code="GATE_D.INPUT_AUTHORITY_UNAVAILABLE",
+                    )
+                    for _ in range(3):
+                        result = controller.tm_fuzzy_validation_status()
+                        self.assertEqual(result.safe_code, "GATE_D.INPUT_AUTHORITY_UNAVAILABLE")
+                    self.assertEqual(diagnostic.call_count, epoch)
+                    diagnostic.assert_called_with({
+                        "stage": "fuzzy_validation", "status": "failed",
+                        "code": "GATE_D.INPUT_AUTHORITY_UNAVAILABLE",
+                    })
+
+                status.return_value = GateDRunStatus(
+                    epoch=3, state=GateDRunState.FAILED,
+                    safe_code="GATE_D.WORK_ROOT_UNAVAILABLE",
+                )
+                diagnostic.side_effect = OSError("/private/customer/key: secret body")
+                self.assertEqual(
+                    controller.tm_fuzzy_validation_status().safe_code,
+                    "GATE_D.WORK_ROOT_UNAVAILABLE",
+                )
+                controller.tm_fuzzy_validation_status()
+                self.assertEqual(diagnostic.call_count, 3)
+                self.assertFalse(controller.tm_retrieval_status().fuzzy_available)
+
+                status.return_value = GateDRunStatus(
+                    epoch=3, state=GateDRunState.SUCCEEDED, safe_code=None,
+                )
+                self.assertIs(
+                    controller.tm_fuzzy_validation_status().state,
+                    FuzzyValidationState.SUCCEEDED,
+                )
+                self.assertFalse(controller.tm_retrieval_status().fuzzy_available)
+                self.assertEqual(diagnostic.call_count, 3)
+
+                status.return_value = GateDRunStatus(
+                    epoch=4, state=GateDRunState.FAILED,
+                    safe_code="/private/customer/key: secret body",
+                )
+                with self.assertRaises(ValueError):
+                    controller.tm_fuzzy_validation_status()
+                self.assertEqual(diagnostic.call_count, 3)
+
     def test_module_top_level_uses_only_stdlib_imports(self) -> None:
         tree = ast.parse((ROOT / "qt_editor.py").read_text(encoding="utf-8"))
         top_level_imports: set[str] = set()
