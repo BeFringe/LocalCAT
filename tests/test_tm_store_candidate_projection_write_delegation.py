@@ -1372,6 +1372,77 @@ class CandidateProjectionWriteDelegationTests(unittest.TestCase):
 
                 self.assertEqual(_disk_state(stage), before)
 
+    def test_generated_gram_constraint_fault_after_batches_restores_owner_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage, store, _fts5_available = _store(root)
+            before = _disk_state(stage)
+            original_frequencies = projection.character_ngram_frequencies
+            original_insert = projection._insert_generated_streamed_candidate_gram_rows
+            partial_counts: list[int] = []
+
+            def invalid_last_frequency(
+                source: str,
+                gram_size: int,
+            ) -> tuple[tuple[str, int], ...]:
+                frequencies = original_frequencies(source, gram_size)
+                if source == "source-259" and gram_size == 1:
+                    return (*frequencies, (chr(0x10FFFF), 0))
+                return frequencies
+
+            def observe_constraint_failure(
+                connection: sqlite3.Connection,
+                prepared: tuple[tuple[int, str, int], ...],
+                *,
+                gram_size: int,
+            ) -> int:
+                self.assertTrue(connection.in_transaction)
+                try:
+                    return original_insert(
+                        connection,
+                        prepared,
+                        gram_size=gram_size,
+                    )
+                except sqlite3.IntegrityError:
+                    partial_counts.append(
+                        connection.execute("SELECT COUNT(*) FROM tm_gram").fetchone()[0]
+                    )
+                    self.assertTrue(connection.in_transaction)
+                    raise
+
+            with (
+                patch.object(
+                    projection,
+                    "character_ngram_frequencies",
+                    side_effect=invalid_last_frequency,
+                ),
+                patch.object(
+                    projection,
+                    "_insert_generated_streamed_candidate_gram_rows",
+                    side_effect=observe_constraint_failure,
+                ),
+                self.assertRaisesRegex(sqlite3.IntegrityError, "term_frequency > 0"),
+            ):
+                store.append_streamed_batch(
+                    batch_id="migration.gram-constraint",
+                    kind="migration",
+                    drafts=(
+                        (_draft(f"source-{index}", f"target-{index}"), index + 1)
+                        for index in range(260)
+                    ),
+                    source_digest="a" * 64,
+                    source_path=(root / "gram-constraint.jsonl").resolve(),
+                    invalid_count=0,
+                    duplicate_source_count=0,
+                    chunk_size=260,
+                )
+
+            self.assertEqual(len(partial_counts), 1)
+            self.assertGreater(partial_counts[0], 128)
+            self.assertEqual(_disk_state(stage), before)
+
     def test_second_streamed_chunk_fault_keeps_only_committed_checkpoint(
         self,
     ) -> None:
