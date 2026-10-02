@@ -3749,15 +3749,11 @@ class EditorController:
     def confirm_current(
         self,
     ) -> ConfirmResult | ControllerWorkspaceConfirmResult:
-        """Write the current translation to every writable TM before confirmation."""
+        """Confirm the segment, writing nonblank translations to writable TMs."""
 
         with self._tm_query_lock:
             self._require_tm_runtime_available()
             current = self.current_segment
-            if not current.target.strip():
-                raise EditorControllerError(
-                    "target text must not be empty before confirmation"
-                )
             workspace_mode = self._workspace_service is not None
             workspace_edit_preparation: object | None = None
             workspace_identity: SegmentIdentity | None = None
@@ -3779,6 +3775,8 @@ class EditorController:
             adapter = self._tm_adapter
 
             def publish_resources() -> WriteReport:
+                if not current.target.strip():
+                    return WriteReport()
                 if adapter is not None:
                     published = adapter.append_confirmed(
                         segment=current,

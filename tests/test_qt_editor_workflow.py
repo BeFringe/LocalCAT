@@ -102,6 +102,51 @@ class QtEditorWorkflowTest(unittest.TestCase):
             window._confirm_unsaved = lambda: True
             window.close()
 
+    def test_blank_confirmation_button_and_shortcuts_show_no_tm_write_feedback(self) -> None:
+        for action, target in (("button", ""), ("return", " \t"), ("enter", "")):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temp_dir:
+                window, tm = self._window(Path(temp_dir))
+                assert tm is not None
+                tm_before = tm.path.read_bytes()
+                errors: list[str] = []
+                window._show_error = lambda title, message: errors.append(message)
+                window._confirm_unsaved = lambda: True
+                try:
+                    # The next target differs, so feedback must describe the confirmed one.
+                    window.controller.go_to(3)
+                    window.controller.update_target("下一段译文")
+                    window.controller.go_to(1)
+                    window._render_project()
+                    window.target_editor.setPlainText(target)
+                    window.show()
+                    window.activateWindow()
+                    window.target_editor.setFocus()
+                    self._events()
+
+                    if action == "button":
+                        QTest.mouseClick(window.confirm_button, Qt.MouseButton.LeftButton)
+                    else:
+                        QTest.keyClick(
+                            window.target_editor,
+                            Qt.Key.Key_Return if action == "return" else Qt.Key.Key_Enter,
+                            Qt.KeyboardModifier.ControlModifier,
+                        )
+                    self._events()
+
+                    self.assertEqual(errors, [])
+                    self.assertTrue(window.controller.project.segments[1].confirmed)
+                    self.assertEqual(window.controller.project.segments[1].target, target)
+                    self.assertEqual(window.controller.current_index, 3)
+                    self.assertEqual(window.progress_bar.value(), 3)
+                    self.assertEqual(window.target_editor.toPlainText(), "下一段译文")
+                    self.assertEqual(
+                        window.statusBar().currentMessage(),
+                        "已确认留空，未写入记忆库",
+                    )
+                    self.assertEqual(tm.path.read_bytes(), tm_before)
+                finally:
+                    window.close()
+
     def test_platform_primary_keypad_enter_confirms(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             window, _ = self._window(Path(temp_dir), with_tm=False)

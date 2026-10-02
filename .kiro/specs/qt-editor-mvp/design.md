@@ -168,13 +168,15 @@ sequenceDiagram
     participant TMResources
     User->>QtEditor: 编辑译文并确认
     QtEditor->>EditorController: confirm_current
-    EditorController->>TMResources: save to update resources
-    TMResources-->>EditorController: write results
+    opt target 含非空白内容
+        EditorController->>TMResources: save to active update resources
+        TMResources-->>EditorController: write results
+    end
     EditorController-->>QtEditor: updated session and progress
     QtEditor-->>User: 标记已确认并进入下一段
 ```
 
-确认动作先校验非空译文；所有目标 TM 写入均成功后再标记确认。若部分资源写入失败，返回具体资源错误，当前段不自动前进。
+确认允许空字符串与仅含空白的译文，并保留 target 原值。Controller 仍执行既有会话、项目及 Chunk 编辑校验和确认提交；以 `target.strip()` 判定是否需要 TM 写入。非空时所有目标 TM 写入均成功后再标记确认；若部分资源写入失败，返回具体资源错误，当前段不自动前进。留空时不调用 legacy 或 canonical TM 写入端口，使用空的成功写入报告，复用正常确认、进度、导航和保存路径。Qt 在动作前取得当前译文是否留空，用于成功后显示“已确认留空，未写入记忆库”；按钮与快捷键共用该行为。后续编辑仍撤销确认，不新增持久状态或修改 Core 的非空 TM 记录合同。
 
 ### 资源导入
 
@@ -424,7 +426,7 @@ erDiagram
 **不变量**
 
 - Segment id 在单项目内唯一，source 非空。
-- 只有非空 target 可确认。
+- 空或仅含空白的 target 可由用户主动确认；确认状态与是否产生 TM 记录相互独立，TM 记录仍要求非空 source/target。
 - 非活动资源的 lookup/update 即使为 true 也不生效。
 - TM JSONL 同源后写胜出；术语导入同源后写胜出。
 - 配置与数据写入均为 UTF-8，本地绝对路径不得为空。

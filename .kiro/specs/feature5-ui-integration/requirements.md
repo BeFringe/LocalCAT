@@ -88,7 +88,7 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 3. If 当前项目、当前段、当前 source、参与查询的资源、可用匹配能力或 fuzzy 阈值在建议产生后发生变化, the LocalCAT Qt 编辑器 shall 拒绝应用该过期建议
 4. If 建议应用被拒绝或失败, the LocalCAT Qt 编辑器 shall 保持当前 target、confirmed、dirty、当前位置和 TM 内容不变
 5. When 建议应用成功或被拒绝, the LocalCAT Qt 编辑器 shall 使用非阻塞反馈说明结果
-6. When 用户随后确认当前段, the LocalCAT Qt 编辑器 shall 只向同时启用 Active 与 Update 的翻译记忆资源写回译文
+6. When 用户随后确认当前段的非空译文, the LocalCAT Qt 编辑器 shall 只向同时启用 Active 与 Update 的翻译记忆资源写回译文；空或仅含空白的译文按 Qt 确认合同完成项目确认，不调用 TM 写入端口
 7. While 一个翻译记忆资源未启用 Update, the LocalCAT Qt 编辑器 shall 允许该资源按 Active 与 Lookup 配置参与查询，但不得因应用或确认建议改变该资源字节
 
 ### Requirement 5：Canonical 激活、更新与唯一运行时状态
