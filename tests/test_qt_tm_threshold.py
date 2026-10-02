@@ -197,6 +197,55 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             self.assertIn("82%", window.statusBar().currentMessage())
             window.close()
 
+    def test_failed_validation_copy_is_shared_and_does_not_infer_performance(self) -> None:
+        with worker_temporary_directory() as temporary:
+            controller, _adapter, _runtime, _repository = _legacy_fixture(
+                Path(temporary)
+            )
+            closed = RetrievalDisplayState(
+                context_available=True, fuzzy_available=False,
+                safe_codes=("TM.RETRIEVAL.FUZZY_BENCHMARK_MISSING",),
+            )
+            with (
+                patch.object(controller, "tm_fuzzy_validation_status") as lifecycle,
+                patch.object(controller, "tm_retrieval_status", return_value=closed),
+            ):
+                lifecycle.return_value = FuzzyValidationDisplay(
+                    state=FuzzyValidationState.IDLE, safe_code=None,
+                )
+                window = QtEditorWindow(controller)
+                dialog = window.create_settings_dialog()
+                window.show()
+                dialog.show()
+                self._events()
+                try:
+                    cases = (
+                        ("GATE_D.GATE_C_REQUIRED", "Fuzzy 不可用：Fuzzy 资格验证未完成"),
+                        ("GATE_D.WORK_ROOT_UNAVAILABLE", "Fuzzy 不可用：Fuzzy 资格验证未完成"),
+                        ("GATE_D.INPUT_AUTHORITY_UNAVAILABLE", "Fuzzy 不可用：Fuzzy 资格验证未完成"),
+                        ("GATE_D.BENCHMARK_FAILED", "Fuzzy 不可用：Fuzzy 性能验证未通过"),
+                        ("GATE_D.REVALIDATION_REQUIRED", "Fuzzy 需重新验证"),
+                        ("GATE_D.ATTESTATION_INVALID", "Fuzzy 需重新验证"),
+                        ("GATE_D.REVALIDATION_UNAVAILABLE", "Fuzzy 需重新验证"),
+                    )
+                    for code, expected in cases:
+                        with self.subTest(code=code):
+                            lifecycle.return_value = FuzzyValidationDisplay(
+                                state=FuzzyValidationState.FAILED, safe_code=code,
+                            )
+                            window._poll_fuzzy_validation()
+                            self.assertEqual(window.tm_threshold_state.text(), expected)
+                            self.assertEqual(dialog.tm_threshold_state.text(), expected)
+                            self.assertEqual(dialog.status_label.text(), expected + "。")
+                            for chip in (window.tm_threshold_chip, dialog.tm_threshold_chip):
+                                self.assertEqual(chip.toolTip(), expected)
+                                self.assertNotIn(code, chip.accessibleName())
+                                self.assertIs(chip.property("fuzzyAvailable"), False)
+                            self.assertFalse(window._fuzzy_validation_timer.isActive())
+                finally:
+                    dialog.close()
+                    window.close()
+
     def test_completed_denial_does_not_claim_fuzzy_qualification(self) -> None:
         with worker_temporary_directory() as temporary:
             controller, _adapter, _runtime, _repository = _legacy_fixture(

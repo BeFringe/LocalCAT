@@ -753,6 +753,7 @@ def _compose_editor_controller(
     from datetime import datetime, timezone
 
     from capability_host import compose_capability_host, compose_frozen_capability_host, compose_ordinary_capability_host
+    from editor_contracts import FuzzyValidationDisplay, FuzzyValidationState
     from editor_controller import compose_project_enabled_editor_controller
     from editor_tm_adapter import EditorTMAdapter
     from platform_source_authority import RootedSourceAuthority
@@ -810,16 +811,38 @@ def _compose_editor_controller(
         except Exception:
             pass
         startup_trace.finish("controller_resource_composition")
+        last_fuzzy_status: tuple[FuzzyValidationState, str | None] | None = None
+
+        def observe_fuzzy_validation(
+            status: FuzzyValidationDisplay, *, requested: bool = False,
+        ) -> FuzzyValidationDisplay:
+            nonlocal last_fuzzy_status
+            observed = (status.state, status.safe_code)
+            changed = observed != last_fuzzy_status
+            last_fuzzy_status = observed
+            if status.state is FuzzyValidationState.FAILED and (changed or requested):
+                try:
+                    _startup_diagnostic({
+                        "stage": "fuzzy_validation",
+                        "status": "failed",
+                        "code": status.safe_code,
+                    })
+                except Exception:
+                    # Diagnostic failure must not alter lifecycle or capability.
+                    pass
+            return status
+
         controller = compose_project_enabled_editor_controller(
             repository,
             tm_adapter=EditorTMAdapter(
                 runtime_host=runtime_host,
                 capability_host=capability_composition.host,
-                fuzzy_validation_status=lambda: _fuzzy_validation_display(
-                    capability_composition
+                fuzzy_validation_status=lambda: observe_fuzzy_validation(
+                    _fuzzy_validation_display(capability_composition)
                 ),
-                fuzzy_validation_start=lambda: _request_fuzzy_revalidation(
-                    capability_composition
+                fuzzy_validation_start=lambda: observe_fuzzy_validation(
+                    _request_fuzzy_revalidation(capability_composition),
+                    requested=True,
                 ),
             ),
         )
