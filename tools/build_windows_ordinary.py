@@ -44,6 +44,24 @@ def assignment(path: Path, name: str):
     raise ValueError(f"owner declaration unavailable: {name}")
 
 
+def version_resource(root: Path) -> Path:
+    from PyInstaller.utils.win32.versioninfo import StringFileInfo, load_version_info_from_text_file
+
+    path = root / "packaging/windows/version_info.txt"
+    info = load_version_info_from_text_file(path)
+    declared = assignment(root / "qt_editor.py", "APPLICATION_VERSION")
+    major, minor, patch = map(int, declared.split("."))
+    expected = (major << 16 | minor, patch << 16)
+    strings = {item.name: item.val for group in info.kids if isinstance(group, StringFileInfo)
+               for table in group.kids for item in table.kids}
+    if (any(strings.get(key) != declared for key in ("FileVersion", "ProductVersion"))
+            or any(strings.get(key) != "LocalCAT" for key in ("ProductName", "FileDescription"))
+            or (info.ffi.fileVersionMS, info.ffi.fileVersionLS) != expected
+            or (info.ffi.productVersionMS, info.ffi.productVersionLS) != expected):
+        raise ValueError("Windows version metadata differs from the application declaration")
+    return path
+
+
 def collect_inputs(root: Path) -> tuple[dict[str, str], set[str], set[str]]:
     declaration = json.loads((root / "packaging/windows/frozen_roots.json").read_bytes())
     inputs: set[str] = {"frozen_ordinary_entry.py"}
@@ -100,6 +118,8 @@ def build(output: Path) -> Path:
         raise RuntimeError("ordinary build requires a clean tracked tree")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     output.mkdir(parents=True, exist_ok=True)
+    metadata = version_resource(ROOT)
+    build_inputs = {metadata.relative_to(ROOT).as_posix(): digest(metadata)}
     inputs, data, modules = collect_inputs(ROOT)
     # This data file is finalized with actual collected runtime facts below.
     inputs_file = output / INPUT_RECORD
@@ -115,7 +135,7 @@ def build(output: Path) -> Path:
         "hookspath=[], hooksconfig={}, runtime_hooks=[], excludes=['xlwings', 'tkinter'], noarchive=False, optimize=0)\n"
         f"Path({str(toc)!r}).write_text(json.dumps(dict(pure=list(a.pure), scripts=list(a.scripts), binaries=list(a.binaries), datas=list(a.datas))), encoding='utf-8')\n"
         "pyz = PYZ(a.pure)\n"
-        f"exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='LocalCAT', debug=False, bootloader_ignore_signals=False, strip=False, upx=False, console=False, disable_windowed_traceback=True, icon={str(ROOT / 'LocalCAT-logo-silver.ico')!r})\n"
+        f"exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name='LocalCAT', debug=False, bootloader_ignore_signals=False, strip=False, upx=False, console=False, disable_windowed_traceback=True, icon={str(ROOT / 'LocalCAT-logo-silver.ico')!r}, version={str(metadata)!r})\n"
         "coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='LocalCAT')\n",
         encoding="utf-8",
     )
@@ -161,10 +181,13 @@ def build(output: Path) -> Path:
               "data_ids": sorted(data), "core_execution": execution, "runtime_files": runtime_files}
     (dist / "_internal" / INPUT_RECORD).write_bytes(canonical_json(record))
     # Verify the source did not move while Analysis compiled it.
-    if collect_inputs(ROOT)[0] != inputs or subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT).strip():
+    if (collect_inputs(ROOT)[0] != inputs
+            or any(digest(ROOT / name) != value for name, value in build_inputs.items())
+            or subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT).strip()):
         raise RuntimeError("build inputs changed during collection")
     write_candidate_record(dist, {"repository_commit": commit, "recipe_sha256": digest(spec),
                                  "dependency_lock_sha256": digest(ROOT / "requirements-frozen-build.txt"),
+                                 "build_input_digests": build_inputs,
                                  "owner_outputs": mapping})
     load_candidate(dist / "LocalCAT.exe", verify_payload=True)
     return dist / "LocalCAT.exe"

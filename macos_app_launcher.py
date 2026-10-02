@@ -275,7 +275,7 @@ class MacOSAppLauncher:
             "CFBundleInfoDictionaryVersion": "6.0",
             "CFBundleName": "LocalCAT",
             "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "1.0",
+            "CFBundleShortVersionString": "0.5.2",
             "CFBundleVersion": "1",
             "LSMultipleInstancesProhibited": True,
             "NSHighResolutionCapable": True,

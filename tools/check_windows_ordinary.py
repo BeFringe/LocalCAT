@@ -18,6 +18,33 @@ from frozen_candidate import load_candidate
 from frozen_worker_transport import _worker_header
 
 
+def check_executable_metadata(executable: Path) -> dict:
+    from PyInstaller.utils.win32.versioninfo import (
+        StringFileInfo, load_version_info_from_text_file, read_version_info_from_executable,
+    )
+    from tools.build_windows_ordinary import version_resource
+
+    def values(info):
+        def parts(high, low):
+            return [high >> 16, high & 0xffff, low >> 16, low & 0xffff]
+
+        strings = {item.name: item.val for group in info.kids if isinstance(group, StringFileInfo)
+                   for table in group.kids for item in table.kids}
+        return {
+            "file_version": parts(info.ffi.fileVersionMS, info.ffi.fileVersionLS),
+            "product_version": parts(info.ffi.productVersionMS, info.ffi.productVersionLS),
+            "strings": {key: strings.get(key) for key in
+                        ("ProductName", "FileDescription", "FileVersion", "ProductVersion")},
+        }
+
+    actual = read_version_info_from_executable(str(executable))
+    assert actual is not None, "executable has no version metadata"
+    facts = values(actual)
+    expected = values(load_version_info_from_text_file(version_resource(ROOT)))
+    assert facts == expected, "executable version metadata differs from the declared product"
+    return facts
+
+
 def clean_environment() -> dict[str, str]:
     environment = {key: value for key, value in os.environ.items()
                    if not key.upper().startswith(("PYTHON", "QT_", "QML", "_PYI", "PYINSTALLER"))}
@@ -248,6 +275,7 @@ def run_checks(executable: Path, report: Path) -> dict:
     work.mkdir()
     facts = {"candidate_id": candidate.candidate_id, "final_evidence": False, "checks": {}}
     checks = facts["checks"]
+    checks["executable_metadata"] = check_executable_metadata(executable)
     options = dict(cwd=executable.parent.parent, env=environment, close_fds=True)
 
     # No console or inherited standard streams, as with a graphical launch.
