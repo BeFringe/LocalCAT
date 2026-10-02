@@ -6,11 +6,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from platform_fs_contracts import PlatformFileError
 from platform_fs import compose_platform_file_backend
 from tm_benchmark_platform_io import (
     create_new_rooted_file,
+    create_windows_private_work_root,
     iter_rooted_file_lines,
     rooted_file_facts,
     rooted_first_nonempty_line,
@@ -26,6 +28,57 @@ class WindowsBenchmarkPlatformIOTests(unittest.TestCase):
     _MANIFEST_NAME = "store.manifest.json"
     _PRIVATE_NAME = ".localcat-activation-private-v1.test"
     _QUARANTINE_NAME = ".localcat-activation-quarantine-v1"
+
+    def test_explicit_parent_creates_fresh_private_roots_when_temp_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            with patch("tm_benchmark_platform_io.tempfile.gettempdir", return_value=str(base / "missing-temp")):
+                with self.assertRaises(OSError):
+                    create_windows_private_work_root("localcat-test-")
+                roots = [
+                    create_windows_private_work_root("localcat-test-", parent=base)
+                    for _ in range(2)
+                ]
+            self.assertNotEqual(roots[0], roots[1])
+            for work_root in roots:
+                self.assertEqual(work_root.parent, base)
+                self.assertEqual(tuple(work_root.iterdir()), ())
+                backend = compose_platform_file_backend(work_root)
+                authority = evidence = None
+                try:
+                    authority = backend.bind_root(work_root)
+                    evidence = backend.prove_private(authority)
+                    authority.reprove()
+                finally:
+                    if evidence is not None:
+                        evidence.close()
+                    if authority is not None:
+                        authority.close()
+
+    def test_explicit_parent_must_be_an_absolute_native_path(self) -> None:
+        for parent in ("C:\\", Path("relative"), PureWindowsPath("C:/")):
+            with self.subTest(parent=parent):
+                with self.assertRaises(ValueError):
+                    create_windows_private_work_root("localcat-test-", parent=parent)
+
+    def test_explicit_parent_rejects_reparse_ancestor_without_temp_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            outside = base / "outside"
+            outside.mkdir()
+            parent = outside / "nested"
+            parent.mkdir()
+            planted = base / "junction"
+            created = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(planted), str(outside)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            with patch("tm_benchmark_platform_io.tempfile.gettempdir") as get_temp:
+                with self.assertRaises(PlatformFileError):
+                    create_windows_private_work_root("localcat-test-", parent=planted / "nested")
+                get_temp.assert_not_called()
+            self.assertEqual(tuple(parent.iterdir()), ())
 
     def _populate_direct_namespace(self, root: Path) -> None:
         for name in (
