@@ -1268,16 +1268,30 @@ def _insert_generated_streamed_candidate_gram_rows(
                 (record_id, term_frequency)
             )
     gram_row_count = sum(len(rows) for rows in postings.values())
-    connection.executemany(
+    # Keep each SQL statement bounded without changing term-major rowid order.
+    # A limit below one row still lets SQLite report its native binding failure.
+    batch_rows = max(
+        1,
+        min(128, connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) // 4),
+    )
+    insert_prefix = (
         "INSERT INTO tm_gram("
         "gram_size, gram, record_id, term_frequency) "
-        "VALUES (?, ?, ?, ?)",
-        (
-            (gram_size, gram, record_id, term_frequency)
-            for gram in sorted(postings)
-            for record_id, term_frequency in postings[gram]
-        ),
+        "VALUES "
     )
+    batch_sql = insert_prefix + ",".join(("(?, ?, ?, ?)",) * batch_rows)
+    parameters: list[int | str] = []
+    for gram in sorted(postings):
+        for record_id, term_frequency in postings[gram]:
+            parameters.extend((gram_size, gram, record_id, term_frequency))
+            if len(parameters) == batch_rows * 4:
+                connection.execute(batch_sql, parameters)
+                parameters.clear()
+    if parameters:
+        connection.execute(
+            insert_prefix + ",".join(("(?, ?, ?, ?)",) * (len(parameters) // 4)),
+            parameters,
+        )
     return gram_row_count
 
 

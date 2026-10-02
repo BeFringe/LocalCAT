@@ -529,6 +529,76 @@ def future_candidate_callback(connection, callback):
         self.assertIn("ROWID<?", details)
 
 
+class CandidateProjectionWriteTests(unittest.TestCase):
+    def test_generated_grams_use_bounded_statements_with_actual_sqlite_limit(
+        self,
+    ) -> None:
+        for variable_limit, expected_statements in (
+            (4, 520),
+            (13, 174),
+            (511, 5),
+            (512, 5),
+            (2_000, 5),
+        ):
+            with self.subTest(variable_limit=variable_limit):
+                connection = _connection()
+                self.addCleanup(connection.close)
+                connection.execute("DELETE FROM tm_gram")
+                connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+                    variable_limit,
+                )
+                statements: list[str] = []
+                connection.set_trace_callback(statements.append)
+
+                count = projection._insert_generated_streamed_candidate_gram_rows(
+                    connection,
+                    tuple((index, "abab", index + 1) for index in range(260)),
+                    gram_size=1,
+                )
+
+                connection.set_trace_callback(None)
+                self.assertEqual(count, 520)
+                self.assertEqual(len(statements), expected_statements)
+                self.assertTrue(
+                    all(statement.startswith("INSERT INTO tm_gram(")
+                        for statement in statements)
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*), SUM(term_frequency) FROM tm_gram"
+                    ).fetchone(),
+                    (520, 1_040),
+                )
+                self.assertTrue(connection.in_transaction)
+
+    def test_generated_grams_below_one_row_variable_limit_keep_sqlite_failure(
+        self,
+    ) -> None:
+        for variable_limit in (0, 3):
+            with self.subTest(variable_limit=variable_limit):
+                connection = _connection()
+                self.addCleanup(connection.close)
+                connection.execute("DELETE FROM tm_gram")
+                connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,
+                    variable_limit,
+                )
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "too many SQL variables",
+                ):
+                    projection._insert_generated_streamed_candidate_gram_rows(
+                        connection,
+                        ((0, "a", 1),),
+                        gram_size=1,
+                    )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM tm_gram").fetchone(),
+                    (0,),
+                )
+
+
 class CandidateProjectionReadTests(unittest.TestCase):
     def test_validator_direct_grams_match_canonical_helper(self) -> None:
         connection = sqlite3.connect(":memory:")
