@@ -5897,7 +5897,7 @@ class QtEditorWindow(QMainWindow):
             dialog.status_label.setText(
                 f"Fuzzy 性能验证已完成。{dialog.tm_threshold_state.text()}。"
                 if status.state is FuzzyValidationState.SUCCEEDED
-                else "Fuzzy 性能资格验证未通过。"
+                else f"{dialog.tm_threshold_state.text()}。"
             )
 
     def _poll_fuzzy_validation(self) -> None:
