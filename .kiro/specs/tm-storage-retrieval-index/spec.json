@@ -1,9 +1,9 @@
 {
   "feature_name": "tm-storage-retrieval-index",
   "created_at": "2026-07-27T09:52:52Z",
-  "updated_at": "2026-09-20T14:55:15Z",
+  "updated_at": "2026-10-04T14:27:37Z",
   "language": "zh-CN",
-  "phase": "tasks-approved",
+  "phase": "design-generated",
   "approvals": {
     "requirements": {
       "generated": true,
@@ -11,16 +11,17 @@
     },
     "design": {
       "generated": true,
-      "approved": true
+      "approved": false
     },
     "tasks": {
       "generated": true,
-      "approved": true
+      "approved": false
     }
   },
-  "ready_for_implementation": true,
+  "ready_for_implementation": false,
   "approval_scope": {
     "historical": "既有Requirements 1–9、source与WA-06 R4审批及完成事实保留原范围，9.6c/9.6d完成不代表普通frozen验收。",
-    "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 下普通 packaged 的 WA-06 第5条、Design 输入/兼容身份/session/worker 合同与 Tasks 9.6b/9.6e。按现有依赖实施，优先以 9.6e 验证逐输入摘要与实际 fixture/contract 内容的消费接缝，不把摘要伪装为源码 bytes，不以构建记录替代真实 Gate 执行；候选和正式 Gate 尚未验收，超出本轮合同的 delta 仍需审批。"
+    "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 下普通 packaged 的 WA-06 第5条、Design 输入/兼容身份/session/worker 合同与 Tasks 9.6b/9.6e。按现有依赖实施，优先以 9.6e 验证逐输入摘要与实际 fixture/contract 内容的消费接缝，不把摘要伪装为源码 bytes，不以构建记录替代真实 Gate 执行；候选和正式 Gate 尚未验收，超出本轮合同的 delta 仍需审批。",
+    "pending": "时间准入修订：R8.8–10 的产品规则已明确；Retrieval capability publication 的新准入/警示/恢复 Design、Task 9.7 与 ADR-029 待批准。既有批准和完成事实保持原范围。"
   }
 }
