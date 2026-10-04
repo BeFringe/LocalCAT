@@ -71,13 +71,32 @@ def run_ordinary_core_smoke(composition, work_root: Path) -> dict:
     return report
 
 
-def finish_ordinary_smoke(app, composition, validation_worker, marker: Path) -> None:
+def finish_ordinary_smoke(app, composition, validation_worker, marker: Path, *, window) -> None:
     """Keep processing Qt events while the same Host's Core consumers run."""
     import json
     import time
-    from threading import Thread
+    from threading import Event, Thread
     from uuid import uuid4
+    from editor_contracts import FuzzyValidationState
     outcomes = {}
+    core_done, stop_polling = Event(), Event()
+    owner_lock = getattr(composition.retrieval_gate_d_owner, "_RetrievalGateDOwner__condition")
+    # Fixed smoke-only holds of the existing locks, after Core work completes.
+    # The observer owns the locks; Qt still reads through its production ports.
+    holds = tuple((name, lock, Event(), Event(), Event(), Event()) for name, lock in (
+        ("owner", owner_lock),
+        ("host", getattr(composition.host, "_CapabilityHost__lock")),
+        ("controller", window.controller._tm_query_lock),
+        ("close", owner_lock),
+    ))
+
+    def record_failure(error):
+        outcomes.setdefault("error_type", type(error).__name__)
+        outcomes.setdefault("error_code", getattr(error, "error_code", "ORDINARY.SMOKE_FAILED"))
+        outcomes["generations_after_failure"] = {
+            "matcher": composition.host.matcher_snapshot().generation,
+            "retrieval": composition.host.retrieval_snapshot().generation,
+        }
 
     def observe():
         try:
@@ -95,25 +114,115 @@ def finish_ordinary_smoke(app, composition, validation_worker, marker: Path) -> 
             outcomes.update(run_ordinary_core_smoke(composition, marker.parent / ("core-smoke-" + uuid4().hex)))
             outcomes["matcher_generation"] = matcher.generation
             outcomes["retrieval_generation"] = retrieval.generation
+            core_done.set()
+            for _name, lock, requested, held, release, released in holds:
+                if not requested.wait(5):
+                    raise TimeoutError("ordinary polling hold was not requested")
+                if stop_polling.is_set():
+                    return
+                with lock:
+                    held.set()
+                    if not release.wait(5):
+                        raise TimeoutError("ordinary polling hold was not released")
+                released.set()
         except Exception as error:
-            outcomes["error_type"] = type(error).__name__
-            outcomes["error_code"] = getattr(error, "error_code", "ORDINARY.SMOKE_FAILED")
-            outcomes["generations_after_failure"] = {
-                "matcher": composition.host.matcher_snapshot().generation,
-                "retrieval": composition.host.retrieval_snapshot().generation,
-            }
+            record_failure(error)
 
     observer = Thread(target=observe, name="LocalCAT-ordinary-smoke", daemon=False)
     observer.start()
     deadline = time.monotonic() + 300.0
-    while observer.is_alive() and time.monotonic() < deadline:
+    while observer.is_alive() and not core_done.is_set() and time.monotonic() < deadline:
         app.processEvents()
         time.sleep(0.01)
-    if observer.is_alive():
+    if observer.is_alive() and not core_done.is_set():
         composition._close_frozen_inputs()
         raise TimeoutError("ordinary consumer chain timeout")
     app.processEvents()
     bridge = validation_worker._localcat_capability_completion_bridge
+    polling_error = None
+    dialog = None
+    if core_done.is_set() and "error_type" not in outcomes:
+        polling = outcomes["polling"] = {"contention": []}
+        try:
+            dialog = window.create_settings_dialog()
+            dialog.show()
+            app.processEvents()
+            baseline = window.controller.poll_tm_threshold_display()
+            if baseline is None or baseline.validation.state is FuzzyValidationState.RUNNING:
+                raise RuntimeError("ordinary smoke requires a settled startup display")
+            polling["baseline_state"] = baseline.validation.state.name
+            polling["baseline_safe_code"] = baseline.validation.safe_code
+            for name, _lock, requested, held, release, released in holds:
+                old_views = (window.tm_threshold_state.text(), dialog.tm_threshold_state.text())
+                requested.set()
+                if not held.wait(5):
+                    raise TimeoutError("ordinary polling lock was not held")
+                started = time.monotonic()
+                if window.controller.poll_tm_threshold_display() is not None:
+                    raise RuntimeError("ordinary busy poll did not defer")
+                window._poll_fuzzy_validation()
+                window._refresh_tm_threshold_entry()
+                dialog._refresh_tm_threshold_entry()
+                elapsed_ms = (time.monotonic() - started) * 1000
+                if old_views != (window.tm_threshold_state.text(), dialog.tm_threshold_state.text()):
+                    raise RuntimeError("ordinary busy poll replaced the displayed state")
+                if not window._fuzzy_validation_timer.isActive() or not dialog._tm_threshold_timer.isActive():
+                    raise RuntimeError("ordinary busy poll did not schedule both retries")
+                composition._frozen_input_source._require_open()
+                if name == "close":
+                    polling["queued_before_close"] = bridge.delivered_count
+                    window._capability_display_refresh_requested.emit()
+                    dialog.close()
+                    if not window.close():
+                        raise RuntimeError("ordinary smoke window did not close")
+                    if window._fuzzy_validation_timer.isActive() or dialog._tm_threshold_timer.isActive():
+                        raise RuntimeError("ordinary close did not stop the polling timers")
+                release.set()
+                if not released.wait(5):
+                    raise TimeoutError("ordinary polling lock remained held")
+                # Only Qt's existing timers may retry and render after release.
+                retry_deadline = time.monotonic() + 5.0
+                if name == "close":
+                    retry_deadline = time.monotonic() + 2 * max(
+                        window._fuzzy_validation_timer.interval(), dialog._tm_threshold_timer.interval(),
+                    ) / 1000 + 0.05
+                while time.monotonic() < retry_deadline:
+                    app.processEvents()
+                    if name != "close" and not (
+                        window._fuzzy_validation_timer.isActive() or dialog._tm_threshold_timer.isActive()
+                    ):
+                        break
+                    time.sleep(0.01)
+                if window._fuzzy_validation_timer.isActive() or dialog._tm_threshold_timer.isActive():
+                    raise RuntimeError("ordinary polling retry timers did not stop")
+                if name == "close":
+                    polling["queued_after_close"] = bridge.delivered_count
+                    if polling["queued_after_close"] != polling["queued_before_close"]:
+                        raise RuntimeError("ordinary close delivered a queued capability refresh")
+                else:
+                    display = window.controller.poll_tm_threshold_display()
+                    if display != baseline:
+                        raise RuntimeError("ordinary smoke retry changed the settled startup display")
+                    if window.tm_threshold_state.text() != dialog.tm_threshold_state.text():
+                        raise RuntimeError("ordinary polling retry did not align both entries")
+                    polling["contention"].append({"lock": name, "deferred": True,
+                        "views_retained": True, "source_live": True, "poll_elapsed_ms": elapsed_ms,
+                        "retry_state": display.validation.state.name, "retry_timers_stopped": True})
+        except Exception as error:
+            polling_error = error
+        finally:
+            stop_polling.set()
+            for _name, _lock, requested, _held, release, _released in holds:
+                release.set()
+                requested.set()
+            if dialog is not None:
+                dialog.close()
+    observer.join(timeout=5)
+    if observer.is_alive():
+        composition._close_frozen_inputs()
+        raise TimeoutError("ordinary polling observer did not stop")
+    if polling_error is not None:
+        record_failure(polling_error)
     outcomes["queued_notification"] = {"count": bridge.delivered_count,
                                         "on_owner_thread": bridge.delivered_on_owner}
     if "error_type" not in outcomes and (bridge.delivered_count < 1 or not bridge.delivered_on_owner):
