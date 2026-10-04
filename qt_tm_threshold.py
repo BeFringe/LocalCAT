@@ -73,6 +73,10 @@ def configure_tm_threshold_entry(
     if retrieval_status.fuzzy_available:
         state_text = "Fuzzy 可用"
         tooltip = "调整本机共享的 Fuzzy 最低相似度（60%～100%）"
+        if retrieval_status.performance_warning_codes:
+            warning = "部分模糊检索未达性能目标，结果可能较慢"
+            state_text = f"{state_text}；{warning}"
+            tooltip = f"{tooltip}；{warning}"
     elif fuzzy_validation.state is FuzzyValidationState.RUNNING:
         state_text = "Fuzzy 性能验证中"
         tooltip = "Fuzzy 性能验证正在后台运行；完成前阈值不可调整"
