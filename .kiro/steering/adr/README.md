@@ -26,7 +26,7 @@
 | ADR-010 | 已采纳 | 有界 fuzzy 候选证明 |
 | ADR-011 | 已采纳 | Feature 5 与 UI 的冻结合同集成 |
 | ADR-012 | 已采纳 | 未发布的首次激活残留不构成 canonical authority |
-| ADR-013 | 已采纳 | Gate D 跨进程证据重授权模型 |
+| ADR-013 | 部分被 ADR-029 取代 | Gate D 跨进程证据重授权模型 |
 | ADR-014 | 已采纳 | 设备本地预处理偏好的 workspace 持久化 |
 | ADR-015 | 已采纳 | Parser/Codec 中立边界、用途感知选择与能力式扩展 |
 | ADR-016 | 已采纳 | 已发布 canonical authority 的设备身份重新证明 |
@@ -41,6 +41,7 @@
 | ADR-025 | 已采纳 | Windows 发布耐久合同与硬断电资格分层 |
 | ADR-026 | 已采纳 | 按 owner 语义完成发布与 Parser 无状态 canonical writer |
 | ADR-027 | 已采纳 | Windows 导出输出锁的安全闲置回收 |
-| ADR-028 | 已采纳 | Windows source 独立交付与普通 frozen 证明范围 |
+| ADR-028 | 已采纳（时间准入由 ADR-029 部分取代） | Windows source 独立交付与普通 frozen 证明范围 |
+| ADR-029 | 已采纳 | Fuzzy 时间性能报告与功能准入分离 |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。
