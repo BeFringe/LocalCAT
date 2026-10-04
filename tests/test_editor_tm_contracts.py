@@ -27,6 +27,41 @@ _DIGEST = "a" * 64
 _OTHER_DIGEST = "b" * 64
 
 
+class RetrievalPerformanceWarningContractTests(unittest.TestCase):
+    def test_warnings_are_separate_frozen_and_strictly_round_trip(self):
+        warnings = ("EXACT_P95", "FUZZY_P95", "MIGRATION")
+        display = RetrievalDisplayState(True, True, (), warnings)
+        self.assertEqual(display.safe_codes, ())
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            display.performance_warning_codes = ()
+        encoded = editor_tm_contract_to_json(display)
+        self.assertEqual(editor_tm_contract_from_json(encoded), display)
+        payload = json.loads(encoded)
+        self.assertEqual(payload["payload"]["performance_warning_codes"], list(warnings))
+        del payload["payload"]["performance_warning_codes"]
+        with self.assertRaises(ValueError):
+            editor_tm_contract_from_json(json.dumps(payload))
+
+    def test_warning_field_rejects_invalid_types_codes_order_and_closed_state(self):
+        class TupleSubclass(tuple):
+            pass
+
+        class StringSubclass(str):
+            pass
+
+        for value in (["EXACT_P95"], TupleSubclass(), (StringSubclass("EXACT_P95"),),
+                      (1,), ("PEAK_RSS",), ("private/path",),
+                      ("EXACT_P95", "EXACT_P95"), ("MIGRATION", "EXACT_P95")):
+            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
+                RetrievalDisplayState(True, True, (), value)
+        with self.assertRaises(ValueError):
+            RetrievalDisplayState(True, False, ("TM.RETRIEVAL.CLOSED",), ("EXACT_P95",))
+        display = RetrievalDisplayState(True, True, ())
+        object.__setattr__(display, "performance_warning_codes", ["EXACT_P95"])
+        with self.assertRaises(TypeError):
+            editor_tm_contract_to_json(display)
+
+
 def _identity(**changes: object) -> SuggestionQueryIdentity:
     values: dict[str, Any] = {
         "project_session_id": "session-1",
