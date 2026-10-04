@@ -110,17 +110,21 @@ flowchart LR
     WIN --> WINAPI
     WINAPI --> K32[Kernel32 / Advapi32]
 
-    BOOT[普通产品及 worker 入口]
-    MANIFEST[tools/generate_windows_frozen_manifest.py]
-    SPEC[packaging/windows/LocalCAT.spec]
+    BOOT[frozen_ordinary_entry.py]
+    OWNER[owner roots / fixtures / assets]
+    BUILD[tools/build_windows_ordinary.py]
+    SPEC[构建输出目录 / LocalCAT.spec]
     DIST[LocalCAT.exe + _internal]
-    MANIFEST --> SPEC --> DIST
-    BOOT --> DIST
+    OWNER --> BUILD
+    BOOT --> BUILD
+    BUILD --> SPEC --> DIST
+    BUILD -. 输入与实际产物对应 .-> DIST
     DIST --> UI
+    DIST --> WORKER[same-EXE migration / query worker]
 ```
 
 **Architecture Integration**:
-- Selected pattern: Hexagonal ports/adapters around file authority, plus a separate build-time frozen manifest pipeline。
+- Selected pattern: Hexagonal ports/adapters around file authority，普通构建使用独立的 PyInstaller 收集与输入—产物对应流程。
 - Domain/feature boundaries: 平台层只拥有 handle/identity/lock/publish/private proof；业务层继续决定 state transitions、receipts 和 user errors。
 - Existing patterns preserved: immutable dataclass contracts、stable code、fail-closed capability factory、candidate/journal/LKG、readback before commit、Gate recomputation。
 - New components rationale: 集中 FFI、handle lifetime 与 proof；避免每个业务模块重复平台分支。
@@ -138,9 +142,9 @@ flowchart LR
 | Packaging | PyInstaller 6.22.2 固定构建工具 | 标准 onedir/windowed EXE | stock bootloader、Analysis/PYZ/EXE/COLLECT；既有实验组合须在真实产品重验 |
 | Verification | `unittest`, subprocess/PowerShell harness | contract, adversarial, crash, packaged E2E | no platform safety skips in Windows release lane |
 
-## File Structure Plan
+## File Structure
 
-### Added Files
+### 平台与普通 frozen 主要文件
 
 ```text
 platform_fs_contracts.py                 # opaque authority/identity/lock/publish contracts and stable low-level errors
@@ -148,27 +152,28 @@ platform_fs.py                           # adapter composition; returns only val
 platform_fs_posix.py                     # current dirfd/flock/fsync behavior, moved without semantic change
 platform_fs_windows.py                   # Windows rooted walk, handle profiles, locks, publish and ACL proof
 windows_file_api.py                      # ctypes declarations/constants/structures/error conversion only
-frozen_product_entry.py                  # 普通 packaged 产品入口与用户资源接线，修改既有模块
-frozen_worker_entry.py                   # 产品/两个 Core worker 的限定分派，修改既有模块
-frozen_worker_transport.py               # same-EXE 二进制管道、取消与进程回收，修改既有模块
+frozen_ordinary_entry.py                 # 普通 EXE 的产品/worker 模式分派与安全启动诊断
+frozen_candidate.py                      # 候选清单与实际运行产物一致性
+frozen_product_entry.py                  # 普通 packaged 产品入口与用户资源接线
+frozen_worker_entry.py                   # 两个 Core worker 的限定入口
+frozen_worker_transport.py               # same-EXE 二进制管道、取消与进程回收
+requirements-frozen-build.txt            # 固定普通构建依赖；不修改 UI runtime requirements
+LocalCAT-logo-silver.ico                 # 普通 Windows EXE 图标
 packaging/windows/
-├── LocalCAT.spec                        # 新增普通 Analysis/PYZ/EXE/COLLECT 配方
-├── requirements-build.txt               # 固定实际构建依赖与来源；不修改 UI runtime requirements
-├── frozen_roots.json                    # owner roots/assets; Gate graphs are resolved transitively, not copied by hand
+├── frozen_roots.json                    # 既有 owner 声明；普通构建只消费所需输入
 ├── evidence-scenarios/                  # platform-owned versioned release-lane scenario contracts
-├── LocalCAT.ico                         # version-controlled Windows icon
 └── version_info.txt                     # Windows product/version metadata
-tools/generate_windows_frozen_manifest.py # 复用 owner 声明，普通入口生成输入—产物清单，不启用 source-only/完整 AST 证明
-tools/windows_frozen_packaging.py         # 增加普通构建命令，旧 W3 producer 不在普通路径调用
-tools/validate_windows_release.py        # 候选清单、入口、Qt、FTS5 与业务 E2E 汇总
+tools/build_windows_ordinary.py          # 在输出目录生成 spec，执行 Analysis/PYZ/EXE/COLLECT 并绑定实际产物
+tools/check_windows_ordinary.py          # 普通候选入口、资源与 worker 消费检查；不代替最终验收
+tools/validate_windows_release.py        # release evidence 记录与严格校验；不授予 capability
 tests/test_platform_fs_contracts.py
 tests/test_platform_fs_windows.py
-tests/test_platform_fs_windows_process.py
-tests/test_windows_release_manifest.py
-tests/test_windows_frozen_e2e.py
+tests/test_windows_release_evidence.py
+tests/test_windows_ordinary_candidate.py
+tests/test_windows_ordinary_transport.py
 ```
 
-上表同时列既有待修改模块与计划新增配方，均非本轮代码变更。`frozen_roots.json` 复用 owner 声明；Gate 需要的 contract/vectors 由 Core 决定，普通构建不继承 W3 的全量 AST/source-only 验证。构建输出位于 build/artifacts，不能成为手写第二份 authority。`durability_profiles.json` 与硬断电证据仍非输入。
+上表对应现有平台与普通构建实现。`frozen_roots.json` 复用 owner 声明；Gate 需要的 contract/vectors 由 Core 决定，普通构建不调用旧 `tools/generate_windows_frozen_manifest.py` 或 `tools/windows_frozen_packaging.py`，不继承 W3 的全量 AST/source-only 验证。`LocalCAT.spec`、Analysis 记录及发行物在指定构建输出目录生成，不能成为手写第二份 authority。`durability_profiles.json` 与硬断电证据仍非输入。
 
 ### Modified Files by Migration Cluster
 - **Amendment Cluster 1 — startup/rooted**: `parser_source.py`、`collaborative_chunk_store.py`、`qt_editor.py`；由 Parser/Chunk/Qt owners 接入 platform factory，删除业务顶层 POSIX import。
@@ -176,7 +181,7 @@ tests/test_windows_frozen_e2e.py
 - **Amendment Cluster 3 — TM**: `tm_migration.py`、`tm_content_attestation.py`、`tm_snapshot_artifacts.py`、`tm_snapshot_recovery.py`、`tm_activation_journal.py`、`tm_activation_recovery.py`、`tm_stage_sealer.py`、`tm_schema_upgrade.py`、`tm_sqlite_store.py`、`tm_benchmark*.py` 及直接 identity/fsync consumers；由 Feature 5/Core/Integration owners 交付。
 - **普通 packaged 消费接缝**：Core 修改 `tm_gate_inputs.py`、`tm_benchmark*.py` 中 session/fingerprint/worker 消费；Feature5 修改 `capability_host.py`、`capability_frozen_inputs.py` 中输入组合并复用现有发布生命周期；Qt 修改 `qt_editor.py` 的普通产品组合分支与正常入口。具体合同/测试由各 owning Design 定义，平台不据文件清单取得业务 authority。
 - **Tests**: owning amendments 移除仅因 POSIX implementation 的 skip并交付 fresh evidence；Windows release matrix 对 mandatory cases 将 skip 判为 failure。
-- **Requirements/build docs**: `packaging/windows/requirements-build.txt` 固定普通构建依赖；不把 PyInstaller/xlwings 加入 `requirements-ui.txt`。
+- **Requirements/build docs**: `requirements-frozen-build.txt` 固定普通构建依赖；不把 PyInstaller/xlwings 加入 `requirements-ui.txt`。
 
 ## Core Contracts
 
