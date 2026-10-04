@@ -156,6 +156,9 @@ WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿�
 5. When 生成性能验收报告, the LocalCAT TM 子系统 shall 记录硬件、操作系统、运行环境、语料构成、查询数量、预热方式和统计口径。
 6. When 生成性能验收报告, the LocalCAT TM 子系统 shall 分别报告 warm exact p95、fuzzy top-10 p95、迁移耗时和峰值常驻内存。
 7. If 任一性能指标超过批准门限, the LocalCAT TM 子系统 shall 把验收标记为失败并指出超限指标。
+8. When 本机真实完整验证及当前路径的来源、兼容性和报告复证成立, the LocalCAT TM 子系统 shall 不以 `EXACT_P95`、`FUZZY_P95`、`MIGRATION` 三项时间超限单独否决 Fuzzy，并 shall 保留原性能报告失败结果。
+9. If Gate C correctness、实际路径 oracle/召回、完整执行或证据复证不成立，峰值 RSS 超过 `512 MiB`，或存在未识别失败项, the LocalCAT TM 子系统 shall 拒绝相应 Fuzzy 准入；执行超时被终止或取消不得按完整执行的时间超限处理。
+10. When Core 开放存在时间超限的 Fuzzy 路径, the LocalCAT TM 子系统 shall 从同一判定提供不可授权的性能警示，并 shall 在新发布和本机冷恢复中采用相同准入规则；策略兼容身份改变后，旧资格须显式重验。
 
 ### Requirement 9: 文本匹配能力的可验证发布门
 

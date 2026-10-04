@@ -1023,6 +1023,21 @@ threshold 只过滤 FUZZY；dedupe 使用 `(resource_id, record_id)`；global li
 
 ### Retrieval capability publication
 
+#### 时间指标与功能准入修订
+
+本节映射 Requirement 8.8–10 与 [ADR-029](../../steering/adr/adr-029.md)。既有验证与历史完成范围保留；准入修订不改变原性能报告或日常查询算法。
+
+- **Boundary Commitments**：`tm_retrieval_capability.py` 仍是唯一准入判定 owner；`tm_benchmark_gate.py` 负责真实执行、发布协调和本机资格；`tm_contracts.py` 继续严格重算报告。Core 不拥有验证按钮、Qt 调度或发行裁决。
+- **Allowed Dependencies / File Structure Plan**：在上述三个现有模块及对应 evaluator、Gate D publication/attestation 测试中完成；`tm_benchmark.py`、Gate C roots 和现有输入清单只同步真实受影响的实现身份，不新增 profile、registry、持久 schema 或第二判定模块。
+- **准入与报告**：Gate D owner 继续负责原始样本、oracle、process facts 与完整 bundle 的复证；capability evaluator 不解析原 bundle 或重复执行计量，只消费它实际拥有的不可变 `BenchmarkReport`，复用 `tm_contracts` 核验字段、summary、contract/environment/path、digest、verdict 及有效窗口。capability owner 内复用一个逐路径准入函数：只有三项时间失败可不否决；RSS、oracle/召回、未知失败及不完整执行继续拒绝。`_path_decision` 和 Gate D 发布一致性检查消费该同一规则，不复制 allowlist；Gate C correctness 保持独立。`BenchmarkReport`/`SuiteReport.passed`、`failed_gates`/`failed_paths` 及测量数值不改变含义。
+- **安全警示**：既有 `RetrievalFuzzyPathDecision` 增加不可变 `performance_warning_codes`，仅表达经严格重算的三项时间超限，固定顺序、无重复。开放路径允许携带警示，但不得把它塞入只代表关闭原因的 `unavailable_code`/evidence summary。snapshot 的克隆、验证及防篡改比较覆盖新增字段；是否可用仍由原 `available` 决定。
+- **发布和恢复**：保持真实 run receipt、single-use、generation、取消/commit 胜负、rollback 与持久化事务。POSIX/Windows restore 仍核查 HMAC、完整 bundle 和 compatibility，再经同一 evaluator 重铸决定；不把 Qt 或调用者失败列表当 authority。现有 implementation fingerprint 和 Gate C evaluator roots 已覆盖策略模块；策略变更使旧资格要求显式重验，不提供旧 FAIL 自动升级或跨机复用。
+- **Revalidation Triggers / 退出条件**：覆盖时间三项分别/组合、一路 RSS 拒绝另一路时间警示可用、Gate C 关闭、oracle失败、未知失败、畸形报告、来源/兼容失配、取消和回滚，以及新发布与冷恢复决定相同。新候选执行真实 Gate C/D 双路径并保留实测 PASS/FAIL；不要求人为制造性能失败，不改签历史样本。Core 变化触发受影响 source 和平台消费者回归。
+- **Out of Boundary**：改变验证触发方式、首次免验证、放宽 RSS、Phase 1 算法改造、日常 Qt 查询异步和最终发行标准。
+- **Governance Impact**：遵循 ADR-009/011 的 owner 与消费边界；ADR-029 部分取代 ADR-013/028 的时间准入含义。相邻 Feature5 负责安全警示，平台 R12 分别记录功能与性能；开发线继承同一治理 tip，不复制治理补丁。
+
+以下既有发布合同中的 Gate D hard-gate 结果按本节区分报告与准入；其余 authority、快照和资源规则保持。
+
 `tm_retrieval_capability.py` 是 retrieval gate 的唯一判定与发布边界。它只依赖 frozen contracts 和不可变 validation evidence，不导入 store、candidate、retrieval 或 benchmark runner；`tm_sqlite_store.py`、`tm_candidate_index.py` 和 `tm_benchmark.py` 也不得反向成为能力判定权威。`SQLiteTMStore.health()` 只报告同一 generation 的物理事实和 canonical exact 可用性，CONTEXT/FUZZY 的 query-effective availability 由 Retrieval 在内存中组合，不能写回 DB、coordinator、binding 或 migration report。
 
 Gate C 的固定输入、expected/observed canonical digest 重算和 manifest 生成由 `tm_retrieval_validation.py` 独占；它是离线 validation leaf，可以消费 `tm_retrieval.py` 的纯分类/评分入口、公开 query/store 端口和 `tm_retrieval_capability.py` 的 frozen evidence values，以临时资源重放事务回滚、局部失败和 global-limit cohorts，但任何 production runtime 模块都不得反向导入它。该模块不接触 facade 或 Qt，也不得发布能力。`tm_retrieval_capability.py` 保持 evaluator/publisher 状态机边界，不继续吸收 fixture codec、向量 runner 或测试语料；避免把“如何产生证据”和“谁有权解释/发布证据”重新耦合。
@@ -1242,7 +1257,7 @@ Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CP
 - 报告 Python、SQLite、UCD、FTS5、CPU、RAM、OS、corpus digest、warmup、percentile definition、scorer/index config。
 - 硬门：candidate oracle recall=100%；exact p95 ≤50 ms；fuzzy p95 ≤500 ms；migration ≤120 s；RSS ≤512 MiB。
 - 样本数、digest、环境或 contract 字段不一致直接失败，不能只比较四个性能数字。
-- FTS5 trigram fast path 与无 FTS5 的 1/2/3-gram fallback 必须分别执行和报告。fallback 在 100k 上超限时按 Requirement 8.7 把对应能力标记失败，不在 Design 阶段猜测、放宽门限或用 fast path 的成功掩盖失败。
+- FTS5 trigram fast path 与无 FTS5 的 1/2/3-gram fallback 必须分别执行和报告。fallback 在 100k 上超限时按 Requirement 8.7 把对应性能报告标记失败；功能准入另按 8.8–10，不放宽数值或用 fast path 的成功掩盖失败。
 
 ## 数据一致性与迁移
 
@@ -1350,7 +1365,7 @@ Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CP
 2. **Gate B — Canonical physical store**：完成 SQLite schema、snapshot binding、mutable stage、完整 candidate index、StageSealer、coordinator 和 exact parity；只接受 SealedStage 原子激活。
 3. **Physical activation**：成功后立即把 exact/query/save compatibility facade 切到 canonical SQLite，并完成 Excel/core regression；只有首次激活失败且无 prior canonical 时才继续原 JSONL。
 4. **Gate C — Retrieval correctness**：先以 raw same-source vectors 验证并开放 CONTEXT，再完成 phased candidate metadata、FUZZY pipeline、事务和局部失败矩阵；oracle recall 未过只关闭 FUZZY。
-5. **Gate D — benchmark-v1**：FTS5 与 fallback 分别达到 100k hard gates 后，才发布相应 fuzzy capability；超限显式失败但不撤销 canonical authority。
+5. **Gate D — benchmark-v1**：FTS5 与 fallback 分别完成真实 100k 验证，按 Requirement 8.8–10 发布逐路径决定；性能超限如实报告，必要准入条件失败只关闭相应 Fuzzy，不撤销 canonical authority。
 6. **Matcher gate**：由独立 validation manifest 发布 UNAVAILABLE/BASIC/TEXT_V1；不从 sidecar、FTS5 或 benchmark 状态推断。
 7. 后续独立 Qt integration commit 只消费 Core capability-gated matcher 和 full query，不创建第二权威。
 

@@ -1,7 +1,7 @@
 {
   "feature_name": "tm-storage-retrieval-index",
   "created_at": "2026-07-27T09:52:52Z",
-  "updated_at": "2026-09-20T14:55:15Z",
+  "updated_at": "2026-10-04T17:01:52Z",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -21,6 +21,7 @@
   "ready_for_implementation": true,
   "approval_scope": {
     "historical": "既有Requirements 1–9、source与WA-06 R4审批及完成事实保留原范围，9.6c/9.6d完成不代表普通frozen验收。",
-    "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 下普通 packaged 的 WA-06 第5条、Design 输入/兼容身份/session/worker 合同与 Tasks 9.6b/9.6e。按现有依赖实施，优先以 9.6e 验证逐输入摘要与实际 fixture/contract 内容的消费接缝，不把摘要伪装为源码 bytes，不以构建记录替代真实 Gate 执行；候选和正式 Gate 尚未验收，超出本轮合同的 delta 仍需审批。"
+    "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 下普通 packaged 的 WA-06 第5条、Design 输入/兼容身份/session/worker 合同与 Tasks 9.6b/9.6e。按现有依赖实施，优先以 9.6e 验证逐输入摘要与实际 fixture/contract 内容的消费接缝，不把摘要伪装为源码 bytes，不以构建记录替代真实 Gate 执行；候选和正式 Gate 尚未验收，超出本轮合同的 delta 仍需审批。",
+    "fuzzy_time_admission": "2026-10-05 批准 ADR-029 下 R8.8–10、Retrieval capability publication 的准入/警示/发布/冷恢复 Design 与 Task 9.7。完整、真实且兼容的结果中，仅三项时间超限不再单独禁止对应路径；报告仍失败，512 MiB 与其他必要条件继续限制准入。按合同执行受影响的真实 Gate C/D，不改签旧报告；日常建议异步与 Phase 1 优化不在本轮范围。"
   }
 }
