@@ -41,6 +41,14 @@ LocalCAT 从 **Trie 术语 + JSONL 精确 TM → Excel 无状态工作流 → Qt
 
 RPY/XLIFF 项目 codec、多 Sheet workbook、目录自动发现、机器翻译、QA、账户、云端同步和实时多人协作仍属后续范围。TMX/CSV/XLSX 的语言资源支持不等于相同格式可作为编辑项目打开。
 
+## Windows：普通 frozen 候选
+
+0.5.2 候选 `681a898d51c7` 已在无需用户安装 Python/Qt 的独立 Windows 环境完成项目、TM/TMX、FTS5、保存冷开与必要数据保护验证；最终发行裁决仍待治理集成收束，尚无发布标签。候选与性能结果见[验收范围](.kiro/specs/windows-platform-enablement/cross-spec-amendments.md#时间准入修订候选-681a)。
+
+将候选 ZIP **完整解压**到本地 NTFS 目录，打开其中的 `LocalCAT/LocalCAT.exe`，不要单独移动 EXE 或删除 `_internal`。程序自带 Python/Qt，无需创建 venv；首页可打开项目，也可在 EXE 所在目录使用 PowerShell 命令 `.\LocalCAT.exe --project 'D:\Translation\project.localcat-project'`。默认配置和资源位于 `%LOCALAPPDATA%\LocalCAT`，项目仍保存在用户选定位置；更新应用前先退出程序，保留这些用户数据。
+
+首次缺少本机资格时，Fuzzy 等待设置中的手动验证；编辑、保存和可用的精确检索不必等待。验证期间可以继续编辑保存。验证机的 Fuzzy 时间指标仍超限，完整性、正确性和内存等必要条件通过后按 ADR-029 带警示使用，性能报告仍为失败。一次工作区位置写入被占用导致冷开未恢复最后浏览段，译文与资格已保存；该位置问题尚未查明，保留为已知限制。
+
 ## Windows：已交付的 source 版本
 
 Windows 11 的 **CPython 3.14 x64 + 专用 venv + source + 轻量 launcher** 已完成用户旅程验收：真实 Qt 窗口、项目保存/冷重开、TM 激活/重启恢复、TMX 导入、FTS5 查询，以及头像与无匹配回退。
@@ -107,7 +115,7 @@ macOS 普通终端启动会在创建 Qt 前经 LaunchServices 打开已签名入
 
 - 项目、TM 和资源各自拥有保存、发布与恢复语义；失败不能静默替换原数据。Windows 使用自己的句柄、锁和 ACL/MIC 端口，POSIX 使用本机原语。
 - TMX 拒绝 DTD/ENTITY/外部实体；含不支持 XML 行内元素的单元会跳过并反馈。大型导入仍受格式限额约束。
-- canonical Fuzzy 的正确性与性能由 Core Gate C/D 证明；本机资格可以在兼容时恢复，失配后显式重验。JSONL/ResourcePackage 搬运数据，不搬运资格。
+- canonical Fuzzy 启动时恢复兼容的本机资格；缺失或失配时从设置中手动验证，期间可以继续编辑和保存。完整验证中仅时间指标超限时，Fuzzy 仍可使用并显示性能提示，性能报告继续保留失败；正确性、内存等必要条件仍限制准入。JSONL/ResourcePackage 搬运数据，不搬运资格。
 - 普通 frozen 保留必要数据保护、Core Gate 和包内业务验收，按 ADR-028 收窄旧 W3 的完整启动来源证明；尚无完成的 frozen 发行声明。
 
 ## 开发与验证
