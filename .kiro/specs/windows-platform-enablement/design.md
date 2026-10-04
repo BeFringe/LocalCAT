@@ -602,6 +602,7 @@ flowchart TD
 - 上述深入矩阵未改变时仅在下表复用前提全部成立后引用既有 owner 证据；原数据保证及反例没有被删除，也不重签为本次重新运行。
 
 ### Consumer Integration Tests
+- Fuzzy 时间准入修订按 Core 9.7 与 Feature5 6.8/9.2a 消费：沿用主体编辑、手动验证与后台等待合同；完整验证后按 Core 决定显示能力及性能警示。记录完整执行、原性能 verdict、功能许可和发行结论四项事实；不把 SUCCEEDED 或“能用”当性能 PASS。准入策略改变由现有 fingerprint 触发真实 Gate C/D 和冷恢复；既有轮询修复只在下一候选补验锁争用延期、终态、关闭和等待期间编辑/保存，不重跑全部历史矩阵，不先认定仍缺代码修复。历史 7.3 和相邻完成项保持原证据范围。
 - Parser read/write 与 body-safe failure 在候选实际消费；深入 rooted matrix 按实际变更重验或引用原 owner 证据。
 - collaborative controller import/startup、publish/recover；不得再有业务顶层 `fcntl`。
 - project save/reopen、deterministic package export/import/recovery；resource/TMX import/export。
