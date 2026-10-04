@@ -84,6 +84,7 @@ import platform
 import re
 import sqlite3
 import sys
+import time
 import unicodedata
 from typing import Protocol
 from unittest.mock import patch
@@ -140,6 +141,7 @@ _SHA256_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _NATIVE_PATH_TYPE = type(Path("."))
 _MAX_TEST_RECORD_COUNT = 1_000
 _MAX_TEST_QUERY_COUNT = 200
+_ORACLE_WORK_BUDGET_NS = 1_000_000
 
 
 class OraclePathUnavailableError(RuntimeError):
@@ -645,6 +647,7 @@ def compute_full_scan_oracle(
                     "query reference id must belong to the oracle subset"
                 )
         scored: list[tuple[int, float]] = []
+        work_deadline_ns = time.perf_counter_ns() + _ORACLE_WORK_BUDGET_NS
         for index, record in enumerate(records_tuple):
             # Observe the existing owner between bounded batches, without
             # changing scores or recomputing the implementation fingerprint.
@@ -657,6 +660,11 @@ def compute_full_scan_oracle(
             ):
                 raise RuntimeError("scorer returned an invalid similarity")
             scored.append((record.record_id, final_similarity))
+            if time.perf_counter_ns() >= work_deadline_ns:
+                # Let foreground native I/O regain the GIL during this
+                # background full scan. Owner checks keep their own cadence.
+                time.sleep(0.001)
+                work_deadline_ns = time.perf_counter_ns() + _ORACLE_WORK_BUDGET_NS
         above_threshold = tuple(
             record_id
             for record_id, final_similarity in scored

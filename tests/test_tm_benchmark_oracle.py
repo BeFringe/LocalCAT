@@ -560,6 +560,77 @@ class OraclePayloadTests(unittest.TestCase):
 
 
 class FullScanOracleTests(unittest.TestCase):
+    def _assert_cooperative_scan(
+        self, score_costs_ns: tuple[int, ...], *, between_queries_ns: int = 0
+    ) -> None:
+        records = tuple(
+            _make_record(record_id, ("aabba", "bbaab", "zzzzz")[record_id % 3])
+            for record_id in range(1, 11)
+        )
+        queries = (
+            _make_query(1, "aabba", category="near-edit", reference_record_id=1),
+            _make_query(2, "bbaab", category="near-edit", reference_record_id=2),
+        )
+        expected = compute_full_scan_oracle(
+            contract=_CONTRACT, records=records, queries=queries
+        )
+        now_ns = 0
+        work_since_progress_ns = 0
+        score_count = 0
+        progress_at_scores: list[int] = []
+        real_score = SimilarityScorerV1.score
+        real_row = FullScanQueryOracle
+
+        def score(scorer, *args, **kwargs):
+            nonlocal now_ns, work_since_progress_ns, score_count
+            # Pending foreground work must get a turn before another score
+            # begins after the budget expires, even if one score exceeds it.
+            self.assertLess(work_since_progress_ns, 1_000_000)
+            result = real_score(scorer, *args, **kwargs)
+            cost_ns = score_costs_ns[score_count % len(score_costs_ns)]
+            now_ns += cost_ns
+            work_since_progress_ns += cost_ns
+            score_count += 1
+            return result
+
+        def service_foreground(seconds):
+            nonlocal now_ns, work_since_progress_ns
+            self.assertEqual(seconds, 0.001)
+            self.assertGreaterEqual(work_since_progress_ns, 1_000_000)
+            progress_at_scores.append(score_count)
+            work_since_progress_ns = 0
+            # An OS wake-up can be late: resumed work still gets a fresh
+            # budget instead of immediately yielding on an expired deadline.
+            now_ns += 25_000_000
+
+        def finish_query(**kwargs):
+            nonlocal now_ns, work_since_progress_ns
+            row = real_row(**kwargs)
+            now_ns += between_queries_ns
+            work_since_progress_ns = 0
+            return row
+
+        with (
+            patch.object(SimilarityScorerV1, "score", score),
+            patch("tm_benchmark_oracle.time.perf_counter_ns", side_effect=lambda: now_ns),
+            patch("tm_benchmark_oracle.time.sleep", side_effect=service_foreground),
+            patch("tm_benchmark_oracle.FullScanQueryOracle", side_effect=finish_query),
+        ):
+            actual = compute_full_scan_oracle(
+                contract=_CONTRACT, records=records, queries=queries
+            )
+        self.assertEqual(actual, expected)
+        self.assertEqual(score_count, len(records) * len(queries))
+        self.assertTrue(progress_at_scores)
+        self.assertLess(progress_at_scores[0], len(records))
+        self.assertTrue(any(count > len(records) for count in progress_at_scores))
+
+    def test_full_scan_yields_during_scoring_without_changing_truth(self) -> None:
+        self._assert_cooperative_scan((200_000, 300_000, 2_000_000))
+
+    def test_full_scan_starts_a_fresh_work_budget_for_each_query(self) -> None:
+        self._assert_cooperative_scan((180_000,), between_queries_ns=100_000_000)
+
     def _padded(
         self,
         records: tuple[BenchmarkRecord, ...],
