@@ -56,6 +56,7 @@ Skills are located in `.opencode/skills/kiro-*/SKILL.md`
 - `kiro-verify-completion` — fresh-evidence gate before success or completion claims
 
 ## Development Rules
+- Before governance changes or a related rebase, read and follow `.kiro/steering/repository-safety.md`, especially its governance integration and controlled replay rules. Do not infer permission to cross protected history from approval of an ADR.
 - 3-phase approval workflow: Requirements → Design → Tasks → Implementation
 - Human review required each phase; use `-y` only for intentional fast-track
 - Keep steering current and verify alignment with `/kiro-spec-status`
