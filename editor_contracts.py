@@ -1279,6 +1279,7 @@ class RetrievalDisplayState:
     context_available: bool
     fuzzy_available: bool
     safe_codes: tuple[str, ...]
+    performance_warning_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_exact_bool(
@@ -1290,6 +1291,15 @@ class RetrievalDisplayState:
             "retrieval fuzzy available",
         )
         _validate_safe_codes(self.safe_codes, "retrieval safe codes")
+        warnings = self.performance_warning_codes
+        _validate_safe_codes(warnings, "retrieval performance warning codes")
+        if warnings != tuple(
+            code for code in ("EXACT_P95", "FUZZY_P95", "MIGRATION")
+            if code in warnings
+        ):
+            raise ValueError("retrieval performance warning codes must be known and ordered")
+        if warnings and not self.fuzzy_available:
+            raise ValueError("retrieval performance warnings require available fuzzy")
         if (
             not self.context_available or not self.fuzzy_available
         ) and not self.safe_codes:
@@ -1996,6 +2006,7 @@ def _editor_tm_contract_payload(
         return "RetrievalDisplayState", {
             "context_available": contract.context_available,
             "fuzzy_available": contract.fuzzy_available,
+            "performance_warning_codes": list(contract.performance_warning_codes),
             "safe_codes": list(contract.safe_codes),
         }
     if type(contract) is TextMatcherDisplayState:
@@ -2143,12 +2154,13 @@ def _decode_tm_resource_status(value: object) -> TMResourceStatus:
 def _decode_retrieval_display_state(value: object) -> RetrievalDisplayState:
     payload = _editor_tm_strict_fields(
         value,
-        ("context_available", "fuzzy_available", "safe_codes"),
+        ("context_available", "fuzzy_available", "safe_codes", "performance_warning_codes"),
     )
     return RetrievalDisplayState(
         context_available=payload["context_available"],
         fuzzy_available=payload["fuzzy_available"],
         safe_codes=_editor_tm_string_tuple(payload["safe_codes"]),
+        performance_warning_codes=_editor_tm_string_tuple(payload["performance_warning_codes"]),
     )
 
 
