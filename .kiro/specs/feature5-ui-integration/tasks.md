@@ -462,14 +462,14 @@
   - _Requirements: 7.1, 7.2, 7.3, 7.4, 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10_
   - _Boundary: Feature GO and Cross-Spec Revalidation_
 
-- [ ] 9.2a 汇合普通Windows候选的CapabilityHost/TM集成验收
+- [x] 9.2a 汇合普通Windows候选的CapabilityHost/TM集成验收
   - 在下一份实际候选合并准入旅程与既有轮询修复的补验：锁争用时延期、正确终态刷新、关闭后停止投递，以及验证期间编辑/保存。只有新失败才继续修改轮询代码；Core 9.7 按策略变更执行真实 Gate C/D，不作为轮询修复的额外门。
   - 在clean-user同候选完成Host启动、真实TM激活/重启恢复、FTS5查询、实际建议消费、设备资格与resource-local安全投影；证据绑定平台候选关联和Core兼容/执行事实，不要求原始`.py`或W3来源链。
   - 依平台Requirement 12核对候选必测、复用的未变owner证据与变更触发重验；任何缺项、失败或不成立的复用前提保持未完成。当前结果交WA-08产品journey与平台7.4汇总，不等待7.4先通过，也不单独宣布0.5.2完成。
   - _Amendment: WA-07_
   - _Depends: 7.6b, 6.8, tm-storage-retrieval-index 9.6b, tm-storage-retrieval-index 9.7, ADR-028, ADR-029, windows-platform-enablement 7.3_
 
-- [ ] 6.8 消费独立的 Fuzzy 性能警示与准入决定
+- [x] 6.8 消费独立的 Fuzzy 性能警示与准入决定
   - Host/Controller 从同一 Core snapshot 输出警示；Qt 双入口区分验证进度、功能可用和性能结果，保持手动验证触发与用户偏好的收窄语义。
   - 完成时，时间警示可用、一路 RSS 拒绝另一路可用、Gate C 关闭、失败/取消与冷恢复均显示正确；不存在 UI evidence 解析、第二缓存授权或“所有资源可用”的错误提示。
   - _Requirements: 6.8–13, 7.5–7_
