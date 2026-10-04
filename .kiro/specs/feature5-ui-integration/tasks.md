@@ -468,6 +468,26 @@
   - _Amendment: WA-07_
   - _Depends: 本轮消费合同获批, 7.6b, tm-storage-retrieval-index 9.6b, ADR-028, windows-platform-enablement 7.3_
 
+- [ ] 5.7 收束日常 TM 建议异步与取消的最小设计
+  - 核对 Controller 查询锁、Host lifecycle lock、query lease 和 generation 的实际持有范围；区分 scorer budget 与取消，给出短锁捕获/执行/提交需要的最小接缝。
+  - 完成时，以 A→B→A、资源/阈值变化、关闭和迟到结果的有限时序实验说明线程与取消可行性，向对应 owner 提交精确 Design/Tasks delta；不据此实施未经批准的 Core 接口或引入分阶段报告。
+  - _Boundary: Feature5 当前段建议执行设计；Core 只读相邻端口分析_
+  - _Depends: 本修订设计研究范围批准_
+
+- [ ] 6.8 消费独立的 Fuzzy 性能警示与准入决定
+  - Host/Controller 从同一 Core snapshot 输出警示；Qt 双入口区分验证进度、功能可用和性能结果，保持手动验证触发与用户偏好的收窄语义。
+  - 完成时，时间警示可用、一路 RSS 拒绝另一路可用、Gate C 关闭、失败/取消与冷恢复均显示正确；不存在 UI evidence 解析、第二缓存授权或“所有资源可用”的错误提示。
+  - _Requirements: 6.8–14, 7.5–7_
+  - _Boundary: Host 安全投影、Controller DTO 与 Qt TM 展示_
+  - _Depends: ADR-029 采纳、本修订 Design/Tasks 批准、tm-storage-retrieval-index 9.7_
+
+- [ ] 7.7 验证 Fuzzy 等待期间编辑及完成后的真实消费
+  - 在同一普通候选以显式验证覆盖编辑、保存、切段、关闭、终态提示和实际建议；必要条件失败仍拒绝，只有时间失败时按 Core 决定消费并提示，原报告不改签。
+  - 完成时，等待交互、功能许可、性能 verdict 和冷恢复分别有实际结果；日常查询若仍阻塞，明确登记 5.7 的具体设计缺口，不以后台 Gate 完成代答。
+  - _Requirements: 6.8–14, 9.8–9_
+  - _Boundary: 普通候选 Feature5 产品消费_
+  - _Depends: 6.8_
+
 ## Implementation Notes
 
 - Task 9.2a：实际 ProjectPackage 应用建议暴露了 Controller 在 runtime generation 提交锁内重新读取同一代次的死锁。workspace target 提交仍在原 reservation 内完成，并立即递增 query epoch、清除旧建议；仅将新基线捕获延至下一次查询同步，保留过期拒绝与并发换代保护。局部修复及 source 回归不代答同候选产品验收，任务继续未完成。
