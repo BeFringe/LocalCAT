@@ -23,6 +23,7 @@ from editor_contracts import (
     EditorProject,
     EditorSegment,
     FuzzyValidationDisplay,
+    TMThresholdDisplay,
     FuzzyValidationState,
     ImportReport,
     ImportRequest,
@@ -3344,6 +3345,32 @@ class EditorController:
                 raise TypeError("TM retrieval display contract is invalid")
             status.__post_init__()
             return replace(status)
+
+    def poll_tm_threshold_display(self) -> TMThresholdDisplay | None:
+        """Try one presentation read; a busy publication is retried by the UI."""
+
+        if not self._tm_query_lock.acquire(False):
+            return None
+        try:
+            adapter = self._tm_adapter
+            if adapter is None:
+                validation = FuzzyValidationDisplay(
+                    FuzzyValidationState.IDLE, None,
+                )
+                display = RetrievalDisplayState(
+                    False, False, ("TM.RETRIEVAL.UNAVAILABLE",),
+                )
+            else:
+                pair = adapter._poll_fuzzy_display_for_controller()
+                if pair is None:
+                    return None
+                validation, display = pair
+            blocked = self._tm_runtime_blocked_safe_code
+            if blocked is not None:
+                display = RetrievalDisplayState(False, False, (blocked,))
+            return TMThresholdDisplay(self.tm_preferences(), display, validation)
+        finally:
+            self._tm_query_lock.release()
 
     def tm_fuzzy_validation_status(self) -> FuzzyValidationDisplay:
         """Return process-local validation lifecycle without authorizing fuzzy."""

@@ -599,6 +599,7 @@ class ClusterERemediationTests(unittest.TestCase):
                     fuzzy_validation_status=lambda: (
                         qt_editor._fuzzy_validation_display(composition)
                     ),
+                    fuzzy_validation_poll=lambda: qt_editor._poll_fuzzy_validation_display(composition),
                     fuzzy_validation_start=lambda: (
                         qt_editor._request_fuzzy_revalidation(composition)
                     ),
@@ -724,6 +725,7 @@ class ClusterERemediationTests(unittest.TestCase):
                     fuzzy_validation_status=lambda: (
                         qt_editor._fuzzy_validation_display(composition)
                     ),
+                    fuzzy_validation_poll=lambda: qt_editor._poll_fuzzy_validation_display(composition),
                     fuzzy_validation_start=lambda: (
                         qt_editor._request_fuzzy_revalidation(composition)
                     ),

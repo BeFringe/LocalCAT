@@ -3349,6 +3349,8 @@ class RetrievalGateDOwnerPort(Protocol):
 
     def status(self) -> GateDRunStatus: ...
 
+    def _try_display(self) -> tuple[GateDRunStatus, RetrievalDisplayState] | None: ...
+
     def wait(self, timeout: float | None = None) -> GateDRunStatus: ...
 
 
@@ -3879,6 +3881,20 @@ class CapabilityHost(metaclass=_publication_reference_type):
 
         with self.__lock:
             return self.__status
+
+    def _try_retrieval_display(self) -> RetrievalDisplayState | None:
+        """Copy committed display facts, or defer without waiting on publication."""
+
+        if not self.__lock.acquire(False):
+            return None
+        try:
+            display = self.__retrieval_operation_display
+            if type(display) is not RetrievalDisplayState:
+                raise TypeError("retrieval display contract is invalid")
+            display.__post_init__()
+            return _clone_retrieval_display(display)
+        finally:
+            self.__lock.release()
 
     def _composition_matcher_owner(
         self,
@@ -4706,6 +4722,23 @@ class _RetrievalGateDOwner(metaclass=_publication_reference_type):
     def status(self) -> GateDRunStatus:
         with self.__condition:
             return self.__status
+
+    def _try_display(self) -> tuple[GateDRunStatus, RetrievalDisplayState] | None:
+        """Read lifecycle and availability together in publication lock order."""
+
+        if not self.__condition.acquire(False):
+            return None
+        try:
+            display = self.__host._try_retrieval_display()
+            if display is None:
+                return None
+            status = self.__status
+            if type(status) is not GateDRunStatus:
+                raise TypeError("Gate D status contract is invalid")
+            status.__post_init__()
+            return GateDRunStatus(status.epoch, status.state, status.safe_code), display
+        finally:
+            self.__condition.release()
 
     def restore_gate_d(
         self,

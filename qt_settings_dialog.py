@@ -22,9 +22,11 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QKeyEvent,
+    QHideEvent,
     QPaintEvent,
     QPainter,
     QResizeEvent,
+    QShowEvent,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -59,6 +61,7 @@ from shiboken6 import isValid as _qt_object_is_valid
 
 from editor_contracts import (
     FuzzyValidationState,
+    TMThresholdDisplay,
     ImportReport,
     ImportRequest,
     ResourceConfig,
@@ -954,6 +957,10 @@ class QtSettingsDialog(QDialog):
         self._tm_operation_timer = QTimer(self)
         self._tm_operation_timer.setInterval(75)
         self._tm_operation_timer.timeout.connect(self._poll_tm_operation)
+        self._tm_threshold_timer = QTimer(self)
+        self._tm_threshold_timer.setInterval(250)
+        self._tm_threshold_timer.timeout.connect(self._refresh_tm_threshold_entry)
+        self.finished.connect(self._tm_threshold_timer.stop)
         self._build_ui()
         self.setTabOrder(self.new_resource_button, self.tm_threshold_chip)
         self._render_cached_resources()
@@ -963,6 +970,14 @@ class QtSettingsDialog(QDialog):
                 self._apply_system_theme
             )
             application.paletteChanged.connect(self._queue_system_theme_refresh)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self._refresh_tm_threshold_entry()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        self._tm_threshold_timer.stop()
+        super().hideEvent(event)
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
@@ -1544,18 +1559,33 @@ class QtSettingsDialog(QDialog):
     def _refresh_tm_threshold_entry(self) -> None:
         """Render the settings entry from fresh defensive Controller values."""
 
-        retrieval_status = self.controller.tm_retrieval_status()
-        fuzzy_validation = self.controller.tm_fuzzy_validation_status()
+        display = self.controller.poll_tm_threshold_display()
+        if display is None:
+            if self.isVisible():
+                self._tm_threshold_timer.start()
+            return
+        self._render_tm_threshold_display(display)
+
+    def _render_tm_threshold_display(self, display: TMThresholdDisplay) -> None:
+        if type(display) is not TMThresholdDisplay:
+            raise TypeError("TM threshold display contract is invalid")
+        display.__post_init__()
+        retrieval_status = display.retrieval
+        fuzzy_validation = display.validation
         configure_tm_threshold_entry(
             self.tm_threshold_chip,
             self.tm_threshold_state,
-            preferences=self.controller.tm_preferences(),
+            preferences=display.preferences,
             retrieval_status=retrieval_status,
             fuzzy_validation=fuzzy_validation,
         )
         needs_revalidation = not retrieval_status.fuzzy_available
         self.fuzzy_revalidate_button.setVisible(needs_revalidation)
         running = fuzzy_validation.state is FuzzyValidationState.RUNNING
+        if running and self.isVisible():
+            self._tm_threshold_timer.start()
+        else:
+            self._tm_threshold_timer.stop()
         self.fuzzy_revalidate_button.setEnabled(
             needs_revalidation and not running
         )
