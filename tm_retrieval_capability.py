@@ -30,6 +30,8 @@ from tm_contracts import (
     BenchmarkReport,
     benchmark_contract_digest,
     benchmark_environment_digest,
+    contract_from_json,
+    contract_to_json,
 )
 
 
@@ -42,6 +44,7 @@ RETRIEVAL_CAPABILITY_SUMMARY_VERSION = "retrieval-capability-summary-v1"
 _CONTEXT_NAMESPACE = "RETRIEVAL.CONTEXT"
 _FUZZY_CORRECTNESS_NAMESPACE = "RETRIEVAL.FUZZY_CORRECTNESS"
 _FUZZY_BENCHMARK_NAMESPACE = "RETRIEVAL.FUZZY_BENCHMARK"
+_PERFORMANCE_WARNING_ORDER = ("EXACT_P95", "FUZZY_P95", "MIGRATION")
 
 RETRIEVAL_CONTEXT_IDENTITY_INVALID_CODE = (
     f"{_CONTEXT_NAMESPACE}_IDENTITY_INVALID"
@@ -232,6 +235,7 @@ class RetrievalFuzzyPathDecision:
     path: str
     available: bool
     unavailable_code: str | None
+    performance_warning_codes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         path = _require_identity(self.path, "fuzzy path")
@@ -241,6 +245,18 @@ class RetrievalFuzzyPathDecision:
             self.available,
             "fuzzy path availability",
         )
+        warnings = _require_exact_tuple(
+            self.performance_warning_codes,
+            "performance warning codes",
+        )
+        for code in warnings:
+            _require_stable_code(code, "performance warning code")
+        if warnings != tuple(
+            code for code in _PERFORMANCE_WARNING_ORDER if code in warnings
+        ):
+            raise ValueError(
+                "performance warning codes must be known, unique and ordered"
+            )
         if available:
             if self.unavailable_code is not None:
                 raise ValueError(
@@ -313,6 +329,8 @@ class RetrievalCapabilitySnapshot:
             raise TypeError(
                 "snapshot gram_fallback must be RetrievalFuzzyPathDecision"
             )
+        self.fts5_trigram.__post_init__()
+        self.gram_fallback.__post_init__()
         if self.fts5_trigram.path != "FTS5_TRIGRAM":
             raise ValueError("fts5_trigram decision must use FTS5_TRIGRAM")
         if self.gram_fallback.path != "GRAM_FALLBACK":
@@ -928,10 +946,16 @@ def _decisions_payload(
         "fts5_trigram": {
             "available": decisions[2].available,
             "unavailable_code": decisions[2].unavailable_code,
+            "performance_warning_codes": list(
+                decisions[2].performance_warning_codes
+            ),
         },
         "gram_fallback": {
             "available": decisions[3].available,
             "unavailable_code": decisions[3].unavailable_code,
+            "performance_warning_codes": list(
+                decisions[3].performance_warning_codes
+            ),
         },
     }
 
@@ -1131,7 +1155,12 @@ def _fuzzy_core_decision(
 
 
 def _benchmark_report_is_valid(report: BenchmarkReport) -> bool:
+    if type(report) is not BenchmarkReport:
+        return False
     try:
+        # Reuse the contract owner's full validation, including measured
+        # failures, counts, path facts and verdict; digests alone cannot suffice.
+        validated = contract_from_json(contract_to_json(report))
         recomputed_contract = benchmark_contract_digest(report.contract)
         recomputed_environment = benchmark_environment_digest(
             report.environment
@@ -1139,9 +1168,30 @@ def _benchmark_report_is_valid(report: BenchmarkReport) -> bool:
     except (TypeError, ValueError):
         return False
     return (
-        recomputed_contract == report.contract_digest
+        validated == report
+        and recomputed_contract == report.contract_digest
         and recomputed_environment == report.environment_digest
     )
+
+
+def _benchmark_report_admission(
+    report: BenchmarkReport,
+) -> tuple[bool, tuple[str, ...]]:
+    """Derive functional admission and advisory time failures from one report.
+
+    The report remains a performance FAIL. Correctness/recall, RSS and any
+    unsupported or malformed failure still deny functional admission.
+    Identity and validity-window checks belong to the surrounding evaluator.
+    """
+    if not _benchmark_report_is_valid(report):
+        return False, ()
+    warnings = tuple(
+        code for code in _PERFORMANCE_WARNING_ORDER if code in report.failed_gates
+    )
+    admitted = all(
+        code in _PERFORMANCE_WARNING_ORDER for code in report.failed_gates
+    )
+    return admitted, warnings
 
 
 def _path_decision(
@@ -1172,14 +1222,28 @@ def _path_decision(
     if (
         report.execution_path.value != expectation.path
         or report.contract_digest != expectation.contract_digest
-        or report.passed is not True
-        or report.failed_gates != ()
-        or not _benchmark_report_is_valid(report)
     ):
         return RetrievalFuzzyPathDecision(
             path=expectation.path,
             available=False,
             unavailable_code=failed_code,
+        )
+    admitted, warnings = _benchmark_report_admission(report)
+    if not admitted:
+        active = _is_active_window(
+            generated_at_utc=evidence.generated_at_utc,
+            valid_until_utc=evidence.valid_until_utc,
+            evaluated_at_utc=evaluated_at_utc,
+        ) and _is_active_window(
+            generated_at_utc=manifest.generated_at_utc,
+            valid_until_utc=manifest.valid_until_utc,
+            evaluated_at_utc=evaluated_at_utc,
+        )
+        return RetrievalFuzzyPathDecision(
+            path=expectation.path,
+            available=False,
+            unavailable_code=failed_code,
+            performance_warning_codes=warnings if active else (),
         )
     if not _is_active_window(
         generated_at_utc=evidence.generated_at_utc,
@@ -1205,6 +1269,7 @@ def _path_decision(
         path=expectation.path,
         available=True,
         unavailable_code=None,
+        performance_warning_codes=warnings,
     )
 
 
@@ -1250,7 +1315,7 @@ class RetrievalCapabilityEvaluator:
             manifest_payload_json = _manifest_payload_json(
                 validated_manifest
             )
-        except (TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError):
             return _closed_snapshot(
                 self.__expectation,
                 evaluated_at_utc=instant,
@@ -1260,7 +1325,8 @@ class RetrievalCapabilityEvaluator:
                 ),
                 fts5_code=RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_FAILED_CODE,
                 gram_code=RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_FAILED_CODE,
-                manifest=validated_manifest,
+                # The malformed payload cannot be safely canonicalized again.
+                manifest=None,
             )
 
         identity_ok = _envelope_identity_matches(

@@ -24,6 +24,11 @@ from platform_fs_contracts import (
 from tests.test_tm_benchmark_gate import (
     _base_capability_manifest,
     _combined_bundle,
+    _time_failure_bundle,
+    _capability_publisher,
+    _GENERATED_AT,
+    _VALID_UNTIL,
+    _EVALUATED_AT,
 )
 
 
@@ -39,8 +44,9 @@ class _AttestationInputs(TypedDict):
 
 class GateDAttestationTests(unittest.TestCase):
     @staticmethod
-    def _run_result():
-        bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+    def _run_result(bundle=None):
+        if bundle is None:
+            bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
         artifact = tm_benchmark_gate.benchmark_evidence_bundle_to_json(
             bundle
         ).encode("utf-8")
@@ -51,6 +57,36 @@ class GateDAttestationTests(unittest.TestCase):
             artifact_digest=hashlib.sha256(artifact).hexdigest(),
             test_mode=False,
         )
+
+    def test_time_failure_qualification_restores_same_admission_and_warnings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for rss in (300_000_000, 600_000_000):
+                with self.subTest(rss=rss):
+                    state_root = (Path(temporary) / str(rss)).resolve()
+                    manifest = _base_capability_manifest()
+                    original = self._run_result(_time_failure_bundle(fts5_peak_rss_bytes=rss))
+                    tm_benchmark_gate._persist_gate_d_attestation(
+                        contract_path=(ROOT / "benchmark_tm_contract.json").resolve(),
+                        state_root=state_root, base_manifest=manifest,
+                        run_result=original, issued_at_utc=_EVALUATED_AT,
+                    )
+                    restored = tm_benchmark_gate._restore_gate_d_attestation(
+                        contract_path=(ROOT / "benchmark_tm_contract.json").resolve(),
+                        state_root=state_root, base_manifest=manifest,
+                    )
+                    snapshots = []
+                    for run_result in (original, restored):
+                        published = tm_benchmark_gate.publish_retrieval_capability_gate_d(
+                            manifest, run_result, _capability_publisher(),
+                            generated_at_utc=_GENERATED_AT, valid_until_utc=_VALID_UNTIL,
+                            evaluated_at_utc=_EVALUATED_AT,
+                        )
+                        snapshots.append(published.snapshot)
+                    self.assertEqual(snapshots[0], snapshots[1])
+                    self.assertEqual(snapshots[1].fts5_trigram.available, rss < 512 * 1024 * 1024)
+                    self.assertTrue(snapshots[1].gram_fallback.available)
+                    self.assertEqual(snapshots[1].gram_fallback.performance_warning_codes, ("EXACT_P95", "FUZZY_P95", "MIGRATION"))
+                    self.assertFalse(restored.bundle.suite_report.passed)
 
     def test_real_receipt_round_trips_as_same_device_qualification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -100,6 +136,24 @@ class GateDAttestationTests(unittest.TestCase):
                     payload["windows_private_proof"]["security_profile_id"],
                     "WindowsPrivateSecurityV2",
                 )
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows W2 owner contract")
+    def test_windows_fresh_process_restores_time_warnings_without_rewriting_performance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            facts = []
+            for mode in ("persist-time", "restore-time"):
+                completed = subprocess.run(
+                    [sys.executable, "-m", "tests.windows_tm_gate_d_attestation_worker", mode, str(Path(temporary) / "gate-d")],
+                    cwd=ROOT, check=False, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+                facts.append(json.loads(completed.stdout))
+            self.assertEqual(facts[0]["decisions"], facts[1]["decisions"])
+            self.assertEqual(facts[1]["decisions"], [
+                {"available": True, "warnings": ["EXACT_P95", "FUZZY_P95", "MIGRATION"]},
+            ] * 2)
+            self.assertFalse(facts[0]["performance_passed"])
+            self.assertFalse(facts[1]["performance_passed"])
 
     @unittest.skipUnless(sys.platform == "win32", "Windows W2 owner contract")
     def test_windows_second_persist_replaces_under_child_w1_lock(self) -> None:

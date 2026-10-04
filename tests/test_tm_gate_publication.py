@@ -40,6 +40,54 @@ def _transition(publisher, session, prepare):
 
 
 class GatePublicationLifetimeTests(unittest.TestCase):
+    def test_time_warning_candidate_cancel_and_install_failure_preserve_prior_snapshot(self):
+        from tests import test_tm_benchmark_gate as fixtures
+        import tm_benchmark_gate as gate
+
+        for failure in ("cancel", "install"):
+            with self.subTest(failure=failure):
+                publisher = fixtures._capability_publisher()
+                prior = publisher.snapshot()
+                result = fixtures.GateDPublicationTests._run_result(fixtures._time_failure_bundle())
+                owner = gate._gate_d_receipt_owner(result)
+                self.addCleanup(owner.close)
+                refs = _References()
+                old, new = refs.handoff, object()
+                candidates = []
+                with owner.open_session() as session:
+                    def prepare(candidate):
+                        candidates.append(candidate.snapshot)
+                        plan = session._prepare_reference_publication((
+                            (_References.handoff, refs, old, new),
+                        ), candidate)
+                        if failure == "cancel":
+                            owner._revoke_publication()
+                        return plan
+
+                    install = retrieval._install_publication_reference
+
+                    def fault(assignment):
+                        install(assignment)
+                        if assignment[1] is publisher:
+                            raise RuntimeError("time warning install failure")
+
+                    with mock.patch.object(retrieval, "_install_publication_reference", side_effect=fault) if failure == "install" else nullcontext():
+                        with self.assertRaises((gate.BenchmarkGateDError, RuntimeError)):
+                            gate._publish_retrieval_capability_gate_d_prepared(
+                                fixtures._base_capability_manifest(), result, publisher,
+                                generated_at_utc=fixtures._GENERATED_AT,
+                                valid_until_utc=fixtures._VALID_UNTIL,
+                                evaluated_at_utc=fixtures._EVALUATED_AT,
+                                prepare_publication=prepare,
+                                _publication_bindings=gate._GATE_D_PUBLICATION_BINDINGS,
+                                _input_session=session,
+                            )
+                    self.assertTrue(candidates[0].fts5_trigram.available)
+                    self.assertEqual(candidates[0].fts5_trigram.performance_warning_codes, ("EXACT_P95", "FUZZY_P95", "MIGRATION"))
+                    self.assertIs(publisher.snapshot(), prior)
+                    self.assertIs(refs.handoff, old)
+                    self.assertFalse(session._publication_completed())
+
     def test_actual_gate_d_rejects_readonly_member_before_locked_observer_can_see_any_write(self) -> None:
         from tests import test_tm_benchmark_gate as fixtures
         import tm_benchmark_gate as gate

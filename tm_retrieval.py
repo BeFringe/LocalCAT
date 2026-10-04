@@ -1231,11 +1231,17 @@ def _snapshot_capability_snapshot(
             path=snapshot.fts5_trigram.path,
             available=snapshot.fts5_trigram.available,
             unavailable_code=snapshot.fts5_trigram.unavailable_code,
+            performance_warning_codes=(
+                snapshot.fts5_trigram.performance_warning_codes
+            ),
         ),
         gram_fallback=RetrievalFuzzyPathDecision(
             path=snapshot.gram_fallback.path,
             available=snapshot.gram_fallback.available,
             unavailable_code=snapshot.gram_fallback.unavailable_code,
+            performance_warning_codes=(
+                snapshot.gram_fallback.performance_warning_codes
+            ),
         ),
         summary=RetrievalCapabilityEvidenceSummary(
             summary_version=snapshot.summary.summary_version,

@@ -840,6 +840,19 @@ def _combined_bundle(
     )
 
 
+def _time_failure_bundle(*, fts5_peak_rss_bytes: int = 300_000_000) -> BenchmarkEvidenceBundle:
+    """Strict synthetic measurements; never qualify real performance."""
+    fts5_run, fts5_oracle = _fts5_fixture(
+        missing_top10_queries=0, latency_scale=100_000,
+        migration_elapsed_ns=121_000_000_000, peak_rss_bytes=fts5_peak_rss_bytes,
+    )
+    fallback_run, fallback_oracle = _fallback_fixture(
+        missing_top10_queries=0, latency_scale=100_000,
+        migration_elapsed_ns=121_000_000_000,
+    )
+    return combine_benchmark_evidence(fts5_run, fallback_run, fts5_oracle, fallback_oracle)
+
+
 class CombineBenchmarkEvidenceTests(unittest.TestCase):
     def test_combine_builds_immutable_bundle_with_both_paths(self) -> None:
         bundle = _combined_bundle()
@@ -2399,6 +2412,41 @@ class GateDWindowsEvidencePublisherTests(unittest.TestCase):
 
 class GateDPublicationTests(unittest.TestCase):
     """Gate D capability publication: compose, refresh once, verify truth."""
+
+    def test_time_failed_reports_publish_open_warnings_and_keep_rss_path_closed(self):
+        for rss in (300_000_000, 600_000_000):
+            with self.subTest(rss=rss):
+                bundle = _time_failure_bundle(fts5_peak_rss_bytes=rss)
+                publisher = _capability_publisher()
+                result = publish_retrieval_capability_gate_d(
+                    _base_capability_manifest(), self._run_result(bundle), publisher,
+                    generated_at_utc=_GENERATED_AT, valid_until_utc=_VALID_UNTIL,
+                    evaluated_at_utc=_EVALUATED_AT,
+                )
+                self.assertFalse(bundle.suite_report.passed)
+                self.assertEqual(bundle.suite_report.failed_paths, (_FTS5, _FALLBACK))
+                self.assertIs(publisher.snapshot(), result.snapshot)
+                self.assertEqual(result.snapshot.fts5_trigram.available, rss < 512 * 1024 * 1024)
+                self.assertTrue(result.snapshot.gram_fallback.available)
+                for decision in (result.snapshot.fts5_trigram, result.snapshot.gram_fallback):
+                    self.assertEqual(decision.performance_warning_codes, ("EXACT_P95", "FUZZY_P95", "MIGRATION"))
+                self.assertIsNone(result.snapshot.gram_fallback.unavailable_code)
+
+    def test_publication_consistency_rejects_warning_tamper(self):
+        bundle = _time_failure_bundle()
+        publisher = _capability_publisher()
+        result = publish_retrieval_capability_gate_d(
+            _base_capability_manifest(), self._run_result(bundle), publisher,
+            generated_at_utc=_GENERATED_AT, valid_until_utc=_VALID_UNTIL,
+            evaluated_at_utc=_EVALUATED_AT,
+        )
+        fts5, fallback = retrieval_benchmark_evidence_pair(
+            bundle, generated_at_utc=_GENERATED_AT, valid_until_utc=_VALID_UNTIL,
+        )
+        object.__setattr__(result.snapshot.fts5_trigram, "performance_warning_codes", ())
+        with self.assertRaises(BenchmarkGateDError) as caught:
+            tm_benchmark_gate._verify_path_decisions_match_reports(result.snapshot, fts5, fallback)
+        self.assertEqual(caught.exception.error_code, "GATE_D.PUBLICATION_DECISION_MISMATCH")
 
     @staticmethod
     def _run_result(
