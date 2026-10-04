@@ -476,6 +476,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 7.2, tm-storage-retrieval-index 9.6b, feature5-ui-integration 6.6b_
 
 - [ ] 7.4 在同一候选贯通完整产品旅程
+  - 时间准入修订获批后，汇合 Core 9.7 与 Feature5 6.8/7.7；完整验证、逐路径性能 verdict、功能准入与最终发行结论分别记录，不重开或重签历史 7.3。
   - 汇合 WA-01/02/03/04/05 的实际 packaged API、Feature5 安全投影和 WA-08 Qt journey；owner 使用 7.2 已可运行产物及 7.3 资格，不等待本项先完成。
   - 覆盖正常首页/项目参数、Project 编辑保存冷重开、TM 激活/重启恢复、TMX 直接导入、FTS5/trigram 创建查询重开、真实建议、qwindows、资源与头像 fallback；默认资源仅缺失时播种。
   - 完成时，各 owner 证据对应同一候选，Qt 经正常产品入口消费真实业务；如候选变化，按 Requirement 12 重新验证，不拼接不同 EXE。该项不代答 Task 8 的数据反例与最终发行裁决。
