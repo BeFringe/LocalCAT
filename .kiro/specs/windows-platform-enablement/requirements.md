@@ -144,6 +144,8 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 ### Requirement 12：端到端发布矩阵与可复现证据
 **目标：** 作为发布审批者，我希望在干净 Windows 环境取得完整、可复现的通过证据，以便最终 EXE 的平台等价性可审计而非凭推断接受。
 
+时间准入修订由 Core Requirement 8.8–10、Feature5 Requirement 6.13 拥有，按 ADR-029 接续。候选验收分别记录验证执行是否完整、性能报告 PASS/FAIL、Core 功能准入与最终发行裁决；仅时间超限时允许功能不等于性能或发行通过，512 MiB 及其他必要条件仍按 owning 合同验收。
+
 #### 验收标准
 1. When Windows 发行候选进入最终验收, the 验证流程 shall 在同一实际候选上验证干净用户/无开发环境、非仓库 CWD、真实 Qt 首页/项目参数、项目编辑保存重开、TM 激活/重启恢复、TMX 直接导入、FTS5/trigram 创建查询重开、真实 Matcher/建议消费、资格恢复/失配，以及 worker 取消/关闭/超时/异常退出和新增资源加载路径。首次普通 packaged 资格及检索兼容性变化 shall 实际执行正式 Gate C/D 与 100k 双 intended paths；后续仅 UI/无关资源变化时，可由当前候选的 Core 核验并恢复同设备、兼容性未变的有效资格，记录原证据及复用依据，不重跑无关性能矩阵或重签旧结果。
 2. When 验证候选的数据保护, the 验证流程 shall 在真实消费者中覆盖默认资源不覆盖、锁竞争、发布失败、中断恢复、权限/reparse 拒绝与既有数据不损坏；同时验证 TMX ResourcePackage 的 import/apply 负向拒绝及资源迁移不携带 Fuzzy 资格。更深入的底层故障矩阵按 12.5–12.7 确定重跑或复用。
