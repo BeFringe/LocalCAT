@@ -12,6 +12,7 @@ module is imported here.
 from __future__ import annotations
 
 import hashlib
+from itertools import combinations
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -120,7 +121,7 @@ def _report(
     passed: bool = True,
 ) -> BenchmarkReport:
     contract = _contract()
-    exact_p95_ms = 49.0 if passed else 51.0
+    exact_p95_ms = 49.0
     environment = (
         ("cpu", "test-cpu"),
         (
@@ -161,9 +162,9 @@ def _report(
         fuzzy_top10_p95_ms=499.0,
         fuzzy_top10_max_ms=750.0,
         migration_seconds=119.0,
-        peak_rss_mib=511.0,
+        peak_rss_mib=511.0 if passed else 513.0,
         passed=passed,
-        failed_gates=() if passed else ("EXACT_P95",),
+        failed_gates=() if passed else ("PEAK_RSS",),
         environment=environment,
         environment_digest=benchmark_environment_digest(environment),
     )
@@ -691,6 +692,130 @@ class IndependentGateTests(unittest.TestCase):
             snapshot.fuzzy_available_for("GRAM_FALLBACK"),
             (False, RETRIEVAL_FUZZY_BENCHMARK_EVIDENCE_MISSING_CODE),
         )
+
+
+class TimePerformanceAdmissionTests(unittest.TestCase):
+    @staticmethod
+    def evidence(path, failures):
+        return replace(
+            _benchmark_evidence(path),
+            report=replace(
+                _report(path),
+                candidate_recall=0.99 if "CANDIDATE_RECALL" in failures else 1.0,
+                exact_p95_ms=51.0 if "EXACT_P95" in failures else 49.0,
+                fuzzy_top10_p95_ms=501.0 if "FUZZY_P95" in failures else 499.0,
+                migration_seconds=121.0 if "MIGRATION" in failures else 119.0,
+                peak_rss_mib=513.0 if "PEAK_RSS" in failures else 511.0,
+                passed=not failures,
+                failed_gates=failures,
+            ),
+        )
+
+    def test_each_time_failure_combination_opens_with_honest_report_and_warnings(self):
+        codes = ("EXACT_P95", "FUZZY_P95", "MIGRATION")
+        for size in range(1, 4):
+            for failures in combinations(codes, size):
+                for path in BenchmarkExecutionPath:
+                    with self.subTest(failures=failures, path=path):
+                        evidence = self.evidence(path, failures)
+                        manifest = _manifest(**{
+                            "fts5_benchmark" if path.value == "FTS5_TRIGRAM" else "gram_benchmark": evidence,
+                        })
+                        snapshot = RetrievalCapabilityEvaluator(_expectation()).evaluate(
+                            manifest, evaluated_at_utc=EVALUATED_AT,
+                        )
+                        decision = snapshot.fts5_trigram if path.value == "FTS5_TRIGRAM" else snapshot.gram_fallback
+                        self.assertTrue(decision.available)
+                        self.assertEqual(decision.performance_warning_codes, failures)
+                        self.assertIsNone(decision.unavailable_code)
+                        self.assertEqual(snapshot.summary.unavailable_codes, ())
+                        self.assertFalse(evidence.report.passed)
+                        self.assertEqual(evidence.report.failed_gates, failures)
+
+    def test_rss_and_recall_remain_closed_while_other_path_time_failures_open(self):
+        for blocker in ("PEAK_RSS", "CANDIDATE_RECALL"):
+            failures = ("EXACT_P95", blocker) if blocker == "PEAK_RSS" else (blocker, "EXACT_P95")
+            snapshot = RetrievalCapabilityEvaluator(_expectation()).evaluate(
+                _manifest(
+                    fts5_benchmark=self.evidence(BenchmarkExecutionPath.FTS5_TRIGRAM, failures),
+                    gram_benchmark=self.evidence(BenchmarkExecutionPath.GRAM_FALLBACK, ("MIGRATION",)),
+                ), evaluated_at_utc=EVALUATED_AT,
+            )
+            self.assertFalse(snapshot.fts5_trigram.available)
+            self.assertEqual(snapshot.fts5_trigram.performance_warning_codes, ("EXACT_P95",))
+            self.assertTrue(snapshot.gram_fallback.available)
+            self.assertEqual(snapshot.gram_fallback.performance_warning_codes, ("MIGRATION",))
+
+    def test_time_warning_cannot_bypass_gate_c_identity_or_expiry(self):
+        evidence = self.evidence(BenchmarkExecutionPath.FTS5_TRIGRAM, ("EXACT_P95",))
+        gate_c_closed = _manifest(
+            fts5_benchmark=evidence,
+            fuzzy_core_cohort=_cohort("fuzzy.core.correctness.cohort.v1", FUZZY_CORE_COHORT_DIGEST, passed=False),
+        )
+        evaluator = RetrievalCapabilityEvaluator(_expectation())
+        snapshot = evaluator.evaluate(gate_c_closed, evaluated_at_utc=EVALUATED_AT)
+        self.assertTrue(snapshot.fts5_trigram.available)
+        self.assertEqual(snapshot.fuzzy_available_for("FTS5_TRIGRAM"), (False, RETRIEVAL_FUZZY_CORRECTNESS_EVIDENCE_FAILED_CODE))
+        for manifest in (
+            _manifest(fts5_benchmark=evidence, evaluator_digest=_digest("old-policy")),
+            _manifest(fts5_benchmark=evidence, valid_until_utc="2026-08-12T11:00:00Z"),
+        ):
+            snapshot = evaluator.evaluate(manifest, evaluated_at_utc=EVALUATED_AT)
+            self.assertFalse(snapshot.fts5_trigram.available)
+            self.assertEqual(snapshot.fts5_trigram.performance_warning_codes, ())
+
+    def test_expired_rss_failure_keeps_denial_without_time_warning(self):
+        snapshot = RetrievalCapabilityEvaluator(_expectation()).evaluate(
+            _manifest(
+                fts5_benchmark=self.evidence(BenchmarkExecutionPath.FTS5_TRIGRAM, ("FUZZY_P95", "PEAK_RSS")),
+                valid_until_utc="2026-08-12T11:00:00Z",
+            ), evaluated_at_utc=EVALUATED_AT,
+        )
+        self.assertFalse(snapshot.fts5_trigram.available)
+        self.assertEqual(snapshot.fts5_trigram.performance_warning_codes, ())
+
+    def test_malformed_or_unknown_report_failures_do_not_become_warnings(self):
+        for field, value in (
+            ("failed_gates", ("EXACT_P95", "UNKNOWN")),
+            ("passed", True),
+            ("exact_p95_ms", 49.0),
+            ("fuzzy_sample_count", 239),
+            ("path_config_digest", _digest("foreign-path")),
+            ("environment_digest", _digest("foreign-environment")),
+            ("exact_p95_ms", float("nan")),
+            ("execution_path", "FTS5_TRIGRAM"),
+        ):
+            with self.subTest(field=field):
+                evidence = self.evidence(BenchmarkExecutionPath.FTS5_TRIGRAM, ("EXACT_P95",))
+                manifest = _manifest(fts5_benchmark=evidence)
+                object.__setattr__(evidence.report, field, value)
+                snapshot = RetrievalCapabilityEvaluator(_expectation()).evaluate(
+                    manifest, evaluated_at_utc=EVALUATED_AT,
+                )
+                self.assertFalse(snapshot.fts5_trigram.available)
+                self.assertEqual(snapshot.fts5_trigram.performance_warning_codes, ())
+
+    def test_warning_contract_clone_and_tamper_checks(self):
+        from tm_retrieval import _snapshot_capability_snapshot
+
+        snapshot = RetrievalCapabilityEvaluator(_expectation()).evaluate(
+            _manifest(fts5_benchmark=self.evidence(BenchmarkExecutionPath.FTS5_TRIGRAM, ("EXACT_P95", "MIGRATION"))),
+            evaluated_at_utc=EVALUATED_AT,
+        )
+        clone = _snapshot_capability_snapshot(snapshot)
+        self.assertEqual(clone.fts5_trigram.performance_warning_codes, ("EXACT_P95", "MIGRATION"))
+        self.assertIsNot(clone.fts5_trigram, snapshot.fts5_trigram)
+        with self.assertRaises(FrozenInstanceError):
+            snapshot.fts5_trigram.performance_warning_codes = ()  # pyright: ignore[reportAttributeAccessIssue]
+        for invalid in (["EXACT_P95"], ("UNKNOWN",), ("EXACT_P95", "EXACT_P95"), ("MIGRATION", "EXACT_P95"), (1,)):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises((ValueError, TypeError)):
+                    replace(snapshot.fts5_trigram, performance_warning_codes=invalid)
+                object.__setattr__(snapshot.fts5_trigram, "performance_warning_codes", invalid)
+                with self.assertRaises((ValueError, TypeError)):
+                    _snapshot_capability_snapshot(snapshot)
+                with self.assertRaises((ValueError, TypeError)):
+                    replace(snapshot)
 
 
 class SummaryOpacityAndDeterminismTests(unittest.TestCase):

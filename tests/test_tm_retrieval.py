@@ -5358,6 +5358,16 @@ class TMRetrievalCapabilityIntegrationTests(unittest.TestCase):
         ):
             service._query_reserved((), query, snapshot_tampered)
 
+    def test_reserved_query_rejects_warning_only_snapshot_drift(self) -> None:
+        service = TMRetrievalService(capability_publisher=_retrieval_capability_publisher())
+        reservation = service._reserve_query_operation()
+        object.__setattr__(
+            reservation.capability_snapshot.fts5_trigram,
+            "performance_warning_codes", ("EXACT_P95",),
+        )
+        with self.assertRaisesRegex(ValueError, "capability snapshot drift"):
+            service._query_reserved((), _service_query(resource_order=()), reservation)
+
     def test_reserved_query_refresh_callback_uses_old_snapshot_without_locking(
         self,
     ) -> None:

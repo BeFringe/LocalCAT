@@ -19,6 +19,11 @@ from tests.gate_d_input_support import issue_source_bound_fixture_result
 from tests.test_tm_benchmark_gate import (
     _base_capability_manifest,
     _combined_bundle,
+    _time_failure_bundle,
+    _capability_publisher,
+    _GENERATED_AT,
+    _VALID_UNTIL,
+    _EVALUATED_AT,
 )
 
 
@@ -26,8 +31,8 @@ CONTRACT_PATH = (WORKSPACE_ROOT / "benchmark_tm_contract.json").resolve()
 ISSUED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
 
 
-def _run_result() -> tm_benchmark_gate.BenchmarkGateDRunResult:
-    bundle = _combined_bundle(fts5_missing=0, fallback_missing=0)
+def _run_result(*, time_failures: bool = False) -> tm_benchmark_gate.BenchmarkGateDRunResult:
+    bundle = _time_failure_bundle() if time_failures else _combined_bundle(fts5_missing=0, fallback_missing=0)
     artifact = tm_benchmark_gate.benchmark_evidence_bundle_to_json(bundle).encode(
         "utf-8"
     )
@@ -60,18 +65,20 @@ def _qualification_facts(state_root: Path) -> dict[str, object]:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 2 or arguments[0] not in {"persist", "restore"}:
+    if len(arguments) != 2 or arguments[0] not in {"persist", "restore", "persist-time", "restore-time"}:
         return 2
     state_root = Path(arguments[1]).resolve()
     manifest = _base_capability_manifest()
     try:
         restored = None
-        if arguments[0] == "persist":
+        time_failures = arguments[0].endswith("-time")
+        if arguments[0].startswith("persist"):
+            run_result = _run_result(time_failures=time_failures)
             tm_benchmark_gate._persist_gate_d_attestation(
                 contract_path=CONTRACT_PATH,
                 state_root=state_root,
                 base_manifest=manifest,
-                run_result=_run_result(),
+                run_result=run_result,
                 issued_at_utc=ISSUED_AT,
             )
         else:
@@ -80,12 +87,24 @@ def main(arguments: list[str]) -> int:
                 state_root=state_root,
                 base_manifest=manifest,
             )
+            run_result = restored
         facts = _qualification_facts(state_root)
         facts["mode"] = arguments[0]
         facts["pid"] = os.getpid()
         if restored is not None:
             facts["restored_artifact_digest"] = restored.artifact_digest
             facts["restored_bundle_digest"] = restored.bundle_digest
+        if time_failures:
+            published = tm_benchmark_gate.publish_retrieval_capability_gate_d(
+                manifest, run_result, _capability_publisher(),
+                generated_at_utc=_GENERATED_AT, valid_until_utc=_VALID_UNTIL,
+                evaluated_at_utc=_EVALUATED_AT,
+            )
+            facts["decisions"] = [
+                {"available": decision.available, "warnings": decision.performance_warning_codes}
+                for decision in (published.snapshot.fts5_trigram, published.snapshot.gram_fallback)
+            ]
+            facts["performance_passed"] = run_result.bundle.suite_report.passed
         sys.stdout.write(json.dumps(facts, sort_keys=True, separators=(",", ":")) + "\n")
         return 0
     except tm_benchmark_gate.BenchmarkGateDError as error:

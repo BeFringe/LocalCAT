@@ -34,8 +34,8 @@ it composes one new manifest preserving every envelope and Gate C fact
 byte-for-byte/value-for-value and replacing only the two fuzzy benchmark
 fields from ``retrieval_benchmark_evidence_pair``.  A Core-private publisher
 transition verifies the candidate's retained Gate C decisions and per-path
-report truth, prepares the immutable publication result, and only then makes
-that exact snapshot query-visible.  The owner never constructs a publisher
+admission and time warnings, prepares the immutable publication result, and
+only then makes that exact snapshot query-visible.  The owner never constructs a publisher
 or evaluator, never imports the evaluator, and never bypasses the publisher
 to grant availability.
 
@@ -197,6 +197,7 @@ from tm_retrieval_capability import (
     RetrievalCorrectnessCohortEvidence,
     _RETRIEVAL_CAPABILITY_SNAPSHOT_DESCRIPTOR,
     _validated_refresh_retrieval_capability,
+    _benchmark_report_admission,
 )
 from platform_fs import (
     compose_platform_file_backend,
@@ -5411,23 +5412,21 @@ def _require_utc_datetime(value: object) -> datetime:
     return value
 
 
-def _report_path_truth(evidence: RetrievalBenchmarkEvidence) -> bool:
-    """True exactly when one path report honestly passes every gate."""
-    report = evidence.report
-    return report.passed is True and report.failed_gates == ()
-
-
 def _verify_path_decisions_match_reports(
     snapshot: RetrievalCapabilitySnapshot,
     fts5_evidence: RetrievalBenchmarkEvidence,
     fallback_evidence: RetrievalBenchmarkEvidence,
 ) -> None:
-    """Fail closed unless per-path decisions match each report truth."""
+    """Require the evaluator's admission and warnings for each strict report."""
     for decision, evidence in (
         (snapshot.fts5_trigram, fts5_evidence),
         (snapshot.gram_fallback, fallback_evidence),
     ):
-        if decision.available != _report_path_truth(evidence):
+        admitted, warnings = _benchmark_report_admission(evidence.report)
+        if (
+            decision.available != admitted
+            or decision.performance_warning_codes != warnings
+        ):
             raise BenchmarkGateDError(
                 "GATE_D.PUBLICATION_DECISION_MISMATCH"
             )
@@ -5517,9 +5516,10 @@ def _publish_retrieval_capability_gate_d_prepared(
     explicit validity
     window.  Performs exactly one Core-owned validated publisher transition
     at the explicit evaluated instant: per-path decisions are checked against
-    report truth before the candidate can become query-visible.  A failed
-    report must stay closed and a passed report must be open.  The owner never
-    constructs a publisher/evaluator and never grants availability itself.
+    evaluator admission and warnings before the candidate becomes visible.
+    Time-only performance failures remain honest failures in the report.
+    The owner never constructs a publisher/evaluator and never grants
+    availability itself.
     """
 
     if _input_session is not None:
