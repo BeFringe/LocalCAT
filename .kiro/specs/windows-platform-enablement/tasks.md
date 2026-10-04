@@ -475,7 +475,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Core Qualification and Host Consumption Integration_
   - _Depends: 7.2, tm-storage-retrieval-index 9.6b, feature5-ui-integration 6.6b_
 
-- [ ] 7.4 在同一候选贯通完整产品旅程
+- [x] 7.4 在同一候选贯通完整产品旅程
   - 汇合 Core 9.7 与 Feature5 6.8/9.2a 的准入消费及轮询实际候选补验；完整验证、逐路径性能 verdict、功能准入与最终发行结论分别记录，不重开或重签历史 7.3。
   - 汇合 WA-01/02/03/04/05 的实际 packaged API、Feature5 安全投影和 WA-08 Qt journey；owner 使用 7.2 已可运行产物及 7.3 资格，不等待本项先完成。
   - 覆盖正常首页/项目参数、Project 编辑保存冷重开、TM 激活/重启恢复、TMX 直接导入、FTS5/trigram 创建查询重开、真实建议、qwindows、资源与头像 fallback；默认资源仅缺失时播种。
@@ -484,9 +484,9 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Packaged Product Journey Integration_
   - _Depends: 7.3, WA-01 5.12b, WA-02 1.4b, WA-02 4.5b, WA-04 5.5a, WA-05 5.4a, feature5-ui-integration 9.2a, qt-editor-json-mvp-increment 5.4b_
 
-- [ ] 8. 验证最终候选中的数据保护与失败边界
+- [x] 8. 验证最终候选中的数据保护与失败边界
 
-- [ ] 8.1 验证干净环境、资源缺失和 worker 生命周期
+- [x] 8.1 验证干净环境、资源缺失和 worker 生命周期
   - 对最终候选从干净用户、非仓库 CWD、无 Python/Qt 开发环境启动；验证声明资源缺失/损坏、可选头像 fallback、已有配置/资源不被默认值覆盖。
   - 在最终候选复验 7.2c 涉及的实际入口/transport/Qt 生命周期；复用的是未变底层机制证据，不是其他 EXE 的集成结果。
   - 完成时，所有必测失败均可诊断，取消胜负与 child 回收成立，不访问 checkout。
@@ -494,7 +494,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Packaged Entry and Lifecycle Acceptance_
   - _Depends: 7.4_
 
-- [ ] 8.2 验证项目与 TM 的真实保护/恢复
+- [x] 8.2 验证项目与 TM 的真实保护/恢复
   - 经实际消费者执行双实例锁竞争、target-open/发布失败、进程中断/冷重开、权限/reparse 拒绝；核对原项目/资源与 old/new/recovery-only、canonical authority 和 UI 安全投影。
   - 依据 12.5–12.7 对受影响的 token/ACL/MIC、FileId、share、instruction fault 与 OS reboot 深入矩阵重验；未变部分列明原 owner 证据及不变前提，不重签为本次 PASS。
   - 完成时，候选实际保护成立，所有触发项有结果，复用有可核查依据；domain/Entra 和硬断电实验不扩成新门。
@@ -502,7 +502,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Packaged Data Protection and Recovery_
   - _Depends: 8.1_
 
-- [ ] 8.3 验证资源交换与检索失败边界
+- [x] 8.3 验证资源交换与检索失败边界
   - TMX 错误/逃逸/reparse/读取漂移保持目标零变更；真实 SQLite 创建/查询/重开及缺失 FTS5 的稳定失败，不以 compile-option 代答。
   - TMX ResourcePackage 保持 export-only、import/apply 负向拒绝；JSONL/ResourcePackage 搬运数据不搬运本机 Fuzzy 资格。
   - 完成时，失败不损坏原资源、不会被渲染为普通 no-match 或未经批准 fallback，原业务语义不变。
@@ -512,7 +512,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 - [ ] 9. 闭合受影响回归与独立发行评审
 
-- [ ] 9.1 核对实际变更与证据复用范围
+- [x] 9.1 核对实际变更与证据复用范围
   - 对最终 diff/依赖/调用合同/关键运行条件判定 Core、数据端口和共享代码影响；检查业务模块没有重新引入直接 POSIX/Win32 primitive，普通入口没有隐式激活 W3。
   - 按 Design 验收表运行实际触发的 source/macOS/Linux 回归与 Windows 深入矩阵；未变 owner 证据保留原锚/范围，复用不写成新 PASS。
   - 完成时，所有触发项通过且复用前提可复核，不机械要求每次纯 UI/头像变化重跑全仓各平台。
@@ -544,8 +544,6 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 - Task 3.3 已规定完整既有 W1 payload 在活身份、私有安全与内容复证后直接进入 `LockFileEx`；无写入的普通取得不执行 `FlushFileBuffers`，首次创建和 strict-prefix 恢复仍须 write/flush/readback。
 
 ## Implementation Notes
-
-- Task 7.4：`3628fde4e2a4` 的 ProjectPackage 导入已到达正常编辑会话，但应用真实 TM 建议使主线程重复等待 runtime generation 锁；强制结束这个验证进程后，已保存项目、源文件与否定资格记录未变。修复归 Feature5 Controller 的建议消费接缝；须在重建候选中重放应用、保存和冷重开，不能以 source 回归关闭本项，既有性能失败仍独立保留。
 
 - Task 9.1：对实际变化的最终路径、内容捕获、W1、输出锁和 SOURCE 窗口补验时，激活用例须复用既有 Windows 长路径清理 helper；不吞清理失败。SOURCE 用例分别证明 Windows 活句柄以 sharing violation 阻断写入、POSIX 在发生变化后终端拒绝，不能用任意 PermissionError 跳过或将两种机制混写。测试修正不改变普通候选或 Core 兼容身份；跨平台和最终候选验收范围继续分别记账。
 

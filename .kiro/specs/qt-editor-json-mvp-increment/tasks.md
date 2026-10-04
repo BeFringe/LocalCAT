@@ -407,7 +407,7 @@
   - _Amendment: WA-08_
   - _Depends: 5.2a, 5.3a, WA-03 source phase, WA-04 source phase, WA-05 source phase, WA-07 source phase, windows-platform-enablement 6.6a_
 
-- [ ] 5.4b 执行同候选clean-user Windows完整产品journey
+- [x] 5.4b 执行同候选clean-user Windows完整产品journey
   - 从non-repo CWD、无需用户安装Python/Qt的干净用户环境启动普通onedir/windowed EXE，完成正常首页/项目参数、编辑保存重开、Project/ResourcePackage消费、TM激活/重启恢复、TMX直接导入、FTS5创建查询重开与真实建议消费；同时验证已有Qt工具、资源与头像行为。相邻业务能力只从其owner入口消费，不在Qt补造授权。
   - 在该最终候选实际覆盖默认资源不覆盖已有数据、资源迁移不携带Fuzzy资格、TMX ResourcePackage import/apply负向拒绝、失败保留原项目/资源，以及取消/关闭/退出；Core正式资格与数据端口证据按WA-06/07关联，不从UI成功状态推断Gate PASS。
   - 完成时，平台Requirement 12候选必测项与复用前提均有明确来源；若修复改变候选，更新关联并按影响范围重验，最终不能拼接不同EXE成功片段。不借环境变量、复制checkout或现场patch修复测试中的产物；本任务贡献同一0.5.2验收，不把烟测另算交付。

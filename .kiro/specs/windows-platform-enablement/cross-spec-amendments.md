@@ -203,7 +203,7 @@ WA-06原R3事实的当前可达tree为`db7e7ef0024d297264fbc7434b28ec7f77adf96c`
 
 WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c/7.2、Core 9.6e 与 Feature5 3.6b 的首条实际普通生产链保留原范围，其小样本结果不授予正式资格。正式本机资格与 Core 产品消费由下方 WA-06 已验收候选事实登记；其余 owner 的 clean-user 汇合及平台 `7.4 → 8/9/10` 仍待闭合，没有 terminal `MERGED_PASS`。
 
-### 普通候选集成事实
+### 普通候选集成事实：8fae 已登记范围
 
 | dispatch_id | revision | owning_spec | integration_anchor | current_status | disposition |
 |---|---|---|---|---|---|
@@ -264,4 +264,34 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 已完成范围为 Core `9.6b`、Feature5 `6.6b/7.6b` 与平台 `7.3`，独立累计评审支持此范围。本机净化环境不等同独立未安装 Python/Qt 的 Windows 环境；Feature5 `9.2a`、Qt `5.4b` 与平台 `7.4/8/9/10` 仍待收束，发行状态保持 `NOT_VERIFIED`。后续只补缺失环境及实际变更触发项，不机械重跑已完成矩阵。
 
-`WR-*` 记录稳定revalidation anchor、结果和“无 contract delta”的owner确认；完整命令、日志、矩阵与摘要归受版本控制的evidence manifest或受保留CI artifact，不把ignored本机副本写入本ledger。只有ledger全部闭合且实际代码差异仍落在获批边界内，最终Windows Feature GO才可进入审查。
+#### 时间准入修订候选 681a
+
+候选 `681a898d51c7093ab75fe2bfd5ea41efe729b5099f1be5ce5413794ca132c3b3` 由 `f5c76e8b00819ae6081b07f44e91703ed0d42891` 构建；后续任务登记不改变该产物。交付包 `LocalCAT-0.5.2-candidate-681a898d51c7-windows-x64.zip` 为 55,618,931 bytes、189 files，SHA-256 `5ce8b9cbcb496af80a96a037cf5291e0353ccfc333056924c15ebf08e1848ef5`；EXE SHA-256 为 `2e4ee917e3ce587c4b020802e98ce7fe54bd4997e2f1bea4de068832669a7e76`。
+
+两台 Windows 设备实际运行相同候选与 Core fingerprint `0d98ec8c497d2dbc55056d96610162533cf55a81c23f10450573e64701b93767`，均完成正式 Gate C、5000/200 oracle 及 100k 双路径。验证机未安装用户 Python/Qt，产品从包内加载 CPython 3.14.7、Qt 6.11.1、SQLite 3.50.4，经正常入口、独立数据目录与非仓库 CWD 运行；Codex 自用运行时未参与产品逻辑。
+
+| 设备 / 路径 | Recall | Exact P95 ms | Fuzzy P95 ms | 迁移 s | RSS MiB | 性能报告 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 开发机 / FTS5 | 1 | 0.8860 | 386.1537 | 63.7072283 | 415.48046875 | PASS |
+| 开发机 / fallback | 1 | 1.1204 | 380.7316 | 93.2754103 | 419.53515625 | PASS |
+| 验证机 / FTS5 | 1 | 2.1331 | 564.0952 | 90.1006187 | 415.83203125 | FAIL：FUZZY_P95 |
+| 验证机 / fallback | 1 | 1.7143 | 573.2625 | 131.6469845 | 419.63671875 | FAIL：FUZZY_P95、MIGRATION |
+
+按 ADR-029，验证机的完整结果仅时间失败，两条路径可用并带性能警示；原报告保持 FAIL。真实 TMX 导入及 canonical/FTS5 激活后，Qt 实际应用 EXACT 100% 与 FUZZY 92% 建议，保存并在新进程恢复译文、第 181 段、建议和双入口警示。资格与报告字节未变，冷开不重跑 Gate。开发机同候选另外覆盖发布锁争用延期、正确终态刷新、关闭停止投递、取消与后台编辑保存。Core `9.7`、Feature5 `6.8/9.2a` 已完成各自验收；这不把性能 FAIL 或后续发行裁决改成 PASS。
+
+验证机首次运行有一次 `workspace.json` 替换遭遇 WinError 32，位置未恢复，但项目译文与资格恢复成功。随后正常用户旅程的保存、位置恢复和 stderr 均正常；初次失败原因仍未确定，不声明已修复。后台保存的约 16 秒观测包含桌面操作与重叠动作，不能作为纯保存耗时或低延迟结论。原始运行报告、截图和失败材料随候选保留在 `artifacts/windows/ordinary-build-oracle-scheduling/`，不逐次提交机械摘要。
+
+| Owner / 当前任务 | 同候选的实际消费与有限复用 |
+| --- | --- |
+| WA-02/03 Project / Chunk；平台 `8.2` | 项目包编辑保存、目标占用与外部真实 owner 锁拒绝，解除后可重试；未保存编辑进程中断后保留最后成功保存内容。深层 carrier/Chunk 事务与 OS reboot 矩阵沿原 owner 范围复用，不写成两个 EXE 同时写入或本候选重新执行全部发布阶段。 |
+| WA-06 Core / 平台数据端口；平台 `8.2` | TM reservation 竞争、canonical ACL 和 private junction 拒绝均通过实际消费者，健康资源仍可查询；首次 BUILD 中断后，冷开保留既有 healthy canonical，未发布 probe 保持原 legacy authority，未复用或删除不明残留。该中断不代表已验证所有 durable publish 阶段。 |
+| WA-01/04/05 Parser / Resource / TMX；平台 `8.3` | 实际 TMX malformed 与 junction 输入拒绝且资源零变更；真实 FTS5 创建/查询/冷开。TMX ResourcePackage 导出后 import/apply 拒绝；CSV 包经预览和创建导入，独立数据目录可查看 5 条术语且没有 Fuzzy 资格。逃逸/读取漂移和缺 FTS5 的深入分支按未变 owner 合同复用，4 项当前 source negative 不冒充 EXE 缺模块实验。 |
+| WA-07/08 Feature5 / Qt；`6.8/9.2a`、`5.4b`、平台 `7.4/8.1` | 独立无用户 Python/Qt 的真实旅程、资格警示与冷恢复成立。当前 EXE 的首页/项目参数、声明资源拒绝、既有数据不覆盖、worker/关闭/轮询终态均有原件；单 JSON inventory 实际显示无头像“—”，正常退出且项目不变。未声明随包提供头像 catalog。 |
+
+上述范围已通过独立审阅，支持 Qt `5.4b` 与平台 `7.4/8.1–8.3`。旧 3c20/8fae 的 owner 任务和 source/pre-build 锚不改签；本候选共用机制的复用以实际实现、依赖、调用合同及运行条件不变为前提。数据端口、Parser/Project/Resource/TMX 与 SQLite 激活持久化实现相对后续修复基线未变，6 个相关 Python/SQLite/Qt runtime 二进制及依赖锁未变；Core 准入、Host 投影、轮询和 oracle 调度的变化已由当前真实 Gate/旅程及受影响回归覆盖。
+
+回归原件包括 Windows 数据端口 72 项、长路径恢复 5 项，以及 macOS CPython 3.14.7 / Qt 6.11.1 / SQLite 3.53.1 的受影响 source 回归共 181 过、7 项 Windows-only skip。Mac 包含实际 5000/200 双路径 oracle，不代表 macOS frozen、全量 100k 或 Linux PASS；本轮未改变 Linux launcher/POSIX backend、RSS 单位或平台选择，未触发新的 Linux 专项。原 Windows 两进程初次激活与 kill-holder 恢复矩阵保留 owner `f28ec5d` 原范围；原 `windows_tm_current_source_evidence.json` 及未变测试可从保留的实际 Git 链恢复，不重签为本候选执行。
+
+最终发行仍由 Task `9.2/10.1` 独立裁决；当前技术验收不豁免 Design 已要求的 Steering 结构/路线图同步，不将性能 FAIL 改成 PASS。
+
+历史 `WR-*`、source/pre-build 状态及原锚保持其原有范围；普通发行以当前 required owning task、同候选必测与触发项、有限复用依据及独立评审闭合为准，不要求重开 W3 staged 状态。完整命令、日志和截图随对应候选保留，本节登记有信息增量的集成结论；只有这些范围闭合且实际代码差异仍在获批边界内，最终 Windows Feature GO 才可进入裁决。
