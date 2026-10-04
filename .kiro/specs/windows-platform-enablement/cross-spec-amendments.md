@@ -163,7 +163,7 @@ W1 + ADR-025 + Steering ownership
 | integration_anchor | 单一稳定commit；其tree包含该row已批准的amendment实现与所声明验收，较早实现提交由Git ancestry追溯；禁止记录工作树hash、patch-equivalent或随分支推进变化的tip |
 | disposition | 仅在终态记录`MERGED_PASS` / `BLOCKED` / `SUPERSEDED`，不得用 `SKIPPED` 放行 required row |
 
-### Historical Source Integration Facts
+### 原始 source 验收锚
 
 下表保留原source验收登记及其原始anchor。Task 7.0发现这些旧commit仍存在于保留历史，但均不是当前接受链的祖先；不能再把本表直接当作当前可达性证明。下方另列真实可达的集成锚，不修改旧evidence中的commit或摘要。
 
@@ -178,7 +178,7 @@ W1 + ADR-025 + Steering ownership
 | WA-07 | `R1` | `feature5-ui-integration` | `76f9ea47c7962d2d6d3daaf3c18195dc6afc53e4` | `SOURCE_MERGED_PASS` | — |
 | WA-08 | `R1` | `qt-editor-json-mvp-increment` | `8f0a418a6e5fbbd7cfc302c75300a78fbad76680` | `SOURCE_MERGED_PASS` | — |
 
-### Current Integration Facts
+### 当前继承的 source／构建前基线
 
 下表列出当前继承的 source 与构建前消费基线。代码、有效测试和批准合同继续保留；原 W3 验收报告归强证明路线，不作为普通发行的当前验收。表中状态不表示重新运行 source，也不授予普通 frozen 资格。
 
@@ -201,7 +201,7 @@ WA-06原R3事实的当前可达tree为`db7e7ef0024d297264fbc7434b28ec7f77adf96c`
 
 历史 owner 声明位于 [`packaging/windows/frozen_roots.json`](../../../packaging/windows/frozen_roots.json)，包含 Gate roots、benchmark inventory、动态 import、worker 映射及默认资源。7.0/7.1 的代码与[构建接口](frozen-build-inputs.md)保留原用途；普通发行只复用有实际消费者的输入，其活动接线以当前 Design 和 Core owning 合同为准，不默认携带该声明的完整源码闭包。
 
-WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c/7.2、Core 9.6e 与 Feature5 3.6b 的首条实际普通生产链保留原范围，其小样本结果不授予正式资格。正式本机资格与 Core 产品消费由下方 WA-06 当前候选事实登记；其余 owner 的 clean-user 汇合及平台 `7.4 → 8/9/10` 仍待闭合，没有 terminal `MERGED_PASS`。
+WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c/7.2、Core 9.6e 与 Feature5 3.6b 的首条实际普通生产链保留原范围，其小样本结果不授予正式资格。正式本机资格与 Core 产品消费由下方 WA-06 已验收候选事实登记；其余 owner 的 clean-user 汇合及平台 `7.4 → 8/9/10` 仍待闭合，没有 terminal `MERGED_PASS`。
 
 ### 普通候选集成事实
 
@@ -232,22 +232,22 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 未变 owner 的 source 复用限定在原 Windows 持久化及 Qt 深入矩阵；前提、变更接缝与摘要见原 `owner-reuse-audit.json`（SHA-256 `eb6ddb688841c20fbe88afdfe9da13522ce654104e63471a7d487cd304c111b2`）。原始任务、source 锚和失败记录不变，后续 Core/worker 改动须重验受影响消费；本次不声明最终发行通过。
 
-#### 当前候选 8fae
+#### 已验收候选 8fae
 
 候选 `8faeee03e1dd31d1162ce1d3447602a7af09fd1b20ac3313fa19bb321f51f5ad` 来自原构建提交 `4d8276f90417927bf329b879239cb9722238b131`；Core fingerprint 为 `4912f458ddf5c009683d319dd97bec959cc6f1b6ec4a4ae3367b102d93c836ab`。后续测试与文档修订未改变产物。原构建血缘由保留标签追溯，不以整理后的提交重签构建或资格。
 
 交付候选为 `LocalCAT-0.5.2-candidate-8faeee03e1dd-windows-x64.zip`（55,606,410 bytes、189 files），SHA-256 `8080c25542e60617788a02e06258ed6ddae18af181f61dabaf39210449bb8951`；EXE SHA-256 `7a60477e75aa9e1295d650382e7147abb89090559691e310fd0e8ea12a0e0de6`。ZIP 与原 payload 逐文件一致，不携带设备密钥或资格。
 
-| 实际能力 | 当前候选结果与边界 |
+| 实际能力 | 该候选结果与边界 |
 | --- | --- |
 | Core 与 Host 正式资格 | 正常设置入口实际执行 Gate C、5000/200 oracle 与 100k FTS5/fallback Gate D，经 same-EXE fresh worker 和既有 Host 发布；冷开恢复、Fuzzy 建议应用及保存真实完成。 |
 | TM 导出→激活→查询 | 2929 条 JSONL 搬运后按原顺序、内容和 provenance 激活、冷开查询；不复制数据库、设备密钥或资格。导出目标占用与 W1 锁拒绝保持旧数据，解除后重试成功。 |
 | 资格与资源隔离 | 缺失、损坏、不兼容及 ACL 异常资格只关闭 Fuzzy，Exact 保持；canonical ACL 拒绝及 private junction 均不回落 activated JSONL，健康资源可用，恢复后 Exact 可用且数据不变。 |
 | 后台工作与关闭 | 实际运行中关闭窗口，父进程 exit 0、子进程回收、无资格安装、数据不变；采集器 WinError 5 与缺少最终 query exit code 的观察限制保留。当前 worker 的 16 个协议/异常反例与未变旧候选 GUI 异常投影有限复用，未声称新跑完整 GUI kill 矩阵。 |
 | Project/TMX/Resource 用户旅程 | 两文档六段 Project、两条 TMX 的 Exact/Context 消费、应用保存与中断后冷开；Termbase package 导出/预览/创建/应用/冷开；TMX package import 拒绝且零变更。 |
-| 普通入口与资源 | 仓库外 CWD 正常 EXE 启动；候选副本中声明的 terms.csv 缺失/损坏导致稳定失败、exit 1 且用户数据不变。qwindows 负向矩阵仅复用未变 DLL/入口机制；当前候选实际加载窗口。 |
+| 普通入口与资源 | 仓库外 CWD 正常 EXE 启动；候选副本中声明的 terms.csv 缺失/损坏导致稳定失败、exit 1 且用户数据不变。qwindows 负向矩阵仅复用未变 DLL/入口机制；该候选实际加载窗口。 |
 
-最新一次完整计量为单次 `measured_repeats=1`，沿用原 warmup、计时与 child-lifetime RSS 口径；不是稳定裕量保证：
+该候选登记的最后一次完整计量为单次 `measured_repeats=1`，沿用原 warmup、计时与 child-lifetime RSS 口径；不是稳定裕量保证：
 
 | 路径 | Recall | Exact P95 ms | Fuzzy P95 ms | 迁移 s | RSS MiB |
 | --- | --- | --- | --- | --- | --- |
