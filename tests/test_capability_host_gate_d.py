@@ -543,6 +543,45 @@ def _query_effective_recall(snapshot: object) -> CandidateRecallMetadata:
 
 
 class CapabilityHostGateDTests(unittest.TestCase):
+    def test_display_poll_hides_prepared_success_until_commit_or_rollback(self) -> None:
+        for rollback in (False, True):
+            with self.subTest(rollback=rollback):
+                execution = _FakeGateDExecution()
+                composition = _composition(self, execution)
+                _gate_c(composition)
+                owner = _gate_d_owner(composition)
+                prepared, release = Event(), Event()
+                original_publish = execution.publish
+
+                def held_publish(**kwargs: Any) -> object:
+                    original_prepare = kwargs["prepare_publication"]
+
+                    def hold_prepared(snapshot: object) -> object:
+                        result = original_prepare(snapshot)
+                        prepared.set()
+                        if not release.wait(5):
+                            raise AssertionError("display poll waited on publication")
+                        if rollback:
+                            raise host_module._GateDOperationalError("GATE_D.CLEANUP_PENDING")
+                        return result
+
+                    return original_publish(**{**kwargs, "prepare_publication": hold_prepared})
+
+                with patch.object(execution, "publish", held_publish):
+                    owner.start_gate_d(evaluated_at_utc=_EVALUATED_AT)
+                    self.assertTrue(prepared.wait(5))
+                    try:
+                        # The real prepare callback has assigned the tentative
+                        # success. It cannot escape the still-held owner lock.
+                        self.assertIs(getattr(owner, "_RetrievalGateDOwner__status").state, host_module.GateDRunState.SUCCEEDED)
+                        self.assertIsNone(owner._try_display())
+                    finally:
+                        release.set()
+                    owner.wait(timeout=5)
+                status, display = owner._try_display()
+                self.assertIs(status.state, host_module.GateDRunState.FAILED if rollback else host_module.GateDRunState.SUCCEEDED)
+                self.assertEqual(display.fuzzy_available, not rollback)
+
     def test_composition_defers_only_gate_d_exclusive_code_anchors(self) -> None:
         authority = current_source_authority()
         declaration_modules: list[str] = []

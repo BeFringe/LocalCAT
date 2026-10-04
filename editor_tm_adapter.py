@@ -228,6 +228,7 @@ class EditorTMAdapter:
         "_capability_host",
         "_fuzzy_validation_start",
         "_fuzzy_validation_status",
+        "_fuzzy_validation_poll",
         "_runtime_host",
     )
 
@@ -240,6 +241,9 @@ class EditorTMAdapter:
         | None = None,
         fuzzy_validation_start: Callable[[], FuzzyValidationDisplay]
         | None = None,
+        fuzzy_validation_poll: Callable[
+            [], tuple[FuzzyValidationDisplay, RetrievalDisplayState] | None
+        ] | None = None,
     ) -> None:
         if type(runtime_host) is not TMRuntimeHost:
             raise TypeError("editor TM adapter runtime host must be TMRuntimeHost")
@@ -263,6 +267,11 @@ class EditorTMAdapter:
         self._capability_host = capability_host
         self._fuzzy_validation_status = fuzzy_validation_status
         self._fuzzy_validation_start = fuzzy_validation_start
+        if fuzzy_validation_poll is not None and not callable(
+            fuzzy_validation_poll
+        ):
+            raise TypeError("fuzzy validation poll must be callable")
+        self._fuzzy_validation_poll = fuzzy_validation_poll
 
     def _text_matcher_handoff_for_controller(
         self,
@@ -508,6 +517,47 @@ class EditorTMAdapter:
         return FuzzyValidationDisplay(
             state=status.state,
             safe_code=status.safe_code,
+        )
+
+    def _poll_fuzzy_display_for_controller(
+        self,
+    ) -> tuple[FuzzyValidationDisplay, RetrievalDisplayState] | None:
+        """Read presentation only; never synchronize resources or query epochs."""
+
+        reader = self._fuzzy_validation_poll
+        if reader is None:
+            if self._fuzzy_validation_status is not None:
+                raise RuntimeError(
+                    "configured validation requires a paired display reader"
+                )
+            display = self._capability_host._try_retrieval_display()
+            if display is None:
+                return None
+            pair = (
+                FuzzyValidationDisplay(FuzzyValidationState.IDLE, None),
+                display,
+            )
+        else:
+            pair = reader()
+            if pair is None:
+                return None
+        if type(pair) is not tuple or len(pair) != 2:
+            raise TypeError("fuzzy validation display pair is invalid")
+        status, display = pair
+        if (
+            type(status) is not FuzzyValidationDisplay
+            or type(display) is not RetrievalDisplayState
+        ):
+            raise TypeError("fuzzy validation display pair is invalid")
+        status.__post_init__()
+        display.__post_init__()
+        return (
+            FuzzyValidationDisplay(status.state, status.safe_code),
+            RetrievalDisplayState(
+                display.context_available,
+                display.fuzzy_available,
+                tuple(display.safe_codes),
+            ),
         )
 
     def _start_fuzzy_validation_for_controller(

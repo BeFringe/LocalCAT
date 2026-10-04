@@ -20,6 +20,7 @@ from editor_contracts import (
     FuzzyValidationState,
     RetrievalDisplayState,
     TMPreferences,
+    TMThresholdDisplay,
 )
 from editor_controller import EditorController
 from editor_tm_adapter import EditorTMAdapter
@@ -209,6 +210,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             with (
                 patch.object(controller, "tm_fuzzy_validation_status") as lifecycle,
                 patch.object(controller, "tm_retrieval_status", return_value=closed),
+                patch.object(controller, "poll_tm_threshold_display", side_effect=lambda: TMThresholdDisplay(TMPreferences(), closed, lifecycle.return_value)),
             ):
                 lifecycle.return_value = FuzzyValidationDisplay(
                     state=FuzzyValidationState.IDLE, safe_code=None,
@@ -264,6 +266,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             with (
                 patch.object(controller, "tm_fuzzy_validation_status", return_value=running) as lifecycle,
                 patch.object(controller, "tm_retrieval_status", return_value=closed),
+                patch.object(controller, "poll_tm_threshold_display", side_effect=lambda: TMThresholdDisplay(TMPreferences(), closed, lifecycle.return_value)),
             ):
                 window = QtEditorWindow(controller)
                 dialog = window.create_settings_dialog()
@@ -345,6 +348,13 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
                     controller,
                     "tm_fuzzy_validation_status",
                     return_value=running,
+                ),
+                patch.object(
+                    controller,
+                    "poll_tm_threshold_display",
+                    return_value=TMThresholdDisplay(
+                        controller.tm_preferences(), controller.tm_retrieval_status(), running,
+                    ),
                 ),
             ):
                 dialog.fuzzy_revalidate_button.click()

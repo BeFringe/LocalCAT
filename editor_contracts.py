@@ -1331,6 +1331,25 @@ class FuzzyValidationDisplay:
 
 
 @dataclass(frozen=True, slots=True)
+class TMThresholdDisplay:
+    """One non-authoritative threshold presentation; never a query capability."""
+
+    preferences: TMPreferences
+    retrieval: RetrievalDisplayState
+    validation: FuzzyValidationDisplay
+
+    def __post_init__(self) -> None:
+        for value, expected in (
+            (self.preferences, TMPreferences),
+            (self.retrieval, RetrievalDisplayState),
+            (self.validation, FuzzyValidationDisplay),
+        ):
+            if type(value) is not expected:
+                raise TypeError("TM threshold display contract is invalid")
+            value.__post_init__()
+
+
+@dataclass(frozen=True, slots=True)
 class TMSuggestionReport:
     """One immutable, body-safe current-segment TM query projection."""
 
