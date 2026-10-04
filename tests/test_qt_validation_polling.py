@@ -1,6 +1,8 @@
 """A busy publication must defer UI display reads without waiting or revoking."""
 
 from threading import Condition, Event, Thread
+import json
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +18,116 @@ from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
 from tests import test_windows_ordinary_candidate as candidate_tests
 from editor_contracts import FuzzyValidationState, TMThresholdDisplay
+
+
+class OrdinaryPollingSmokeTests(unittest.TestCase):
+    """Source-only checks of the diagnostic harness, not candidate evidence."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        fixture = QtValidationPollingTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.fixture = fixture
+        self.composition = fixture.composition
+        self.window = fixture.window
+        # Reuse the guarded-lock fixture; only the smoke prelude is isolated.
+        object.__setattr__(self.composition, "_frozen_input_source", fixture.inputs)
+        self.marker = fixture.inputs.root_path.parent / "smoke.json"
+        self.marker.write_text('{"entry": "ordinary"}', encoding="utf-8")
+        self.window.show()
+
+    def _run(self, *, core_error=None, restore_missing=False):
+        from contextlib import ExitStack
+        import frozen_product_entry
+
+        with ExitStack() as stack:
+            for owner, method in (
+                (self.composition.matcher_validation_owner, "validate_text_v1"),
+                (self.composition.retrieval_gate_c_validation_owner, "validate_gate_c"),
+            ):
+                stack.enter_context(patch.object(type(owner), method))
+            owner = self.composition.retrieval_gate_d_owner
+            if restore_missing:
+                # The prelude's Gate C graph is isolated, but the real owner
+                # performs its RUNNING -> FAILED transition for missing state.
+                stack.enter_context(patch.object(type(self.composition.host), "_capture_gate_d_graph",
+                                                 return_value=object()))
+                object.__setattr__(owner, "_RetrievalGateDOwner__attestation_root", None)
+            else:
+                stack.enter_context(patch.object(type(owner), "restore_gate_d"))
+            stack.enter_context(patch.object(type(self.composition.host), "matcher_snapshot",
+                                             return_value=SimpleNamespace(generation=1, matcher=object())))
+            stack.enter_context(patch.object(type(self.composition.host), "retrieval_operation_snapshot",
+                                             return_value=SimpleNamespace(generation=1)))
+            stack.enter_context(patch.object(type(self.composition.host), "_gate_c_diagnostics", return_value={
+                "context_available": True, "fuzzy_core_available": True, "fuzzy_available": False,
+            }))
+            stack.enter_context(patch.object(frozen_product_entry, "run_ordinary_core_smoke",
+                                             side_effect=core_error, return_value={
+                                                 "test_mode": True, "final_evidence": False,
+                                             }))
+            worker = qt_editor._start_capability_validation(self.composition, self.window)
+            self.bridge = worker._localcat_capability_completion_bridge
+            frozen_product_entry.finish_ordinary_smoke(
+                self.app, self.composition, worker, self.marker, window=self.window,
+            )
+
+    def test_smoke_observes_three_real_lock_deferrals_and_drops_queued_close(self):
+        self._run()
+        core = json.loads(self.marker.read_bytes())["ordinary_core"]
+        self.assertTrue(core["test_mode"])
+        self.assertFalse(core["final_evidence"])
+        polling = core["polling"]
+        self.assertEqual([item["lock"] for item in polling["contention"]],
+                         ["owner", "host", "controller"])
+        for item in polling["contention"]:
+            self.assertTrue(item["deferred"])
+            self.assertTrue(item["views_retained"])
+            self.assertTrue(item["source_live"])
+            self.assertTrue(item["retry_timers_stopped"])
+            self.assertEqual(item["retry_state"], "IDLE")
+            self.assertGreaterEqual(item["poll_elapsed_ms"], 0.0)
+        self.assertGreaterEqual(polling["queued_before_close"], 1)
+        self.assertEqual(polling["queued_before_close"], polling["queued_after_close"])
+        self.assertFalse(self.window.isVisible())
+        self.assertFalse(self.window._fuzzy_validation_timer.isActive())
+        self.assertFalse(self.window.settings_dialog._tm_threshold_timer.isActive())
+        with self.assertRaisesRegex(RuntimeError, "revoked"):
+            self.fixture.inputs._require_open()
+
+    def test_smoke_failure_releases_observer_lock_and_records_error(self):
+        with patch.object(self.window, "_poll_fuzzy_validation", side_effect=ValueError("poll probe failed")):
+            with self.assertRaisesRegex(RuntimeError, "ordinary consumer chain failed"):
+                self._run()
+        core = json.loads(self.marker.read_bytes())["ordinary_core"]
+        self.assertEqual(core["error_type"], "ValueError")
+        from threading import enumerate as threads
+        self.assertFalse(any(item.name == "LocalCAT-ordinary-smoke" for item in threads()))
+        self.assertTrue(self.fixture.condition.acquire(False))
+        self.fixture.condition.release()
+
+    def test_smoke_retries_the_real_missing_qualification_terminal_state(self):
+        self._run(restore_missing=True)
+        status = self.composition.retrieval_gate_d_owner.status()
+        self.assertIs(status.state, host.GateDRunState.FAILED)
+        self.assertEqual(status.safe_code, "GATE_D.REVALIDATION_REQUIRED")
+        polling = json.loads(self.marker.read_bytes())["ordinary_core"]["polling"]
+        self.assertEqual(polling["baseline_state"], "FAILED")
+        self.assertEqual(polling["baseline_safe_code"], "GATE_D.REVALIDATION_REQUIRED")
+        self.assertEqual([item["retry_state"] for item in polling["contention"]],
+                         ["FAILED", "FAILED", "FAILED"])
+
+    def test_core_failure_keeps_existing_marker_and_skips_polling(self):
+        with self.assertRaisesRegex(RuntimeError, "ordinary consumer chain failed"):
+            self._run(core_error=RuntimeError("worker closed"))
+        core = json.loads(self.marker.read_bytes())["ordinary_core"]
+        self.assertEqual(core["error_type"], "RuntimeError")
+        self.assertEqual(core["generations_after_failure"]["matcher"], 1)
+        self.assertNotIn("polling", core)
 
 
 class QtValidationPollingTests(unittest.TestCase):
