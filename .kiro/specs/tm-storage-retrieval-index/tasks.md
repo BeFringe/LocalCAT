@@ -601,6 +601,14 @@
   - _Delivery phase: ordinary frozen first production chain_
   - _Depends: 本轮Core与相邻消费合同获批, 9.6c, 9.6d, ADR-013, ADR-028, windows-platform-enablement 7.2a_
 
+- [ ] 9.7 贯通时间性能报告与 Fuzzy 准入、发布及冷恢复
+  - 在唯一 capability owner 内完成严格报告到逐路径准入与时间警示的判定；Gate D publication 使用同一规则，报告数值、passed/failed_gates 保持原义。
+  - 保留 RSS、Gate C、oracle、完整执行、来源与兼容性拒绝；现有指纹覆盖策略变化，旧资格要求显式重验，不新增恢复 schema/profile。
+  - 完成时，时间单项/组合、混合路径、必要门失败、畸形/未知失败、取消/rollback、发布和冷恢复一致性均有真实 owner 回归；新候选实际完成 Gate C/D 两路并如实记录 PASS/FAIL，历史 9.6b/9.6e 不改签。
+  - _Requirements: 8.1–10_
+  - _Boundary: Core capability evaluator、Gate D publication/attestation 与安全警示合同_
+  - _Depends: 继承含 ADR-029、ADR-013/028 取代标注及 tech.md 同步的唯一治理 tip；9.6e_
+
 ## Implementation Notes
 
 - Task 9.6b：合法非legacy provenance经导出后仍须按实际source逐项保真核对，不能硬编码为legacy来源。SQLite流式游标须在成功和异常路径都关闭，否则异常引用持有的游标会阻止Windows清理。
