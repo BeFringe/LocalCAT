@@ -41,7 +41,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 | Feature 5 UI Integration | `ui-mvp`（独立 Spec） | 精确 Feature 5 merge、composition root、Controller adapter、TM suggestion/阈值/状态、macOS bundle | 重写 Core、接管 Qt Req3 搜索或 Req7 术语 CRUD |
 | Parser Foundation | `parser-rebaseline` | 中立 contracts/source/registry/composition、八个单输入组合、唯一 Application surface | 不拥有多文档、RPY 实现、chunk、sync 或 TM storage |
 | Windows source | `codex/windows-platform-enablement` | 已完成平台文件/锁/发布/private-proof、业务适配、轻量 launcher 与用户旅程 | 不依赖 W3 完成，不声称自带 Python |
-| Windows frozen | `codex/windows-frozen-reassessment` | 0.5.2 普通自包含产品闭环；continuation 独立保留 W3 强证明实现及验收事实 | 不把旧强证明任务自动继承为普通发行前置，不接管业务 owner |
+| Windows frozen | `reassessment` | 0.5.2 普通自包含产品闭环；continuation 独立保留 W3 强证明实现及验收事实 | 不把旧强证明任务自动继承为普通发行前置，不接管业务 owner |
 | Multi-document / Chunk / Resource | 各 owning Spec | 已完成 workspace、ProjectPackage、分工与资源交换；继续维护 | 不改写 Parser 单输入局部身份，不提供在线同步 |
 
 `governance/kiro-steering` 不是产品 Delivery Lane；它只是 `.kiro/steering/**`、ADR、`.kiro/settings/**`、SDD Skills 与 `AGENTS.md` 的单一治理发布 worktree，避免在正交产品线重复生成 patch-equivalent 治理提交。Windows Platform Enablement 是平台/发行适配线，也不取得相邻产品 Feature 的业务实现权。`parser-rebaseline` 已按批准的 `parser-subsystem-extraction` Requirements/Design/Tasks 完成契约、Foundation、codec、facade 迁移与 current-source evidence 重验；它没有取得相邻 Feature 的实现权。
@@ -78,10 +78,11 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
   - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
   - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
 - **当前 — Windows source 交付与 frozen 分线**:
-  - source 平台和业务适配、轻量入口与用户旅程已完成；frozen 按 ADR-028 重估，不撤销 source 结果。ADR-024/025/027 已分别收窄身份提供方环境、硬断电资格和导出锁收尾；
+  - source 平台和业务适配、轻量入口与用户旅程已完成；普通 frozen 已按 ADR-028 落地 stock onedir/windowed、same-EXE worker 与既有 Host 生命周期。ADR-024/025/027 已分别收窄身份提供方环境、硬断电资格和导出锁收尾；
   - Parser、Chunk、Project、Resource、TMX、TM Core、Feature5/UI 与 Qt 继续拥有各自业务不变量，并只通过 owning branch amendment 接入；`tmx-context-interchange` 的唯一 owner branch 为 `ui-mvp`；
   - Qt speaker avatar 只作为 Windows catalog 索引/解码与无匹配 fallback 回归，不改变资源语义、ignore 规则或打包 ownership；
-  - 旧 W3 Task 7.2 尚未通过；7.0/7.1 与 Core R4 成果保留，按新的普通发行边界择需复用，不能当作 packaged E2E。
+  - continuation 保留旧 W3 的 Task 7.2 未闭合事实及 7.0/7.1、Core R4 原成果；普通路线的候选消费与最终发行按当前 owning Tasks 登记，不沿用 W3 未决项阻塞普通发行；
+  - ADR-029 将三项时间目标与 Fuzzy 功能准入分开：完整、真实且兼容的验证仅时间超限时可警示使用，性能报告仍失败；内存、正确性、完整性及其他必要条件继续限制准入。日常异步查询与 Phase 1 优化独立于本轮发行。
 - **已实现 — Termbase column selection import**:
   - CSV/XLSX 术语导入在 Qt 非阻塞取得 codec-owned 有界列 preview，用户显式选择 source/target 物理列和首行用途；
   - preview 与正式导入绑定完整 source identity，并在同一新 sealed snapshot 上复核可见列数后才允许 stream/Store transaction；
@@ -112,7 +113,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 - 活动 worktree 必须位于持久文件系统；不得把 `/tmp`、tmpfs 或其他会被系统清理的目录作为唯一工作副本。
 - `.kiro/` 是项目事实来源，必须由 Git 跟踪；生成或批准新的 Spec 阶段后应及时形成可恢复提交。
 - Windows consumer 不得直接增加 POSIX/Win32 primitive 分支；共享平台能力只能由 `windows-platform-enablement` 提供，业务 authority 与 recovery 决策仍由 owning Spec 保留。
-- Windows source 使用用户自管 CPython 3.14 x64；普通 frozen 优先探索 PyInstaller `--onedir --windowed`，不再强制旧 W3 Boot TCB/source-only 证明。`--onefile`、installer、signing、remote/UNC 与未获证明的 filesystem 不在当前 scope。
+- Windows source 使用用户自管 CPython 3.14 x64；普通 frozen 使用 PyInstaller `--onedir --windowed`，不再强制旧 W3 Boot TCB/source-only 证明。`--onefile`、installer、signing、remote/UNC 与未获证明的 filesystem 不在当前 scope。
 
 ## Boundary Strategy
 
@@ -140,7 +141,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 ## Specs (dependency order)
 
 - [x] `parser-subsystem-extraction` -- 单输入 Parser contracts/source/registry/composition、八个内建用途/格式组合与兼容 facade 迁移。Dependencies: ADR-015
-- [ ] `windows-platform-enablement` -- source Task 1–6 已完成；frozen Task 7–10 待按 ADR-028 重新设计并独立验收，不反向阻塞 source。
+- [ ] `windows-platform-enablement` -- source Task 1–6 已完成；普通 frozen 设计与实现已按 ADR-028/029 贯通，Task 7–9 登记同候选旅程、数据保护、Core 验证与有限复用，Task 10 独立作最终发行裁决，不反向阻塞 source。
 - [x] `termbase-column-selection-import` -- CSV/XLSX codec-owned 有界列 preview、显式物理列/表头选择、source identity与可见列复核、Qt 非阻塞消费。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
 - [x] `qt-editor-json-mvp-increment` 基础产品 -- speaker、搜索/预处理/术语 CRUD 与正式 matcher 入口；Windows source 旅程已完成，frozen amendment 另行验收。
 - [x] `tm-storage-retrieval-index` 基础产品 -- SQLite、JSONL 迁移、Levenshtein/Dice、统一 matcher 与 exact/context/fuzzy；Windows source 和 R4 pre-build 已完成，packaged 资格另行验收。
@@ -173,7 +174,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 3. **Merge direction**：只从精确 `feature5@dd7c9fdb268b4ee8ac3545f43e3f5f19e715ff3b` 形成可追踪 merge；不得 squash 或 cherry-pick 重建等价历史。
 4. **Integration gate**：merge 后由 integration Spec 完成 composition root、Controller adapter、canonical activation、mixed resource 与 TM suggestion 验收；原 Qt 的正交功能继续按自身 Spec 完成。
 5. **Integration anchor**：legacy source-LWW 与当前 100% 卡片只证明 legacy exact compatibility；多候选、非 100%、阈值、fuzzy 与全局 top-10 必须由真实 canonical SQLite + production `TMRetrievalService` 证明。
-6. **Windows 交付门**：source 与 frozen 分别验收；已完成 source 不等待 packaged E2E。frozen 需按 ADR-028 收束后续设计并在真实包内验证业务与 Core Gate；共享治理仍只提交一次，再由活动线继承。
+6. **Windows 交付门**：source 与 frozen 分别验收；已完成 source 不等待 packaged E2E。普通 frozen 按 ADR-028 在真实候选内验证业务、数据保护与 Core Gate，按 ADR-029 分别记录验证完整性、性能结果、功能准入和发行裁决；共享治理仍只提交一次，再由活动线按受控重放规则继承。
 
 ## Confirmed Requirements Decisions
 

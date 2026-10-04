@@ -57,6 +57,12 @@ Layer 1 resource / termbase / canonical TM storage
 ├── capability_host.py           # Matcher/Gate C/Gate D 发布与 host lifecycle
 ├── tm_application_composition.py # legacy/canonical resource resolver/runtime host
 ├── qt_editor.py                 # stdlib composition/bootstrap 与 desktop install CLI
+├── frozen_ordinary_entry.py     # 普通 onedir/windowed 产品与限定 same-EXE worker 分派
+├── frozen_candidate.py          # 当前产物及 owner 输入摘要读取，不签发业务资格
+├── frozen_product_entry.py      # 普通资源与消费验证支持；保留 W3 产品组合入口
+├── frozen_worker_entry.py       # 独立 migration/query child 的 Core 消费入口
+├── frozen_worker_transport.py   # 二进制管道、请求关联、取消与 child 回收
+├── capability_frozen_inputs.py  # 普通候选输入接入既有 Core/Host 生命周期
 ├── qt_editor_window.py          # Layer 4 主编辑器、多文档章节/保存反馈、TM 与项目搜索
 ├── qt_browse_group_dialog.py    # Layer 4 浏览/校对单文档分组轮次投影与设备本地设置
 ├── qt_chunk_manager_dialog.py  # Layer 4 协作分工 preview/apply 与高级范围选择
@@ -89,6 +95,9 @@ Layer 1 resource / termbase / canonical TM storage
 ├── macos_app_launcher.py        # user-local .app atomic builder/validator
 ├── macos/LocalCATLauncher.c     # native execv bootstrap source
 ├── LocalCAT-launcher             # universal arm64/x86_64 Mach-O asset
+├── tools/build_windows_ordinary.py # 固定依赖与 owner 驱动的普通 PyInstaller 构建
+├── requirements-frozen-build.txt # Windows 普通发行构建依赖
+├── packaging/windows/           # Windows 入口/构建声明、版本资源与保留的 W3 材料
 ├── tools/generate_multi_document_current_source_evidence.py # Multi-Document final-roots evidence owner
 ├── multi_document_current_source_evidence.json # 19-root canonical current-source evidence
 ├── tools/generate_collaborative_chunks_current_source_evidence.py # Chunk overlay evidence owner
@@ -99,6 +108,8 @@ Layer 1 resource / termbase / canonical TM storage
 ```
 
 `po/` 与 `workloads/` 保留翻译数据和基准夹具；根目录 `tm.jsonl`、`terms.csv` 作为首次启动默认资源注册。
+
+普通 frozen 的 `localcat-candidate.json` 与 `localcat-owner-inputs.json` 随对应产物保存。逐输入摘要用于构建输入与产物关联，以及既有 fingerprint/兼容性判断；contract 与 fixture 由真实内容消费，它们不替代 Gate 执行。普通入口复用 Core 判定、Host 发布/恢复和 Qt 安全投影，不经过 W3 定制 native entry 或完整 Boot TCB。两条路线共存不改变业务 owner 或平台数据保护端口。
 
 ## 导入规则
 
