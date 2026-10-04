@@ -3581,10 +3581,23 @@ def _retrieval_display(
         )
     fts5_available, _ = capability.fuzzy_available_for("FTS5_TRIGRAM")
     fallback_available, _ = capability.fuzzy_available_for("GRAM_FALLBACK")
+    warnings = {
+        code
+        for decision, available in (
+            (capability.fts5_trigram, fts5_available),
+            (capability.gram_fallback, fallback_available),
+        )
+        if available
+        for code in decision.performance_warning_codes
+    }
     return RetrievalDisplayState(
         context_available=capability.context.available,
         fuzzy_available=fts5_available or fallback_available,
         safe_codes=capability.summary.unavailable_codes,
+        performance_warning_codes=tuple(
+            code for code in ("EXACT_P95", "FUZZY_P95", "MIGRATION")
+            if code in warnings
+        ),
     )
 
 
@@ -3595,6 +3608,7 @@ def _clone_retrieval_display(
         context_available=display.context_available,
         fuzzy_available=display.fuzzy_available,
         safe_codes=tuple(display.safe_codes),
+        performance_warning_codes=tuple(display.performance_warning_codes),
     )
 
 

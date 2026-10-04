@@ -45,6 +45,47 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
     def _events() -> None:
         QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
 
+    def test_core_time_warning_reaches_both_entries_and_retains_threshold_editing(self):
+        from tests.test_capability_host_performance_warning import (
+            _compose_warning_host, _publish_warning_bundle, _warning_bundle,
+            _warning_controller,
+        )
+
+        with worker_temporary_directory() as temporary:
+            composition = _compose_warning_host()
+            controller = _warning_controller(Path(temporary), composition)
+            window = QtEditorWindow(controller)
+            dialog = window.create_settings_dialog()
+            window.show()
+            dialog.show()
+            self._events()
+            try:
+                self.assertIs(window.tm_threshold_chip.property("fuzzyAvailable"), False)
+                _publish_warning_bundle(composition, _warning_bundle(rss_blocked=True))
+                window._poll_fuzzy_validation()
+                warning = "部分模糊检索未达性能目标，结果可能较慢"
+                self.assertEqual(window.tm_threshold_state.text(), dialog.tm_threshold_state.text())
+                for chip, label in ((window.tm_threshold_chip, window.tm_threshold_state),
+                                    (dialog.tm_threshold_chip, dialog.tm_threshold_state)):
+                    self.assertIn(warning, label.text())
+                    self.assertIn(warning, chip.accessibleName())
+                    self.assertIn(warning, chip.toolTip())
+                    self.assertIs(chip.property("fuzzyAvailable"), True)
+                    self.assertNotIn("MIGRATION", label.text())
+                    self.assertNotIn("PASS", label.text())
+                with patch("qt_tm_threshold.QInputDialog.exec", return_value=QDialog.DialogCode.Accepted), patch("qt_tm_threshold.QInputDialog.doubleValue", return_value=78):
+                    dialog.tm_threshold_chip.setFocus()
+                    QTest.keyClick(dialog.tm_threshold_chip, Qt.Key.Key_Return)
+                self._events()
+                self.assertEqual(controller.tm_preferences(), TMPreferences(0.78))
+                for chip in (window.tm_threshold_chip, dialog.tm_threshold_chip):
+                    self.assertIn("78%", chip.text())
+                self.assertIn(warning, window.tm_threshold_state.text())
+                self.assertFalse(window._fuzzy_validation_timer.isActive())
+            finally:
+                dialog.close()
+                window.close()
+
     def _threshold_entries(
         self,
         window: QtEditorWindow,

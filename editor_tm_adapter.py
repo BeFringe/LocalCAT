@@ -557,6 +557,7 @@ class EditorTMAdapter:
                 display.context_available,
                 display.fuzzy_available,
                 tuple(display.safe_codes),
+                tuple(display.performance_warning_codes),
             ),
         )
 
@@ -1056,6 +1057,7 @@ def _project_retrieval_display(
         context_available=display.context_available,
         fuzzy_available=display.fuzzy_available,
         safe_codes=tuple(display.safe_codes),
+        performance_warning_codes=tuple(display.performance_warning_codes),
     )
 
 
