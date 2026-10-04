@@ -96,7 +96,7 @@ python translation_runner.py
 - Active + Lookup 决定查询集合；Active + Update 决定确认写回集合。
 - TM/termbase 候选图均先完整构建和验证，成功后一次替换；失败保留上一组可用实例或明确 fail closed。
 - 浏览/校对页与三栏编辑器共享同一个 `EditorProject` 会话，只读表格不复制或覆盖未保存译文。
-- canonical 查询固定 EXACT → CONTEXT → FUZZY；Gate D 按 ADR-013 由 Core 复证设备本地资格，兼容键命中可跨进程恢复，缺失/失配只允许显式重验。FUZZY 仍只在正式 capability 开放且候选分数达到 device-local 阈值时出现，从不自动应用。
+- canonical 查询固定 EXACT → CONTEXT → FUZZY；Gate D 按 ADR-013 由 Core 复证设备本地资格，兼容键命中可跨进程恢复，缺失/失配只允许显式重验。ADR-029 将完整、真实且兼容结果中的三项时间超限与功能准入分开：原性能报告仍失败，RSS 512 MiB、正确性、召回、完整性及来源等必要条件继续限制对应路径；UI 只消费能力与性能警示。FUZZY 仍只在正式 capability 开放且候选分数达到 device-local 阈值时出现，从不自动应用。
 - 已发布 canonical 的跨重启平台文件身份恢复按 ADR-016；普通打开、内容证明、generation 与 Fuzzy 资格边界保持不变。
 - 项目搜索与版本化术语共用 capability-gated `TextMatcher`的 Unicode/Whole Word 语义；Qt 不复制 matcher 实现。
 - Parser 与 Engine 按 ADR-015 保持互不导入；Application 兼容入口/adapter 映射中立 parsed records 与既有 Editor/TM/Termbase contract。SQLite 是 canonical TM 持久化基线，不归 Parser Foundation；TM ADR 决定 schema、迁移、snapshot 与 capability authority，benchmark 决定 Levenshtein/Dice 组合、候选策略、阈值与性能门。
