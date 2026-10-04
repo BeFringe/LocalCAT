@@ -206,12 +206,23 @@ sequenceDiagram
 - 初始 exact-only service 可使用 Core default closed publisher，但该 sentinel publisher **不得**接收批准 Gate C roots。`recompute_retrieval_validation()` 成功后，host 必须用同一 `release.expectation` 新建 Core evaluator/publisher，先以 `initial_manifest=None` 保持关闭，再只刷新 `release.manifest`，并原子替换整套 retrieval service。
 - Gate C-only 源文件在 source composition 的启动 proof window 内已由 `RootedSourceAuthority` 绑定活句柄、exact bytes 与 digest，但不在首页首帧临界路径解析 AST 或编译 code anchor。首次后台 validation 必须进入新的串行 proof window，从 retained content 物化完整 `_ModuleSourceCodeAnchor`、runtime module bindings、`_CoreRetrievalValidationBinding` 与 `_RetrievalCheckoutIdentity`；仅当 terminal source/root reproof 成功才保存本 composition 的完整对象。后续每次 validation 仍进入 fresh proof window 并执行完整 `is_current()`，不得跨进程或绕过运行时代码复验。Gate C/D 共享的 `tm_retrieval_capability` 保持同一个启动期完整 anchor，Gate D 不重复物化。
 - Gate D只能消费上述新publisher和同一base manifest。真实重验固定当前`benchmark_tm_contract.json`，经既有平台私有存储端口创建新work root与absent evidence path；POSIX采用原0700表示，Windows采用既有SID/ACL/MIC证明。Windows Host已配置设备本地资格目录时，在其parent下创建独立的新私有工作目录，不向资格目录内部写入工作文件；选定parent须经过原有rooted校验，失败不得回退到其他位置。未配置资格目录的调用保留平台默认临时目录。成功real run由Core写入ADR-013设备本地HMAC attestation；后续进程只在strict bundle、设备密钥、runtime、implementation/proof/contract与Gate C identity全复证后重铸receipt，Qt/application不解析、不重铸。普通packaged的输入来源和terminal采用上节有限组合，不套用source AST/外置`.py`前置。
-- 启动先执行 Matcher 与 Gate C，再快速尝试 attestation restore；不得自动运行 100k Gate D。缺失、损坏或 compatibility drift 时保留 exact/context 并显示显式重验入口。用户启动的 Gate D 在后台运行，不阻塞 Qt 主线程；失败保持当前较低能力。
+- 启动先执行 Matcher 与 Gate C，再快速尝试 attestation restore；不得自动运行 100k Gate D。缺失、损坏或 compatibility drift 时保留 exact/context 并显示显式重验入口。用户启动的 Gate D 在后台运行，不阻塞 Qt 主线程；执行失败或必要准入条件不成立时保持当前较低能力，只有时间超限的报告 FAIL 按下文准入修订消费。
 - Source composition 在启动 proof window 中保留 Gate D-only 模块的 rooted file handle、exact bytes 与 digest，但不在资源就绪临界路径构造其 AST/code anchor。后台 attestation restore 或显式 run 必须进入新的 sequential proof window，只从该 retained content 构造完整 anchor，并在调用 Core owner前再次闭合 source/runtime binding；只有 terminal reproof 成功后才可在本次 composition 内复用完整 anchor，后续每次 binding 仍须执行 fresh source/runtime recheck，且不得跨进程持久化。不得用 `pyc`、loader cache、runtime `__code__` 或持久摘要替代。
 - Qt 可经 Controller-only、process-local 的安全 lifecycle 投影区分 Gate D `IDLE/RUNNING/SUCCEEDED/FAILED`。该投影只驱动“Fuzzy 性能验证中”或有限失败原因，不参与 query、threshold 或 capability 判定；Exact/Context/Fuzzy 可用性仍只来自同代 `RetrievalDisplayState`。RUNNING 时阈值入口持续可发现但不可提交，正式 Gate D publication 后沿既有 queued generation bridge 刷新当前建议与入口。
   - 轮询在 owner condition → Host lock 顺序下非阻塞取得 lifecycle 与检索展示，再由 Controller 连同偏好投影给两个阈值入口；锁忙时保留当前展示并由 Qt timer 延期，不读取待提交状态或触发同步资源刷新。显式重验终态沿同一 queued bridge 请求建议刷新，展示投影不成为查询或提交 authority。
 
 ### 当前段 mixed query
+
+#### 时间准入修订的安全消费
+
+本节映射 Requirement 6.8–13 与 Core Requirement 8.8–10，遵循 [ADR-029](../../steering/adr/adr-029.md)。恢复、手动触发和后台验证期间编辑/保存可用沿用既有合同。
+
+- **Boundary Commitments / Allowed Dependencies**：Core 判定功能准入与时间警示；Feature5 只在现有 `capability_host.py`、`editor_contracts.py`、`editor_tm_adapter.py`、`editor_controller.py` 和两个 Qt TM 入口消费。Qt 不读取 evidence、不合成失败集合，不以 `SUCCEEDED` 或用户开关授权。
+- **File Structure Plan**：Host 从同一 Core snapshot 复制逐路径警示，在既有 `RetrievalDisplayState` 增加独立的不可变 `performance_warning_codes`；克隆和精确类型校验覆盖该字段。Controller 的配对阈值展示带出该值；`qt_tm_threshold.py`、`qt_editor_window.py`、`qt_settings_dialog.py` 仅做统一的有限中文提示。没有旁路缓存或第二 publisher。
+- **跨路径语义**：全局 `fuzzy_available` 仍受 Gate C correctness 及至少一个可用路径约束；只聚合已开放路径的时间警示。全局提示采用“部分模糊检索未达性能目标，结果可能较慢”，不声称每个资源均可用。资源/实际查询继续消费对应路径的原能力决定；一路 RSS 拒绝、另一路时间超限可用时，不能用全局 OR 放开被拒绝路径。Gate C 关闭时不得显示“Fuzzy 可用”。
+- **三个独立阶段**：启动只恢复兼容资格，缺失/失配保留手动按钮；后台验证期间轮询非阻塞、主体编辑保存及各自有效的 Exact/Context 继续工作；完成后按同一 capability snapshot 显示可用性与警示。`SUCCEEDED` 仅表示发布完成，报告 FAIL 与功能可用可以同时成立。
+- **Revalidation Triggers / 退出条件**：新增字段触发 Host 克隆、Layer 4 DTO、双入口、资源局部路径、手动重验与冷恢复回归；用实际候选验证等待时编辑/保存/切段、关闭、完成后警示和建议消费。source/offscreen 轮询测试不替代该产品旅程。
+- **Out of Boundary / Governance Impact**：不改变触发方式、不取消首次验证、不修改 Core 数值或数据保护；遵循 ADR-009/011/029。平台只汇总候选事实，不取得 Core authority。日常建议异步与 Phase 1 优化独立处理，不是本轮准入实现的依赖。
 
 ```mermaid
 sequenceDiagram
