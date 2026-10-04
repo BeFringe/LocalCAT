@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "qt_editor_window.py", line 5909, in _poll_fuzzy_validation
+  File "editor_controller.py", line 3358, in tm_fuzzy_validation_status
+  File "editor_tm_adapter.py", line 504, in _inspect_fuzzy_validation_for_controller
+  File "qt_editor.py", line 841, in <lambda>
+  File "qt_editor.py", line 549, in _fuzzy_validation_display
+  File "capability_host.py", line 4707, in status
+  File "threading.py", line 314, in __enter__
+  File "capability_frozen_inputs.py", line 53, in __enter__
+  File "capability_frozen_inputs.py", line 43, in acquire
+  File "capability_frozen_inputs.py", line 36, in require_worker_wait_allowed
+  File "capability_frozen_inputs.py", line 403, in require_worker_wait_allowed
+RuntimeError: ordinary worker wait cannot block the UI thread

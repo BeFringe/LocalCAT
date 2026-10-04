@@ -1,0 +1,424 @@
+machine,source,field,value
+DEV,DEV report,schema_version,tm-benchmark-bundle-v2
+DEV,DEV report,proof_query_version,proof-query-v3
+DEV,DEV report,bundle_digest,789af50cd95532a060c6ee3b71735158a80632edeb3ef7428c156f3ed7c59927
+DEV,DEV report,contract_digest,fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4
+DEV,DEV report,suite_contract_digest,cc727db1711a64ecdb15fd1cd689f9e591b20533b3c0fd60b8a7fc20e6b1d5a1
+DEV,DEV report,implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+DEV,DEV report,contract.candidate_budget_version,candidate-budget-v1
+DEV,DEV report,contract.candidate_recall_gate,1.0
+DEV,DEV report,contract.contract_version,benchmark-v1
+DEV,DEV report,contract.corpus_composition_digest,e57b794e9b224376724350dab03bd4b8990246b42cd72de956fc23776fa84835
+DEV,DEV report,contract.corpus_composition_version,tm-corpus-composition-v1
+DEV,DEV report,contract.corpus_digest,560ebb304362c86af9dec6540dfcb5370b1fcbbdf01b938e6a7b675a3d8c8bfe
+DEV,DEV report,contract.corpus_generator_version,tm-benchmark-corpus-v1
+DEV,DEV report,contract.corpus_record_count,100000
+DEV,DEV report,contract.corpus_seed,20260729
+DEV,DEV report,contract.exact_cohort_count,1200
+DEV,DEV report,contract.exact_cohort_digest,613c92a7b45fd728d920fe92ead0d8bf73e520d512bd6e30cb6cc4dfdd092e9e
+DEV,DEV report,contract.exact_min_samples,1000
+DEV,DEV report,contract.exact_p95_gate_ms,50.0
+DEV,DEV report,contract.fallback_path_config_digest,792f57dba4ba9fbc9a72fa72012a596aaff6e99d6d6bad3c66fb99232111f936
+DEV,DEV report,contract.fast_path_config_digest,1a0de4fe6e04903698a87b1e0341cbe092ee49346f580b51c3adefd161e87079
+DEV,DEV report,contract.fuzzy_cohort_count,240
+DEV,DEV report,contract.fuzzy_cohort_digest,7f9c6bc6ca2b9d871ba7a11c01126c7953ad89e68e4d1978f2bc4636ff581b1f
+DEV,DEV report,contract.fuzzy_min_samples,200
+DEV,DEV report,contract.fuzzy_p95_gate_ms,500.0
+DEV,DEV report,contract.measured_repeats,1
+DEV,DEV report,contract.migration_gate_seconds,120.0
+DEV,DEV report,contract.minimum_similarity,0.6
+DEV,DEV report,contract.oracle_query_count,200
+DEV,DEV report,contract.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+DEV,DEV report,contract.oracle_subset_record_count,5000
+DEV,DEV report,contract.peak_rss_gate_mib,512.0
+DEV,DEV report,contract.percentile_method,nearest-rank
+DEV,DEV report,contract.rss_scope,child-process-lifetime-v1
+DEV,DEV report,contract.scorer_config_digest,2de89b48cb0c3331aa984e28d4a4fd21fad273cc2f8bd8df65b2bbea8d389034
+DEV,DEV report,contract.top_k,10
+DEV,DEV report,contract.warmup_queries_per_cohort,100
+DEV,DEV report,fts5.report.execution_path,FTS5_TRIGRAM
+DEV,DEV report,fts5.report.passed,true
+DEV,DEV report,fts5.report.failed_gates,[]
+DEV,DEV report,fts5.report.candidate_recall,1.0
+DEV,DEV report,fts5.report.migration_seconds,70.2095285
+DEV,DEV report,fts5.report.exact_p95_ms,1.1471
+DEV,DEV report,fts5.report.fuzzy_top10_p95_ms,390.8631
+DEV,DEV report,fts5.report.peak_rss_mib,413.86328125
+DEV,DEV report,fts5.report.exact_sample_count,1200
+DEV,DEV report,fts5.report.fuzzy_sample_count,240
+DEV,DEV report,fts5.report.corpus_digest,560ebb304362c86af9dec6540dfcb5370b1fcbbdf01b938e6a7b675a3d8c8bfe
+DEV,DEV report,fts5.report.corpus_composition_digest,e57b794e9b224376724350dab03bd4b8990246b42cd72de956fc23776fa84835
+DEV,DEV report,fts5.report.exact_cohort_digest,613c92a7b45fd728d920fe92ead0d8bf73e520d512bd6e30cb6cc4dfdd092e9e
+DEV,DEV report,fts5.report.fuzzy_cohort_digest,7f9c6bc6ca2b9d871ba7a11c01126c7953ad89e68e4d1978f2bc4636ff581b1f
+DEV,DEV report,fts5.report.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+DEV,DEV report,fts5.report.scorer_config_digest,2de89b48cb0c3331aa984e28d4a4fd21fad273cc2f8bd8df65b2bbea8d389034
+DEV,DEV report,fts5.report.path_config_digest,1a0de4fe6e04903698a87b1e0341cbe092ee49346f580b51c3adefd161e87079
+DEV,DEV report,fts5.process_facts.actual_index_kind,FTS5_TRIGRAM
+DEV,DEV report,fts5.process_facts.record_count,100000
+DEV,DEV report,fts5.process_facts.fixture_digest,7f208ae2daef26d3f7f913444094e7e5319f444b66e5fb3f848ca5469db1d10b
+DEV,DEV report,fts5.process_facts.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+DEV,DEV report,fts5.process_facts.rss_scope,child-process-lifetime-v1
+DEV,DEV report,fts5.query_facts.actual_index_kind,FTS5_TRIGRAM
+DEV,DEV report,fts5.query_facts.record_count,100000
+DEV,DEV report,fts5.query_facts.processes_distinct,true
+DEV,DEV report,fts5.query_facts.artifact_baseline_digest,4a46d9abcf5432b28228e4977bbd020af5fd2701a16c2ec69203ea33bc38f034
+DEV,DEV report,fts5.query_facts.sidecar_digest,3f7e7900bd3db384354be004e2331c1f32fc6d5acab2ab804796b038b7700a55
+DEV,DEV report,fts5.query_facts.manifest_digest,32b221003b6b3b7abb4762c458ca59a38acdc37eb869e08ec3ec979094510a32
+DEV,DEV report,fts5.report.environment.fts5_enabled,true
+DEV,DEV report,fts5.report.environment.measured_repeats,1
+DEV,DEV report,fts5.report.environment.os,Windows
+DEV,DEV report,fts5.report.environment.percentile_method,nearest-rank
+DEV,DEV report,fts5.report.environment.python_version,3.14.7
+DEV,DEV report,fts5.report.environment.ram_mib,unknown
+DEV,DEV report,fts5.report.environment.rss_platform,windows
+DEV,DEV report,fts5.report.environment.rss_raw_unit,bytes
+DEV,DEV report,fts5.report.environment.rss_scope,child-process-lifetime-v1
+DEV,DEV report,fts5.report.environment.sqlite_version,3.50.4
+DEV,DEV report,fts5.report.environment.timing_clock,perf_counter_ns
+DEV,DEV report,fts5.report.environment.unicode_version,16.0.0
+DEV,DEV report,fts5.report.environment.warmup_queries_per_cohort,100
+DEV,DEV report,fts5.latency_evidence.measured_repeats,1
+DEV,DEV report,fts5.latency_evidence.warmup_queries_per_cohort,100
+DEV,DEV report,fts5.latency_evidence.percentile_method,nearest-rank
+DEV,DEV report,fts5.latency_evidence.timing_clock,perf_counter_ns
+DEV,DEV report,fts5.latency_evidence.top_k,10
+DEV,DEV report,fts5.latency_evidence.minimum_similarity,0.6
+DEV,DEV report,fts5.oracle.schema_version,tm-benchmark-oracle-evidence-v2
+DEV,DEV report,fts5.oracle.execution_path,FTS5_TRIGRAM
+DEV,DEV report,fts5.oracle.store_index_kind,FTS5_TRIGRAM
+DEV,DEV report,fts5.oracle.test_mode,false
+DEV,DEV report,fts5.oracle.all_queries_available,true
+DEV,DEV report,fts5.oracle.recall_passed,true
+DEV,DEV report,fts5.oracle.oracle_subset_record_count,5000
+DEV,DEV report,fts5.oracle.oracle_query_count,200
+DEV,DEV report,fts5.oracle.query_count,200
+DEV,DEV report,fts5.oracle.missing_above_threshold_total,0
+DEV,DEV report,fts5.oracle.missing_top10_total,0
+DEV,DEV report,fts5.oracle.index_kind_drift_count,0
+DEV,DEV report,fts5.oracle.fixture_digest,7a85da14099bf50c4985329ae6933dfb0d8cf122ed5f2bcfba869ef53ac9ce89
+DEV,DEV report,fts5.oracle.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+DEV,DEV report,fts5.oracle.contract_digest,fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4
+DEV,DEV report,fts5.oracle.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+DEV,DEV report,fallback.report.execution_path,GRAM_FALLBACK
+DEV,DEV report,fallback.report.passed,true
+DEV,DEV report,fallback.report.failed_gates,[]
+DEV,DEV report,fallback.report.candidate_recall,1.0
+DEV,DEV report,fallback.report.migration_seconds,102.5576811
+DEV,DEV report,fallback.report.exact_p95_ms,0.7027
+DEV,DEV report,fallback.report.fuzzy_top10_p95_ms,392.0292
+DEV,DEV report,fallback.report.peak_rss_mib,418.78515625
+DEV,DEV report,fallback.report.exact_sample_count,1200
+DEV,DEV report,fallback.report.fuzzy_sample_count,240
+DEV,DEV report,fallback.report.corpus_digest,560ebb304362c86af9dec6540dfcb5370b1fcbbdf01b938e6a7b675a3d8c8bfe
+DEV,DEV report,fallback.report.corpus_composition_digest,e57b794e9b224376724350dab03bd4b8990246b42cd72de956fc23776fa84835
+DEV,DEV report,fallback.report.exact_cohort_digest,613c92a7b45fd728d920fe92ead0d8bf73e520d512bd6e30cb6cc4dfdd092e9e
+DEV,DEV report,fallback.report.fuzzy_cohort_digest,7f9c6bc6ca2b9d871ba7a11c01126c7953ad89e68e4d1978f2bc4636ff581b1f
+DEV,DEV report,fallback.report.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+DEV,DEV report,fallback.report.scorer_config_digest,2de89b48cb0c3331aa984e28d4a4fd21fad273cc2f8bd8df65b2bbea8d389034
+DEV,DEV report,fallback.report.path_config_digest,792f57dba4ba9fbc9a72fa72012a596aaff6e99d6d6bad3c66fb99232111f936
+DEV,DEV report,fallback.process_facts.actual_index_kind,GRAM_FALLBACK
+DEV,DEV report,fallback.process_facts.record_count,100000
+DEV,DEV report,fallback.process_facts.fixture_digest,7f208ae2daef26d3f7f913444094e7e5319f444b66e5fb3f848ca5469db1d10b
+DEV,DEV report,fallback.process_facts.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+DEV,DEV report,fallback.process_facts.rss_scope,child-process-lifetime-v1
+DEV,DEV report,fallback.query_facts.actual_index_kind,GRAM_FALLBACK
+DEV,DEV report,fallback.query_facts.record_count,100000
+DEV,DEV report,fallback.query_facts.processes_distinct,true
+DEV,DEV report,fallback.query_facts.artifact_baseline_digest,ed4322e01129ba610e463a109fc66fa507af3d4adeb29acf959e41b41c91030e
+DEV,DEV report,fallback.query_facts.sidecar_digest,75d0071ecb61b65aa89c2b2ce29a07d0002cf4e7bb3252c9505c606d21db69be
+DEV,DEV report,fallback.query_facts.manifest_digest,32b221003b6b3b7abb4762c458ca59a38acdc37eb869e08ec3ec979094510a32
+DEV,DEV report,fallback.report.environment.fts5_enabled,false
+DEV,DEV report,fallback.report.environment.measured_repeats,1
+DEV,DEV report,fallback.report.environment.os,Windows
+DEV,DEV report,fallback.report.environment.percentile_method,nearest-rank
+DEV,DEV report,fallback.report.environment.python_version,3.14.7
+DEV,DEV report,fallback.report.environment.ram_mib,unknown
+DEV,DEV report,fallback.report.environment.rss_platform,windows
+DEV,DEV report,fallback.report.environment.rss_raw_unit,bytes
+DEV,DEV report,fallback.report.environment.rss_scope,child-process-lifetime-v1
+DEV,DEV report,fallback.report.environment.sqlite_version,3.50.4
+DEV,DEV report,fallback.report.environment.timing_clock,perf_counter_ns
+DEV,DEV report,fallback.report.environment.unicode_version,16.0.0
+DEV,DEV report,fallback.report.environment.warmup_queries_per_cohort,100
+DEV,DEV report,fallback.latency_evidence.measured_repeats,1
+DEV,DEV report,fallback.latency_evidence.warmup_queries_per_cohort,100
+DEV,DEV report,fallback.latency_evidence.percentile_method,nearest-rank
+DEV,DEV report,fallback.latency_evidence.timing_clock,perf_counter_ns
+DEV,DEV report,fallback.latency_evidence.top_k,10
+DEV,DEV report,fallback.latency_evidence.minimum_similarity,0.6
+DEV,DEV report,fallback.oracle.schema_version,tm-benchmark-oracle-evidence-v2
+DEV,DEV report,fallback.oracle.execution_path,GRAM_FALLBACK
+DEV,DEV report,fallback.oracle.store_index_kind,GRAM_FALLBACK
+DEV,DEV report,fallback.oracle.test_mode,false
+DEV,DEV report,fallback.oracle.all_queries_available,true
+DEV,DEV report,fallback.oracle.recall_passed,true
+DEV,DEV report,fallback.oracle.oracle_subset_record_count,5000
+DEV,DEV report,fallback.oracle.oracle_query_count,200
+DEV,DEV report,fallback.oracle.query_count,200
+DEV,DEV report,fallback.oracle.missing_above_threshold_total,0
+DEV,DEV report,fallback.oracle.missing_top10_total,0
+DEV,DEV report,fallback.oracle.index_kind_drift_count,0
+DEV,DEV report,fallback.oracle.fixture_digest,7a85da14099bf50c4985329ae6933dfb0d8cf122ed5f2bcfba869ef53ac9ce89
+DEV,DEV report,fallback.oracle.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+DEV,DEV report,fallback.oracle.contract_digest,fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4
+DEV,DEV report,fallback.oracle.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+DEV,DEV report,suite_report.passed,true
+DEV,DEV report,suite_report.failed_paths,[]
+VAL,VAL report,schema_version,tm-benchmark-bundle-v2
+VAL,VAL report,proof_query_version,proof-query-v3
+VAL,VAL report,bundle_digest,94522eab9b4a12922f40f3ff15f7bf33e326ad5a37cbf6e44471bf13b0912492
+VAL,VAL report,contract_digest,fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4
+VAL,VAL report,suite_contract_digest,cc727db1711a64ecdb15fd1cd689f9e591b20533b3c0fd60b8a7fc20e6b1d5a1
+VAL,VAL report,implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+VAL,VAL report,contract.candidate_budget_version,candidate-budget-v1
+VAL,VAL report,contract.candidate_recall_gate,1.0
+VAL,VAL report,contract.contract_version,benchmark-v1
+VAL,VAL report,contract.corpus_composition_digest,e57b794e9b224376724350dab03bd4b8990246b42cd72de956fc23776fa84835
+VAL,VAL report,contract.corpus_composition_version,tm-corpus-composition-v1
+VAL,VAL report,contract.corpus_digest,560ebb304362c86af9dec6540dfcb5370b1fcbbdf01b938e6a7b675a3d8c8bfe
+VAL,VAL report,contract.corpus_generator_version,tm-benchmark-corpus-v1
+VAL,VAL report,contract.corpus_record_count,100000
+VAL,VAL report,contract.corpus_seed,20260729
+VAL,VAL report,contract.exact_cohort_count,1200
+VAL,VAL report,contract.exact_cohort_digest,613c92a7b45fd728d920fe92ead0d8bf73e520d512bd6e30cb6cc4dfdd092e9e
+VAL,VAL report,contract.exact_min_samples,1000
+VAL,VAL report,contract.exact_p95_gate_ms,50.0
+VAL,VAL report,contract.fallback_path_config_digest,792f57dba4ba9fbc9a72fa72012a596aaff6e99d6d6bad3c66fb99232111f936
+VAL,VAL report,contract.fast_path_config_digest,1a0de4fe6e04903698a87b1e0341cbe092ee49346f580b51c3adefd161e87079
+VAL,VAL report,contract.fuzzy_cohort_count,240
+VAL,VAL report,contract.fuzzy_cohort_digest,7f9c6bc6ca2b9d871ba7a11c01126c7953ad89e68e4d1978f2bc4636ff581b1f
+VAL,VAL report,contract.fuzzy_min_samples,200
+VAL,VAL report,contract.fuzzy_p95_gate_ms,500.0
+VAL,VAL report,contract.measured_repeats,1
+VAL,VAL report,contract.migration_gate_seconds,120.0
+VAL,VAL report,contract.minimum_similarity,0.6
+VAL,VAL report,contract.oracle_query_count,200
+VAL,VAL report,contract.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+VAL,VAL report,contract.oracle_subset_record_count,5000
+VAL,VAL report,contract.peak_rss_gate_mib,512.0
+VAL,VAL report,contract.percentile_method,nearest-rank
+VAL,VAL report,contract.rss_scope,child-process-lifetime-v1
+VAL,VAL report,contract.scorer_config_digest,2de89b48cb0c3331aa984e28d4a4fd21fad273cc2f8bd8df65b2bbea8d389034
+VAL,VAL report,contract.top_k,10
+VAL,VAL report,contract.warmup_queries_per_cohort,100
+VAL,VAL report,fts5.report.execution_path,FTS5_TRIGRAM
+VAL,VAL report,fts5.report.passed,false
+VAL,VAL report,fts5.report.failed_gates,"[""FUZZY_P95""]"
+VAL,VAL report,fts5.report.candidate_recall,1.0
+VAL,VAL report,fts5.report.migration_seconds,100.4749898
+VAL,VAL report,fts5.report.exact_p95_ms,1.8019
+VAL,VAL report,fts5.report.fuzzy_top10_p95_ms,644.1111
+VAL,VAL report,fts5.report.peak_rss_mib,415.296875
+VAL,VAL report,fts5.report.exact_sample_count,1200
+VAL,VAL report,fts5.report.fuzzy_sample_count,240
+VAL,VAL report,fts5.report.corpus_digest,560ebb304362c86af9dec6540dfcb5370b1fcbbdf01b938e6a7b675a3d8c8bfe
+VAL,VAL report,fts5.report.corpus_composition_digest,e57b794e9b224376724350dab03bd4b8990246b42cd72de956fc23776fa84835
+VAL,VAL report,fts5.report.exact_cohort_digest,613c92a7b45fd728d920fe92ead0d8bf73e520d512bd6e30cb6cc4dfdd092e9e
+VAL,VAL report,fts5.report.fuzzy_cohort_digest,7f9c6bc6ca2b9d871ba7a11c01126c7953ad89e68e4d1978f2bc4636ff581b1f
+VAL,VAL report,fts5.report.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+VAL,VAL report,fts5.report.scorer_config_digest,2de89b48cb0c3331aa984e28d4a4fd21fad273cc2f8bd8df65b2bbea8d389034
+VAL,VAL report,fts5.report.path_config_digest,1a0de4fe6e04903698a87b1e0341cbe092ee49346f580b51c3adefd161e87079
+VAL,VAL report,fts5.process_facts.actual_index_kind,FTS5_TRIGRAM
+VAL,VAL report,fts5.process_facts.record_count,100000
+VAL,VAL report,fts5.process_facts.fixture_digest,7f208ae2daef26d3f7f913444094e7e5319f444b66e5fb3f848ca5469db1d10b
+VAL,VAL report,fts5.process_facts.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+VAL,VAL report,fts5.process_facts.rss_scope,child-process-lifetime-v1
+VAL,VAL report,fts5.query_facts.actual_index_kind,FTS5_TRIGRAM
+VAL,VAL report,fts5.query_facts.record_count,100000
+VAL,VAL report,fts5.query_facts.processes_distinct,true
+VAL,VAL report,fts5.query_facts.artifact_baseline_digest,9aad337ddccdd1ef5da7c49d656ad31e1adce97fdcb2774e3825b5f43900f6fb
+VAL,VAL report,fts5.query_facts.sidecar_digest,53f5b49b4509167fe6838cf7f63d4d137521a798c546d5df1067c271de5fc7b5
+VAL,VAL report,fts5.query_facts.manifest_digest,32b221003b6b3b7abb4762c458ca59a38acdc37eb869e08ec3ec979094510a32
+VAL,VAL report,fts5.report.environment.fts5_enabled,true
+VAL,VAL report,fts5.report.environment.measured_repeats,1
+VAL,VAL report,fts5.report.environment.os,Windows
+VAL,VAL report,fts5.report.environment.percentile_method,nearest-rank
+VAL,VAL report,fts5.report.environment.python_version,3.14.7
+VAL,VAL report,fts5.report.environment.ram_mib,unknown
+VAL,VAL report,fts5.report.environment.rss_platform,windows
+VAL,VAL report,fts5.report.environment.rss_raw_unit,bytes
+VAL,VAL report,fts5.report.environment.rss_scope,child-process-lifetime-v1
+VAL,VAL report,fts5.report.environment.sqlite_version,3.50.4
+VAL,VAL report,fts5.report.environment.timing_clock,perf_counter_ns
+VAL,VAL report,fts5.report.environment.unicode_version,16.0.0
+VAL,VAL report,fts5.report.environment.warmup_queries_per_cohort,100
+VAL,VAL report,fts5.latency_evidence.measured_repeats,1
+VAL,VAL report,fts5.latency_evidence.warmup_queries_per_cohort,100
+VAL,VAL report,fts5.latency_evidence.percentile_method,nearest-rank
+VAL,VAL report,fts5.latency_evidence.timing_clock,perf_counter_ns
+VAL,VAL report,fts5.latency_evidence.top_k,10
+VAL,VAL report,fts5.latency_evidence.minimum_similarity,0.6
+VAL,VAL report,fts5.oracle.schema_version,tm-benchmark-oracle-evidence-v2
+VAL,VAL report,fts5.oracle.execution_path,FTS5_TRIGRAM
+VAL,VAL report,fts5.oracle.store_index_kind,FTS5_TRIGRAM
+VAL,VAL report,fts5.oracle.test_mode,false
+VAL,VAL report,fts5.oracle.all_queries_available,true
+VAL,VAL report,fts5.oracle.recall_passed,true
+VAL,VAL report,fts5.oracle.oracle_subset_record_count,5000
+VAL,VAL report,fts5.oracle.oracle_query_count,200
+VAL,VAL report,fts5.oracle.query_count,200
+VAL,VAL report,fts5.oracle.missing_above_threshold_total,0
+VAL,VAL report,fts5.oracle.missing_top10_total,0
+VAL,VAL report,fts5.oracle.index_kind_drift_count,0
+VAL,VAL report,fts5.oracle.fixture_digest,7a85da14099bf50c4985329ae6933dfb0d8cf122ed5f2bcfba869ef53ac9ce89
+VAL,VAL report,fts5.oracle.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+VAL,VAL report,fts5.oracle.contract_digest,fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4
+VAL,VAL report,fts5.oracle.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+VAL,VAL report,fallback.report.execution_path,GRAM_FALLBACK
+VAL,VAL report,fallback.report.passed,false
+VAL,VAL report,fallback.report.failed_gates,"[""FUZZY_P95"",""MIGRATION""]"
+VAL,VAL report,fallback.report.candidate_recall,1.0
+VAL,VAL report,fallback.report.migration_seconds,147.8519898
+VAL,VAL report,fallback.report.exact_p95_ms,1.7446
+VAL,VAL report,fallback.report.fuzzy_top10_p95_ms,641.6725
+VAL,VAL report,fallback.report.peak_rss_mib,419.28125
+VAL,VAL report,fallback.report.exact_sample_count,1200
+VAL,VAL report,fallback.report.fuzzy_sample_count,240
+VAL,VAL report,fallback.report.corpus_digest,560ebb304362c86af9dec6540dfcb5370b1fcbbdf01b938e6a7b675a3d8c8bfe
+VAL,VAL report,fallback.report.corpus_composition_digest,e57b794e9b224376724350dab03bd4b8990246b42cd72de956fc23776fa84835
+VAL,VAL report,fallback.report.exact_cohort_digest,613c92a7b45fd728d920fe92ead0d8bf73e520d512bd6e30cb6cc4dfdd092e9e
+VAL,VAL report,fallback.report.fuzzy_cohort_digest,7f9c6bc6ca2b9d871ba7a11c01126c7953ad89e68e4d1978f2bc4636ff581b1f
+VAL,VAL report,fallback.report.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+VAL,VAL report,fallback.report.scorer_config_digest,2de89b48cb0c3331aa984e28d4a4fd21fad273cc2f8bd8df65b2bbea8d389034
+VAL,VAL report,fallback.report.path_config_digest,792f57dba4ba9fbc9a72fa72012a596aaff6e99d6d6bad3c66fb99232111f936
+VAL,VAL report,fallback.process_facts.actual_index_kind,GRAM_FALLBACK
+VAL,VAL report,fallback.process_facts.record_count,100000
+VAL,VAL report,fallback.process_facts.fixture_digest,7f208ae2daef26d3f7f913444094e7e5319f444b66e5fb3f848ca5469db1d10b
+VAL,VAL report,fallback.process_facts.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+VAL,VAL report,fallback.process_facts.rss_scope,child-process-lifetime-v1
+VAL,VAL report,fallback.query_facts.actual_index_kind,GRAM_FALLBACK
+VAL,VAL report,fallback.query_facts.record_count,100000
+VAL,VAL report,fallback.query_facts.processes_distinct,true
+VAL,VAL report,fallback.query_facts.artifact_baseline_digest,f10d1cba9e5361576bc4bd8ca2c64d9466f9fff6cb5e765c5fc132fd2ad8c6bf
+VAL,VAL report,fallback.query_facts.sidecar_digest,1b607d77f3e0d33989dcdc68561edaa014875f53ba02525990ee2d79222da171
+VAL,VAL report,fallback.query_facts.manifest_digest,32b221003b6b3b7abb4762c458ca59a38acdc37eb869e08ec3ec979094510a32
+VAL,VAL report,fallback.report.environment.fts5_enabled,false
+VAL,VAL report,fallback.report.environment.measured_repeats,1
+VAL,VAL report,fallback.report.environment.os,Windows
+VAL,VAL report,fallback.report.environment.percentile_method,nearest-rank
+VAL,VAL report,fallback.report.environment.python_version,3.14.7
+VAL,VAL report,fallback.report.environment.ram_mib,unknown
+VAL,VAL report,fallback.report.environment.rss_platform,windows
+VAL,VAL report,fallback.report.environment.rss_raw_unit,bytes
+VAL,VAL report,fallback.report.environment.rss_scope,child-process-lifetime-v1
+VAL,VAL report,fallback.report.environment.sqlite_version,3.50.4
+VAL,VAL report,fallback.report.environment.timing_clock,perf_counter_ns
+VAL,VAL report,fallback.report.environment.unicode_version,16.0.0
+VAL,VAL report,fallback.report.environment.warmup_queries_per_cohort,100
+VAL,VAL report,fallback.latency_evidence.measured_repeats,1
+VAL,VAL report,fallback.latency_evidence.warmup_queries_per_cohort,100
+VAL,VAL report,fallback.latency_evidence.percentile_method,nearest-rank
+VAL,VAL report,fallback.latency_evidence.timing_clock,perf_counter_ns
+VAL,VAL report,fallback.latency_evidence.top_k,10
+VAL,VAL report,fallback.latency_evidence.minimum_similarity,0.6
+VAL,VAL report,fallback.oracle.schema_version,tm-benchmark-oracle-evidence-v2
+VAL,VAL report,fallback.oracle.execution_path,GRAM_FALLBACK
+VAL,VAL report,fallback.oracle.store_index_kind,GRAM_FALLBACK
+VAL,VAL report,fallback.oracle.test_mode,false
+VAL,VAL report,fallback.oracle.all_queries_available,true
+VAL,VAL report,fallback.oracle.recall_passed,true
+VAL,VAL report,fallback.oracle.oracle_subset_record_count,5000
+VAL,VAL report,fallback.oracle.oracle_query_count,200
+VAL,VAL report,fallback.oracle.query_count,200
+VAL,VAL report,fallback.oracle.missing_above_threshold_total,0
+VAL,VAL report,fallback.oracle.missing_top10_total,0
+VAL,VAL report,fallback.oracle.index_kind_drift_count,0
+VAL,VAL report,fallback.oracle.fixture_digest,7a85da14099bf50c4985329ae6933dfb0d8cf122ed5f2bcfba869ef53ac9ce89
+VAL,VAL report,fallback.oracle.oracle_subset_digest,e88a3af393b19b65f06cfffba565be2c535e1462ccc1f1d4edfd8f285db246e2
+VAL,VAL report,fallback.oracle.contract_digest,fda4be33a9f73452e978a7a8a122e66b33f39d44e84c942f425ccae1d503a5a4
+VAL,VAL report,fallback.oracle.implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+VAL,VAL report,suite_report.passed,false
+VAL,VAL report,suite_report.failed_paths,"[""FTS5_TRIGRAM"",""GRAM_FALLBACK""]"
+DEV,DEV candidate,candidate_id,2addbf93a1287a11599ba4fcbb31456c909b13d01f5ea37eba118526baaf54c0
+DEV,DEV candidate,repository_commit,7b51cce583dbeb32d35047abbee614bbc609f457
+DEV,DEV candidate,exe_sha256,fa21aa938118b09060ae769453ec92e5916b45b18f26bb25548cfecacb717743
+VAL,VAL identity,ObservedAt,2026-10-03T06:00:45.9653486+08:00
+VAL,VAL identity,CandidateID,2addbf93a1287a11599ba4fcbb31456c909b13d01f5ea37eba118526baaf54c0
+VAL,VAL identity,ExecutableSHA256,fa21aa938118b09060ae769453ec92e5916b45b18f26bb25548cfecacb717743
+VAL,VAL identity,ExpectedSource,7b51cce
+VAL,VAL revalidation request,RequestedAt,2026-10-03T06:04:00.8847437+08:00
+VAL,VAL revalidation request,PID,13584
+VAL,VAL revalidation request,Action,One normal Settings Revalidate Fuzzy click
+VAL,VAL launch record,StartedAt,2026-10-03T06:01:20.5136853+08:00
+VAL,VAL launch record,PID,13584
+VAL,VAL report observation,ObservedAt,2026-10-03T06:21:07.7708680+08:00
+VAL,VAL report observation,ReportSHA256,87a4b394d343a0805745ac0f9f0a12bb91085bae223e5c517570bc3f8c730f90
+VAL,VAL report observation,SuitePassed,false
+VAL,VAL qualification metadata,At,2026-10-03T06:21:38.3733087+08:00
+VAL,VAL qualification metadata,Length,1013536
+VAL,VAL qualification metadata,SHA256,08d8e77ce9dba0ee80087d012e2965e4b6f1ae7ca49b753419f995a474004789
+VAL,VAL publication observation,ObservedAt,2026-10-03T06:22:43.5170312+08:00
+VAL,VAL publication observation,QualificationSHA256,08d8e77ce9dba0ee80087d012e2965e4b6f1ae7ca49b753419f995a474004789
+VAL,VAL publication observation,QualificationBytes,1013536
+VAL,VAL publication observation,Schema,localcat.gate-d-attestation.v2
+VAL,VAL publication observation,IssuedAtUTC,2026-10-02T22:04:01Z
+VAL,VAL publication observation,ArtifactDigest,87a4b394d343a0805745ac0f9f0a12bb91085bae223e5c517570bc3f8c730f90
+VAL,VAL publication observation,ArtifactSize,922308
+VAL,VAL publication observation,ArtifactDigestMatchesReport,true
+VAL,VAL publication observation,StoredSuitePassed,false
+VAL,VAL publication observation,StoredFailedPaths,"[""FTS5_TRIGRAM"",""GRAM_FALLBACK""]"
+VAL,VAL publication observation,SignatureValidation,To be checked by normal Host cold-start restore; not verified by this metadata extraction
+VAL,VAL close observation,EndedAt,2026-10-03T06:24:10.4278510+08:00
+VAL,VAL close observation,ExitCode,null
+VAL,VAL close observation,Close,normal clean L09 close after dismissing Settings; no save or discard
+VAL,VAL close observation,FirstCloseAttempt,"Main window disabled by open Settings, CloseMainWindow=false; no shutdown occurred"
+VAL,VAL cold observation,ObservedAt,2026-10-03T06:25:24.6031002+08:00
+VAL,VAL cold observation,QualificationBytes,1013536
+VAL,VAL cold observation,QualificationSHA256,08d8e77ce9dba0ee80087d012e2965e4b6f1ae7ca49b753419f995a474004789
+VAL,VAL cold observation,QualificationHashUnchanged,true
+VAL,VAL cold observation,ChildProcesses,[]
+VAL,VAL cold observation,ColdRevalidationClicks,0
+VAL,VAL cold observation,ObservedUIStatus,Fuzzy 不可用：Fuzzy 性能验证尚未通过
+VAL,VAL received codec result,strict_codec_accepted,true
+VAL,VAL received codec result,report_sha256,87a4b394d343a0805745ac0f9f0a12bb91085bae223e5c517570bc3f8c730f90
+VAL,VAL received codec result,bundle_digest,94522eab9b4a12922f40f3ff15f7bf33e326ad5a37cbf6e44471bf13b0912492
+VAL,VAL received codec result,implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+VAL,VAL received codec result,suite_passed,false
+VAL,VAL received codec result,path_failures,"[{""path"":""FTS5_TRIGRAM"",""failed_gates"":[""FUZZY_P95""]},{""path"":""GRAM_FALLBACK"",""failed_gates"":[""FUZZY_P95"",""MIGRATION""]}]"
+DEV,DEV launch record,started_utc,2026-10-02T21:05:19.613135+00:00
+DEV,DEV launch record,exited_utc,2026-10-02T21:22:12.167392+00:00
+DEV,DEV launch record,exit_code,0
+DEV,DEV report observation,observed_at,2026-10-02T21:20:09.907455+00:00
+DEV,DEV report observation,candidate_id,2addbf93a1287a11599ba4fcbb31456c909b13d01f5ea37eba118526baaf54c0
+DEV,DEV report observation,artifact_sha256,9d2e91c68874a6d8f8c28436a1fb3f09bbdec9a1ecef2d6cd3c298f3689df0a5
+DEV,DEV report observation,bundle_digest,789af50cd95532a060c6ee3b71735158a80632edeb3ef7428c156f3ed7c59927
+DEV,DEV report observation,implementation_fingerprint,1735533d07b1c5f185270a89c9cbb1e25699ed89ec2ed0460839b55ccd67f000
+DEV,DEV qualification hash,Algorithm,SHA256
+DEV,DEV qualification hash,Hash,5A630DF258554AF917F072C07420AC787571C975D4ECB9560583A7776E9BC213
+DEV,DEV cold launch record,started_utc,2026-10-02T21:22:12.719259+00:00
+DEV,DEV cold launch record,exited_utc,2026-10-02T21:26:06.673269+00:00
+DEV,DEV cold launch record,exit_code,0
+DEV,DEV close observation,observed_at,2026-10-02T21:22:12.182992+00:00
+DEV,DEV close observation,exit_code,0
+DEV,DEV close observation,children_observed_at_close,[]
+DEV,DEV close observation,no_remaining_child,true
+DEV,DEV close observation,close_seconds,0.3795901000012236
+DEV,DEV close observation,close_mode,normal WM_CLOSE; no force termination
+DEV,DEV cold qualification hash,same_bytes,true
+DEV,DEV cold qualification hash,sha256,5a630df258554af917f072c07420ac787571c975d4ecb9560583a7776e9bc213
+DEV,DEV cold UI observation,observedAt,2026-10-02T21:23:06.6427285Z
+DEV,DEV cold UI observation,controls[0].name,Fuzzy 可用
+DEV,DEV cold UI observation,controls[0].enabled,true
+DEV,DEV cold UI observation,controls[1].name,Fuzzy 阈值 60%，Fuzzy 可用
+DEV,DEV cold UI observation,controls[1].enabled,true
+VAL,VAL startup log,[0].time,2026-10-02T22:01:20.835572+00:00
+VAL,VAL startup log,[0].pid,13584
+VAL,VAL startup log,[0].stage,qt_imports
+VAL,VAL startup log,[0].status,ok
+VAL,VAL startup log,[14].time,2026-10-02T22:01:23.995710+00:00
+VAL,VAL startup log,[14].pid,13584
+VAL,VAL startup log,[14].stage,first_events
+VAL,VAL startup log,[14].status,ok
+VAL,VAL startup log,[15].time,2026-10-02T22:01:25.462186+00:00
+VAL,VAL startup log,[15].pid,13584
+VAL,VAL startup log,[15].stage,fuzzy_validation
+VAL,VAL startup log,[15].status,failed
+VAL,VAL startup log,[15].code,GATE_D.REVALIDATION_REQUIRED
+VAL,VAL startup log,[16].time,2026-10-02T22:24:10.751519+00:00
+VAL,VAL startup log,[16].pid,9760
+VAL,VAL startup log,[16].stage,qt_imports
+VAL,VAL startup log,[16].status,ok
+VAL,VAL startup log,[30].time,2026-10-02T22:24:14.150489+00:00
+VAL,VAL startup log,[30].pid,9760
+VAL,VAL startup log,[30].stage,first_events
+VAL,VAL startup log,[30].status,ok
