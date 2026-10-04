@@ -526,11 +526,7 @@ def _write_source_launch_smoke_marker(
 def _fuzzy_validation_display(composition: object):
     """Project the composition-private Gate D lifecycle into a safe DTO."""
 
-    from capability_host import (
-        CapabilityHostComposition,
-        GateDRunState,
-        GateDRunStatus,
-    )
+    from capability_host import CapabilityHostComposition
     from editor_contracts import (
         FuzzyValidationDisplay,
         FuzzyValidationState,
@@ -546,7 +542,13 @@ def _fuzzy_validation_display(composition: object):
             state=FuzzyValidationState.IDLE,
             safe_code=None,
         )
-    status = owner.status()
+    return _project_fuzzy_validation(owner.status())
+
+
+def _project_fuzzy_validation(status: object):
+    from capability_host import GateDRunState, GateDRunStatus
+    from editor_contracts import FuzzyValidationDisplay, FuzzyValidationState
+
     if type(status) is not GateDRunStatus:
         raise TypeError("Gate D status contract is invalid")
     status.__post_init__()
@@ -562,6 +564,21 @@ def _fuzzy_validation_display(composition: object):
     )
 
 
+def _poll_fuzzy_validation_display(composition: object):
+    from capability_host import CapabilityHostComposition
+
+    if type(composition) is not CapabilityHostComposition:
+        raise TypeError("fuzzy validation poll requires one host composition")
+    owner = composition.retrieval_gate_d_owner
+    if owner is None:
+        raise RuntimeError("fuzzy validation owner is unavailable")
+    pair = owner._try_display()
+    if pair is None:
+        return None
+    status, display = pair
+    return _project_fuzzy_validation(status), display
+
+
 def _request_fuzzy_revalidation(composition: object):
     """Start the explicit real Gate D run and return its safe lifecycle."""
 
@@ -574,10 +591,10 @@ def _request_fuzzy_revalidation(composition: object):
     owner = composition.retrieval_gate_d_owner
     if owner is None:
         raise RuntimeError("Fuzzy revalidation owner is unavailable")
-    _ = owner.start_gate_d(
+    status = owner.start_gate_d(
         evaluated_at_utc=datetime.now(timezone.utc).replace(microsecond=0)
     )
-    return _fuzzy_validation_display(composition)
+    return _project_fuzzy_validation(status)
 
 
 def _start_capability_validation(
@@ -591,6 +608,7 @@ def _start_capability_validation(
 
     from capability_host import CapabilityHostComposition
     from PySide6.QtCore import QCoreApplication, QObject, QThread, Qt, Signal, Slot
+    from shiboken6 import isValid
 
     if type(composition) is not CapabilityHostComposition:
         raise TypeError(
@@ -633,11 +651,18 @@ def _start_capability_validation(
                 "capability completion requires one bound Qt receiver"
             )
         bridge = CapabilityCompletionBridge()
+
+        def deliver_capability_change() -> None:
+            # Closing may occur after emission but before this queued delivery.
+            if cancelled.is_set() or not isValid(receiver):
+                return
+            bridge.observe_delivery()
+            callback()
+
         _ = bridge.changed.connect(
-            callback,
+            deliver_capability_change,
             Qt.ConnectionType.QueuedConnection,
         )
-        bridge.changed.connect(bridge.observe_delivery, Qt.ConnectionType.QueuedConnection)
         receiver.destroyed.connect(cancel)
         closing = getattr(receiver, "_capability_validation_closed", None)
         if closing is not None:
@@ -649,6 +674,13 @@ def _start_capability_validation(
     def notify_capability_change() -> None:
         if bridge is not None and not cancelled.is_set():
             bridge.changed.emit()
+
+    if bridge is not None:
+        refresh_requested = getattr(
+            receiver, "_capability_display_refresh_requested", None,
+        )
+        if refresh_requested is not None:
+            refresh_requested.connect(notify_capability_change)
 
     def validate_stages() -> None:
         if cancelled.is_set():
@@ -832,6 +864,13 @@ def _compose_editor_controller(
                     pass
             return status
 
+        def poll_fuzzy_validation():
+            pair = _poll_fuzzy_validation_display(capability_composition)
+            if pair is None:
+                return None
+            status, display = pair
+            return observe_fuzzy_validation(status), display
+
         controller = compose_project_enabled_editor_controller(
             repository,
             tm_adapter=EditorTMAdapter(
@@ -844,6 +883,7 @@ def _compose_editor_controller(
                     _request_fuzzy_revalidation(capability_composition),
                     requested=True,
                 ),
+                fuzzy_validation_poll=poll_fuzzy_validation,
             ),
         )
     except Exception as exc:
