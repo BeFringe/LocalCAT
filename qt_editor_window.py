@@ -90,6 +90,7 @@ from editor_contracts import (
     DisplayPreferences,
     EditorSegment,
     FuzzyValidationDisplay,
+    TMThresholdDisplay,
     FuzzyValidationState,
     LegacyExactTMSuggestion,
     ProjectSearchReport,
@@ -870,6 +871,7 @@ class QtEditorWindow(QMainWindow):
     """LocalCAT desktop shell; all domain operations go through EditorController."""
 
     _capability_validation_closed = Signal()
+    _capability_display_refresh_requested = Signal()
 
     def __init__(
         self,
@@ -5824,16 +5826,28 @@ class QtEditorWindow(QMainWindow):
         self.term_cards_layout.addStretch()
         return bundle
 
-    def _refresh_tm_threshold_entry(self) -> None:
+    def _refresh_tm_threshold_entry(
+        self, display: TMThresholdDisplay | None = None,
+    ) -> None:
         """Render the compact entry from fresh defensive Controller values."""
 
+        if display is None:
+            display = self.controller.poll_tm_threshold_display()
+        if display is None:
+            self._fuzzy_validation_timer.start()
+            return
+        if type(display) is not TMThresholdDisplay:
+            raise TypeError("TM threshold display contract is invalid")
+        display.__post_init__()
         configure_tm_threshold_entry(
             self.tm_threshold_chip,
             self.tm_threshold_state,
-            preferences=self.controller.tm_preferences(),
-            retrieval_status=self.controller.tm_retrieval_status(),
-            fuzzy_validation=self.controller.tm_fuzzy_validation_status(),
+            preferences=display.preferences,
+            retrieval_status=display.retrieval,
+            fuzzy_validation=display.validation,
         )
+        if display.validation.state is FuzzyValidationState.RUNNING:
+            self._fuzzy_validation_timer.start()
 
     def _request_tm_threshold_update(self) -> None:
         """Submit one chip edit through the Controller and refresh visible cards."""
@@ -5885,32 +5899,39 @@ class QtEditorWindow(QMainWindow):
         status.__post_init__()
         if status.state is FuzzyValidationState.RUNNING:
             self._fuzzy_validation_timer.start()
-            self._refresh_tm_threshold_entry()
             dialog = self.settings_dialog
             if dialog is not None and dialog.isVisible():
                 dialog.status_label.setText("Fuzzy 性能验证中。")
             self.statusBar().showMessage("Fuzzy 性能验证中。", 5000)
+        self._poll_fuzzy_validation()
+
+    def _poll_fuzzy_validation(self) -> None:
+        display = self.controller.poll_tm_threshold_display()
+        if display is None:
+            self._fuzzy_validation_timer.start()
+            return
+        self._refresh_tm_threshold_entry(display)
+        dialog = self.settings_dialog
+        if dialog is not None:
+            dialog._render_tm_threshold_display(display)
+        status = display.validation
+        if status.state is FuzzyValidationState.RUNNING:
             return
         self._fuzzy_validation_timer.stop()
-        if self._has_active_project():
-            self.refresh_suggestions()
-        else:
-            self._refresh_tm_threshold_entry()
-        dialog = self.settings_dialog
-        if dialog is not None and dialog.isVisible():
-            dialog.refresh_resources()
+        # Explicit revalidation uses the bootstrap's queued generation bridge;
+        # polling itself must not synchronize resources or query suggestions.
+        if status.state is not FuzzyValidationState.IDLE:
+            self._capability_display_refresh_requested.emit()
+        if (
+            dialog is not None
+            and dialog.isVisible()
+            and status.state is not FuzzyValidationState.IDLE
+        ):
             dialog.status_label.setText(
                 f"Fuzzy 性能验证已完成。{dialog.tm_threshold_state.text()}。"
                 if status.state is FuzzyValidationState.SUCCEEDED
                 else f"{dialog.tm_threshold_state.text()}。"
             )
-
-    def _poll_fuzzy_validation(self) -> None:
-        status = self.controller.tm_fuzzy_validation_status()
-        if status.state is FuzzyValidationState.RUNNING:
-            self._refresh_tm_threshold_entry()
-            return
-        self._settings_fuzzy_validation_changed(status)
 
     @staticmethod
     def _tm_state_message(
@@ -6298,6 +6319,7 @@ class QtEditorWindow(QMainWindow):
                 except RuntimeError:
                     pass
             event.accept()
+            self._fuzzy_validation_timer.stop()
             self._capability_validation_closed.emit()
         else:
             event.ignore()
