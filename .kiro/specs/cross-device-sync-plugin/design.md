@@ -32,22 +32,28 @@ transport schema/ETag/重试合同变化重验两个 provider 与恢复；owner 
 
 ## Governance Impact
 
-- **Applicable Steering**：本地优先、显式 opt-in、层级依赖、spec-ownership、repository-safety。
-- **Applicable ADRs**：ADR-018/019 的 immutable package 与独立 authority；ResourcePortability owning R/D/T；ADR-020 及后继的本地 rooted 发布。
-- **ADR disposition**：候选决策集中为“可选网络组合、Sync transport/state v1 与秘密后端边界”；只批准远端 CAS、设备同步状态和依赖，不创造通用 Package authority。RPY-first 的 ADR-018 §13 窄取代沿用 RPY Design 的治理前置，不重复立同义决策。
-- **Scope amendment**：Pending。Project 增加无路径整包 artifact port；Application/Qt 增加手动同步命令；平台/发行批准 botocore、keyring、defusedxml 的可选组合及秘密 backend。Resource 优先复用既有 port，仅在实际合同不足时提增量。
-- **Steering sync**：治理 owner 在相应决策后同步 product 的 opt-in 网络例外、tech/structure/spec-ownership 的依赖和模块，roadmap 保持 RPY→Sync；不回写历史验收。
-- **Downstream revalidation**：Project/Resource 的 preview/apply/恢复，RPY 缺失 codec，Qt session 生命周期，source 与普通 Windows frozen 的可选依赖。
-
-**实施判定：NO-GO，直到候选决策及必要 owner amendment 批准。** R/D/T 自动生成仅形成完整提案，Tasks 不执行未批准的协议或相邻修改。
+- **Decision basis**：[ADR-031](../../steering/adr/adr-031.md) 定义 opt-in 网络组合、Sync transport/state v1 与秘密后端边界；[ADR-030](../../steering/adr/adr-030.md) 定义 RPY 手工包前置。ADR-018/019 与 Resource owning 合同保持两种包的独立 authority。
+- **Contract changes**：Project 整包 artifact、Qt 手动同步视图及平台可选依赖组合见 [相邻合同与执行依赖](#相邻合同与执行依赖)。Resource 复用已有 artifact/preview/apply/receipt。
+- **Steering sync**：product 的 opt-in 网络例外、tech/structure/spec-ownership 的依赖和模块；roadmap 保持 RPY→Sync。
+- **Downstream revalidation**：Project/Resource 的 preview/apply/恢复、RPY 缺失 codec、Qt session 生命周期、source 与普通 Windows frozen 的可选依赖。
 
 ## Architecture
 
 ### Existing Architecture Analysis
 
-Resource 已有 `ResourcePackageArtifact.metadata/open_bounded_stream()/close()`，由 sealed package 的 `transfer_artifact()` 转移 retained authority。Project 当前只有 `OpenedProjectPackage.path/open_member()`，缺少整包受限出口；不能把这些路径/成员能力交给 provider。Project 的 `export_copy` 不改变 save baseline；`save_workspace` 必须有已提交 save report 和 durable receipt，不能仅看返回或保存数量。
+Resource 已有 `ResourcePackageArtifact.metadata/open_bounded_stream()/close()`，由 sealed package 的 `transfer_artifact()` 转移 retained authority。Project 消费 [整包 artifact 合同](../multi-document-project-workspace/design.md#受限整包-artifact)；`OpenedProjectPackage.path/open_member()` 不能交给 provider。Project 的 `export_copy` 不改变 save baseline；`save_workspace` 必须有已提交 save report 和 durable receipt，不能仅看返回或保存数量。
 
 Remotely Save 可参考 provider 分离和自有远端设置，但其公开写入接口不传 expected ETag，不能直接继承为本设计的 CAS 协议。Kiss Translator 的密码字段/眼睛按钮只参考交互，不引入其加密功能或复制源码。
+
+### 相邻合同与执行依赖
+
+| Owner 与现行合同 | 合同差异 | 唯一执行任务 |
+| --- | --- | --- |
+| [Project Requirements 8](../multi-document-project-workspace/requirements.md#requirement-8手工-projectpackage-导出验证预览导入与-receipt)；[整包 artifact](../multi-document-project-workspace/design.md#受限整包-artifact) | 提供 retained、bounded 整包流和 owner 内容 fingerprint，不暴露路径/member 或未完成包；下载仍由 owner validate/preview/apply/receipt，apply 后再导出复证 | [Sync Tasks](tasks.md) 1.3、5.1 |
+| [平台 Requirements 6、11](../windows-platform-enablement/requirements.md)；[依赖与秘密组合](../windows-platform-enablement/design.md#同步的可选依赖与秘密组合) | 延迟加载固定可选依赖与 allowlisted 系统秘密 backend；禁用同步不请求秘密或网络，普通发行显式声明模块闭包 | [Sync Tasks](tasks.md) 1.1、2.2、6.2 |
+| [Qt Requirements 11](../qt-editor-json-mvp-increment/requirements.md#requirement-11手动同步交互)；[Controller/Qt 接缝](../qt-editor-json-mvp-increment/design.md#项目打开格式导出与手动同步视图) | 手动连接、计划、冲突、导入确认和部分失败反馈；秘密默认遮蔽、可点开、关窗恢复，不提供加密开关 | [Sync Tasks](tasks.md) 2.3、6.1、6.3、7.3 |
+
+Resource 复用既有 `ResourcePackageArtifact`、preview/apply/receipt，不新增共同 Package authority。RPY 手工包闭环是同步前置；provider 不解释 TL 或 private member。任务依赖和完成状态只维护在原执行清单。
 
 ### Architecture Pattern & Boundary Map
 
@@ -201,7 +207,7 @@ Project owner 拟提供 `ProjectPackageArtifact`：完整已验证包的 size/di
 
 ### SyncState 与恢复
 
-`sync-state-v1` 是独立设备状态，按 connection ID 加本地进程锁，rooted JSON snapshot+pending intent 持久化；每次替换复读验证，只有确认 durable 的 base 可用。若新状态写入结果不确定，重新打开/验证，失败即 recovery-required，不覆盖损坏状态。该协议须由治理候选批准，不复用 Project/Resource manifest 或修改其日志。
+`sync-state-v1` 是独立设备状态，按 connection ID 加本地进程锁，rooted JSON snapshot+pending intent 持久化；每次替换复读验证，只有确认 durable 的 base 可用。若新状态写入结果不确定，重新打开/验证，失败即 recovery-required，不覆盖损坏状态。独立状态边界见 [ADR-031](../../steering/adr/adr-031.md)；不复用 Project/Resource manifest 或修改其日志。
 
 每项 pending 存 operation UUID、config revision、方向、item UUID、预期 base/remote version、输入/输出 artifact 摘要、owner 提供的 pending/结果引用（若存在）、本地绑定与预期 fingerprint、阶段和可恢复副本引用；不保存秘密、正文或远端响应体。阶段为 `prepared → transfer_confirmed → owner_apply_started (下载) → owner_result_recorded (下载) → content_verified → base_committed`；不同内容转入 pending_alignment。owner_apply_started 必须在调用 owner 前持久化，owner_result_recorded 保存已返回的安全结果事实。上传不需要虚构 owner apply；本地导出在 prepared 前已成功。
 

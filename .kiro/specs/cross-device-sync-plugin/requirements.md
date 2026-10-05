@@ -13,9 +13,9 @@ LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户�
 ### Scope Lineage
 
 - **Owning spec**：`cross-device-sync-plugin`。
-- **被修订的既有范围说明**：产品的纯本地默认行为通过显式可选同步扩展；Multi/Resource 的网络传输延期项仅在各自批准的包出口之外编排。
+- **被修订的既有范围说明**：产品的纯本地默认行为通过显式可选同步扩展；Multi/Resource 的网络传输延期项仅在各自定义的包出口之外编排。
 - **相邻规格 / 契约**：`multi-document-project-workspace`、`language-resource-portability`、`rpy-project-codec`、平台文件/秘密后端、Qt Controller。
-- **审批状态**：用户已选择 S3-compatible 先行、WebDAV 后续，R2/InfiniCLOUD 仅为实际验收服务、不加密、凭据默认遮蔽且可显示，并要求自动生成 R/D/T；新传输/持久状态/依赖边界与相邻 owner amendment 待独立治理闭合，尚未授权运行实现。
+- **范围差异**：可选手动同步只传输完整包；Project 增加整包 artifact，Qt 提供中立交互，平台负责可选依赖与秘密后端组合。 具体 owner 合同与执行依赖见 [相邻合同](design.md#相邻合同与执行依赖)。
 
 ## 需求
 
