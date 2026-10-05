@@ -273,7 +273,7 @@ Store 内部不得在 import 时把 wrapper 绑定到另一个局部别名，否
 - 先只删除 closed scan 证明无 consumer 的 wrapper并完成最终 architecture cleanup，从而固定 production runtime；随后把 leaf/projection/store/index 同时写入 Gate C artifact/build roots、`BENCHMARK_IMPLEMENTATION_SOURCE_PATHS` 与 fault/acceptance closed source registry，并冻结全部 current-source roots。
 - 在 registries 已冻结的同一 final fingerprint 上重放 store/retrieval 全量矩阵与 Gate C，再真实运行 Gate D。
 - 最后只生成 fault/acceptance/release evidence并同步不属于 evidence roots 的治理文档；runtime 文件真实存在后同步 `structure.md`，归档 border，标 Feature GO。
-- Gate C 开始后若 production、测试矩阵 registry 或任一 current-source root 再变化，所有后续证据一律 stale，必须从 Gate C 重新执行。
+- 本 Wave 的 Gate C 开始后若 production、测试矩阵 registry 或任一 current-source root 再变化，该阶段后续证据一律 stale，必须从 Gate C 重新执行。后续维护保留原报告范围，按实际改变的 owner 输入验证当前代码。
 
 ## 验证设计
 
@@ -291,6 +291,10 @@ Store 内部不得在 import 时把 wrapper 绑定到另一个局部别名，否
 - FTS5/fallback、short/long query、duplicate fold、dense/sparse、stale generation；
 - append/streamed success 与 extension/SQL/chunk/commit faults；
 - activation、reattestation、binding、snapshot、schema upgrade 与 migration 邻接回归。
+
+### 历史验收与当前架构验证
+
+Wave 4 的 final roots 与验收报告保留原运行范围。后续 characterization 直接检查当前 candidate owner、依赖、SQL/事务边界和 Gate/benchmark registry 覆盖，不要求原 fault/acceptance/release JSON 随当前源码刷新。当前 source 发布仍由 Core 工具对显式输入执行 freshness 与真实验证；移除旧报告与当前文件 hash 的永久相等断言不改变 Gate roots、fixture、runtime fingerprint 或能力准入，也不把历史 GO 转换为当前 GO。
 
 ### Evidence 与性能
 

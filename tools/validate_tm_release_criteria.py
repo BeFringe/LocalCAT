@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the closed 86-criterion Feature 5 release decision."""
+"""Build the current Feature 5 release decision."""
 
 from __future__ import annotations
 
@@ -47,6 +47,8 @@ from tm_benchmark_gate import (  # noqa: E402
     benchmark_implementation_fingerprint,
 )
 from tools.tm_release_evidence_io import (  # noqa: E402
+    artifact_output_path,
+    evidence_input_path,
     atomic_write as _platform_atomic_write,
     strict_read_regular as _platform_strict_read_regular,
     validate_evidence_target as _platform_validate_evidence_target,
@@ -73,7 +75,7 @@ class _EvidenceRow(Protocol):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Validate all 86 Feature 5 acceptance criteria.",
+        description="Validate all current Feature 5 acceptance criteria.",
     )
     parser.add_argument(
         "--repository-root",
@@ -83,8 +85,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--emit",
         type=Path,
-        default=_REPOSITORY_ROOT / _RELEASE_EVIDENCE_PATH,
+        required=True,
     )
+    for option in ("acceptance", "fault", "benchmark"):
+        parser.add_argument(f"--{option}-evidence", type=Path, required=True)
     parser.add_argument(
         "--require-go",
         action="store_true",
@@ -453,14 +457,13 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("release repository root must match validator checkout")
     if repository_root.resolve(strict=True) != _REPOSITORY_ROOT:
         raise ValueError("release repository root is not canonical")
-    evidence_path = arguments.emit
-    if not evidence_path.is_absolute():
-        evidence_path = repository_root / evidence_path
-    evidence_path = evidence_path.absolute()
-    canonical_evidence_path = repository_root / _RELEASE_EVIDENCE_PATH
-    if evidence_path != canonical_evidence_path:
-        raise ValueError("release evidence must use the canonical output path")
-    _validate_evidence_target(evidence_path)
+    acceptance_path = evidence_input_path(repository_root, arguments.acceptance_evidence)
+    fault_path = evidence_input_path(repository_root, arguments.fault_evidence)
+    benchmark_path = evidence_input_path(repository_root, arguments.benchmark_evidence)
+    evidence_path = artifact_output_path(
+        repository_root, arguments.emit,
+        inputs=(acceptance_path, fault_path, benchmark_path),
+    )
 
     requirements_bytes, requirements_digest = _read_strict_regular(
         repository_root,
@@ -469,8 +472,8 @@ def main(argv: list[str] | None = None) -> int:
     criteria = parse_requirement_criteria(requirements_bytes.decode("utf-8"))
     criterion_ids = tuple(item.criterion_id for item in criteria)
     binding_ids = tuple(item.criterion_id for item in RELEASE_CRITERIA_BINDINGS)
-    if len(criteria) != 86 or binding_ids != criterion_ids:
-        raise ValueError("release registry must exactly bind all 86 criteria")
+    if not criteria or binding_ids != criterion_ids:
+        raise ValueError("release registry must exactly bind all current criteria")
     registry_digest = release_criteria_registry_digest()
     release_source_files = _release_source_file_digests(repository_root)
     release_source_fingerprint = release_criteria_source_fingerprint(
@@ -481,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
     acceptance_status, acceptance_digest, acceptance_fingerprint = (
         _validate_matrix_evidence(
             root=repository_root,
-            relative=_ACCEPTANCE_EVIDENCE_PATH,
+            relative=acceptance_path,
             schema_version=ACCEPTANCE_MATRIX_SCHEMA_VERSION,
             rows=ACCEPTANCE_MATRIX_ROWS,
             registry_digest=acceptance_matrix_registry_digest(),
@@ -491,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     fault_status, fault_digest, fault_fingerprint = _validate_matrix_evidence(
         root=repository_root,
-        relative=_FAULT_EVIDENCE_PATH,
+        relative=fault_path,
         schema_version=FAULT_MATRIX_SCHEMA_VERSION,
         rows=FAULT_MATRIX_ROWS,
         registry_digest=fault_matrix_registry_digest(),
@@ -500,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     benchmark_bytes, benchmark_digest = _read_strict_regular(
         repository_root,
-        _BENCHMARK_EVIDENCE_PATH,
+        benchmark_path,
     )
     benchmark_bundle = benchmark_evidence_bundle_from_json(
         benchmark_bytes.decode("utf-8")
@@ -534,7 +537,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("requirements changed during release validation")
         acceptance_after = _validate_matrix_evidence(
             root=repository_root,
-            relative=_ACCEPTANCE_EVIDENCE_PATH,
+            relative=acceptance_path,
             schema_version=ACCEPTANCE_MATRIX_SCHEMA_VERSION,
             rows=ACCEPTANCE_MATRIX_ROWS,
             registry_digest=acceptance_matrix_registry_digest(),
@@ -551,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         fault_after = _validate_matrix_evidence(
             root=repository_root,
-            relative=_FAULT_EVIDENCE_PATH,
+            relative=fault_path,
             schema_version=FAULT_MATRIX_SCHEMA_VERSION,
             rows=FAULT_MATRIX_ROWS,
             registry_digest=fault_matrix_registry_digest(),
@@ -562,7 +565,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("fault evidence changed during release validation")
         benchmark_bytes_after, benchmark_digest_after = _read_strict_regular(
             repository_root,
-            _BENCHMARK_EVIDENCE_PATH,
+            benchmark_path,
         )
         if (
             benchmark_bytes_after != benchmark_bytes

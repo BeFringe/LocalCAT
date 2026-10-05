@@ -609,6 +609,16 @@
   - _Boundary: Core capability evaluator、Gate D publication/attestation 与安全警示合同_
   - _Depends: 继承含 ADR-029、ADR-013/028 取代标注及 tech.md 同步的唯一治理 tip；9.6e_
 
+- [x] 9.8 分离历史报告与当前发布验证的产物消费
+  - acceptance/fault/source release/Windows source release 显式选择运行产物；release 的三份输入与 Windows benchmark/C3B 输入始终使用同组所选路径，输出不得覆盖源码、历史报告或本次输入。
+  - 保留 rooted 严格读写、当前源码/registry/fingerprint 核对、真实测试执行、发布前后完整快照复证及 NO_GO/require-go；Windows worker 模式保持独立启动。
+  - release 原映射完整保留，补齐 R8.8–10 的已有 evaluator、发布与冷恢复测试；按当前 Requirements 一一核对，不把原 86 条写成永久总数。
+  - 历史报告只按原运行范围解释；当前架构和验证器正反测试直接约束当前代码，不要求刷新历史 JSON。Windows source 保留五组职责、显式选择集与 skip 拒绝；清单可解析不代表本轮执行通过。
+  - 退出条件：定向测试覆盖显式路径、输入陈旧/失配/漂移、执行失败和时间超限 NO_GO；历史报告、runtime、fixture、Gate roots 及设备资格字节不变，不生成新 GO。
+  - _Requirements: 8.1–10、9.9–12；Windows Compatibility Amendment WA-06 5_
+  - _Boundary: Core 发布验证工具、直接输入生产者、registry 与测试；Store 相邻维护遵循其 Task 5.6 的历史消费与直接架构守卫边界_
+  - _Depends: 9.7_
+
 ## Implementation Notes
 
 - Task 9.6b：合法非legacy provenance经导出后仍须按实际source逐项保真核对，不能硬编码为legacy来源。SQLite流式游标须在成功和异常路径都关闭，否则异常引用持有的游标会阻止Windows清理。

@@ -28,6 +28,47 @@ _WINDOWS_RELEASE_LOCK_NAME = ".localcat-release-evidence.lock"
 _WINDOWS_RELEASE_LOCK_PAYLOAD = b"localcat.release-evidence-owner.v1\0"
 
 
+def evidence_input_path(root: Path, path: Path | str) -> str:
+    """Select a checkout-relative input without resolving an alias."""
+    selected = Path(path)
+    if ".." in selected.parts:
+        raise ValueError("evidence input path is not canonical")
+    if selected.is_absolute():
+        try:
+            selected = selected.relative_to(root)
+        except ValueError:
+            raise ValueError("evidence input must be inside the validator checkout") from None
+    if not selected.parts or selected.anchor:
+        raise ValueError("evidence input path is not canonical")
+    return selected.as_posix()
+
+
+def artifact_output_path(
+    root: Path,
+    path: Path,
+    *,
+    inputs: tuple[str, ...] = (),
+) -> Path:
+    """Select an explicit run output, leaving checkout sources untouched."""
+    if ".." in path.parts:
+        raise ValueError("artifact output path is not canonical")
+    selected = path if path.is_absolute() else root / path
+    try:
+        relative = selected.relative_to(root)
+    except ValueError:
+        relative = None
+    if relative is not None and (
+        len(relative.parts) < 3 or relative.parts[0] != "artifacts"
+    ):
+        raise ValueError("checkout output must use an artifact run directory")
+    if selected in {(root / name).resolve(strict=False) for name in inputs}:
+        raise ValueError("artifact output must not replace an input")
+    if selected.parent.resolve(strict=True) != selected.parent:
+        raise ValueError("artifact output parent is not canonical")
+    validate_evidence_target(selected, target_error="artifact output is not regular")
+    return selected
+
+
 def strict_read_regular(
     root: Path,
     relative: Path,
@@ -463,7 +504,9 @@ def _posix_atomic_write(
 
 
 __all__ = [
+    "artifact_output_path",
     "atomic_write",
+    "evidence_input_path",
     "strict_read_regular",
     "validate_evidence_target",
 ]

@@ -1,7 +1,7 @@
 {
   "feature_name": "tm-store-module-extraction",
   "created_at": "2026-08-21T00:00:00Z",
-  "updated_at": "2026-08-21T14:40:00Z",
+  "updated_at": "2026-10-05T03:41:34Z",
   "language": "zh-CN",
   "phase": "tasks-generated",
   "approvals": {
@@ -18,5 +18,8 @@
       "approved": true
     }
   },
-  "ready_for_implementation": true
+  "ready_for_implementation": true,
+  "approval_scope": {
+    "release_artifact_maintenance": "2026-10-05 SHA/Git 专项授权的维护增量：显式运行产物与直接输入链、历史报告消费解耦和对应架构/验证测试；Core 补齐既有 R8.8–10 的发布映射。原审批与完成事实保留，历史报告、runtime、fixture、Gate roots 和资格不变，不据此生成当前 GO。"
+  }
 }

@@ -25,6 +25,7 @@ from tests.fault_matrix_registry import (  # noqa: E402
     fault_matrix_source_paths,
 )
 from tools.tm_release_evidence_io import (  # noqa: E402
+    artifact_output_path,
     atomic_write as _platform_atomic_write,
     strict_read_regular as _platform_strict_read_regular,
     validate_evidence_target as _platform_validate_evidence_target,
@@ -43,7 +44,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--emit",
         type=Path,
-        default=_REPOSITORY_ROOT / "fault_matrix_evidence.json",
+        required=True,
     )
     return parser
 
@@ -145,14 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("fault matrix repository root must match the validator checkout")
     if repository_root.resolve(strict=True) != _REPOSITORY_ROOT:
         raise ValueError("fault matrix repository root is not canonical")
-    evidence_path = arguments.emit
-    if not evidence_path.is_absolute():
-        evidence_path = repository_root / evidence_path
-    evidence_path = evidence_path.absolute()
-    canonical_evidence_path = repository_root / "fault_matrix_evidence.json"
-    if evidence_path != canonical_evidence_path:
-        raise ValueError("fault matrix evidence must use the canonical output path")
-    _validate_evidence_target(evidence_path)
+    evidence_path = artifact_output_path(repository_root, arguments.emit)
 
     registry_digest = fault_matrix_registry_digest()
     source_files = _source_file_digests(repository_root)
