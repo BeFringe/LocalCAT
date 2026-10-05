@@ -1,25 +1,25 @@
 # 实施计划
 
-实施前置：Design 的 Governance Impact 仍为 NO-GO。顺序修订及 Parser/Multi/Qt 必要 amendment 必须先获 owner 批准；下列任务是条件式实施提案，不能通过勾选任务代替授权。任务默认顺序执行，每个子项按单一可验证结果安排，约 1–3 小时；实际超出时按同一边界拆分。
+按下列 owner 依赖实施，任务完成须有当前实现证据；跨规格合同与唯一任务归属见 [cross-spec-amendments.md](cross-spec-amendments.md)。任务默认顺序执行，每个子项按单一可验证结果安排，约 1–3 小时；实际超出时按同一边界拆分。
 
-- [ ] 1. 建立已批准的中立接缝与可重现输入
+- [ ] 1. 建立中立接缝与可重现输入
 - [x] 1.1 建立受支持与拒绝输入的合成夹具
   - 覆盖同文件 dialogue/old-new、narrator、speaker/属性分离、extend/centered、with transition、空目标、BOM/换行与拒绝语法；使用合成内容。
   - 完成时，每个 fixture 有确定的输入分类与期望中立记录，单独 checkout 可运行，不读取外部项目目录。
   - _Requirements: 1.2, 1.4, 2.1, 2.2, 7.4_
   - _Boundary: RpyCodec fixtures_
-- [ ] 1.2 实现 Parser owner 批准的 round-trip 准备合同
+- [ ] 1.2 实现 Parser owner 的 round-trip 准备合同
   - 接通可选 factory、live codec/token 验证与受限准备结果；缺失能力返回明确 unsupported。
   - 完成时，伪 codec 可验证调用顺序，foreign/stale token 在目标打开前失败，既有 canonical codec 契约不变。
   - _Requirements: 1.3, 4.4, 7.2_
   - _Boundary: Parser owner amendment_
-- [ ] 1.3 实现 Parser owner 批准的 prepared 发布能力
+- [ ] 1.3 实现 Parser owner 的 prepared 发布能力
   - 绑定准备结果与 issuing surface/source/output 摘要、目标条件及消费状态，调用平台原子发布并返回明确结果；不经过 canonical serializer 重编码。
   - 完成时，伪造/复用/过期准备结果不能写入，现有父目录下可发布受限 round-trip bytes，故障返回 failed/uncertain 而非成功，不新增 journal/LKG。
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
   - _Boundary: Parser owner publication amendment_
   - _Depends: 1.2_
-- [ ] 1.4 接入已批准单文件 profile 与私有数据通道
+- [ ] 1.4 接入单文件 profile 与私有数据通道
   - 消费 Multi 增量 5.6 提供的非 legacy 单 Document profile；本任务只接入配置 surface 与 verified private handoff，保留 rooted source 至首包发布，不重复实现 profile。
   - 完成时，中立伪 codec 可创建/重开一个 Document 的包；原 legacy 与多文件 profile 拒绝规则不变。
   - _Requirements: 3.1, 3.2, 3.4, 7.2_
@@ -73,13 +73,13 @@
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
   - _Boundary: Parser publishing / RpyProjectAdapter integration_
   - _Depends: 1.3, 3.3_
-- [ ] 3.5 实现经平台 owner 批准的嵌套导出目录合同
+- [ ] 3.5 实现平台 owner 的嵌套导出目录合同
   - 准备已有祖先身份、缺失后缀及 absent 条件；定义确认后的逐组件物化与发布目标绑定，预览零目录写入。
   - 完成时，fake 平台证明目录/目标竞争会 stale，本批创建祖先才可复用，retirement authority 不能冒充目标绑定。
   - _Requirements: 4.4, 5.4, 7.2_
   - _Boundary: Platform export-directory contracts_
 - [ ] 3.6 实现 POSIX 导出子目录物化
-  - 在批准根内按组件 no-follow 创建并复证，返回 Parser 可消费的目标绑定；取消/失败释放 handle，不收养竞争创建对象。
+  - 在用户选择的导出根内按组件 no-follow 创建并复证，返回 Parser 可消费的目标绑定；取消/失败释放 handle，不收养竞争创建对象。
   - 完成时，缺失目录导出可用，symlink/祖先替换/创建失败不发布目标，已建空目录如实报告。
   - _Requirements: 4.4, 4.5, 5.4, 7.2_
   - _Boundary: Platform POSIX export-directory backend_
@@ -145,8 +145,8 @@
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 6.1, 6.2, 6.4, 7.4_
   - _Boundary: Product acceptance integration_
 - [ ] 6.3 闭合治理同步与下游消费验证
-  - 由治理 owner 将已批准且已实现的能力同步到 product/tech/structure/roadmap、spec-ownership 与 Multi 顺序说明；owner 提交只消费唯一治理变更。
-  - 完成时，实际 diff 与已批准 amendment 一致，Parser/Project/Qt 回归及 Sync 手工包前提可验证；未完成项不得记为 Feature GO。
+  - 由治理 owner 将实际实现的能力同步到 product/tech/structure/roadmap、spec-ownership 与 Multi 顺序说明；owner 提交只消费唯一治理变更。
+  - 完成时，实际 diff 与现行合同一致，Parser/Project/Qt 回归及 Sync 手工包前提可验证；未完成项不得记为 Feature GO。
   - _Requirements: 1.4, 3.4, 6.4, 7.4_
   - _Boundary: Governance / downstream integration closure_
   - _Depends: 6.1, 6.2_

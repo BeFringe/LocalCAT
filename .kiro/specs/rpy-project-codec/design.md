@@ -36,27 +36,16 @@ TL profile/token 版本变化重验 RPY golden fixtures 与旧包缺失/不兼�
 
 ## Governance Impact
 
-- **Applicable Steering**：product、tech、structure、spec-ownership、repository-safety；以 roadmap 的 RPY→Sync 产品顺序为目标。
-- **Applicable ADRs**：ADR-015 的 Parser/codec 分权、ADR-018 的项目/codec 分权、ADR-019 的严格 ProjectPackage、ADR-020/025/026 的平台与无状态 Parser 写入。
-- **ADR disposition**：待治理线最小取代 ADR-018 决策 13 中“RPY 在 Sync 后”的顺序。保留其身份、包、权限决定；不静默改写 adopted 历史。
-- **Scope amendment**：Pending。Parser 扩展中立 round-trip prepare；Multi 增加单 TL 的非 legacy origin profile、配置 codec intake、private payload handoff、根目录递归预览/显式选择与导出协调；Qt 增加中立入口；平台增加导出根下受控子目录准备/创建/绑定端口。下表给出精确提案，不把生成视为批准。
-- **Steering sync**：治理 owner 同步 Multi border/review-clustering 的旧顺序及 spec-ownership；交付时依据实际能力更新 product/tech/structure/roadmap。
-- **Downstream revalidation**：Parser canonical 路径、Multi 单/多文档与包恢复、Qt/Chunk mutation guards、ResourcePackage 手工消费、Sync 的 RPY 包冷重开。
-
-**实施判定：NO-GO，直到上述顺序和相邻合同提案获得对应 owner 批准。** 本文及 Tasks 是本轮要求的完整设计/任务草案；不是用首个“治理任务”代替授权。审批后才能启动其依赖的 runtime 工作。
-
-| Owner | 拟议合同增量 | 不变项 |
-| --- | --- | --- |
-| Parser | 可选 `round_trip_serializer_factory`；surface 的 `prepare_round_trip`/`write_prepared`；codec 在源/token 复证后产生受限输出 | canonical API、八个内建组合与 verified terminal；不加入 RPY 字段 |
-| Multi | `explicit-single-file-v1` 非 legacy profile；允许一个 Document 的 OriginBinding；intake 接收配置 surface 与中立 private bytes；单独的 source export 协调 | strict ZIP v1 的既有键、成员 closure、identity 与包事务；`LEGACY_SINGLE_JSON` 不扩宽 |
-| Platform | 受控 descendant-directory prepare/create/bind；绑定已存在祖先与缺失后缀的 absent 条件 | 不借用 retirement/ledger authority；不授予 codec 路径访问 |
-| Controller/Qt | 消费 Multi 根目录选择/章节树投影、RPY 选择分流、项目包另存、导出预览/逐文件报告 | Qt 不取得 provider、token、path authority 或 package handle；Chunk 权限继续生效 |
+- **Decision basis**：[ADR-030](../../steering/adr/adr-030.md) 定义目录选择、格式导出与 RPY→Sync 顺序；ADR-015/018/019 保持 Parser、codec、项目包分权，ADR-020/025/026 保持 rooted 发布与无状态 Parser。
+- **Contract changes**：各 owner 的当前条款与唯一执行任务见 [跨规格合同](cross-spec-amendments.md)，本设计只定义 RPY 语法、private payload 与 Application 消费方式。
+- **Steering sync**：Multi border/review-clustering 的顺序、spec-ownership，以及交付后 product/tech/structure/roadmap 的实际能力。
+- **Downstream revalidation**：Parser canonical 路径、Project 单/多文档与包恢复、Qt/Chunk mutation guards、ResourcePackage 手工消费、Sync 的 RPY 包冷重开。
 
 ## Architecture
 
 ### Existing Architecture Analysis
 
-`FormatId` 已开放，provider binding 已能配置 enabled/兼容版本；但 descriptor 只提供 reader/canonical serializer。`RoundTripTokenEnvelope` 已定义身份和 source/format-state fingerprint，却没有通用 round-trip 调用。`ProjectDocumentWriterPort` 是 Multi Design 的未来接缝；当前 source write-back 返回 unsupported。intake 固定内建格式及空 private member，OriginBinding 的 explicit-selected-files-v1 至少需要两个文档。因此单 TL 必须走批准后的 Project 扩展，不能假装 legacy JSON。
+`FormatId` 与已知 provider composition 提供格式选择；RPY 消费 Parser 的中立 round-trip 接缝，以及 Project 的配置 intake/private handoff、`explicit-single-file-v1` 与 `explicit-selected-files-v1`。这些依赖的实现与验证由 Tasks 指向各 owner 的执行项，不将单 TL 伪装为 legacy JSON。
 
 ### Architecture Pattern & Boundary Map
 
@@ -98,7 +87,7 @@ flowchart LR
 | `tests/fixtures/rpy/` | 合成 TL、期望中立记录与导出；无外部目录依赖 |
 | 修改 `parser_contracts.py`、`parser_composition.py`、`parser_source.py` | Parser owner 的通用 prepare/publish amendment |
 | 修改 `project_workspace_contracts.py`、`project_workspace_intake.py` | Multi owner 的单文件 profile、注入 surface 与 private payload 通道 |
-| 修改 `platform_fs_contracts.py`、`platform_fs_posix.py`、`platform_fs_windows.py` | 平台 owner 批准的导出子目录准备/创建/绑定；与 Multi 只读观察端口分别验收 |
+| 修改 `platform_fs_contracts.py`、`platform_fs_posix.py`、`platform_fs_windows.py` | 平台 owner 的导出子目录准备/创建/绑定；与 Multi 只读观察端口分别验收 |
 | 修改 `editor_controller.py`、`qt_editor_window.py`、`qt_editor.py` | 明确的跨 owner composition/命令集成；codec 只在 composition 注册 |
 | 修改 `tools/build_windows_ordinary.py`、`packaging/windows/frozen_roots.json` | 将新模块纳入正常发行；不改变 Core/Gate 输入合同 |
 
@@ -130,7 +119,7 @@ stateDiagram-v2
 
 预览绑定 session、workspace revision、选定 Document identities、codec identity、source/private digest、输出目标身份和导出策略。导出全部当前 target；空/未确认是可见警示，不自动填源文或丢段。用户编辑、重开、换 provider 或重选路径使预览失效。TL 导出不清除 package dirty，也不更新 package baseline。
 
-多文件导出由用户选择一个导出根目录，按已验证的 source_ref 重建相对目录，不按 basename 展平。先准备/验证所有输出及目录/大小写/同名冲突，再确认并按顺序独立发布；root 与每个目标 ancestor 在发布前复证，拒绝符号链接/reparse、逸出和替换。缺失子目录仅由平台在批准根内受控创建；预览不建目录，目录创建失败列为未发布，已创建空目录不宣称回滚。取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
+多文件导出由用户选择一个导出根目录，按已验证的 source_ref 重建相对目录，不按 basename 展平。先准备/验证所有输出及目录/大小写/同名冲突，再确认并按顺序独立发布；root 与每个目标 ancestor 在发布前复证，拒绝符号链接/reparse、逸出和替换。缺失子目录仅由平台在用户选择的导出根内受控创建；预览不建目录，目录创建失败列为未发布，已创建空目录不宣称回滚。取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
 
 ## Components and Interfaces
 
@@ -161,27 +150,13 @@ interpolation 按 bracket/quote 深度识别为不执行的 token；`[[` 和 `{{
 
 codec 对 payload 做有界解析，重读 source 重建映射并核对跨度/摘要/ID集合；不能相信包内自报 offsets。原始字节在 source member，payload 仅是可验证映射。包 owner 只验证外层 membership/digest/size，不解码 payload。冷重开时从上述事实重建当前调用的 token；持久 token 本身不是执行授权。
 
-中立接口提案（由 Parser owner 冻结精确 DTO）：
+codec 实现 [Parser 中立 round-trip 准备与发布合同](../parser-subsystem-extraction/design.md#中立-round-trip-准备与发布)：接收 verified source、opaque token 与中立 edits，完成映射复证、保护 token 验证与有界编码，返回 source/output fingerprints。factory 缺失为 unsupported；codec 不接收目标路径、Project session、baseline 或 receipt。
 
-```python
-class RoundTripSerializer(Protocol):
-    def prepare(self, request: RoundTripRequest) -> PreparedFormatBytes: ...
-# request: live codec identity + verified source + token + tuple[neutral segment edits]
-# result: bounded output + source/output fingerprints + structured diagnostics
-# 无目标路径、Project session、baseline、receipt 或私有 RPY 类型
-```
+### 嵌套导出编排
 
-`prepare_round_trip` 先验证现有 `RoundTripTokenEnvelope`，再调用 exact provider factory；factory 缺失等同 unsupported。Application 选定目标后使用 Parser/平台受控发布 surface；复用 `atomic_write_bytes` 的安全原语及 `PreparedCanonicalWrite` 的准备/提交模式，不复用 canonical serializer 的格式语义。不得直接使用 `open(path,'w')`。发布前 source/target身份失效零发布，发布后 durability 不确定返回结构化不确定结果；codec 无 journal/LKG。
+Application 消费 [平台目录合同](../windows-platform-enablement/design.md#只读目录观察与受控目标物化) 的 `prepare_descendant_target`/`materialize_target`，codec 不接触目录。导出 preview 绑定目录 plan、session/revision、source/private/输出摘要；确认前排除重复、大小写与文件/祖先冲突。RPY 批次至多 256 文件，同时遵守平台深度与更小的 owner 限制。
 
-### 嵌套导出的平台目录合同（提案）
-
-现有 rooted bind/open 只覆盖已存在的父目录；retirement 专用目录 authority 不用于导出。平台新增 `prepare_descendant_target(retained_export_root, portable_ref)` 与 `materialize_target(directory_plan, cancellation)` 的中立端口；仅 Application 消费，codec 不知道目录或目标路径。限额继承 portable ref、深度 32、RPY 批量 256 文件和更小的 owner 限制；逐目标物化及时释放非必要 handle，保留本批新目录身份事实至批次结束。
-
-prepare 只读：验证 portable_ref、根/已有祖先身份、既有目标身份或缺失事实，并把缺失目录后缀及目标的 absent 条件封装为不可变 plan。Project 导出 preview 绑定此 plan、session/revision、source/private/输出摘要；父目录不存在时不虚构目标 handle。所有候选路径的重复、大小写冲突以及“某目标文件同时是另一目标祖先”的冲突在确认前拒绝。
-
-用户确认后才允许 materialize：复证已有祖先，按组件 no-follow 创建缺失子目录并保留新 handle/身份，逐层确认仍在原根内。预览中 absent 的目录或目标若被其他进程创建，不收养该对象，返回 stale；仅本批已成功创建并复证的共享祖先可供后续目标复用。既有目标必须匹配预览身份。完成后返回 Parser 受控发布能消费的 rooted target binding，再按原条件执行 prepared write。并发替换、取消或错误关闭全部本次 handle；取消后不启动新目录或文件写入，已发出的系统调用结果仍须复证。创建失败不发布该目标文件，不承诺删除本批已创建空目录，也不把它们报成已导出文件。
-
-Parser owner 的 `write_prepared` 是独立实现任务：验证准备结果的 issuing surface、source/output fingerprint、有效目标绑定与消费状态，再调用既有平台原子发布，投影 published/failed/uncertain。canonical serializer 不重新编码 round-trip bytes，不能把 `PreparedFormatBytes` 直接当作任意可写 bytes；该接口不引入 codec journal/LKG 或 Project receipt。RPY Application 的发布任务仅编排此能力，不假设接口已存在。
+确认后按顺序物化并调用 Parser `write_prepared`，只编排发布结果，不绕过 issuing surface、一次性消费和 rooted binding 验证。目录失败不发布该文件；已创建空目录如实报告，不伪称回滚。canonical serializer 不重新编码 round-trip bytes，Application 不取得 codec journal/LKG 或 Project receipt 权威。
 
 ### RpyProjectAdapter 与 UI
 
@@ -193,7 +168,7 @@ Controller 继续校验 issued identity、session/revision 与 Chunk mutation pe
 
 唯一当前译文/确认状态在 Project 的中立记录/overlay。source member 不变，private member 不镜像 overlay。源调和调用当前 codec 重新提取整体 payload；Project 决定 unchanged/changed/new/removed/ambiguous 并消费显式 rename。缺失旧 codec 时不解释/迁移其 payload；已有包可中立编辑，直到兼容 codec 可用。
 
-设备本地 CodecSettings 保存已知 provider ID/启用状态；不进入 package。新 profile 使用现有 version 字段表达，若 Project owner 判定必须改变严格包 schema，则返回 Design 单独批准，不能默加字段。
+设备本地 CodecSettings 保存已知 provider ID/启用状态；不进入 package。新 profile 使用现有 version 字段表达，若 Project owner 判定需要改变严格包 schema，须先修订 Project owner 合同并经过工作流决策门，不能默加字段。
 
 ## Requirements Traceability
 

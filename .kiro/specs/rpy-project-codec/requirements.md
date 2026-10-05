@@ -15,7 +15,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 - **Owning spec**：`rpy-project-codec`。
 - **被修订的既有范围说明**：Multi Requirements 3.5 的 RPY 延期范围；Multi Design 的 single-file origin 和未来 source writer 接缝；Parser 中立 source-round-trip capability 的执行扩展。
 - **相邻规格 / 契约**：`parser-subsystem-extraction`、`multi-document-project-workspace`、`qt-editor-json-mvp-increment`、`windows-platform-enablement`。
-- **审批状态**：产品已选择 ProjectPackage 与 RPY 优先顺序，并要求自动生成 R/D/T；相邻 owner amendment 及 ADR-018 顺序条款的治理修订仍须单独闭合。生成本规格不批准这些变更，也不启动实现。
+- **范围差异**：单 TL 采用非 legacy ProjectPackage profile，目录选择由 Multi 提供；Parser 提供中立 round-trip 准备/发布，RPY 手工包闭环先于 Sync。 具体 owner 合同与执行依赖见 [跨规格合同](cross-spec-amendments.md)。
 
 ## 需求
 
