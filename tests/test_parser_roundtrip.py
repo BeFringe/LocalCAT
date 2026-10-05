@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 import hashlib
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
@@ -18,8 +20,28 @@ from parser_contracts import (
     SourceReference, TargetPresence, TranslationState,
 )
 from parser_source import CancellationToken
+from platform_fs_contracts import (
+    BoundDirectoryAuthority, CandidateFile, PendingPublication,
+    PlatformFileError, PlatformFileErrorCode,
+)
 from tests.test_parser_composition import _Provider
 from tests.test_parser_registry import _descriptor
+
+
+if sys.platform == "win32":
+    import platform_fs_windows as native_fs
+    _PlatformAdapter = native_fs.WindowsPlatformAdapter
+    _CandidateFile = native_fs._WindowsCandidateFile
+    _BoundDirectory = native_fs._WindowsBoundDirectory
+    _BoundRegularFile = native_fs._WindowsBoundRegularFile
+    _POST_NAMING_FAULTS = ("publish_after_rename", "publish_after_destination_reopen")
+else:
+    import platform_fs_posix as native_fs
+    _PlatformAdapter = native_fs.PosixPlatformAdapter
+    _CandidateFile = native_fs._PosixCandidateFile
+    _BoundDirectory = native_fs._PosixBoundDirectory
+    _BoundRegularFile = native_fs._PosixBoundRegularFile
+    _POST_NAMING_FAULTS = ("candidate_after_naming", "published_after_open")
 
 
 def digest(payload):
@@ -150,10 +172,12 @@ class ParserRoundTripTests(unittest.TestCase):
 
     def test_round_trip_prepare_verifies_source_before_factory_without_target_open(self):
         opened = self.opened()
-        with mock.patch.object(composition, "_rooted_backend", side_effect=AssertionError("target open")), \
-             mock.patch.object(composition, "_atomic_write_bytes", side_effect=AssertionError("publish")):
+        with mock.patch.object(composition, "_rooted_backend", side_effect=AssertionError("target open")) as target_open, \
+             mock.patch.object(composition, "_atomic_write_bytes", side_effect=AssertionError("publish")) as publish:
             prepared = self.surface.prepare_round_trip(opened, self.token(opened), self.edits())
         self.addCleanup(prepared.close)
+        target_open.assert_not_called()
+        publish.assert_not_called()
         self.assertEqual(self.calls, ["read", "factory", "prepare"])
         self.assertEqual(prepared.source_identity, opened.source_identity)
         self.assertEqual(prepared.codec_identity, self.descriptor.identity)
@@ -391,6 +415,8 @@ class ParserRoundTripTests(unittest.TestCase):
     def bound_preparation(self, target=None, opened=None):
         prepared = self.prepare(opened)
         self.surface.bind_round_trip_target(prepared, self.target_reference(target))
+        bound = self.surface._require_round_trip_preparation(prepared).target
+        self.assertIsInstance(bound.parent, _BoundDirectory)
         return prepared
 
     def assert_failed_publication(self, prepared, code=None, surface=None):
@@ -409,8 +435,9 @@ class ParserRoundTripTests(unittest.TestCase):
                 before = set(self.root.iterdir())
                 prepared = self.bound_preparation(target)
                 self.assertEqual(set(self.root.iterdir()), before)
-                with mock.patch.object(type(self.surface._registry), "create_canonical_serializer", side_effect=AssertionError("canonical")):
+                with mock.patch.object(type(self.surface._registry), "create_canonical_serializer", side_effect=AssertionError("canonical")) as canonical:
                     result = self.surface.write_prepared(prepared)
+                canonical.assert_not_called()
                 self.assertEqual(result.outcome.value, "published")
                 self.assertIsNone(result.code)
                 self.assertEqual(target.read_bytes(), self.output)
@@ -433,7 +460,6 @@ class ParserRoundTripTests(unittest.TestCase):
         self.assert_failed_publication(prepared, "PARSER.CAPABILITY.INVALID_PREPARATION")
 
     def test_publish_rejects_target_replaced_changed_removed_or_created_before_mutation(self):
-        import platform_fs_posix as posix
         for change in ("replace", "edit", "remove", "create"):
             with self.subTest(change=change):
                 self.target.write_bytes(b"old")
@@ -443,15 +469,30 @@ class ParserRoundTripTests(unittest.TestCase):
                 if change == "replace":
                     replacement = self.root / "replacement"
                     replacement.write_bytes(b"changed")
-                    replacement.replace(self.target)
+                    mutate = lambda: replacement.replace(self.target)
                 elif change in ("edit", "create"):
-                    self.target.write_bytes(b"changed")
+                    mutate = lambda: self.target.write_bytes(b"changed")
                 else:
-                    self.target.unlink()
+                    mutate = self.target.unlink
+                code = "PARSER.SOURCE.STALE"
+                if sys.platform == "win32" and change != "create":
+                    # Retained SOURCE handles reject these external changes on
+                    # Windows. Releasing preparation must release that guard.
+                    with self.assertRaises(PermissionError) as caught:
+                        mutate()
+                    self.assertEqual(caught.exception.errno, 13)
+                    self.assertIn(caught.exception.winerror, (None, 32) if change == "edit" else (32,))
+                    self.assertEqual(self.target.read_bytes(), b"old")
+                    prepared.close()
+                    code = "PARSER.CAPABILITY.INVALID_PREPARATION"
+                mutate()
                 before = set(self.root.iterdir())
-                with mock.patch.object(posix._PosixBoundDirectory, "create_candidate", side_effect=AssertionError("candidate")), \
-                     mock.patch.object(posix.PosixPlatformAdapter, "acquire", side_effect=AssertionError("lock mutation")):
-                    self.assert_failed_publication(prepared, "PARSER.SOURCE.STALE")
+                with mock.patch.object(BoundDirectoryAuthority, "create_candidate", side_effect=AssertionError("candidate")) as candidate, \
+                     mock.patch.object(_PlatformAdapter, "acquire", side_effect=AssertionError("lock mutation")) as acquire:
+                    self.assert_failed_publication(prepared, code)
+                candidate.assert_not_called()
+                acquire.assert_not_called()
+                self.assertTrue(prepared.closed)
                 self.assertEqual(set(self.root.iterdir()), before)
                 self.assertEqual(self.target.read_bytes() if self.target.exists() else None, None if change == "remove" else b"changed")
 
@@ -461,33 +502,58 @@ class ParserRoundTripTests(unittest.TestCase):
         target = parent / "output"
         target.write_bytes(b"old")
         prepared = self.bound_preparation(target)
-        parent.rename(self.root / "retired")
+        retired = self.root / "retired"
+        code = "PARSER.SOURCE.STALE"
+        if sys.platform == "win32":
+            with self.assertRaises(PermissionError) as caught:
+                parent.rename(retired)
+            self.assertEqual(caught.exception.winerror, 32)
+            self.assertEqual(target.read_bytes(), b"old")
+            self.assertFalse(retired.exists())
+            prepared.close()
+            code = "PARSER.CAPABILITY.INVALID_PREPARATION"
+        parent.rename(retired)
         parent.mkdir()
-        self.assert_failed_publication(prepared, "PARSER.SOURCE.STALE")
+        with mock.patch.object(BoundDirectoryAuthority, "create_candidate", side_effect=AssertionError("candidate")) as candidate, \
+             mock.patch.object(_PlatformAdapter, "acquire", side_effect=AssertionError("lock mutation")) as acquire:
+            self.assert_failed_publication(prepared, code)
+        candidate.assert_not_called()
+        acquire.assert_not_called()
+        self.assertTrue(prepared.closed)
         self.assertEqual(list(parent.iterdir()), [])
-        self.assertEqual((self.root / "retired" / "output").read_bytes(), b"old")
+        self.assertEqual((retired / "output").read_bytes(), b"old")
 
     def test_publish_rechecks_target_after_lock_and_before_begin_publish(self):
-        import platform_fs_posix as posix
-        for seam in ("lock", "flush"):
+        import parser_source
+        seams = ("source-release", "flush") if sys.platform == "win32" else ("lock", "flush")
+        for seam in seams:
             with self.subTest(seam=seam):
                 self.target.write_bytes(b"old")
+                if sys.platform == "win32" and seam == "flush":
+                    # Existing SOURCE is still retained at flush on Windows;
+                    # an absent destination allows a real external creation.
+                    self.target.unlink()
                 prepared = self.bound_preparation()
-                owner = posix.PosixPlatformAdapter if seam == "lock" else posix._PosixCandidateFile
-                method = "acquire" if seam == "lock" else "_flush_content"
+                owner, method = {
+                    "source-release": (parser_source.BoundWriteTarget, "release_existing_for_publish"),
+                    "lock": (_PlatformAdapter, "acquire"),
+                    "flush": (CandidateFile, "flush_content"),
+                }[seam]
                 original = getattr(owner, method)
                 def replace_after(*args, **kwargs):
                     value = original(*args, **kwargs)
                     self.target.write_bytes(b"competitor")
                     return value
-                with mock.patch.object(owner, method, replace_after), \
-                     mock.patch.object(posix._PosixBoundDirectory, "begin_publish", side_effect=AssertionError("publication")):
+                with mock.patch.object(owner, method, autospec=True, side_effect=replace_after) as drift, \
+                     mock.patch.object(BoundDirectoryAuthority, "begin_publish", side_effect=AssertionError("publication")) as publish:
                     self.assert_failed_publication(prepared, "PARSER.SOURCE.STALE")
+                drift.assert_called_once()
+                publish.assert_not_called()
+                self.assertTrue(prepared.closed)
                 self.assertEqual(self.target.read_bytes(), b"competitor")
                 self.assertEqual(list(self.root.glob(".parser-*.tmp")), [])
 
     def test_publish_source_invalidations_and_cancel_precede_target_mutation(self):
-        import platform_fs_posix as posix
         for reason in ("source-closed", "source-identity", "source-content", "cancel"):
             with self.subTest(reason=reason):
                 self.cancellation = CancellationToken()
@@ -504,83 +570,101 @@ class ParserRoundTripTests(unittest.TestCase):
                 else:
                     self.cancellation.cancel()
                 before = set(self.root.iterdir())
-                with mock.patch.object(posix._PosixBoundDirectory, "create_candidate", side_effect=AssertionError("candidate")), \
-                     mock.patch.object(posix.PosixPlatformAdapter, "acquire", side_effect=AssertionError("lock mutation")):
+                with mock.patch.object(BoundDirectoryAuthority, "create_candidate", side_effect=AssertionError("candidate")) as candidate, \
+                     mock.patch.object(_PlatformAdapter, "acquire", side_effect=AssertionError("lock mutation")) as acquire:
                     self.assert_failed_publication(prepared)
+                candidate.assert_not_called()
+                acquire.assert_not_called()
                 self.assertEqual(set(self.root.iterdir()), before)
                 self.assertEqual(self.target.read_bytes(), b"leave target untouched")
                 self.assertTrue(prepared.closed)
 
     def test_publish_prepublication_faults_preserve_old_cleanup_and_consume(self):
-        import platform_fs_posix as posix
-        for owner, method in ((posix._PosixCandidateFile, "_write_chunks"), (posix._PosixCandidateFile, "_flush_content"), (posix.os, "replace")):
+        # Windows arms recovery handling inside _rename_candidate, before its
+        # native rename call. Fail at entry to prove a prepublication failure.
+        rename_fault = (_BoundDirectory, "_rename_candidate") if sys.platform == "win32" else (native_fs.os, "replace")
+        for owner, method in ((_CandidateFile, "_write_chunks"), (_CandidateFile, "_flush_content"), rename_fault):
             with self.subTest(method=method):
                 prepared = self.bound_preparation()
-                with mock.patch.object(owner, method, side_effect=OSError("secret failure")):
+                with mock.patch.object(owner, method, side_effect=OSError("secret failure")) as fault:
                     self.assert_failed_publication(prepared, "PARSER.SOURCE.WRITE_FAILED")
+                fault.assert_called_once()
+                self.assertTrue(prepared.closed)
                 self.assertEqual(self.target.read_bytes(), b"leave target untouched")
                 self.assertEqual(list(self.root.glob(".parser-*.tmp")), [])
                 self.assert_failed_publication(prepared, "PARSER.CAPABILITY.INVALID_PREPARATION")
 
     def test_publish_after_naming_readback_and_terminal_faults_are_uncertain(self):
-        import platform_fs_posix as posix
-        from contextlib import nullcontext
-        for phase in ("candidate_after_naming", "published_after_open", "readback", "terminal", "pending-factory", "pending-close"):
+        for phase in (*_POST_NAMING_FAULTS, "readback", "terminal", "pending-factory", "pending-close"):
             with self.subTest(phase=phase):
+                self.target.write_bytes(b"old before " + phase.encode("ascii"))
+                fault_points = []
                 def fault(point):
+                    fault_points.append(point)
                     if point == phase:
                         raise RuntimeError("secret postpublication fault")
-                self.surface._platform_backend_factory = lambda root: posix.PosixPlatformAdapter(_fault_injector=fault)
+                self.surface._platform_backend_factory = lambda root: _PlatformAdapter(_fault_injector=fault)
                 prepared = self.bound_preparation()
+                bound = self.surface._require_round_trip_preparation(prepared).target
                 patch = nullcontext()
                 if phase == "readback":
-                    patch = mock.patch.object(posix._PosixBoundRegularFile, "read_all", side_effect=RuntimeError("secret readback"))
-                if phase == "terminal":
-                    patch = mock.patch.object(posix._PosixPendingPublication, "terminal_reproof", side_effect=RuntimeError("secret terminal"))
-                if phase == "pending-factory":
-                    from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
-                    patch = mock.patch.object(posix._PosixBoundDirectory, "_create_pending_publication", side_effect=PlatformFileError(PlatformFileErrorCode.PUBLISH_FAILED, retryable=True))
-                if phase == "pending-close":
-                    original_close = posix._PosixPendingPublication.close
+                    patch = mock.patch.object(_BoundRegularFile, "read_all", side_effect=RuntimeError("secret readback"))
+                elif phase == "terminal":
+                    patch = mock.patch.object(PendingPublication, "terminal_reproof", side_effect=RuntimeError("secret terminal"))
+                elif phase == "pending-factory":
+                    patch = mock.patch.object(_BoundDirectory, "_create_pending_publication", side_effect=PlatformFileError(PlatformFileErrorCode.PUBLISH_FAILED, retryable=True))
+                elif phase == "pending-close":
+                    original_close = PendingPublication.close
                     def close_then_fail(pending):
                         original_close(pending)
                         raise RuntimeError("secret close callback")
-                    patch = mock.patch.object(posix._PosixPendingPublication, "close", close_then_fail)
-                with patch:
+                    patch = mock.patch.object(PendingPublication, "close", autospec=True, side_effect=close_then_fail)
+                with patch as injected:
                     result = self.surface.write_prepared(prepared)
+                if phase in _POST_NAMING_FAULTS:
+                    self.assertEqual(fault_points.count(phase), 1)
+                else:
+                    injected.assert_called_once()
                 self.assertEqual(result.outcome.value, "uncertain")
                 self.assertEqual(result.code, "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED")
                 self.assertIsNone(result.receipt)
                 self.assertNotIn("secret", result.safe_summary)
                 self.assertEqual(self.target.read_bytes(), self.output)
+                self.assertTrue(prepared.closed)
+                self.assertTrue(bound.parent.closed)
+                self.assertTrue(bound.existing.closed)
+                self.assertEqual(list(self.root.glob(".parser-*.tmp")), [])
                 self.assert_failed_publication(prepared, "PARSER.CAPABILITY.INVALID_PREPARATION")
 
     def test_publish_cancellation_during_candidate_stops_next_mutation(self):
-        import platform_fs_posix as posix
         prepared = self.bound_preparation()
-        original = posix._PosixCandidateFile._write_chunks
+        original = CandidateFile.write_all
         def cancel_after_write(*args, **kwargs):
             result = original(*args, **kwargs)
             self.cancellation.cancel()
             return result
-        with mock.patch.object(posix._PosixCandidateFile, "_write_chunks", cancel_after_write), \
-             mock.patch.object(posix._PosixCandidateFile, "flush_content", side_effect=AssertionError("new mutation")):
+        with mock.patch.object(CandidateFile, "write_all", autospec=True, side_effect=cancel_after_write) as write, \
+             mock.patch.object(CandidateFile, "flush_content", side_effect=AssertionError("new mutation")) as flush:
             self.assert_failed_publication(prepared, "PARSER.SOURCE.CANCELLED")
+        write.assert_called_once()
+        flush.assert_not_called()
+        self.assertTrue(prepared.closed)
         self.assertEqual(self.target.read_bytes(), b"leave target untouched")
         self.assertEqual(list(self.root.glob(".parser-*.tmp")), [])
 
     def test_publish_cancellation_at_existing_handle_release_does_not_start_naming(self):
         import parser_source
-        import platform_fs_posix as posix
         prepared = self.bound_preparation()
         original = parser_source.BoundWriteTarget.release_existing_for_publish
         def cancel_after_release(bound):
             original(bound)
             self.cancellation.cancel()
-        with mock.patch.object(parser_source.BoundWriteTarget, "release_existing_for_publish", cancel_after_release), \
-             mock.patch.object(posix._PosixBoundDirectory, "begin_publish", side_effect=AssertionError("new mutation")) as publish:
+        with mock.patch.object(parser_source.BoundWriteTarget, "release_existing_for_publish", autospec=True, side_effect=cancel_after_release) as release, \
+             mock.patch.object(BoundDirectoryAuthority, "begin_publish", side_effect=AssertionError("new mutation")) as publish:
             self.assert_failed_publication(prepared, "PARSER.SOURCE.CANCELLED")
+        release.assert_called_once()
         publish.assert_not_called()
+        self.assertTrue(prepared.closed)
         self.assertEqual(self.target.read_bytes(), b"leave target untouched")
         self.assertEqual(list(self.root.glob(".parser-*.tmp")), [])
 
@@ -609,25 +693,29 @@ class ParserRoundTripTests(unittest.TestCase):
         self.assert_failed_publication(prepared, "PARSER.CAPABILITY.INVALID_PREPARATION")
 
     def test_publish_concurrent_reuse_is_rejected_while_first_write_is_in_flight(self):
-        import platform_fs_posix as posix
         prepared = self.bound_preparation()
         writing = threading.Event()
         release = threading.Event()
-        original = posix._PosixCandidateFile._write_chunks
+        original = CandidateFile.write_all
         def paused_write(*args, **kwargs):
             writing.set()
             if not release.wait(5):
                 raise RuntimeError("test release timeout")
             return original(*args, **kwargs)
-        with mock.patch.object(posix._PosixCandidateFile, "_write_chunks", paused_write), ThreadPoolExecutor(2) as pool:
+        with mock.patch.object(CandidateFile, "write_all", autospec=True, side_effect=paused_write) as write, ThreadPoolExecutor(2) as pool:
             first = pool.submit(self.surface.write_prepared, prepared)
             try:
                 self.assertTrue(writing.wait(5))
                 second = pool.submit(self.surface.write_prepared, prepared)
-                self.assertEqual(second.result(2).outcome.value, "failed")
+                rejected = second.result(2)
+                self.assertEqual(rejected.outcome.value, "failed")
+                self.assertEqual(rejected.code, "PARSER.CAPABILITY.INVALID_PREPARATION")
+                self.assertIsNone(rejected.receipt)
             finally:
                 release.set()
             self.assertEqual(first.result(5).outcome.value, "published")
+        write.assert_called_once()
+        self.assertTrue(prepared.closed)
         self.assertEqual(self.target.read_bytes(), self.output)
 
     def test_input_close_releases_every_binding_even_when_one_close_reports_failure(self):
@@ -640,9 +728,10 @@ class ParserRoundTripTests(unittest.TestCase):
             original(bound)
             if bound is bindings[0]:
                 raise RuntimeError("close failure")
-        with mock.patch.object(parser_source.BoundWriteTarget, "close", fail_after_close):
+        with mock.patch.object(parser_source.BoundWriteTarget, "close", autospec=True, side_effect=fail_after_close) as close:
             with self.assertRaises(RuntimeError):
                 opened.close()
+        close.assert_has_calls([mock.call(bound) for bound in bindings], any_order=True)
         self.assertTrue(opened._snapshot.released)
         for prepared, bound in zip(preparations, bindings):
             self.assertTrue(prepared.closed)
