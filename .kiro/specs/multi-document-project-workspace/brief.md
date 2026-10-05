@@ -70,3 +70,7 @@ MateCat 参考中的 file navigation 与本规格的 Document/Chapter 接近；M
 4. Qt 与 current-source acceptance：章节导航、连续段落体验、窄宽布局和真实格式重开。
 
 每簇按人工阶段门推进；在 identity cluster 通过前不得开始 chunk，且不得把当前单 JSON segment id 改写为临时路径/列表索引。
+
+## Pending Increment：根目录预览与章节树
+
+现有文件单选/多选与 ProjectPackage 路径模型之上，增加用户选择根目录、递归预览、勾选并排序的打开流程，支持嵌套目录及单选文件。现有文件夹按钮按相对目录分组导航，保持文档身份和阅读顺序。范围、平台端口及单文件 profile 的待批准增量见 Requirements 13、Design 对应节和 Tasks Cluster 5；不扩大格式 codec 资格或后台扫描范围。

@@ -219,6 +219,74 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 - evidence 绑定同一 final runtime tree；任一 package、identity、保存或兼容失败均为 NO-GO。
 - 独立提交：`test(workspace): 重签多文档 current-source 证据`。
 
+## Cluster 5：显式根目录选择与嵌套导航（待批准增量）
+
+Requirement 13 与对应 Design 尚待批准；以下条件式任务不改变 Cluster 0–4 的完成状态，也不授权平台/Qt 相邻实现。平台观察端口和非 legacy 单文件 profile 必须先获相邻 owner 批准；RPY 格式能力另按独立规格推进。
+
+- [ ] 5.1 实现经平台 owner 批准的只读观察合同
+  - 定义受限 metadata、retained-root 下钻、取消/资源预算和结构化失败；只读能力不借用 live ledger 或写 authority。
+  - 完成时，平台 fake 能验证 handle 生命周期和超限/取消行为，Project 不需要裸路径枚举。
+  - _Requirements: 13.1, 13.3_
+  - _Boundary: Platform observation contracts_
+- [ ] 5.2 实现 POSIX 只读目录观察
+  - 从 retained root 观察和下钻，拒绝 symlink/ancestor drift，及时关闭非祖先 handle，不写源目录。
+  - 完成时，POSIX 合成目录的替换、深度/条目/handle 限额及取消返回明确结果。
+  - _Requirements: 13.1, 13.3_
+  - _Boundary: Platform POSIX backend_
+- [ ] 5.3 实现 Windows 只读目录观察
+  - 使用同一合同处理 retained root、reparse/ancestor drift 与资源释放，不以字符串前缀冒充根约束。
+  - 完成时，Windows 合成 junction/reparse、替换、限额及取消矩阵符合相同失败语义。
+  - _Requirements: 13.1, 13.3_
+  - _Boundary: Platform Windows backend_
+  - _Depends: 5.1_
+- [ ] 5.4 验证平台观察到 Project 的集成合同
+  - 以同一中立 consumer 运行两个 backend 的正反例，验证 metadata 观察不读取正文或授予 source writer。
+  - 完成时，条目/根身份事实、关闭后使用和取消行为一致，平台不泄漏额外路径权限。
+  - _Requirements: 13.1, 13.3, 13.6_
+  - _Boundary: Platform / Project integration validation_
+  - _Depends: 5.2, 5.3_
+- [ ] 5.5 实现 Project 目录预览与显式选择服务
+  - 建立 immutable 候选树、registry 中立能力筛选、确定顺序与 issued selection；默认不选，只有确认选择进入内容读取。
+  - 完成时，两层及更深目录/同名文件可预览，未选内容零读取；不完整扫描/越界/alias/过期选择阻断，筛选不重算根。
+  - _Requirements: 13.1, 13.2, 13.3_
+  - _Boundary: Project discovery/contracts_
+  - _Depends: 5.4_
+- [ ] 5.6 实现单文件 profile 与原根绑定的 intake/包验证
+  - 增加 explicit-single-file-v1 的一文档 cardinality、OriginBinding 与 package decoder/validator；多个文件保留原 profile 限制。
+  - 完成时，使用既有 JSON/TXT codec 即可独立验收：零个拒绝，一个嵌套文件保留原 root/source_ref，真实包保存冷重开保留 identity/overlay；不借用 legacy writer。此任务唯一提供 RPY 1.4 消费的 profile，不依赖 RPY 私有 handoff。
+  - _Requirements: 13.2, 13.3, 13.4_
+  - _Boundary: Project contracts/intake/package_
+  - _Depends: 5.5_
+- [ ] 5.7 接入统一打开流程的根目录勾选 review
+  - Controller/Qt 接入选根、候选树勾选、排序/语言/保存 review，复用现有单/多文件入口；异步取消与 session/generation 复证。
+  - 完成时，根目录单选/多选均可保存，零选/不完整/stale 阻断，取消或迟到结果不改变当前 target/dirty，原文件多选仍可用。
+  - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.6_
+  - _Boundary: Controller / Qt open-flow integration_
+  - _Depends: 5.5, 5.6_
+- [ ] 5.8 将既有文件夹导航投影为目录树
+  - 只使用 Controller-issued identity/source_ref 构树，沿用 current/dirty、键盘跳转与 Chunk 过滤；目录仅展开。
+  - 完成时，包离线冷重开仍可导航，同名文件可区分；目录交错顺序不改变 manifest、连续阅读或搜索次序。
+  - _Requirements: 13.2, 13.5, 13.6_
+  - _Boundary: Controller / Qt navigation projection_
+  - _Depends: 5.6_
+- [ ] 5.9 纳入普通发行模块组合
+  - 将新增发现/合同模块纳入 source 与普通 frozen 的显式声明，不扩张 Core/Host/Gate 合同。
+  - 完成时，普通 Windows frozen 能打开目录预览及章节树，缺源目录时包导航仍可用。
+  - _Requirements: 13.5, 13.6_
+  - _Boundary: Platform build composition_
+- [ ] 5.10 执行增量端到端与故障回归
+  - 执行 source 与 Windows 嵌套目录/包/Qt 旅程及原文件入口回归；合成 fixture 不依赖个人目录。
+  - 完成时，未选内容不读、drift/取消不提交、包冷重开和目录树状态均有当前实现证据，原 profile/writer 负向边界保留。
+  - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6_
+  - _Boundary: Project / Platform / Qt acceptance integration_
+  - _Depends: 5.7, 5.8, 5.9_
+- [ ] 5.11 闭合实际治理同步与下游消费
+  - 由治理 owner 同步已批准且实际实现的目录/单文件边界；RPY 消费此 profile 与选择服务，不复制枚举或持久化。
+  - 完成时，实际 diff 与批准增量一致、平台/Parser/Qt 相关回归可核查；未批准/未实现项不列为完成，不改写历史验收。
+  - _Requirements: 13.4, 13.6_
+  - _Boundary: Governance / downstream integration closure_
+  - _Depends: 5.10_
+
 ## 相邻规格边界
 
 - 恢复/确认 `language-resource-portability` brief 后，提升独立 R/D/T，拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告和冷重开；sync 分别消费已批准 ProjectPackage/ResourcePackage，不复制 live SQLite、journal、sidecar 或 staging residue。

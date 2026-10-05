@@ -893,6 +893,62 @@ public error/report/log不得包含source/target/speaker/private bytes、carrier
 - 每组只携带首段的 issued identity；点击后回到 Controller 现有 `go_to` / `go_to_workspace_segment` 入口。分组顺序、命名和大小都不参与 Project/Document/Segment identity、dirty、save、TM 或 chunk membership。
 - Browse/Review 标题行不展开显示方式、分组大小、阈值或启用复选框；只放置单一设置入口按钮。自动收起式仅在主页保留 Codex 风格的窄刻度轨道，并在标记 hover/focus 时浮出四行预览；固定式则在主页常驻同一四行预览列表。全部设置归属弹窗；跨 Document 浏览或文件夹选择只重建当前 Document 的轮次投影。
 
+## 显式根目录选择增量（待批准）
+
+本节对应 Requirement 13，精确扩展既有 C2A intake 与 C4 打开/导航，不追认历史实现或完成门。单文件 profile 同时供 RPY 消费；RPY grammar/private handoff/导出仍归相邻规格。
+
+### Ownership 与实施前置
+
+Project 拥有发现策略、预览/选择合同、intake 和树投影。平台拥有安全的只读目录观察；现有 `RootedFileSystem` 仅有 bind/open，live-lock/ledger 枚举不能冒充任意用户目录发现。平台 owner 必须批准 retained-root 只读观察端口及 POSIX/Windows 实现；此节提出合同，不默许 Application 使用 `rglob`、裸路径递归绕过平台。Parser 只消费确认的单文件源；Controller/Qt 不枚举或解释文件内容。
+
+相邻审批包括平台观察端口、Project 单文件 OriginBinding/包验证和 Qt 统一入口。当前增量 `ready_for_implementation=false`；原 Tasks Cluster 0–4 的已完成状态不证明新能力存在。原 RPY/Sync 顺序条款的修订继续由 RPY Design 的治理前置处理，本增量不改写 adopted ADR 或后置格式资格。
+
+### 文件与端口计划
+
+| 文件 | 责任 |
+| --- | --- |
+| 新增 `project_workspace_discovery.py` | Project 递归策略、候选树、限额、选择与 stale 校验 |
+| 新增 `project_directory_contracts.py` | frozen preview/entry/selection/rejection DTO，无 Qt/codec 私有类型 |
+| 修改 `platform_fs_contracts.py`、`platform_fs_posix.py`、`platform_fs_windows.py` | 经平台 owner 批准的有界 retained-root 只读观察 port |
+| 修改 `project_workspace_contracts.py`、`project_workspace_intake.py`、`project_package.py` | 单文件 profile cardinality、OriginBinding、验证与冷重开；复用现有 package schema |
+| 修改 `editor_controller.py`、`qt_editor_window.py` | 统一打开入口内的根目录动作、勾选/排序 review、异步生命周期和章节树 |
+| 新增 `tests/test_project_workspace_discovery.py` 及对应平台/Qt 测试 | 合成目录、no-follow/drift/取消、single profile、包与导航旅程 |
+| 修改普通 frozen 的模块声明与构建组合 | 纳入新增模块，不扩张 Core/Host/Gate 合同 |
+
+拟议平台端口 `observe_children(retained_directory, limits, cancellation)` 返回受限不可变条目及同一观察的身份事实；目录下钻取得 no-follow 的 retained descendant handle。目录不加业务写锁、不建 ledger、不写源目录；平台分别处理 POSIX symlink 与 Windows reparse/ancestor drift。观察不是内容读取或永久 authority，所选文件仍经现有 sealed read 与 verified terminal。
+
+Project 的 `DirectorySelectionPreview` 含 issued preview ID、generation、root binding reference、规范化相对树、候选类型/大小及阻断原因，不含绝对路径权限或正文。可选择格式来自配置 Parser registry 的中立 suffix/capability 投影，真正格式资格由 intake 验证；扩展名匹配不能宣告 parse 成功。Qt 只返回 issued entry IDs 与显式顺序，不能回传任意拼接路径。
+
+### 根目录发现与确认流
+
+1. 用户从既有“打开本地项目”流程选择“选择文件”或“选择文件夹”，根目录动作不占用常驻顶栏。直接文件选择/拖入仍按原有规则分流；目录拖入首版不自动处理。现有文件夹按钮只导航。
+2. 用户选定根后平台 bind，Project 有界递归只读 metadata。最多深度 32、10,000 个总条目（含目录/不可选文件）、同时至多 33 个目录 handle；沿深度优先遍历及时释放非祖先 handle。继承更小的平台路径限制。到深度/条目/资源上限或读取目录失败时，标记预览不完整并禁止确认，提示选更小的根重试，不把截断当完整结果。
+3. 普通文件根据配置能力可选；默认未勾选。链接/reparse、非 regular、非法 portable ref 均显示不可选且不跟随；所选 hardlink alias、大小写/规范化碰撞在确认时拒绝。目录本身不作为 Document。未知/不可选格式可显示但不打开正文；用户取消不发布候选。最长 source_ref 和路径组件继续沿用 owner 限额，不把“二级”写成硬性深度。
+4. 候选以规范化相对路径的 Unicode code-point 顺序稳定显示；所选列表初始采用该顺序，用户在 review 中显式调整成为 manifest order。未选内容不读取/parse、不自动加入新发现文件。刷新/换根撤销旧 preview 和确认状态，重新勾选；不后台刷新后静默改变集合。
+5. 确认携带 preview ID、generation 和有序 entry IDs。Project 复证 retained root 与所选文件身份，使用原根生成 source_ref；任一选择失效全部拒绝。确认前的 metadata 不替代 verified terminal。首包发布继续保持绑定并消费原 intake 原子候选/保存结果。取消、关窗、换项目或新请求均撤销 generation，晚到结果丢弃并释放 handle；错误不切换当前项目。
+
+### 单文件 profile 与持久化
+
+零文件禁止确认；一个文件建立 `SINGLE_FILE + explicit-single-file-v1`，OriginBinding 恰有一个文档；两个及以上使用既有 `DIRECTORY + explicit-selected-files-v1`（原至少两个的验证不放宽）。两者均保留最初选择根及相对 source_ref，单选 `script/Chapters/intro.rpy` 不降为 `intro.rpy`。新 profile 通用于获批准的 project_document codec，不假装 legacy JSON，也不批准 RPY 或其他格式本身。
+
+初次 document ID 继续由原 owner 的规范化 source_ref 规则派生，之后 manifest identity 为权威；原根与顺序不会因筛选重新计算。包内仍保存既有 source/document/opaque private members，不增加新 carrier 或私有语法字段；ProjectPackage decoder/validator 明确识别新 profile 与一文档 cardinality，冷重开不需要原根路径。配置 surface/private handoff 的通用增量由 RPY Task 1.4 集成，避免两份 profile 实现。源 writer 仍须独立 live capability，目录发现和 ProjectPackage save 均不授予源文件覆盖权限。
+
+### 章节树只作导航投影
+
+Controller 从 manifest source_ref 生成目录组件，Qt 在既有文件夹菜单展示嵌套组与文件叶项。组按其中叶项在 manifest 的首次出现顺序排列，同组叶项遵守 manifest 相对顺序；树结构允许聚合跨组交错文档，但不反写 manifest 或改变连续阅读/搜索次序。目录项只展开/折叠，叶项继续持有 issued Document identity，支持键盘跳转、current/dirty 状态和现有 Chunk 可见性过滤；无可见叶项的目录不显示。
+
+导航不检查源目录存在性，包移动/离线冷重开后仍可用。同名文件通过路径分组区分；编辑左栏与浏览分隔可提供相对路径提示而不创造新身份。单文件包仍遵循当前文档导航规则。
+
+### 增量验证与追踪
+
+| 需求 | 设计 | 验证 |
+| --- | --- | --- |
+| 13.1, 13.2 | retained-root discovery、issued selection、确定顺序 | 二层及更深目录、同名文件、未勾选零内容读取、根不重算 |
+| 13.3 | 平台 no-follow/drift、上限、generation | 超限/不可读目录、取消/晚到、root/所选文件替换、alias |
+| 13.4 | 单文件 profile、原 intake 与 package | 零/一/多文件、非 legacy、无原根冷重开、既有 profile 负向 |
+| 13.5 | manifest 章节树投影 | 交错目录顺序、键盘/current/dirty/Chunk、离线导航 |
+| 13.6 | 原 Controller/Qt 与正常发行集成 | 合成包端到端、原 TXT/JSON 文件单选/多选回归 |
+
 ## Requirements Traceability
 
 | Requirement | Design coverage | Primary gate |
