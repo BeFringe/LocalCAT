@@ -8,6 +8,7 @@ plugin-format, speaker-profile, or synchronization authority in test code.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from unittest import mock
 
 from openpyxl import Workbook
 
+import parser_source
 from parser_composition import (
     OpenedParserInput,
     ProviderBinding,
@@ -1229,16 +1231,26 @@ class ParserCapabilityAndWriterTests(_Wave4Fixture):
             self._canonical_request(LOCALCAT_JSON_V1),
         )
         failures = (
-            ("parser_source._write_all", OSError("write failed")),
-            ("parser_source.os.fsync", OSError("fsync failed")),
-            ("parser_source.os.replace", OSError("replace failed")),
+            (
+                "platform_fs_posix._PosixCandidateFile._write_chunks",
+                OSError("write failed"),
+            ),
+            (
+                "platform_fs_posix._PosixCandidateFile._flush_content",
+                OSError("content flush failed"),
+            ),
+            ("platform_fs_posix.os.replace", OSError("replace failed")),
         )
         for index, (qualified, failure) in enumerate(failures):
             with self.subTest(fault=qualified):
                 target = self.root / f"atomic-{index}.json"
                 target.write_bytes(b"last-known-good")
-                before = tuple(sorted(path.name for path in self.root.iterdir()))
-                with mock.patch(qualified, side_effect=failure):
+                family = hashlib.sha256(target.name.encode("utf-8")).hexdigest()
+                lock_name = f".parser-{family[:32]}.lock"
+                before = {path.name for path in self.root.iterdir()}
+                with mock.patch(qualified, side_effect=failure) as fault, mock.patch(
+                    "parser_source.WriteReceipt", wraps=parser_source.WriteReceipt
+                ) as receipt:
                     with self.assertRaises(ContractViolation) as caught:
                         prepared.write(
                             TargetReference(
@@ -1247,22 +1259,32 @@ class ParserCapabilityAndWriterTests(_Wave4Fixture):
                                 display_hint=target.name,
                             )
                         )
+                fault.assert_called_once()
+                receipt.assert_not_called()
                 self.assertEqual(
                     caught.exception.code,
                     "PARSER.SOURCE.WRITE_FAILED",
                 )
                 self.assertEqual(target.read_bytes(), b"last-known-good")
                 self.assertEqual(
-                    tuple(sorted(path.name for path in self.root.iterdir())),
-                    before,
+                    {path.name for path in self.root.iterdir()},
+                    before | {lock_name},
                 )
+                self.assertEqual(set(self.root.glob(".parser-*.tmp")), set())
 
         target = self.root / "atomic-temp-create.json"
         target.write_bytes(b"last-known-good")
-        collision = self.root / ".parser-collision.tmp"
+        family = hashlib.sha256(target.name.encode("utf-8")).hexdigest()
+        lock_name = f".parser-{family[:32]}.lock"
+        collision = self.root / f".parser-{family[:16]}-collision.tmp"
         collision.write_bytes(b"pre-existing private object")
-        before = tuple(sorted(path.name for path in self.root.iterdir()))
-        with mock.patch("parser_source.secrets.token_hex", return_value="collision"):
+        collision_before = collision.stat()
+        before = {path.name for path in self.root.iterdir()}
+        with mock.patch(
+            "parser_source.secrets.token_hex", return_value="collision"
+        ) as token_hex, mock.patch(
+            "parser_source.WriteReceipt", wraps=parser_source.WriteReceipt
+        ) as receipt:
             with self.assertRaises(ContractViolation) as caught:
                 prepared.write(
                     TargetReference(
@@ -1271,11 +1293,20 @@ class ParserCapabilityAndWriterTests(_Wave4Fixture):
                         display_hint=target.name,
                     )
                 )
+        self.assertEqual(token_hex.call_args_list, [mock.call(8)] * 32)
+        receipt.assert_not_called()
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
         self.assertEqual(target.read_bytes(), b"last-known-good")
+        collision_after = collision.stat()
         self.assertEqual(
-            tuple(sorted(path.name for path in self.root.iterdir())),
-            before,
+            (collision_after.st_dev, collision_after.st_ino),
+            (collision_before.st_dev, collision_before.st_ino),
+        )
+        self.assertEqual(collision.read_bytes(), b"pre-existing private object")
+        self.assertEqual(set(self.root.glob(".parser-*.tmp")), {collision})
+        self.assertEqual(
+            {path.name for path in self.root.iterdir()},
+            before | {lock_name},
         )
 
 
