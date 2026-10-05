@@ -17,7 +17,7 @@ RPY 不属于 Parser 首波内建 runtime。`rpy-project-codec` 作为可配置�
 ### Scope Lineage（范围沿革）
 
 - 本文在 `parser-subsystem-extraction` 原 Spec 身份下就地重生成，保留 `legacy_spec_id`，不建立同名第二权威。
-- 已获项目 owner 批准的 `rebaseline-plan.md` 是本版 Requirements 的冻结输入；本文对其中的保留、重写、移出和主线顺序进行可验收展开。
+- `rebaseline-plan.md` 是本版 Requirements 的冻结输入；本文对其中的保留、重写、移出和主线顺序进行可验收展开。
 - `parser-rebaseline` 只拥有本规格的 Parser 契约门。它不得修改相邻 Spec 的 brief、Requirements、Design、Tasks 或 review-clustering，也不得借本规格拥有 multi-document、RPY 聚合、chunk 或 sync 实施权。
 - UI→Parser→multi-document→chunk→sync 的顺序是本轮治理边界；手工包→自动同步是后续演化方向，不改变本轮 Parser 的单输入职责。
 
@@ -197,6 +197,10 @@ RPY 不属于 Parser 首波内建 runtime。`rpy-project-codec` 作为可配置�
 5. When round-trip token 缺失、外来、过期或版本不兼容时，写入 shall 在第一次修改目标前失败。
 6. When 只宣称 Canonical_Write 时，输出 shall 明确是规范转换，不得声称保留源字节或排版。
 7. The 首波只有 LocalCAT JSON 声明 Canonical_Write；TXT、PO/POT、TMX、normalized TM JSON、CSV 与 XLSX 均为 reader-only，不得因存在 reader 而自动获得 writer 或 round-trip capability。
+8. When 请求 round-trip prepare, the Parser shall 通过可选中立 factory 准备输出；缺失 factory 返回 unsupported，foreign/stale token 在目标打开前拒绝。
+9. When 发布 prepared 输出, the Parser shall 验证 exact live codec、issuing surface、source/output 摘要与一次性消费状态，并复证目标条件；伪造、复用或过期对象不得发布。
+10. The round-trip path shall 保持 canonical API 与既有 terminal/receipt 语义，不经 canonical serializer 重编码，不引入 journal/LKG、格式私有类型或 Project authority。
+
 
 ### 需求 11：Parser 与应用层边界
 
@@ -262,5 +266,5 @@ RPY 不属于 Parser 首波内建 runtime。`rpy-project-codec` 作为可配置�
 3. When 注入 fatal tail、early close、consumer exception、stale snapshot、writer failure 或 resource commit failure 时，测试 shall 证明没有 partial success 或未授权目标修改。
 4. When 执行架构一致性验收时，证据 shall 证明 Parser 与 Engine 互不依赖，且 Parser 不拥有 Qt、workspace、TMStore、SQLite 或 provider authority。
 5. When 执行兼容性验收时，现有 JSON/TXT、TMX、CSV/XLSX、normalized TM JSON、Qt、runner、资源和 acceptance suites shall 保持通过，或具有明确的版本化契约变更。
-6. The following capabilities shall 保持延期：multi-document aggregation/UI、ProjectPackage/import reconciliation、RPY plugin/ACL 实现与多文件聚合、XLIFF、TMX context/provenance/export、canonical TM storage/retrieval、speaker profiles、按项目语言自动推断术语列、Office/PDF/OCR、collaboration chunks 和 cross-device sync。
+6. The following capabilities shall 保持延期：multi-document aggregation/UI、ProjectPackage/import reconciliation、由独立 RPY codec 拥有的格式语法/ACL 实现与多文件聚合、XLIFF、TMX context/provenance/export、canonical TM storage/retrieval、speaker profiles、按项目语言自动推断术语列、Office/PDF/OCR、collaboration chunks 和 cross-device sync。
 7. When 提议任何延期 capability 时，提议 shall 进入其 owning Spec，不得在 Parser runtime 阶段扩大本文。
