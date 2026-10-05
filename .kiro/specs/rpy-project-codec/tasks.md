@@ -3,7 +3,7 @@
 实施前置：Design 的 Governance Impact 仍为 NO-GO。顺序修订及 Parser/Multi/Qt 必要 amendment 必须先获 owner 批准；下列任务是条件式实施提案，不能通过勾选任务代替授权。任务默认顺序执行，每个子项按单一可验证结果安排，约 1–3 小时；实际超出时按同一边界拆分。
 
 - [ ] 1. 建立已批准的中立接缝与可重现输入
-- [ ] 1.1 建立受支持与拒绝输入的合成夹具
+- [x] 1.1 建立受支持与拒绝输入的合成夹具
   - 覆盖同文件 dialogue/old-new、narrator、speaker/属性分离、extend/centered、with transition、空目标、BOM/换行与拒绝语法；使用合成内容。
   - 完成时，每个 fixture 有确定的输入分类与期望中立记录，单独 checkout 可运行，不读取外部项目目录。
   - _Requirements: 1.2, 1.4, 2.1, 2.2, 7.4_
