@@ -2,7 +2,7 @@
 
 ## 概述
 
-本增量把现有单 JSON 编辑器扩展为更完整的个人翻译工作台：只读盘点并显示项目已有 raw speaker，提供项目内关键词定位、target-only 预处理与单批次撤销、译文框撤销/重做、术语 CRUD，以及 silver logo 和紧凑资源操作。它继续复用唯一的 frozen `EditorProject` 会话，不增加项目格式或第二份可变状态。
+本增量把现有单 JSON 编辑器扩展为更完整的个人翻译工作台：只读盘点并显示项目已有 raw speaker，提供项目内关键词定位、target-only 预处理与单批次撤销、译文框撤销/重做、术语 CRUD，以及 silver logo 和紧凑资源操作。它继续复用唯一的 frozen `EditorProject` 会话，格式扩展由独立 owner 提供，Qt 不增加第二份可变状态。
 
 搜索产品入口属于 Qt，但字符匹配只消费 Feature 5 的中立 `TextMatcher`。Qt 负责字段遍历、结果导航、控件状态和反馈，不实现 case-fold、Whole Word 或 CJK 特判。其他增量服务保持标准库、Qt 无关，并统一经 `EditorController` 暴露。
 
@@ -15,7 +15,7 @@
 
 ### 非目标
 
-- 新项目格式、多文档/章节、目录搜索或 source reconciliation。
+- 格式语法、多文档身份/聚合、目录发现策略与 source reconciliation 的实现。
 - speaker alias、留空 profile、编辑/浏览段落头像、头像配置或持久化和导出变换。
 - Qt 自己实现 Match Case、Whole Word、Unicode 边界或 fuzzy。
 - 正则、脚本、Replace All、项目级无限 undo history。
@@ -32,12 +32,13 @@
 - 译文框本地 undo/redo 的焦点与会话同步。
 - legacy/v1 mixed termbase 的 CRUD、原子保存、冲突反馈和 Trie 热重载。
 - silver logo、紧凑 ellipsis 与相关可访问性/QtTest。
+- Project 统一打开/章节树、格式导出与手动同步的中立 view 和交互生命周期。
 
 ### Out of Boundary
 
 - 项目 codec、source 更新重关联和多章节 `SearchScope`。
 - Feature 5 `TextMatcher` 的字符语义、offset 计算和 capability 判定实现。
-- 术语 fuzzy、云端资源、同步与协作 chunk。
+- 术语 fuzzy、同步协议/包事务与协作 chunk 权限实现。
 - speaker display profile、头像配置/持久化及编辑/浏览头像。
 - 旧 `LogicController` 与 Excel 三态的扩展。
 
@@ -60,18 +61,14 @@
 
 ## Governance Impact
 
-- **Applicable Steering**：`product.md`、`structure.md`、`tech.md`、`feature5-ui-integration.md`、`spec-ownership.md`。
-- **Applicable ADRs**：ADR-009、ADR-011、ADR-014；项目搜索继续只消费 Feature 5 的中立 matcher handoff。
-- **ADR disposition**：既有搜索表面、speaker avatar 与草稿/已确认 preview 筛选为 None；设备本地预处理规则/状态偏好已由项目 owner 采纳 ADR-014，冻结 `workspace.json.preprocessing` 的格式、失败原子性与 authority 排除边界；Feature GO 为 `GO`。
-- **Scope amendment**：Approved，对应 Requirements Scope Lineage 中 2026-08-19 Requirement 3 表面 amendment。
-- **Speaker avatar amendment**：Approved；只增加 Requirement 1 / Task 4.2a 的 Qt presentation 投影，不新增 authority、持久字段或跨 Spec frozen contract。
-- **Project-tool usability amendment**：Approved；修复 inventory 表头裁切，并将预处理规则/状态选择作为 device-local workspace preference，不改变项目格式、segment identity 或 batch apply 事务。
-- **Steering sync**：搜索表面与 avatar 不需要；ADR-014 已同步 `tech.md` 和 `structure.md` 中 `workspace.json` / `WorkspaceStateRepository` 的持久范围，最终 delta 已按五类语义门复核。
-- **Downstream revalidation**：Feature 5 Matcher Gate generation invalidation、JSON/TXT/sample capability、Qt search keyboard/accessibility 及 current-source Requirement 3 acceptance。
+- **Decision basis**：ADR-009/011 的匹配与依赖边界、ADR-014 的设备偏好，以及 ADR-030/031 的目录/格式导出和手动同步入口。
+- **Contract changes**：Requirements 1、3、4 定义项目工具；Requirements 10、11 和下述 Controller/Qt 接缝定义新增中立视图。Project、codec、provider 保有各自 authority。
+- **Steering sync**：tech/structure 的设备偏好、Controller 和 UI 组合边界。
+- **Downstream revalidation**：Matcher generation invalidation、JSON/TXT capability、键盘/无障碍、目录/导出/同步生命周期及 Chunk mutation guards。
 
 ### Windows Compatibility Amendment WA-08
 
-- **ADR mapping与ownership**：follow ADR-028并消费WA-03/04/05/07；前述Feature GO保留原Qt/source范围。Qt increment保留原项目journey、silver logo与inventory-only avatar presentation；Windows Spec拥有普通onedir/windowed构建、候选关联、入口与资源根，不新增Qt authority或Steering层。
+- **ADR mapping与ownership**：follow ADR-028并消费WA-03/04/05/07；Qt increment保留原项目journey、silver logo与inventory-only avatar presentation；Windows Spec拥有普通onedir/windowed构建、候选关联、入口与资源根，不新增Qt authority或Steering层。
 - **Source resources/entry**：source journey从rooted source resource resolver取得logo/avatar catalog；轻量Windows GUI入口只启动用户专用venv的绝对`pythonw.exe`与source bootstrap，提供图标/版本/诊断但不携带runtime或取得packaging authority。
 - **Bundle resources**：普通frozen Qt消费平台入口提供的当前候选资源根和构建声明中的logo、Windows icon、可选avatar catalog；标准PyInstaller资源位置由平台resolver解释，Qt不从CWD、checkout或任意`_MEIPASS`值推导authority。catalog存在时沿用casefold索引、歧义/解码失败语义，未声明或无匹配时保持无头像fallback；不为头像启用source loader、PYZ逐项比较或Core资格重验。
 - **产品入口与用户状态**：普通入口复用`qt_editor`正常首页/显式项目参数处理、同一用户目录resolver及Controller组合，不以W3空编辑器入口代替产品启动。资源播种只写缺失默认项，现有workspace、资源配置、项目与TM数据不被覆盖；安装目录承载只读程序资源，用户可变状态仍归原owner和数据端口。Qt不处理候选/session/资格字段，只消费Controller的安全状态与操作结果。
@@ -245,7 +242,9 @@ flowchart LR
 | 6.1, 6.2, 6.3, 6.4, 6.5, 6.6 | editor undo/redo | QtEditorWindow target editor |
 | 7.1, 7.2, 7.3, 7.4, 7.5, 7.6, 7.7, 7.8, 7.9, 7.10, 7.11, 7.12, 7.13 | term CRUD、legacy/v1、热重载 | TermbaseStore, TermbaseDialog, Controller |
 | 8.1, 8.2, 8.3, 8.4, 8.5 | silver logo 与 ellipsis | QtBootstrap, SettingsDialog |
-| 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7 | 单 JSON、本地性、兼容与错误恢复 | Controller gates, AST/full regressions |
+| 9.1–9.7 | 编辑边界、本地性、兼容与错误恢复 | Controller gates, AST/full regressions |
+| 10.1–10.3 | 根目录选择、章节导航、格式导出与生命周期 | Project/RPY Controller views |
+| 11.1–11.3 | 手动同步、秘密显隐与生命周期 | Sync Controller views, QtSyncDialog |
 
 关键跨线验收采用更细绑定，防止整章覆盖掩盖 capability 或提交缺口：
 
@@ -453,7 +452,7 @@ class TermCleanupReport:
     warning_code: str | None
 ```
 
-`TextMatcherDisplayState` 直接复用 Integration frozen contract，不在 Qt Spec 重定义 readiness、availability boolean、semantics version 或 validation digest。`BASIC_VALIDATED` 的 supported profiles 必须精确为 handoff 的 BASIC 集合；`TEXT_V1_VALIDATED` 必须精确包含 `CONFIGURABLE_TEXT_V1`。Qt MVP 完成验收时 basic search 必须可用；未批准状态只能 fail closed，Qt 不能自行降级匹配。v1 locator 必须有 record id，legacy locator 不得有；file/row digest 使用 SHA-256，ordinal 非负。Prepared paths 必须同目录且不等于 resource path；candidate records 必须已完整验证。COMMITTED 必须有 report，其他 state 不得有；只有 INDETERMINATE 可 quarantined。所有 tuple 在 `__post_init__` 中校验，字符范围必须引用原字段文本，legacy flags 必须同时为 `None`；Batch report 的 changed ids 不重复，term mutation counts 非负。
+`TextMatcherDisplayState` 直接复用 Integration frozen contract，不在 Qt Spec 重定义 readiness、availability boolean、semantics version 或 validation digest。`BASIC_VALIDATED` 的 supported profiles 必须精确为 handoff 的 BASIC 集合；`TEXT_V1_VALIDATED` 必须精确包含 `CONFIGURABLE_TEXT_V1`。Qt MVP 完成验收时 basic search 必须可用；未验证的 matcher 状态只能 fail closed，Qt 不能自行降级匹配。v1 locator 必须有 record id，legacy locator 不得有；file/row digest 使用 SHA-256，ordinal 非负。Prepared paths 必须同目录且不等于 resource path；candidate records 必须已完整验证。COMMITTED 必须有 report，其他 state 不得有；只有 INDETERMINATE 可 quarantined。所有 tuple 在 `__post_init__` 中校验，字符范围必须引用原字段文本，legacy flags 必须同时为 `None`；Batch report 的 changed ids 不重复，term mutation counts 非负。
 
 ### SpeakerInventoryService
 
@@ -618,10 +617,16 @@ class EditorController:
 - ellipsis 使用 `QToolButton(autoRaise=true)`、Fixed horizontal policy 和 32 logical px 最小键盘命中宽度；按钮宽度取 `sizeHint + 8` 且最大 40 logical px。
 - 资源表操作列使用 `ResizeToContents`/Fixed，不参与 Stretch；名称/路径列承担剩余宽度。窗口缩放时操作列保持可见且不覆盖相邻单元格。
 
+### 项目打开、格式导出与手动同步视图
+
+Controller 负责 Application 协调、issued identity、session/generation 与异步结果接纳。Qt 只渲染候选树、selection、source_ref 导航、导出/同步安全结果，并回传 issued IDs 与用户选择；不得枚举源目录、解释格式/包或持有 provider、codec token、private member、平台 authority。
+
+目录节点仅展开，文档导航保持 manifest 阅读顺序；打开和单文件项目规则消费 [Multi Design](../multi-document-project-workspace/design.md#显式根目录选择与单文件项目)，格式导出消费 [RPY Design](../rpy-project-codec/design.md)，同步流程消费 [Sync Design](../cross-device-sync-plugin/design.md)。秘密显隐仅作用于当前字段，不写配置或复制值，关窗后恢复遮蔽。取消、换项目、关窗或相关修改使旧结果失效；既有未保存保护、编辑权限与 Chunk guards 继续生效。
+
 ### Future compatibility seams
 
 - 当前单 JSON 的 segment id 对后续 workspace 视为 opaque local identity；多文档规格负责把它提升为 `(document_id, local_segment_id)`，当前 UI 不预埋 document/chunk 字段，也不按显示顺序重铸身份。
-- 当前项目搜索 request/hit/report 不另造第二套多源查询模型。多文档迁移通过扩展 `SearchScope(current_document, entire_project, current_chunk)` 选择同一个 matcher pipeline；`current_chunk` 只有在协作规格批准稳定成员引用后才可出现。
+- 当前项目搜索 request/hit/report 不另造第二套多源查询模型。多文档迁移通过扩展 `SearchScope(current_document, entire_project, current_chunk)` 选择同一个 matcher pipeline；`current_chunk` 只有在协作规格提供稳定成员引用后才可出现。
 - raw speaker 显示、speaker 字段搜索与 1.1b speaker inventory 已完成；本增量 4.2a 只在 inventory 表面投影固定内置头像。`speaker-display-profiles` 后续仍拥有显示名、显式留空、可配置头像及编辑/浏览投影，且不能改写 raw speaker、搜索字段、项目保存或 TM identity。
 - 集中式术语管理对话框及主窗口/资源设置两级入口已由 4.5(P)/4.7a 闭合；`glossary-management` 后续只扩展批量、检索、注释/来源和互操作，不重建现有 Store/Controller/Qt 事务 authority。
 - ADR-013 的 Fuzzy device attestation 不进入项目、workspace package、TM 导出或未来跨端同步；跨设备恢复项目不能携带另一设备的 Fuzzy 授权。
