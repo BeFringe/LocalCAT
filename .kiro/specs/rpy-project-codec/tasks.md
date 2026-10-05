@@ -1,0 +1,123 @@
+# 实施计划
+
+实施前置：Design 的 Governance Impact 仍为 NO-GO。顺序修订及 Parser/Multi/Qt 必要 amendment 必须先获 owner 批准；下列任务是条件式实施提案，不能通过勾选任务代替授权。任务默认顺序执行，每个子项按单一可验证结果安排，约 1–3 小时；实际超出时按同一边界拆分。
+
+- [ ] 1. 建立已批准的中立接缝与可重现输入
+- [ ] 1.1 建立受支持与拒绝输入的合成夹具
+  - 覆盖 dialogue/string、空目标、BOM/换行、控制行及明确不支持的语法。
+  - 完成时，每个 fixture 有确定的输入分类与期望中立记录，单独 checkout 可运行，不读取外部项目目录。
+  - _Requirements: 1.2, 1.4, 2.1, 2.2, 7.4_
+  - _Boundary: RpyCodec fixtures_
+- [ ] 1.2 实现 Parser owner 批准的 round-trip 准备合同
+  - 接通可选 factory、live codec/token 验证与受限准备结果；缺失能力返回明确 unsupported。
+  - 完成时，伪 codec 可验证调用顺序，foreign/stale token 在目标打开前失败，既有 canonical codec 契约不变。
+  - _Requirements: 1.3, 4.4, 7.2_
+  - _Boundary: Parser owner amendment_
+- [ ] 1.3 实现 Project owner 批准的单文件 intake 与私有数据通道
+  - 支持非 legacy 单 Document profile、配置 surface 与 verified private handoff，保留 rooted source 至首包发布。
+  - 完成时，中立伪 codec 可创建/重开一个 Document 的包；原 legacy 与多文件 profile 拒绝规则不变。
+  - _Requirements: 3.1, 3.2, 3.4, 7.2_
+  - _Boundary: Multi owner amendment_
+  - _Depends: 1.2_
+
+- [ ] 2. 实现独立 TL codec
+- [ ] 2.1 识别有界字符串、缩进和 TL block
+  - 支持声明的编码、注释、引号/转义、header 与控制行，拒绝执行型/多行/不确定语法及空 source。
+  - 完成时，正反 fixture 全部分类正确，超限/截断不会输出可提交候选。
+  - _Requirements: 1.1, 1.2, 2.1, 7.1, 7.2, 7.3_
+  - _Boundary: RpyCodec_
+- [ ] 2.2 映射翻译槽、speaker 与稳定局部身份
+  - 构造中立 source/target，保留空槽和字符串消歧标签，首次导入 confirmed=false。
+  - 完成时，重复 label/old key 明确失败，显示顺序不改变身份，控制行不成为段落。
+  - _Requirements: 2.1, 2.2, 2.3, 2.4_
+  - _Boundary: RpyCodec_
+- [ ] 2.3 验证并封装不透明回填映射
+  - 保存 source digest、字节跨度和保护 token，不镜像当前 target/confirmed。
+  - 完成时，重新读取 source 能复证映射；伪造/重叠/越界 span、版本不符和摘要错误均拒绝。
+  - _Requirements: 3.1, 3.3, 4.4, 7.1_
+  - _Boundary: RpyCodec private payload_
+- [ ] 2.4 实现译文转义与占位符保护
+  - 无修改复用原字节；修改仅编码目标跨度，检查 interpolation 多重集合和 tag 嵌套，不执行表达式。
+  - 完成时，golden 覆盖引号、反斜杠、换行、Unicode、BOM/CRLF 和空目标；错误标签/新增表达式有定位诊断。
+  - _Requirements: 4.2, 4.3, 4.4, 7.3_
+  - _Boundary: RpyTextRules_
+
+- [ ] 3. 完成单文件项目闭环
+- [ ] 3.1 接入已知 provider 配置与产品组合
+  - 设备配置仅启停 allowlisted provider；建 surface 前排除禁用项，避免阻断内建格式。
+  - 完成时，禁用/版本不兼容时 RPY 不可用而 JSON/TXT/PO/POT 仍工作，配置不含模块路径或私有项目内容。
+  - _Requirements: 1.1, 1.3, 1.4_
+  - _Boundary: CodecSettings / Application composition integration_
+  - _Depends: 1.2, 2.3_
+- [ ] 3.2 接入单 TL 保存、冷重开与缺失 codec 行为
+  - 将已验证 source/overlay/private handoff 交给 Project owner，并只消费其 durable receipt。
+  - 完成时，无原始路径仍能从包重开保留 target/confirmed；禁用 codec 后可编辑保存包但不可导出 TL。
+  - _Requirements: 2.3, 3.1, 3.2, 3.3, 3.4_
+  - _Boundary: RpyProjectAdapter / Project integration_
+  - _Depends: 1.3, 3.1_
+- [ ] 3.3 接入绑定当前编辑的导出预览
+  - 展示空/未确认数量、目标和诊断，绑定 session/revision、codec/source/private/目标身份；导出全部 target。
+  - 完成时，修改译文、切换项目/codec 或替换目标使 preview stale；取消无发布。
+  - _Requirements: 4.1, 4.4, 6.3_
+  - _Boundary: RpyProjectAdapter / ProjectExportView_
+  - _Depends: 2.4, 3.2_
+- [ ] 3.4 接入受控发布和不确定结果
+  - 使用批准的 Parser/平台发布 surface，不加入 codec journal；导出不替代 package 保存。
+  - 完成时，发布前故障保留目标，发布后不确定不返回成功，project dirty/baseline 不被导出错误清除。
+  - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
+  - _Boundary: Parser publishing / RpyProjectAdapter integration_
+
+- [ ] 4. 扩展多文件与源调和
+- [ ] 4.1 接入显式多 TL 选择与稳定路径
+  - 所选文件全量验证后形成 workspace，保持 root 下 source_ref/顺序，拒绝混合语言，不扫描目录。
+  - 完成时，不同子目录同名 TL 同时打开、导航、保存和重开而不碰撞。
+  - _Requirements: 1.2, 5.1, 5.2, 7.1_
+  - _Boundary: RpyProjectAdapter / Multi intake integration_
+  - _Depends: 3.2_
+- [ ] 4.2 接入已验证源更新与完整私有映射替换
+  - 复用 Project reconciliation、显式 rename 与 unresolved 处理，不按行号猜测。
+  - 完成时，同 dialogue label 改源文得到 source_changed、保留 target 并清 confirmed；label 或 strings old key 改变得到 new/removed，ambiguous 可见；新 private payload 与新 source 匹配。
+  - _Requirements: 2.4, 5.2, 5.3_
+  - _Boundary: RpyProjectAdapter / Project reconciliation integration_
+- [ ] 4.3 协调批量准备与逐文件导出结果
+  - 先准备所有候选再发布，取消停止未发布项，显示 published/failed/uncertain/not_attempted。
+  - 完成时，第二个文件发布失败不会被报告为全批成功或全批回滚，重试要求新预览。
+  - _Requirements: 4.5, 5.4, 6.3_
+  - _Boundary: RpyProjectAdapter export coordination_
+  - _Depends: 3.4, 4.1_
+
+- [ ] 5. 完成中立桌面入口与发行组合
+- [ ] 5.1 接入项目打开、包另存与导出对话框
+  - Qt 只消费中立 Controller view，保留现有 speaker/编辑/浏览/搜索与 Chunk mutation guard。
+  - 完成时，用户能完成单/多 TL 的打开、编辑、保存、预览和导出，UI 无 token/private 类型。
+  - _Requirements: 4.1, 5.2, 6.1_
+  - _Boundary: Controller / Qt integration_
+  - _Depends: 3.3, 4.3_
+- [ ] 5.2 接入取消和晚到结果生命周期
+  - 异步结果绑定 issued session/generation，关闭、换项目或修改后拒绝旧结果。
+  - 完成时，运行期间 UI 可响应，取消/关窗不发布新候选，不覆盖后续编辑。
+  - _Requirements: 6.3, 7.2_
+  - _Boundary: Controller lifecycle_
+- [ ] 5.3 纳入正常发行的显式模块闭包
+  - 按现有 source/frozen composition 收集新 codec、adapter 和 UI 模块，不改变 Core/Host/Gate 合同。
+  - 完成时，独立 checkout 与普通 frozen 可启用/禁用 RPY，不依赖开发机其他目录或 Ren'Py 安装。
+  - _Requirements: 1.4, 7.4_
+  - _Boundary: Platform build composition_
+
+- [ ] 6. 验证端到端行为并闭合实际影响
+- [ ] 6.1 执行单文件保真与 owner 故障矩阵
+  - 覆盖 stale token/private、发布前后失败、无 codec 包、冷重开与无修改字节一致。
+  - 完成时，拒绝路径不产生虚假 receipt，保存/导出分别满足 owner 合同。
+  - _Requirements: 1.2, 3.2, 3.3, 3.4, 4.2, 4.3, 4.4, 4.5, 7.1, 7.2, 7.3_
+  - _Boundary: RPY / Project / Parser integration validation_
+- [ ] 6.2 执行多文件编辑和手工包用户旅程
+  - 验证相对路径、顺序/调和、部分导出、TM/术语建议与两个设备的包验证/本地资源选择。
+  - 完成时，Project 与 JSONL/CSV ResourcePackage 分别完成冷重开/导入，设备资格未被搬运，未引入 TMX 前置。
+  - _Requirements: 5.1, 5.2, 5.3, 5.4, 6.1, 6.2, 6.4, 7.4_
+  - _Boundary: Product acceptance integration_
+- [ ] 6.3 闭合治理同步与下游消费验证
+  - 由治理 owner 将已批准且已实现的能力同步到 product/tech/structure/roadmap、spec-ownership 与 Multi 顺序说明；owner 提交只消费唯一治理变更。
+  - 完成时，实际 diff 与已批准 amendment 一致，Parser/Project/Qt 回归及 Sync 手工包前提可验证；未完成项不得记为 Feature GO。
+  - _Requirements: 1.4, 3.4, 6.4, 7.4_
+  - _Boundary: Governance / downstream integration closure_
+  - _Depends: 6.1, 6.2_
