@@ -917,6 +917,12 @@ def _open_directory_chain(
     except OSError as error:
         for descriptor in reversed(descriptors):
             _close_fd(descriptor)
+        if error.errno == errno.ENOTDIR:
+            # O_DIRECTORY | O_NOFOLLOW can report a directory symlink this way.
+            raise _platform_error(
+                PlatformFileErrorCode.REPARSE_REJECTED,
+                retryable=False,
+            ) from None
         raise _map_os_error(
             error,
             fallback=PlatformFileErrorCode.OUTSIDE_ROOT,
@@ -1892,9 +1898,10 @@ class PosixPlatformAdapter(
         retained_directories: tuple[int, ...] | None = directories
         descriptor: int | None = None
         try:
+            # Reject a FIFO by retained fstat without waiting for a writer.
             descriptor = os.open(
                 components[-1],
-                _READ_FLAGS,
+                _READ_FLAGS | os.O_NONBLOCK,
                 dir_fd=retained_directories[-1],
             )
             transferred_directories = retained_directories

@@ -540,6 +540,52 @@ class PosixAdapterRuntimeTests(unittest.TestCase):
                 )
         self.assertEqual(caught.exception.code, "PLATFORM.FS.REPARSE_REJECTED")
 
+    def test_rooted_read_rejects_directory_symlink_before_reading_payload(self) -> None:
+        source = self.root_path / "data" / "source.txt"
+        source.write_bytes(b"must not be consumed")
+        (self.root_path / "linked-data").symlink_to(
+            self.root_path / "data", target_is_directory=True
+        )
+        with self.adapter.bind_root(self.root_path) as root, mock.patch(
+            "platform_fs_posix.os.pread"
+        ) as read:
+            with self.assertRaises(PlatformFileError) as caught:
+                self.adapter.open_regular(root, PurePosixPath("linked-data/source.txt"))
+        read.assert_not_called()
+        self.assertEqual(caught.exception.code, "PLATFORM.FS.REPARSE_REJECTED")
+
+    def test_rooted_fifo_rejection_does_not_wait_for_a_writer(self) -> None:
+        os.mkfifo(self.root_path / "data" / "pipe")
+        script = """
+import sys
+from pathlib import Path, PurePosixPath
+from unittest import mock
+from platform_fs_contracts import PlatformFileError
+from platform_fs_posix import PosixPlatformAdapter
+
+adapter = PosixPlatformAdapter()
+with adapter.bind_root(Path(sys.argv[1])) as root, mock.patch(
+    "platform_fs_posix.os.pread"
+) as read:
+    try:
+        adapter.open_regular(root, PurePosixPath("data/pipe"))
+    except PlatformFileError as error:
+        if error.code != "PLATFORM.FS.REPARSE_REJECTED":
+            raise AssertionError(error.code)
+    else:
+        raise AssertionError("FIFO unexpectedly accepted")
+    read.assert_not_called()
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(self.root_path)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
     def test_existing_regular_synchronization_flushes_file_then_parent(self) -> None:
         import platform_fs_posix
 
@@ -1196,6 +1242,7 @@ raise SystemExit(0)
                 deleted.close()
 
                 replaced = parent.create_candidate(".replaced", private=False)
+                replaced.write_all(b"owned")
                 os.replace(
                     self.root_path / "data" / ".replaced",
                     self.root_path / "data" / ".replaced-owned",
@@ -1209,6 +1256,14 @@ raise SystemExit(0)
                     b"foreign",
                 )
                 replaced.close()
+                self.assertEqual(
+                    (self.root_path / "data" / ".replaced-owned").read_bytes(),
+                    b"owned",
+                )
+                self.assertEqual(
+                    (self.root_path / "data" / ".replaced").read_bytes(),
+                    b"foreign",
+                )
 
     def test_candidate_setup_failure_removes_only_the_owned_entry(self) -> None:
         adapter = self.adapter_type(
