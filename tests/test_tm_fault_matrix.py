@@ -137,97 +137,32 @@ class FaultMatrixRegistryTests(unittest.TestCase):
 
 
 class FaultMatrixEvidenceTests(unittest.TestCase):
-    def test_evidence_is_closed_fresh_and_complete(self) -> None:
+    def test_historical_evidence_preserves_its_recorded_scope(self) -> None:
         evidence = _load_evidence()
-        self.assertEqual(
-            set(evidence),
-            {
-                "generated_at_utc",
-                "registry_digest",
-                "rows",
-                "schema_version",
-                "source_files",
-                "source_fingerprint",
-                "summary",
-                "tasks",
-            },
-        )
-        self.assertEqual(
-            evidence["schema_version"],
-            FAULT_MATRIX_SCHEMA_VERSION,
-        )
-        generated = evidence["generated_at_utc"]
-        if type(generated) is not str:
-            raise AssertionError("generated_at_utc must be a string")
-        self.assertIsNotNone(_UTC.fullmatch(generated))
-        registry_digest = evidence["registry_digest"]
-        self.assertEqual(registry_digest, fault_matrix_registry_digest())
-        if type(registry_digest) is not str:
-            raise AssertionError("registry_digest must be a string")
-        self.assertIsNotNone(_SHA256.fullmatch(registry_digest))
-        self.assertEqual(evidence["tasks"], ["9.1", "9.2"])
-
-        raw_sources = evidence["source_files"]
-        if type(raw_sources) is not list:
-            raise AssertionError("source_files must be a list")
-        source_files: list[tuple[str, str]] = []
-        for raw_item in raw_sources:
-            if type(raw_item) is not dict:
-                raise AssertionError("source file facts must be objects")
-            item = cast(dict[str, object], raw_item)
-            self.assertEqual(set(item), {"path", "sha256"})
-            relative = item["path"]
-            digest = item["sha256"]
-            if type(relative) is not str or type(digest) is not str:
-                raise AssertionError("source file path/digest must be strings")
-            self.assertIsNotNone(_SHA256.fullmatch(digest))
-            path = (_ROOT / relative).resolve(strict=True)
-            self.assertEqual(
-                hashlib.sha256(path.read_bytes()).hexdigest(),
-                digest,
-            )
-            source_files.append((relative, digest))
-        self.assertEqual(
-            tuple(relative for relative, _digest in source_files),
-            fault_matrix_source_paths(),
-        )
+        self.assertEqual(set(evidence), {
+            "generated_at_utc", "registry_digest", "rows", "schema_version",
+            "source_files", "source_fingerprint", "summary", "tasks",
+        })
+        self.assertEqual(evidence["schema_version"], FAULT_MATRIX_SCHEMA_VERSION)
+        self.assertRegex(evidence["generated_at_utc"], _UTC)
+        self.assertRegex(evidence["registry_digest"], _SHA256)
+        sources = tuple((item["path"], item["sha256"]) for item in evidence["source_files"])
+        self.assertEqual(len(sources), len({path for path, _ in sources}))
         self.assertEqual(
             evidence["source_fingerprint"],
-            fault_matrix_source_fingerprint(
-                registry_digest,
-                tuple(source_files),
-            ),
+            fault_matrix_source_fingerprint(evidence["registry_digest"], sources),
         )
-
-        raw_rows = evidence["rows"]
-        if type(raw_rows) is not list:
-            raise AssertionError("rows must be a list")
-        self.assertEqual(len(raw_rows), len(FAULT_MATRIX_ROWS))
-        for expected, raw_observed in zip(FAULT_MATRIX_ROWS, raw_rows):
-            if type(raw_observed) is not dict:
-                raise AssertionError("row evidence must be an object")
-            observed = cast(dict[str, object], raw_observed)
-            self.assertEqual(
-                set(observed),
-                {"row_id", "status", "test_ids"},
-            )
-            self.assertEqual(observed["row_id"], expected.row_id)
-            self.assertEqual(observed["status"], "PASS")
-            self.assertEqual(observed["test_ids"], list(expected.test_ids))
-
-        summary = evidence["summary"]
-        if type(summary) is not dict:
-            raise AssertionError("summary must be an object")
-        self.assertEqual(
-            summary,
-            {
-                "passed_rows": len(FAULT_MATRIX_ROWS),
-                "referenced_tests": sum(
-                    len(row.test_ids) for row in FAULT_MATRIX_ROWS
-                ),
-                "total_rows": len(FAULT_MATRIX_ROWS),
-            },
-        )
+        rows = evidence["rows"]
+        self.assertEqual(len(rows), len({row["row_id"] for row in rows}))
+        for row in rows:
+            self.assertEqual(set(row), {"row_id", "status", "test_ids"})
+            self.assertIn(row["status"], ("PASS", "FAIL"))
+            self.assertTrue(row["test_ids"])
+        self.assertEqual(evidence["summary"], {
+            "passed_rows": sum(row["status"] == "PASS" for row in rows),
+            "referenced_tests": sum(len(row["test_ids"]) for row in rows),
+            "total_rows": len(rows),
+        })
 
     def test_evidence_parser_rejects_duplicates_and_nonfinite(self) -> None:
         with self.assertRaises(ValueError):
@@ -254,11 +189,12 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
                 side_effect=AssertionError("tests must not execute"),
             ):
                 with self.assertRaisesRegex(ValueError, "repository root"):
-                    validator.main(["--repository-root", str(alternate)])
-                with self.assertRaisesRegex(ValueError, "canonical output"):
+                    validator.main(["--repository-root", str(alternate), "--emit", str(alternate / "out.json")])
+                with self.assertRaisesRegex(ValueError, "artifact run directory"):
                     validator.main(["--emit", "AGENTS.md"])
 
     def test_validator_rejects_source_drift_before_emit(self) -> None:
+        (_ROOT / "artifacts" / "windows").mkdir(parents=True, exist_ok=True)
         baseline = validator._source_file_digests(_ROOT)
         changed = baseline[:-1] + ((baseline[-1][0], "0" * 64),)
         with (
@@ -275,7 +211,7 @@ class FaultMatrixEvidenceTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(ValueError, "changed before emit"):
-                validator.main([])
+                validator.main(["--emit", "artifacts/windows/matrix-test.json"])
 
     def test_atomic_write_validates_before_and_after_readback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

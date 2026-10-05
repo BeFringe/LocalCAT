@@ -178,11 +178,20 @@ Wave 0 治理与 characterization
   - 对最终 diff 重做五类治理语义门；Multi-Document 等相邻线无越界。
   - _Requirements: 9.1–9.5, 10.1–10.4_
 
-### Wave 4 完成门
+### Wave 4 原实施阶段完成门
 
 - 全部 current-source evidence、Gate C/D 和 release GO 绑定同一 final runtime tree；Gate C 之后没有 production 或 source-registry 变化。
-- 独立提交：`test(tm): 重签 candidate 提取 current-source 证据`；之后只允许一个不改变任何 evidence root 的 governance completion 提交。
+- 原阶段独立提交：`test(tm): 重签 candidate 提取 current-source 证据`；该阶段随后只允许一个不改变 evidence root 的 governance completion 提交。后续维护按其明确范围执行，不追改原验收。
 - Cluster 4 final review 通过后才可勾 Feature completion。
+
+## 验证维护
+
+- [x] 5.6 以当前架构守卫替代旧验收报告的永久 freshness 断言
+  - 保留 candidate owner/port、SQL/事务边界以及 Gate C/benchmark/acceptance/fault roots 的直接检查。SQL 守卫仅补识别固定 INSERT 与问号占位组拼接，未知 caller SQL 仍拒绝；保留具体 candidate patch seam，移除无关全库 patch 数量/摘要。
+  - 移除历史报告必须匹配当前 fingerprint、源码字节与 GO 的混合断言；原 Wave 4 报告和完成事实保持原范围。
+  - 与 Core 9.8 的显式产物验证共同验收，不改 runtime、fixture 或 Gate roots，不重签旧报告。
+  - _Requirements: 8.1–4、9.1–5、10.4_
+  - _Boundary: 本 owner characterization 与历史验收消费；当前发布执行归 Core_
 
 ## 明确禁止
 

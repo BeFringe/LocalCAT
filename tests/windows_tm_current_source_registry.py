@@ -25,9 +25,9 @@ WINDOWS_TM_CURRENT_SOURCE_ROWS = (
             "tests.test_tm_portable_fresh_recovery_journal_windows",
             "tests.test_tm_stage_candidate_copy_windows",
         ),
-        expected_count=93,
+        expected_count=107,
         sorted_test_ids_sha256=(
-            "b85c6bd139e3182f63cac9eed5074be2ff592d5daa75d706d38efd55d90d4215"
+            "ea5e6ab5d55a36455f83411f93d2ee43e329d2056187664254a96b92d8f4cf09"
         ),
     ),
     WindowsTMCurrentSourceRow(
@@ -47,9 +47,9 @@ WINDOWS_TM_CURRENT_SOURCE_ROWS = (
             "tests.test_tm_portable_replacement_owner_windows",
             "tests.test_tm_schema_upgrade_windows",
         ),
-        expected_count=26,
+        expected_count=30,
         sorted_test_ids_sha256=(
-            "71e452f05ac31aa7a8538913f6a69bd9f2ab218d7f5ac77cb6f414e40bc28bd4"
+            "847e22d1bc56df488b71d610f399a3cf81fb37697ace6c9c5575795d6d912d4c"
         ),
     ),
     WindowsTMCurrentSourceRow(
@@ -70,9 +70,9 @@ WINDOWS_TM_CURRENT_SOURCE_ROWS = (
             "tests.test_tm_benchmark_platform_windows",
             "tests.test_tm_current_source_retrieval_windows",
         ),
-        expected_count=10,
+        expected_count=13,
         sorted_test_ids_sha256=(
-            "8db2d3c0762b1507e92234ea44e9ed30d21a94e9bd38749b1871e9bcccf5f16e"
+            "87f1e7e62ce158ad3e01ce55afcab091c55361be170665c2645d70bec71b2803"
         ),
     ),
 )

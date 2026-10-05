@@ -39,6 +39,8 @@ from tools.run_windows_c3b_capability_gate import (  # noqa: E402
     validate_aggregate_matrix,
 )
 from tools.tm_release_evidence_io import (  # noqa: E402
+    artifact_output_path,
+    evidence_input_path,
     atomic_write as platform_atomic_write,
     strict_read_regular,
     validate_evidence_target,
@@ -357,8 +359,9 @@ def _run_row_process(
 
 def _validate_benchmark_input(
     root: Path,
+    relative: str,
 ) -> tuple[dict[str, object], BenchmarkEvidenceBundle]:
-    benchmark_bytes, benchmark_digest = _strict_read(root, "benchmark_tm_evidence.json")
+    benchmark_bytes, benchmark_digest = _strict_read(root, relative)
     bundle = benchmark_evidence_bundle_from_json(benchmark_bytes.decode("utf-8"))
     if bundle.implementation_fingerprint != benchmark_implementation_fingerprint(root):
         raise ValueError("benchmark implementation fingerprint is stale")
@@ -420,7 +423,8 @@ def _atomic_write(path: Path, payload: bytes, validate_snapshot) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository-root", type=Path, default=ROOT)
-    parser.add_argument("--emit", type=Path, default=ROOT / EVIDENCE_NAME)
+    parser.add_argument("--emit", type=Path)
+    parser.add_argument("--benchmark-evidence", type=Path)
     parser.add_argument("--repository-commit")
     parser.add_argument("--c3b-matrix", type=Path)
     parser.add_argument("--c3b-matrix-sha256")
@@ -450,23 +454,21 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("C3B matrix and SHA-256 are required")
     if _SHA256_RE.fullmatch(arguments.c3b_matrix_sha256) is None:
         raise ValueError("C3B matrix SHA-256 must be lowercase 64-hex")
+    c3b_matrix_path = arguments.c3b_matrix.absolute()
     if arguments.temp_root is None:
         raise ValueError("a writable temporary root is required")
     temp_root = _validate_temp_root(arguments.temp_root)
-    evidence_path = arguments.emit
-    if not evidence_path.is_absolute():
-        evidence_path = repository_root / evidence_path
-    evidence_path = evidence_path.absolute()
-    if evidence_path != repository_root / EVIDENCE_NAME:
-        raise ValueError("Windows TM evidence must use the canonical output path")
-    validate_evidence_target(
-        evidence_path,
-        target_error="Windows TM evidence target is not regular",
+    if arguments.emit is None or arguments.benchmark_evidence is None:
+        raise ValueError("explicit artifact output and benchmark evidence are required")
+    benchmark_path = evidence_input_path(repository_root, arguments.benchmark_evidence)
+    evidence_path = artifact_output_path(
+        repository_root, arguments.emit,
+        inputs=(benchmark_path, str(c3b_matrix_path)),
     )
 
-    benchmark_input, benchmark_bundle = _validate_benchmark_input(repository_root)
+    benchmark_input, benchmark_bundle = _validate_benchmark_input(repository_root, benchmark_path)
     c3b = _validate_c3b_matrix(
-        arguments.c3b_matrix,
+        c3b_matrix_path,
         expected_sha256=arguments.c3b_matrix_sha256,
         repository_commit=arguments.repository_commit,
         root=repository_root,
@@ -505,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         if _source_file_digests(repository_root) != source_files:
             raise ValueError("Windows TM sources changed during validation")
         benchmark_input_after, benchmark_after = _validate_benchmark_input(
-            repository_root
+            repository_root, benchmark_path
         )
         if (
             benchmark_input_after != benchmark_input
@@ -513,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise ValueError("benchmark input changed during validation")
         c3b_after = _validate_c3b_matrix(
-            arguments.c3b_matrix,
+            c3b_matrix_path,
             expected_sha256=arguments.c3b_matrix_sha256,
             repository_commit=arguments.repository_commit,
             root=repository_root,

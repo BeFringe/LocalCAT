@@ -1247,6 +1247,11 @@ Gate runner只有在locked real ports完成、bundle原子落盘且strict durabl
 
 Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CPython 3.14 Gate D bundle、C3B source snapshot handoff与activation/recovery/private/schema/snapshot/retrieval清单。合法benchmark/C3B `NO_GO`仍是阻断而非运行器故障，不得跳过；它不重解释Windows v3 portable identity/recovery，也不要求Windows重放历史POSIX inode断言。普通packaged只在共享代码、依赖或消费合同变化时触发受影响source/macOS/Linux owner回归；不要求每个候选无条件在同提交重签全部跨平台矩阵，亦不借此将9.6a升格为frozen验收。
 
+**发布验证产物与历史报告。** acceptance/fault/source release 验证器由调用方显式选择运行输出；仓库内输出位于 `artifacts/` 的独立运行目录，也可另存到仓库外目录，不覆盖源码、历史报告或本次输入。release 显式选择 acceptance、fault、benchmark 输入，Windows source release 显式选择 benchmark 与既有 C3B 输入；acceptance/fault/benchmark 输入仍在 validator checkout 下逐组件严格读取；C3B 保留其原 owner 的路径和验证合同。所选路径必须贯穿初读、真实测试和发布前后复证，禁止在复证时回落根目录旧文件。输出定位先于昂贵执行；Windows fresh `--worker-row` 模式不要求父入口的报告路径。
+
+历史 acceptance/fault/release 与 Windows TM/Feature5/Qt source 报告保留原字节和原适用范围；同目录不表示同一次运行。日常测试检查原报告自身字段、摘要与派生事实，不要求其永久匹配当前源码或当前 GO。当前 Requirements 与 release registry 必须一一覆盖，包含已批准的 8.8–8.10；真实 source 发布仍执行所引用测试并拒绝陈旧、失配、缺失及运行中漂移的输入，时间性能失败仍形成 NO_GO。历史记录、自洽摘要和单元测试夹具均不替代本次真实执行；本次工具维护不生成新的发布或 Gate 结论。
+
+
 - machine-readable `benchmark_tm_contract.json` 必须与 `BenchmarkContract` 一致；`benchmark-v1` 固定 generator/seed/digests、100,000 records、exact ≥1,000 queries、fuzzy ≥200 queries。
 - deterministic corpus 包括 multilingual/CJK/short/duplicate/multi-target/context/near-edit/miss cohorts；query cohort 由 digest 固定，不允许运行时挑选有利样本。
 - oracle subset 固定 5,000 records/200 queries，minimum similarity=0.60、top-k=10；above-threshold 全集与真实 top-10 candidate recall 均须 100%。
