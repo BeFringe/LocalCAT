@@ -418,7 +418,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 7.0/7.1 只保留原 W3 构建前完成事实，其历史 Depends 不再是普通任务的执行门；普通任务从已完成 source 进入。构建摘要/实际内容接缝及 windowed 管道、取消回收分别由 7.2a–c、Core 9.6e 和 Feature5 3.6b 承担。
 
-- [ ] 7. 从普通候选贯通 Core、资格与产品旅程
+- [x] 7. 从普通候选贯通 Core、资格与产品旅程
 
 - [x] 7.0 集成frozen pre-build消费合同与WA-07 trusted bootstrap实现
   - 在1.6全PASS后，集成生成manifest/build前必须存在的owner roots/hooks、WA-06 9.6c/9.6d受信输入与fresh worker消费、WA-07 3.6a `TrustedSourceAuthority`消费实现；WA-01/02/04/05/06及WA-07其余packaged revalidation不得在发行候选生成前标为完成
@@ -510,7 +510,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Packaged Resource and Retrieval Boundaries_
   - _Depends: 8.2_
 
-- [ ] 9. 闭合受影响回归与独立发行评审
+- [x] 9. 闭合受影响回归与独立发行评审
 
 - [x] 9.1 核对实际变更与证据复用范围
   - 对最终 diff/依赖/调用合同/关键运行条件判定 Core、数据端口和共享代码影响；检查业务模块没有重新引入直接 POSIX/Win32 primitive，普通入口没有隐式激活 W3。
@@ -520,7 +520,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Affected Regression and Evidence Reuse_
   - _Depends: 8.3_
 
-- [ ] 9.2 汇总同候选证据并完成独立累计评审
+- [x] 9.2 汇总同候选证据并完成独立累计评审
   - 汇总构建输入—产物、候选 ID、环境/版本、命令/退出码/日志、真实业务/失败结果、owner 引用与影响分析；不把测试数量或构建退出码当产品结论。
   - 独立 reviewer 核对 Requirements 10–12、Core/Host 发布与 worker 生命周期、数据保护、审批和实际 diff；审查强度不降低，Task 8 保持 xhigh 实施/复审。
   - 完成时，所有阻塞 finding 关闭、候选必测/触发项证据有效、无未批准合同变化，才允许进入最终裁决。
@@ -528,9 +528,9 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Independent Packaged Release Review_
   - _Depends: 9.1_
 
-- [ ] 10. 完成 Windows 0.5.2 发行裁决
+- [x] 10. 完成 Windows 0.5.2 发行裁决
 
-- [ ] 10.1 对 0.5.2 作最终发行裁决
+- [x] 10.1 对 0.5.2 作最终发行裁决
   - 以最终候选及 7.4/8/9 的有效证据确认 Qt/Project/TM/TMX/FTS5、必要数据保护与 Core C/D 全部闭合；若审查后改变候选则按 12.7 重新验证，不自动继承结论。
   - 完成时，required owner 项与本轮审批已闭合、无缺失/跳过/伪造结果，由发行 owner 记录实际 VERIFIED 或 NOT_VERIFIED；当前不预填任何结果。
   - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 11.1, 11.2, 11.3, 11.4, 11.5, 12.1, 12.2, 12.3, 12.4, 12.5, 12.6, 12.7_

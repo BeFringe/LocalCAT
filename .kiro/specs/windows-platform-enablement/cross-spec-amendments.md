@@ -1,8 +1,8 @@
 # Cross-Spec Amendment Dispatch and Integration Ledger
 
-## 当前交付解释（2026-09-20）
+## 当前交付解释
 
-source 已由 Task 6.6b 完成独立产品验收。下文 `SOURCE_MERGED_PASS` 是已交付 source 的事实；它不是 frozen 通过，也不因 frozen 仍未达到 `MERGED_PASS` 而变成 source 未完成。
+source 已由 Task 6.6b 完成独立产品验收。下文 `SOURCE_MERGED_PASS` 保留该 source 范围；普通 frozen 候选 `681a898d51c7` 已由 Task 10.1 完成 `VERIFIED` 裁决，具体范围和限制见[同候选验收结论](#时间准入修订候选-681a)。旧 W3 staged 状态不改签为普通发行结果。
 
 [ADR-028](../../steering/adr/adr-028.md) 部分取代原 W3 的完整 Boot TCB/native entry/source-only 前置；下方旧 W3 映射和 staged vocabulary 保留历史用途。WA-06 R3 source、R4 pre-build 与 WA-07/08 source 成果保留，不重签为 packaged 成果。用户明确批准 `reassessment@3e41130` 的普通 frozen 活动 R/D/T 及已列明相邻 owner 修订，按现有依赖实施；旧 ACK 与原始 evidence 保持原范围，不重签候选或正式 Gate 验收。
 
@@ -50,7 +50,7 @@ source 的已批准分期、原 task 和 evidence 保留：`platform 6.6a launch
 
 | 已批准范围（`reassessment@3e41130`） | 唯一 owning 文件 | 本轮状态 |
 | --- | --- | --- |
-| 普通发行 Requirement 10–12、build/entry/transport、验收复用与任务图 | 本 Spec requirements/design/tasks/spec.json | Requirements / Design / Tasks 已获用户明确批准；候选未验收 |
+| 普通发行 Requirement 10–12、build/entry/transport、验收复用与任务图 | 本 Spec requirements/design/tasks/spec.json | Requirements / Design / Tasks 已获用户明确批准；实际候选裁决见下方验收范围 |
 | 输入、compatibility、oracle/query、worker、publication | Core requirements/design/tasks/trusted-input-publication/spec.json | 已获用户明确批准；R4 原完成事实不变 |
 | composition、generation/notification、资格与取消投影 | Feature5 requirements/design/tasks/spec.json | 已获用户明确批准；source 与 3.6a 原范围不变 |
 | 普通资源/入口、最终产品 journey | Qt increment requirements/design/tasks/spec.json | 已获用户明确批准；source 不重签 |
@@ -209,7 +209,7 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 |---|---|---|---|---|---|
 | WA-06 | `R4` | `tm-storage-retrieval-index` | `42fc582421c6872ef2c130c9f3bbe7a4952e8e4b` | `FROZEN_REVALIDATED_PASS` | — |
 
-该锚包含普通候选 `8faeee03e1dd` 的 Core 9.6b、Feature5 6.6b/7.6b 与平台 7.3 本机验收，实际结果及未变 owner 的有限复用见[候选验收范围](#普通候选已验收范围)。本行只推进 WA-06；WA-07/08 的 clean-user 与独立无 Python/Qt 环境仍缺，source/pre-build 原锚及失败事实保留，不将本机验收扩大为发行通过。
+该锚包含普通候选 `8faeee03e1dd` 的 Core 9.6b、Feature5 6.6b/7.6b 与平台 7.3 本机验收，实际结果及未变 owner 的有限复用见[候选验收范围](#普通候选已验收范围)。本行只推进当时的 WA-06；WA-07/08 的 clean-user 与独立无 Python/Qt 环境当时仍缺，source/pre-build 原锚及失败事实保留，不将该次本机验收扩大为发行通过。
 
 ### 普通候选已验收范围
 
@@ -262,7 +262,7 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 原验收记录中可复核的关键报告及 SHA-256：`performance-recheck-8fae/result.json` → `96b6e59f7077ab7e2060349b31ab83d3de190c4d4f538187620a39c6e0486e37`；`product-journey-8fae-01/product-journey-result.json` → `c8f07f7034b59a7a53409d576579bb06d4940764b533f5cea5da601190b3fe61`；`core-host-reuse-8fae.json` → `b1afe7ca305079ea1db426ea5c06b27764a62e1f49d05473fef9b710c34f8381`；`acceptance-review-8fae.json` → `feba193c85731f4189e6af9196e98a0ebf31213a5e97cb4c75e9acf2d6a95250`。完整路径、其余报告和历史失败按上方保留 Git 记录追溯，不再维护另一份滚动汇总文件。
 
-已完成范围为 Core `9.6b`、Feature5 `6.6b/7.6b` 与平台 `7.3`，独立累计评审支持此范围。本机净化环境不等同独立未安装 Python/Qt 的 Windows 环境；Feature5 `9.2a`、Qt `5.4b` 与平台 `7.4/8/9/10` 仍待收束，发行状态保持 `NOT_VERIFIED`。后续只补缺失环境及实际变更触发项，不机械重跑已完成矩阵。
+该次已完成范围为 Core `9.6b`、Feature5 `6.6b/7.6b` 与平台 `7.3`，独立累计评审支持此范围。本机净化环境不等同独立未安装 Python/Qt 的 Windows 环境；当时 Feature5 `9.2a`、Qt `5.4b` 与平台 `7.4/8/9/10` 仍待收束，原发行状态为 `NOT_VERIFIED`。后续只补缺失环境及实际变更触发项，不机械重跑已完成矩阵。
 
 #### 时间准入修订候选 681a
 
@@ -292,6 +292,6 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 回归原件包括 Windows 数据端口 72 项、长路径恢复 5 项，以及 macOS CPython 3.14.7 / Qt 6.11.1 / SQLite 3.53.1 的受影响 source 回归共 181 过、7 项 Windows-only skip。Mac 包含实际 5000/200 双路径 oracle，不代表 macOS frozen、全量 100k 或 Linux PASS；本轮未改变 Linux launcher/POSIX backend、RSS 单位或平台选择，未触发新的 Linux 专项。原 Windows 两进程初次激活与 kill-holder 恢复矩阵保留 owner `f28ec5d` 原范围；原 `windows_tm_current_source_evidence.json` 及未变测试可从保留的实际 Git 链恢复，不重签为本候选执行。
 
-最终发行仍由 Task `9.2/10.1` 独立裁决；当前技术验收不豁免 Design 已要求的 Steering 结构/路线图同步，不将性能 FAIL 改成 PASS。
+**最终裁决：VERIFIED。** Task `9.2/10.1` 的独立累计评审已确认 Requirement 10–12、required owning task、实际候选消费及有限复用闭合，Design 要求的 Steering 同步已继承。结论限定上述 Windows 0.5.2 普通候选，不改写原构建、报告或历史 source/W3 结果；验证机性能报告继续为 FAIL，工作区位置 WinError 32 保留 P2 未修复限制，不外推 macOS frozen、Linux PASS 或完整 W3。
 
 历史 `WR-*`、source/pre-build 状态及原锚保持其原有范围；普通发行以当前 required owning task、同候选必测与触发项、有限复用依据及独立评审闭合为准，不要求重开 W3 staged 状态。完整命令、日志和截图随对应候选保留，本节登记有信息增量的集成结论；只有这些范围闭合且实际代码差异仍在获批边界内，最终 Windows Feature GO 才可进入裁决。
