@@ -1,6 +1,6 @@
 # Brief: qt-editor-json-mvp-increment
 
-> 权威说明：本文是 discovery 输入。当前实施以已批准的 `requirements.md`、`design.md`、`tasks.md` 为准；基础搜索也必须消费 Feature 5 的 `BASIC_VALIDATED` TextMatcher，Qt 不得保留本地 fallback matcher。
+> 权威说明：本文是 discovery 输入。当前实施以现行 `requirements.md`、`design.md`、`tasks.md` 为准；基础搜索也必须消费 Feature 5 的 `BASIC_VALIDATED` TextMatcher，Qt 不得保留本地 fallback matcher。
 
 ## 问题
 
@@ -190,4 +190,4 @@ Editor contracts / existing Trie / local atomic storage
 
 ## 当前阶段
 
-本文件是已进入 Requirements 阶段的 discovery 输入；正式可验收行为以同目录 `requirements.md` 为准。Requirements、Design 和 Tasks 仍需逐阶段批准，本文不是直接实施授权。
+本文件是已进入 Requirements 阶段的 discovery 输入；正式可验收行为以同目录 `requirements.md` 为准。实施阶段门遵循项目工作流，本文只说明问题与范围。

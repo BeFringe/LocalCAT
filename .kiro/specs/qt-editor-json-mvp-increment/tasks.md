@@ -2,11 +2,7 @@
 
 > Feature 5 `TextMatcher` 是基础搜索的硬依赖；本计划不提供本地 casefold/Whole Word 替代实现。历史 Close-without-Saving 缺陷不属于本规格；这里只实现需求 5.5 明确要求的批量撤销点跨项目清理。
 
-> **Q1 tasks-only amendment（2026-08-19）**：按 `feature5-ui-integration-review-clustering` 的 Checkpoint Q，将原 1.1、3.1、3.2 中混合的 Requirement 3 搜索切片与 speaker inventory、preprocessing/batch baseline 切片拆开，并新增 4.3a fresh acceptance 子任务。Q1 只可勾选 1.1a、2.6、3.1a、3.2a、4.3、4.3a；不得借搜索实施完成相邻产品范围。
-
-> **Q2 tasks-only amendment（2026-08-19）**：按同一 Checkpoint Q，将原 4.7 中混合的 term mutation 与 preprocessing 四视图刷新拆为 4.7a/4.7b，并新增 4.5a fresh acceptance 子任务。Q2 只可勾选 2.7、3.4、3.5、4.5、4.5a、4.7a；不得借术语实施完成 preprocessing 或其他 Requirement。
-
-> **Q1 search-surface amendment 已批准（2026-08-19）**：根据 Requirement 3 实机冒烟反馈，新增 1.1c、2.6a、3.2c、4.3b、4.3c，将项目搜索收纳为顶栏可折叠入口，增加明确清除和“未填写 / 草稿 / 已翻译”筛选。该 amendment 不授权 status-only 伪 offset、Approved/Revise 状态或 Replace/Replace All，并必须在 Q2 累计评审前完成 Q1 fresh acceptance。
+搜索切片（1.1a/1.1c、2.6/2.6a、3.1a、3.2a/3.2c、4.3–4.3c）与术语切片（2.7、3.4、3.5、4.5/4.5a、4.7a）分别验证，再按累计依赖集成。4.7b 独立验证预处理四视图刷新；任一切片完成不覆盖其他功能。
 
 > **WA-08普通frozen任务范围**：`a`后缀任务保留Windows source journey与原证据范围；5.2b/5.3b/5.4b承担普通候选的资源、窗口及完整产品消费。构建、候选入口与资源根仍归`windows-platform-enablement`；各候选的验收事实见[候选验收范围](../windows-platform-enablement/cross-spec-amendments.md#普通候选已验收范围)。
 
@@ -202,7 +198,7 @@
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 9.1_
 
 - [x] 4.2a 在 speaker inventory 中增加安全的内置头像投影
-  - 将批准的 `[speaker]Half.png` 作为随应用分发的只读展示资产，只在 inventory 行显示等比缩略图
+  - 将随产品分发的 `[speaker]Half.png` 作为随应用分发的只读展示资产，只在 inventory 行显示等比缩略图
   - 以实际文件名建立 Unicode casefold 索引；raw speaker 只查询索引，不直接拼接路径，重复键、缺失或解码失败均显示无头像
   - 不给 `SpeakerInventory` 合同增加头像/路径/profile 字段，不写入 JSON、workspace、搜索、术语或 TM identity
   - 保持 Task 4.1 编辑与浏览视图无头像；不创建 alias、显式空白 profile、配置入口或推测名称
@@ -419,6 +415,6 @@
   - QtTest 证明 inventory 表头完整、规则保存/重开/重启、两个复选筛选、状态计数和两类确认提示
   - workspace 故障注入证明写失败原子，项目/dirty/revision/search/undo 不变
   - 刷新受影响 acceptance/release evidence，并运行全量 suite
-  - 项目 owner 已人工采纳 ADR-014；Steering 已同步，并已复核最终五类语义门
+  - 依据 ADR-014 核对 Spec、Steering 与当前实现，并在最终验收核对五类语义门
   - _Requirements: 1.11, 4.12, 4.13, 4.14, 4.15, 4.16, 4.17, 4.18, 9.3, 9.4_
   - _Depends: 4.2b, 4.4a_
