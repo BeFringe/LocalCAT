@@ -738,6 +738,7 @@ def _rule_signature(rule: object) -> tuple[object, ...]:
 
 
 PARSER_MODULE_PREFIXES = (
+    "parser_rpy_codec",
     "parser_contracts",
     "parser_source",
     "parser_registry",
@@ -752,6 +753,7 @@ PARSER_MODULE_PREFIXES = (
 )
 
 PARSER_CODEC_PREFIXES = (
+    "parser_rpy_codec",
     "parser_localcat_codec",
     "parser_gettext_codec",
     "parser_tmx_codec",
@@ -935,6 +937,13 @@ def build_parser_architecture_policy() -> ArchitecturePolicy:
                 ("parser_contracts", "parser_source", "parser_json_support"),
                 (),
                 "LocalCAT codec uses its Design-declared neutral dependencies",
+            ),
+            AllowedImportRule(
+                "rpy_codec.allowed_dependencies",
+                ("parser_rpy_codec",),
+                ("parser_contracts",),
+                (),
+                "RPY lexical codec depends only on stdlib and neutral contracts",
             ),
             AllowedImportRule(
                 "gettext_codec.allowed_dependencies",

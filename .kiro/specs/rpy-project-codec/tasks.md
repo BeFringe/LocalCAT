@@ -27,7 +27,7 @@
   - _Depends: 1.2；multi-document-project-workspace 5.6_
 
 - [ ] 2. 实现独立 TL codec
-- [ ] 2.1 识别有界字符串、缩进和 TL block
+- [x] 2.1 识别有界字符串、缩进和 TL block
   - 支持声明的编码、注释、引号/转义、混合两类 header、有限 say 属性/transition 与控制行，拒绝执行型/多行/不确定语法及空 source。
   - 完成时，正反 fixture 全部分类正确，超限/截断不会输出可提交候选。
   - _Requirements: 1.1, 1.2, 2.1, 7.1, 7.2, 7.3_

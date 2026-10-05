@@ -27,6 +27,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 _EXPECTED_PARSER_MODULES = frozenset(
     {
+        "parser_rpy_codec",
         "parser_contracts",
         "parser_source",
         "parser_registry",
@@ -1245,7 +1246,12 @@ class Wave4ProductionArchitectureTests(unittest.TestCase):
 
         self.assertEqual(
             owners_by_codec,
-            {codec: {"parser_composition"} for codec in PARSER_CODEC_PREFIXES},
+            {
+                # Task 2.1 owns lexical facts only; product registration is a
+                # separate RPY task. No consumer may import this codec yet.
+                codec: set() if codec == "parser_rpy_codec" else {"parser_composition"}
+                for codec in PARSER_CODEC_PREFIXES
+            },
         )
 
     def test_each_migrated_format_has_one_parser_grammar_owner(self) -> None:
