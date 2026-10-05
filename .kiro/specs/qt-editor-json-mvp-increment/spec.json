@@ -1,7 +1,7 @@
 {
   "feature_name": "qt-editor-json-mvp-increment",
   "created_at": "2026-07-27T09:51:22Z",
-  "updated_at": "2026-09-20T14:55:15Z",
+  "updated_at": "2026-10-05T09:30:00+00:00",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -22,5 +22,15 @@
   "approval_scope": {
     "historical": "既有Qt增量、表面修订与Windows source审批及完成事实保持原范围，不代表普通frozen已获批或通过。",
     "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 普通候选的 WA-08 资源/入口/验收 Requirements、Design 与 Tasks 5.2b/5.3b/5.4b；按已列明依赖实施，候选必测、证据复用与变更重验仍按原合同执行。本批准不重签既有事实或预填候选/Gate PASS。"
+  },
+  "approved_amendments": {
+    "directory_rpy_manual_sync": {
+      "adrs": [
+        "ADR-030",
+        "ADR-031"
+      ],
+      "scope": "Requirements 10–11；Design「项目打开、格式导出与手动同步视图」。",
+      "approved": true
+    }
   }
 }

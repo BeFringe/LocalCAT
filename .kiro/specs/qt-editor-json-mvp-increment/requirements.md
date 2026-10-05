@@ -4,21 +4,17 @@
 
 LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作的个人译者。它先把项目已有的独立 raw speaker 字段盘点清楚并直接显示，再补齐基础关键词搜索、target-only 简易文字预处理、译文框撤销/重做、术语 CRUD、silver logo 和紧凑资源菜单。
 
-本增量不扩展项目格式，不从 source 猜测 speaker，不修改 source，也不改变既有翻译记忆身份。Match Case / Whole Word 的产品控件属于本增量，但只有统一兼容匹配语义完成并通过验收后才能启用；此前必须明确禁用，不得向用户暗示选项已经生效。
+格式能力由独立 codec/Project owner 提供，Qt 通过中立入口消费；Qt 不从 source 猜测 speaker，不修改 source，也不改变既有翻译记忆身份。Match Case / Whole Word 的产品控件属于本增量，但只有统一兼容匹配语义完成并通过验收后才能启用；此前必须明确禁用，不得向用户暗示选项已经生效。
 
 ## 边界说明
 
-- **范围内**：当前单个 JSON 项目的 raw speaker inventory、inventory-only 内置头像与 raw speaker 显示、基础 source/target/speaker 搜索、target-only 文字预处理及最近一次批量应用撤销、译文框撤销/重做、本地术语 CRUD 与匹配选项记录、silver logo 和窄 ellipsis。
-- **范围外**：新增项目格式、多项目或目录搜索、source 预处理、speaker 推断或拆分、speaker alias、显式留空 profile、编辑/浏览段落头像、头像配置或持久化、正则或脚本、搜索驱动的 Replace All、模糊翻译记忆、云端和多人协作。
+- **范围内**：当前单个 JSON 项目的 raw speaker inventory、inventory-only 内置头像与 raw speaker 显示、基础 source/target/speaker 搜索、target-only 文字预处理及最近一次批量应用撤销、译文框撤销/重做、本地术语 CRUD 与匹配选项记录、silver logo 和窄 ellipsis；消费 Project 的统一打开/目录导航、格式导出与可选手动同步视图。
+- **范围外**：格式语法与包/网络协议实现、多项目搜索、source 预处理、speaker 推断或拆分、speaker alias、显式留空 profile、编辑/浏览段落头像、头像配置或持久化、正则或脚本、搜索驱动的 Replace All、模糊翻译记忆、后台云同步和多人协作。
 - **相邻期望**：Match Case / Whole Word 的统一语义由 Feature 5 提供；能力合并并验收前，相关控件保持禁用。speaker alias、显式留空 profile、编辑/浏览头像与可配置头像属于后续阶段；本增量只在只读 speaker inventory 中投影一组随应用分发的本地头像。既有 JSON/TXT、精确翻译记忆、术语建议和 Excel 工作流不得回归。
 
 ### Scope Lineage
 
-2026-08-19 已批准的项目搜索表面 amendment 仅扩展现有 Requirement 3：将常驻搜索条收纳为顶栏可折叠入口，增加同时清除 query 与已签发结果的明确操作，并在非空关键词搜索中增加由 `target + confirmed` 派生的“未填写 / 草稿 / 已翻译”段状态筛选。它不改项目格式，不新增 approved/revise 层，不重新纳入本 Spec 已排除的 search-driven Replace/Replace All。
-
-2026-08-19 已批准的 speaker inventory avatar amendment 仅扩展 Requirement 1 的只读盘点表面：若应用内置头像目录存在与 raw speaker 精确对应的 `[speaker]Half.png`，盘点表可显示其缩略图。匹配只用于 presentation，不进入 `SpeakerInventory`、JSON、TM identity、搜索字段或 speaker profile；缺失、歧义或无效图片必须安全退化为无头像。Requirement 2 / Task 4.1 的编辑与浏览 raw speaker 表面继续不显示头像。
-
-2026-08-19 已批准的 project-tool usability amendment 修复 speaker inventory“出现次数”表头裁切，并扩展 Requirement 4：预处理对话框以“草稿 / 已确认”两个独立复选框筛选 preview，可显式保存有序 literal 规则、启用状态与筛选偏好到设备本地 `workspace.json`。保存偏好不修改项目且不自动运行规则；只要 preview 包含已确认段，应用前继续显示既有“变化段落设为待确认”警告。
+项目搜索、只读 speaker inventory 与预处理偏好分别由 Requirements 1、3、4 定义。目录选择、格式导出与手动同步增加 Requirements 10、11 的中立视图；格式、项目和网络能力由对应 owner 提供，不扩展 Qt 的解析或持久化权限。
 
 ### Windows Compatibility Amendment WA-08
 
@@ -173,16 +169,36 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 8. When 用户展开编辑/校对模式下拉项, the LocalCAT Qt 编辑器 shall 将 popup 完整放在顶栏控件下方，不覆盖当前“编辑”文字或触发区
 9. When 用户使用平台原生主修饰键 + `Shift+L`（macOS `Command+Shift+L`）, the LocalCAT Qt 编辑器 shall 在“紧凑”与“自动换行”两种段落显示密度之间切换，且工具提示显示原生快捷键
 
-### Requirement 9：单 JSON 边界、兼容性与本地性
+### Requirement 9：编辑边界、兼容性与本地性
 
 **目标：** 作为现有 LocalCAT 用户，我希望本增量保持本地、可恢复且不破坏已有工作流，以便安全采用新增能力。
 
 #### 验收标准
 
 1. The LocalCAT Qt 编辑器 shall 仅对当前打开的单个 JSON 项目承诺本增量的 speaker 盘点、搜索和预处理行为
-2. The LocalCAT Qt 编辑器 shall 不因本增量新增 PO、RPY、XLIFF、多文件夹 JSON 或多项目操作入口
-3. While 用户使用本增量能力, the LocalCAT Qt 编辑器 shall 不发送项目、speaker、搜索、预处理或术语数据到网络
+2. The LocalCAT Qt 编辑器 shall 仅从 Controller 能力投影开放项目/格式入口，不从扩展名、reader 或视图状态推断格式可用性或 writer authority
+3. While 用户编辑、搜索、预处理或管理术语, the LocalCAT Qt 编辑器 shall 保持本地操作；仅用户显式启动手动同步时由同步 owner 传输选定的完整包
 4. If speaker 盘点、搜索、预处理或术语操作失败, the LocalCAT Qt 编辑器 shall 保留失败前可用的项目与资源状态并显示可理解错误
 5. When 任一新操作改变当前项目或术语, the LocalCAT Qt 编辑器 shall 让编辑、浏览、进度和建议中的可见状态保持一致
 6. The LocalCAT Qt 编辑器 shall 保持既有精确翻译记忆优先级、raw speaker 翻译记忆身份、术语建议和 Excel 三态输出不变
 7. The LocalCAT Qt 编辑器 shall 保持既有 JSON/TXT 打开能力和 JSON 保存结果可用，但不把 TXT 宣称为本增量的新能力范围
+
+### Requirement 10：项目打开、目录导航与格式导出
+
+**目标：** 作为处理章节的译者，我希望通过统一入口选择文档并保留相对目录，清楚区分项目保存与格式导出。
+
+#### 验收标准
+
+1. When 用户选择根目录, the Qt 编辑器 shall 显示递归候选预览并支持勾选/排序；现有文件夹按钮只按相对目录导航，不改变 manifest 阅读顺序。
+2. When 用户保存 TL 项目或预览格式导出, the Qt 编辑器 shall 消费中立 Controller view，区分 ProjectPackage 保存与格式导出，显示逐文件结果，不持有 codec token/private member 或平台 authority。
+3. When 目录或导出工作被取消、项目切换、窗口关闭或相关编辑发生变化, the Controller shall 依据 issued session/generation 拒绝晚到结果，并保留既有编辑保存与 Chunk mutation guards。
+
+### Requirement 11：手动同步交互
+
+**目标：** 作为迁移项目的译者，我希望在明确的计划和确认后执行同步，失败时仍可继续本地工作。
+
+#### 验收标准
+
+1. When 用户进入手动同步, the Qt 编辑器 shall 提供连接设置、计划/冲突/导入确认与部分失败结果，只回传 issued IDs 和用户选择，不持有 provider 或包内部 authority。
+2. When 显示秘密字段, the Qt 编辑器 shall 默认以星号遮蔽，允许显式显示，关窗重开恢复遮蔽；显隐不写配置、不复制秘密，也不提供内容加密开关。
+3. When 同步被取消、项目切换、窗口关闭或相关内容改变, the Controller shall 校验 issued session/generation 并拒绝晚到结果，保留未保存编辑、保存能力与 Chunk mutation guards。
