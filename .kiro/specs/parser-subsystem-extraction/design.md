@@ -424,6 +424,12 @@ safe summary 只描述规则和位置，例如“record 7 的 source 类型无�
 
 Foundation 同时验证 metadata 的 JSON-compatible scalar/tuple 结构。每个 segment/resource record 的 `format_metadata`、`DocumentHeader` metadata 和最终 `document_metadata` 都各自是一个 container，各限 256 entries/1 Mi decoded chars；同一输入所有 metadata container 合计限 16 Mi decoded chars，并受 profile depth 约束。未知 plugin object、过深 nesting 或任一局部/全局超限都是 fatal，而不是截断后成功。
 
+### 中立 round-trip 准备与发布
+
+依据 [ADR-030](../../steering/adr/adr-030.md)，可信 descriptor/composition 可注册 `round_trip_serializer_factory`。`prepare_round_trip` 先复证 `RoundTripTokenEnvelope` 与 exact live provider，再调用 serializer；request 只含 verified source、opaque token 与中立 edits，输出有界且绑定 source/output fingerprint。无 factory 返回 unsupported。此端口不含 Project session、baseline、目标路径或格式私有类型。
+
+`write_prepared` 验证 issuing surface、一次性消费状态、源/输出摘要与 rooted target binding，沿用平台原子发布；普通 bytes DTO 不是写权限。发布前故障无发布，发布后证明不足返回 uncertain。round-trip 输出不交给 canonical serializer 重编码；canonical writer、无 journal/LKG 的恢复边界和已有格式语义保持独立。
+
 ## 迭代器与提交授权
 
 codec 的行为合同是结构化 protocol，不是必须继承的 ABC。raw codec 只有一个语法入口，不能自行发布提交终态：
