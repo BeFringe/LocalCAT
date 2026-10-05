@@ -2,11 +2,11 @@
 
 ## Overview
 
-同步是 LocalCAT 的可禁用 Application 模块。它通过受限 artifact port 取得已完成的项目包或资源包，生成 base/local/remote 计划，使用 R2 或 InfiniCLOUD WebDAV 搬运 bytes，并将下载包交回原 owner 验证与应用。
+同步是 LocalCAT 的可禁用 Application 模块。它通过受限 artifact port 取得已完成的项目包或资源包，生成 base/local/remote 计划，使用 S3-compatible 或 WebDAV 适配器搬运 bytes，并将下载包交回原 owner 验证与应用。
 
 ### Goals
 
-先完成 R2 手动上传/下载/双向闭环，再验证具名 InfiniCLOUD provider。并发变化不丢失内容，失败可恢复；本地编辑保存继续可用。凭据默认遮蔽、可显式显示，不启用内容加密。
+先完成 S3-compatible 手动上传/下载/双向闭环，再接 WebDAV；R2 与 InfiniCLOUD 分别作为首批实际验收服务。并发变化不丢失内容，失败可恢复；本地编辑保存继续可用。凭据默认遮蔽、可显式显示，不启用内容加密。
 
 ### Non-Goals
 
@@ -62,8 +62,8 @@ flowchart LR
   A --> O1[Project owner]
   B --> O2[Resource owner]
   S --> T[Provider Port]
-  T --> R[R2]
-  T --> D[InfiniCLOUD DAV]
+  T --> R[S3-compatible]
+  T --> D[WebDAV]
   C --> K[Secret Store]
 ```
 
@@ -72,7 +72,7 @@ flowchart LR
 | 层 | 选择 | 约束 |
 | --- | --- | --- |
 | 合同/计划/状态 | Python stdlib、frozen DTO、严格 JSON | 独立的 `sync-transport-v1`、`sync-state-v1`；不复用包 manifest |
-| R2 | 可选 `botocore` 低层 S3 client | 显式 key/secret、region=auto；使用条件 PutObject，不用高级 multipart uploader |
+| S3-compatible | 可选 `botocore` 低层 S3 client | 显式 endpoint/region/寻址方式与凭据；条件 PutObject，不用高级 multipart uploader |
 | WebDAV | stdlib HTTPS client + `defusedxml` | Depth 1、有限 XML、多状态逐项检查、禁止 DTD/实体；不使用通用文件镜像库 |
 | 秘密 | `keyring` 的 allowlisted 系统 backend | Windows Credential Locker、macOS Keychain、Linux Secret Service；不自动加载任意第三方 backend |
 | UI/异步 | 现有 PySide6/Controller 边界 | worker 结果带 session/generation；Qt 不持有 provider |
@@ -89,7 +89,7 @@ flowchart LR
 | `sync_transport.py` | transport head 编解码、不可变对象命名、CAS 与摘要规则；不解析包 |
 | `sync_state.py` | 设备配置、基线与每项 pending operation 的 rooted 持久化/恢复 |
 | `sync_service.py` | 预览、逐项执行、取消/恢复和 owner 编排 |
-| `sync_r2_provider.py` | R2 低层请求、条件与错误归一化 |
+| `sync_s3_provider.py` | S3-compatible 低层请求、条件与错误归一化；厂商预设不分叉协议实现 |
 | `sync_webdav_provider.py` | DAV HTTP、限额 XML、prefix 约束与能力验证 |
 | `sync_secret_store.py` | 系统 secret backend 与环境变量会话来源；不可打印的 secret wrapper |
 | `sync_project_adapter.py` | Project artifact 与 validate/preview/apply 适配 |
@@ -141,7 +141,7 @@ class ProviderPort(Protocol):
 # WriteResult = Confirmed | Conflict | OutcomeUnknown | SafeFailure
 ```
 
-枚举、digest、size 来自安全 metadata；provider 不解析 transport JSON 或包。GET 返回同一对象响应的 body+version，不能 HEAD 一个版本后无条件 GET 另一个。ETag 为 opaque 条件 token，不等于 SHA-256。缺失强条件能力返回 unsupported；所有写调用必须有条件。物理 delete 是独立可选能力，只供隔离测试对象的安全清理；产品删除使用 CAS tombstone，不依赖 R2 条件 DELETE 的未验证承诺。
+枚举、digest、size 来自安全 metadata；provider 不解析 transport JSON 或包。GET 返回同一对象响应的 body+version，不能 HEAD 一个版本后无条件 GET 另一个。ETag 为 opaque 条件 token，不等于 SHA-256。缺失强条件能力返回 unsupported；所有写调用必须有条件。物理 delete 是独立可选能力，只供隔离测试对象的安全清理；产品删除使用 CAS tombstone，不依赖任一服务的未验证条件 DELETE 承诺。
 
 限额：单 artifact 上限为 owner 允许值与 512 MiB 的较小者；流块 256 KiB；head 64 KiB；每前缀最多 10,000 heads；每页 XML/JSON 16 MiB，累计列举 64 MiB；超限整计划失败。连接超时 10 秒、单次阻塞读写 30 秒、最多 3 次可判定安全的重试，指数退避带抖动。SDK 自身自动重试设为一次，由 service 统一判定；OutcomeUnknown 不能盲重试。取消在网络阻塞超时或下个流检查点生效，不阻塞 Qt。
 
@@ -174,13 +174,22 @@ service 先确认 object 完整可读，再以 absent/expected strong version �
 
 每次覆盖/删除须在计划中确认；默认批量删除超过 5 项或超过已绑定项目的 20%（任一条件）时需要额外确认。阈值是防误操作上限，不能绕过逐项条件写。
 
-### R2 / WebDAV
+### S3-compatible / WebDAV 配置与能力
 
-R2 使用用户配置的 HTTPS S3 endpoint、bucket、prefix 和 region=auto。显式 `R2_KEY`/`R2_SECRET` 为可选凭据来源；两者齐备才建立 client，不列举所有 bucket，不借用 ambient AWS profile。低层 PutObject 的 `IfMatch/IfNoneMatch` 控制对象/head；单请求上传在产品大小上限内，无 multipart 完成竞态。ListObjectsV2 分页完整消费。
+协议类型仅为 `s3` / `webdav`；厂商名不参与 adapter dispatch 或资格判断。设备本地 ConnectionConfig 包含稳定 connection ID、protocol、可选 preset ID、revision 与下述字段；选择预设只填充可编辑值，切换配置须重新验证。
 
-InfiniCLOUD 使用用户账户分配的 `/dav/` URL、User ID 和 Apps Password；与网站登录密码/API key 区别在帮助文案中说明，不自动重置或签发凭据。URL/用户名仅本地配置，本仓库不固化个人账号。Depth 1 递归受限列举，校验每个 multistatus 的 status/href；拒绝越出根、重复/循环 href 和跨 origin redirect，不将 Authorization 转发给其他主机。MKCOL 只建立用户批准 prefix 下的固定命名空间。
+| 协议 | 必需配置 | 可选配置与限制 |
+| --- | --- | --- |
+| S3-compatible | HTTPS endpoint、region、bucket、prefix、access key ID/secret 的凭据来源 | `addressing_style=path/virtual` 显式选择；可选 session token；无默认 AWS profile 或凭据链 |
+| WebDAV | 完整 HTTPS base URL、相对 remote prefix、username/password 来源 | 首版明确支持 Basic over HTTPS；不声称覆盖 Digest/OAuth 等认证，未知模式返回 unsupported |
 
-官方文档没有明确承诺实际节点强 ETag/原子 If-Match：连通性测试只做只读请求；写能力验证是另一个明确说明会创建隔离合成对象的操作。只有双创建/双更新竞争中恰好一方成功、旧条件失败不修改字节、读回版本一致之后，才标记该连接的写能力 verified。能力随 endpoint/config revision 失效；服务器违反条件时即时禁用写操作。未验证时只读，不以“WebDAV Class 1/2”代替并发验收。
+S3Provider 不生成厂商账户域名；endpoint 与 region 必须配置，R2 预设可填 `region=auto`，不得把它作为所有 S3 连接的固定值。仅访问指定 bucket/prefix，不列举所有 bucket。使用 ListObjectsV2 完整分页、同响应 GET body/version 与低层 PutObject `IfMatch/IfNoneMatch`；单请求上传在产品大小上限内，无 multipart 完成竞态。virtual 寻址的初始请求主机由已验证的 endpoint+bucket+寻址方式确定，属于所选连接；它不等同于服务端 redirect。拒绝未经配置允许的 SDK endpoint/region redirect，不依赖环境代理改变认证目标。
+
+WebDAVProvider 保留用户提供的 base URL 路径，不拼接或强制 `/dav/`。逐路径组件编码 remote prefix，避免重复转义及越出根；Depth 1 递归有界列举并检查逐项 status/href，拒绝重复/循环 href 和跨 origin redirect，不转发 Authorization。MKCOL 只建立批准 prefix 下固定命名空间。InfiniCLOUD 预设帮助可说明账户分配 URL、User ID/Apps Password，但不改变通用认证字段或自动签发密码。
+
+凭据来源按字段选择系统 secret reference、当前会话或显式环境变量引用；S3 key/secret 必须齐备，session token 仅在配置时读取。用户已有 `R2_KEY`/`R2_SECRET` 可显式映射至两个字段；其他连接可用其他变量名，程序不探测、遍历或回退到未配置环境变量。普通设置只保存变量名，不保存值。
+
+两个适配器共用按连接能力门：连通性测试只读；写能力验证为单独明确会创建隔离合成对象的操作。双创建/双更新竞争恰好一方成功、旧条件失败不改字节、读回版本一致后，才标记该连接的写能力 verified；这是被测范围的证据，不是对所有兼容服务器的保证。能力绑定规范化 endpoint、bucket/base URL、prefix、region/寻址方式、认证方式和 config revision；任一变化失效，凭据变更也递增 revision。服务器违反条件立即禁用写操作。未知时只读，不能用厂商品牌、S3-compatible 标签或 WebDAV Class 1/2 绕过能力验证。真实首批验证 R2 与 InfiniCLOUD；另用非厂商测试地址验证自定义 endpoint、不同 region/寻址方式、嵌套 DAV base 路径与变量名无硬编码依赖。
 
 ### Artifact adapters 与 owner apply
 
@@ -200,9 +209,9 @@ Project owner 拟提供 `ProjectPackageArtifact`：完整已验证包的 size/di
 
 ### SecretStore、Controller 与 Qt
 
-普通 config 保存 provider 类型、URL/bucket/prefix、username、secret reference、credential source 与 revision；秘密使用 keyring 的明确 allowlist backend。拒绝 keyrings.alt、配置注入的自定义模块和 plaintext fallback。系统秘密后端不可用时可选择仅当前会话输入或 environment source，提示不能持久保存；不将环境值复制到配置。secret wrapper 的 repr/error 永不包含值，原始 SDK/HTTP 请求/响应不进入日志。
+普通 config 保存 protocol、可选 preset、上述非秘密连接字段、username、secret reference、credential source 与 revision；秘密使用 keyring 的明确 allowlist backend。拒绝 keyrings.alt、配置注入的自定义模块和 plaintext fallback。系统秘密后端不可用时可选择仅当前会话输入或 environment source，提示不能持久保存；不将环境值复制到配置。secret wrapper 的 repr/error 永不包含值，原始 SDK/HTTP 请求/响应不进入日志。
 
-设置字段使用 `QLineEdit.Password` 和有可访问名称的眼睛按钮，点击显示仅获取当前字段的短生命周期 reveal 值；关闭/隐藏/重开自动遮蔽并清空 reveal handle。用户名为普通文本，R2 key/secret 与 DAV Apps Password 为密码字段；不保证显示字形必为 ASCII 星号。该交互不等于加密，界面不出现加密开关。
+设置字段使用 `QLineEdit.Password` 和有可访问名称的眼睛按钮，点击显示仅获取当前字段的短生命周期 reveal 值；关闭/隐藏/重开自动遮蔽并清空 reveal handle。用户名为普通文本，S3 access key/secret/session token 与 DAV password 为密码字段；不保证显示字形必为 ASCII 星号。该交互不等于加密，界面不出现加密开关。
 
 Controller 提供连接投影、计划、选择、执行/取消与结果 DTO；worker 持有传输句柄而非 Qt 对象。Qt 只调用 Controller，晚到结果按 generation 丢弃；用户仍可编辑/保存，但 apply 前 revision 变化使计划 stale。下载替换活跃项目时沿用原 owner 的未保存保护与 session 切换。
 
@@ -220,7 +229,7 @@ Controller 提供连接投影、计划、选择、执行/取消与结果 DTO；w
 | 4.1, 4.2, 4.3, 4.4 | planner、base、issued plan | 三种模式、三方矩阵、stale/无基线/列举失败 |
 | 5.1, 5.2, 5.3, 5.4 | CAS head、冲突副本、tombstone | 双写竞争、阈值、版本条件、活跃资源不删除 |
 | 6.1, 6.2, 6.3, 6.4 | service、SyncState、worker | 限额/取消、超时复证、逐项提交、重启恢复 |
-| 7.1, 7.2, 7.3, 7.4 | R2/DAV provider、acceptance tool | 实际条件能力、隔离合成对象、脱敏与两设备 |
+| 7.1, 7.2, 7.3, 7.4, 7.5 | S3/DAV provider、连接能力、acceptance tool | 通用配置、实际条件能力、隔离合成对象、脱敏与两设备 |
 | 8.1, 8.2, 8.3, 8.4 | Controller/Qt、Project adapter | 计划取消、未保存保护、无 codec 包、实际旅程 |
 
 ## Error Handling
@@ -232,6 +241,7 @@ Controller 提供连接投影、计划、选择、执行/取消与结果 DTO；w
 - 纯计划器穷举 base/local/remote 的相同、改变、缺失、tombstone、无基线与模式矩阵；覆盖 4、5。
 - 协议 fake server 注入条件失败、弱 ETag、分页漏项、multistatus 部分失败、越界 href、跨域 redirect、截断、digest mismatch 与写后超时；覆盖 3、5、6、7。
 - 每个持久化阶段崩溃注入，确认上传已生效但 base 未写、下载 owner 已提交但本地未知时停止自动 apply 并重新观察；导入后内容不同不推进共同基线；覆盖 6.2–6.4。
+- 自定义非厂商域名、非 auto region、path/virtual 寻址、可选 session token、非 /dav/ 路径与自定义环境变量映射；预设修改撤销计划/能力；覆盖 1.1、2.3、7.5。
 - secret backend/环境来源与错误注入；Qt 默认隐藏、显式显示、关窗重开、取消、运行中编辑和 stale apply；覆盖 1、2、8。
 - Project/Resource 分别进行真实 owner artifact/export/import 流，缺失 RPY codec 的包仍可中立编辑；覆盖 3、8.3。
 - R2 先在隔离 prefix 做实际双创建/更新竞争和两设备冷重开，再验证 InfiniCLOUD 的具体能力；认证参数由本机配置/环境注入。无配置时报告未运行，不用 skip 冒充通过。真实操作只在用户批准测试范围执行，覆盖 7、8.4。
