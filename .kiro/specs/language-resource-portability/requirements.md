@@ -191,6 +191,8 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 6. The implementation shall 全程本地执行，不向网络发送 package、资源、receipt 或诊断。
 7. If Requirements/Design/Tasks 一致性、定点故障、冷重开、架构边界或 current-source regression 任一未通过，the feature shall 保持 NO-GO，不得供 sync 消费。
 
+8. 架构验收 shall 直接检查当前源码的 owner 依赖、权威与对应行为，不以源码 SHA、文件数量、调用次数或跨快照摘要链代替合同断言；注释、无关测试与合法实现重构不应要求重新签发历史验收。
+
 ## 非功能约束
 
 - 所有跨层合同使用 frozen dataclass、exact built-in type、tuple 和 bounded copies；bool 不冒充 int。

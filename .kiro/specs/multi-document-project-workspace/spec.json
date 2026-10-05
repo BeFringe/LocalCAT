@@ -1,7 +1,7 @@
 {
   "feature_name": "multi-document-project-workspace",
   "created_at": "2026-08-22T03:04:32+08:00",
-  "updated_at": "2026-08-22T17:17:08+08:00",
+  "updated_at": "2026-10-05T03:11:20Z",
   "language": "zh-CN",
   "phase": "tasks-generated",
   "approvals": {
@@ -18,5 +18,6 @@
       "approved": true
     }
   },
-  "ready_for_implementation": true
+  "ready_for_implementation": true,
+  "approval_scope": "原有 Requirements/Design/Tasks 的审批范围保留。本次静态源码快照维护增量：以当前 owner 架构与行为断言替代机械 SHA/数量/跨 JSON 摘要链，移除本 owner 快照和生成器；真实历史报告、fixture、Gate roots 与运行时兼容性依据不变。"
 }

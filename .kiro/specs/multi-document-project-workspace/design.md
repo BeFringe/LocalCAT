@@ -822,9 +822,17 @@ public error/report/log不得包含source/target/speaker/private bytes、carrier
 
 - 文件夹文档菜单、文件图标divider、continuous navigation、search scope、save与package preview；不得恢复独立章节selector。
 - 窄宽布局、keyboard、真实package cold reopen与逐Document save/recovery report projection。
-- 在final roots上重签受影响current-source evidence；未受影响的TM Gate C/D不得机械刷新。
+- 历史 C4 的 current-source 验收保留当时范围；后续源码边界按下述直接测试维护，未受影响的 TM Gate C/D 不得机械刷新。
 
 ## 验证设计
+
+### 当前源码边界检查
+
+`test_multi_document_cluster0_characterization.py` 直接检查 owner composition、workspace/save 的 carrier-neutral 边界；Parser facade 的 canonical DTO、verified terminal、writer delegation 与失败零写入由 `test_parser_project_facade_characterization.py` 验证，复合身份与 JSON 序列化继续由既有 Cluster 1/2 行为测试验证。
+
+静态守卫只读取明确的 owner 文件；需要全仓库检查的 Parser architecture 使用 Git 可见的 Python 源文件，包含新增源码但不扫描 ignored artifacts/venv。禁止依赖直接失败，合法改动不因字节摘要或调用数量变化失败。四个 owner 的静态快照及专用生成器退出活动树，取消 Multi-Document → Chunk → ResourcePackage → TMX 的整份 JSON 摘要依赖；各 owner 的合同与行为测试保持独立。
+
+旧快照保留在 `v0.5.2-windows-frozen` 的 Git 历史，真实执行报告中对它们的引用只表达当时的验证范围，不修改报告原字节或 SHA。fixture、业务内容/receipt digest、Gate roots、运行时兼容性依据和随产物保存的构建清单不属于此次退出范围。
 
 ### Contract / Architecture
 

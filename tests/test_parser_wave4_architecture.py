@@ -6,6 +6,8 @@ import ast
 from collections import Counter
 import importlib.util
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 from tests.parser_architecture_test_support import (
@@ -179,10 +181,6 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
         "tools.validate_tm_fault_matrix",
         "tools.validate_tm_release_criteria",
         "tools.validate_tm_release_evidence",
-        "tools.generate_multi_document_current_source_evidence",
-        "tools.generate_collaborative_chunks_current_source_evidence",
-        "tools.generate_language_resource_portability_current_source_evidence",
-        "tools.generate_tmx_context_interchange_current_source_evidence",
         "tools.anchor_windows_evidence_harness_smoke",
         "tools.audit_w3_stock_bootloader",
         "tools.audit_windows_frozen_custom_entry",
@@ -234,10 +232,19 @@ _EXPECTED_DEFERRED_OWNERS = {
 }
 
 
-def _production_paths() -> tuple[Path, ...]:
+def _production_paths(root: Path = _ROOT) -> tuple[Path, ...]:
     paths: list[Path] = []
-    for path in _ROOT.rglob("*.py"):
-        relative = path.relative_to(_ROOT)
+    source_names = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.py"],
+        cwd=root,
+    ).decode("utf-8").split("\0")
+    for name in source_names:
+        if not name:
+            continue
+        relative = Path(name)
+        path = root / relative
+        if not path.is_file():
+            continue
         if "tests" in relative.parts or "__pycache__" in relative.parts:
             continue
         if any(part.startswith(".") for part in relative.parts):
@@ -245,22 +252,55 @@ def _production_paths() -> tuple[Path, ...]:
         if path.name.startswith("test_"):
             continue
         paths.append(path)
-    return tuple(sorted(paths))
+    return tuple(sorted(set(paths)))
 
 
 def _module_name(path: Path) -> str:
     relative = path.relative_to(_ROOT).with_suffix("")
-    return ".".join(relative.parts)
+    # Packaging scripts may live below hyphenated directories. This name is
+    # only an AST diagnostic identity; it is never imported or executed.
+    return ".".join(part.replace("-", "_") for part in relative.parts)
 
 
 def _production_modules() -> dict[str, SourceModule]:
-    return {
-        _module_name(path): SourceModule(
-            _module_name(path),
-            path.read_text(encoding="utf-8"),
+    modules: dict[str, SourceModule] = {}
+    for path in _production_paths():
+        name = _module_name(path)
+        if name in modules:
+            raise AssertionError(f"ambiguous source module name: {name}")
+        modules[name] = SourceModule(
+            name, path.read_text(encoding="utf-8")
         )
-        for path in _production_paths()
-    }
+    return modules
+
+
+class ProductionSourceDiscoveryTests(unittest.TestCase):
+    def test_packaging_script_directory_has_an_ast_identity(self) -> None:
+        self.assertEqual(
+            _module_name(_ROOT / "packaging/windows/frozen-entry/spike/bootstrap.py"),
+            "packaging.windows.frozen_entry.spike.bootstrap",
+        )
+
+    def test_source_discovery_includes_new_modules_but_not_ignored_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="localcat-architecture-") as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            (root / ".gitignore").write_text("artifacts/\nvenv/\n", encoding="utf-8")
+            for relative in (
+                "owner.py", "new_package/consumer.py", "tests/test_owner.py",
+                "artifacts/history/owner.py", "venv/library.py", "removed.py",
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# source\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "owner.py", "removed.py"], cwd=root, check=True
+            )
+            (root / "removed.py").unlink()
+            self.assertEqual(
+                {path.relative_to(root).as_posix() for path in _production_paths(root)},
+                {"owner.py", "new_package/consumer.py"},
+            )
 
 
 def _parser_modules(modules: dict[str, SourceModule]) -> dict[str, SourceModule]:

@@ -212,6 +212,8 @@ LocalCAT 的多文档工作区已用稳定 `Project → Document → Segment` �
 9. The acceptance shall 证明 `Chunk_Scope_Projection` 不包含 TMX/profile/carrier/destination/loss 字段，stale/retired/foreign projection 在任何后续业务 publication 前可被结构化拒绝；后续消费者不得导入 chunk store、解析 metadata 或借用 search hit/current UI selection 重建 scope。
 10. The Chunk Qt surface shall 不增加项目/资源导出事务或导出按钮；未来项目导出 UI 只能消费 Controller-issued scope projection。资源页 `⋮` 的 managed-resource 导出与项目/分工导出保持独立。
 
+11. 架构验收 shall 直接检查当前源码的 owner 依赖、权威与对应行为，不以源码 SHA、文件数量、调用次数或跨快照摘要链代替合同断言；注释、无关测试与合法实现重构不应要求重新签发历史验收。
+
 ## 非功能约束
 
 - 所有跨层合同使用 exact frozen dataclass 与 tuple；`bool` 不得被当作数值，未知 enum/schema/version 一律 fail closed。
