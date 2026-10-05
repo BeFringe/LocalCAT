@@ -476,6 +476,14 @@
   - _Boundary: Host 安全投影、Controller DTO 与 Qt TM 展示_
   - _Depends: ADR-029, tm-storage-retrieval-index 9.7_
 
+- [ ] 6.9 呈现 Fuzzy 验证的等待预期
+  - 在语言资源设置的手动验证入口旁增加常驻耗时说明，启动前可见，RUNNING 及关闭再打开设置后持续可见；沿用现有 Controller 投影和轮询。
+  - 保持终态、性能警示与启动失败的真实文案，不以预计时长触发状态或能力变化，不新增倒计时或进度协议。
+  - 完成时，定向 Qt 测试覆盖启动前、运行、设置重开、锁争用延期与各终态，并在实际打包窗口确认换行、可访问性及编辑保存可用；旧 0.5.2 报告不重签，纯文案不重跑未变 Core Gate。
+  - _Requirements: 6.8, 6.9, 6.11, 6.13, 6.14, 6.15, 6.16_
+  - _Boundary: Qt 语言资源设置与 Fuzzy 状态展示_
+  - _Depends: 6.5, 6.8_
+
 ## Implementation Notes
 
 - Task 9.2a：实际 ProjectPackage 应用建议暴露了 Controller 在 runtime generation 提交锁内重新读取同一代次的死锁。workspace target 提交仍在原 reservation 内完成，并立即递增 query epoch、清除旧建议；仅将新基线捕获延至下一次查询同步，保留过期拒绝与并发换代保护。局部修复及 source 回归不代答同候选产品验收，任务继续未完成。

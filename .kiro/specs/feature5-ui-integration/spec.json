@@ -1,7 +1,7 @@
 {
   "feature_name": "feature5-ui-integration",
   "created_at": "2026-08-17T00:00:00+08:00",
-  "updated_at": "2026-10-04T17:01:52Z",
+  "updated_at": "2026-10-05T02:54:45Z",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -19,6 +19,16 @@
     }
   },
   "ready_for_implementation": true,
+  "pending_amendments": {
+    "fuzzy_validation_wait_notice": {
+      "requirements": ["6.14", "6.15", "6.16"],
+      "design_section": "Fuzzy 验证等待提示",
+      "tasks": ["6.9"],
+      "generated": true,
+      "approved": false,
+      "ready_for_implementation": false
+    }
+  },
   "approval_scope": {
     "historical": "既有Feature5/source、WA-07及WA-06 R4相邻消费审批保留原范围，3.6a与其他完成事实不改签为普通候选验收。",
     "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 普通 packaged 的 WA-07 来源/Host组合/生命周期要求、Design 与 Tasks 3.6b/6.6b/7.4b/7.6b/9.2a；按平台/Core 既有依赖继续 Host 与生命周期整合。此批准不重签 source/R4 验收，不授予候选或正式 Gate PASS。",

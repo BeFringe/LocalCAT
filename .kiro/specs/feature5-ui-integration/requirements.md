@@ -14,6 +14,8 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 ### Scope Lineage
 
+Fuzzy 验证等待提示增补扩展本规格 Requirement 6.8 的展示范围：用户在发起验证前及等待期间可以看到耗时预期和可继续编辑保存的说明。新增 6.14–16 的 R/D/T 单独待审，不改变既有审批、0.5.2 候选验收、手动触发方式或 Core 准入条件。
+
 `qt-editor-json-mvp-increment` 的获批基线明确排除了模糊 TM、context ranking、SQLite TM schema 与 JSONL TM 迁移。本规格以独立 Spec 新增 Feature 5 与 Qt 之间的跨线实施授权，不修订、回溯改变或将这些历史排除项记为原 Qt Spec 已完成。
 
 2026-08-19 首次激活恢复 amendment 由 ADR-012 授权：无 live reservation 且无任何 durable publication/recovery fact 时，unpublished mutable stage residue 不改变 never-activated JSONL authority，旧 residue 原样保留并允许 fresh-nonce retry。这一补救只恢复 Requirement 5.4/5.6 已批准的 legacy preservation，不授权自动 cleanup，也不放宽真正 durable ambiguity 的 fail-stop。
@@ -131,6 +133,9 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 11. If 本设备资格缺失、损坏或 compatibility key 失配, the LocalCAT Qt 编辑器 shall 保持 Exact/Context 的当前正式能力、显示“Fuzzy 需重新验证”并只由显式用户操作启动 Gate D
 12. The Gate D compatibility key shall 不包含普通 TM 内容、canonical generation 或 Active/Lookup/Update 配置；这些变化不得单独撤销设备 Fuzzy 资格
 13. When Core 已开放 Fuzzy 且存在时间性能超限, the LocalCAT Qt 编辑器 shall 显示性能不足提示而不禁用已授权功能，并 shall 区分验证进度、Core 可用性和性能报告；Gate C 或相应路径必要条件不成立时不得显示该资源已可用
+14. When 语言资源设置提供手动验证入口, the LocalCAT Qt 编辑器 shall 在用户启动验证前显示“验证可能需要数十分钟，期间可以继续编辑和保存”的可见说明，耗时表述不得承诺固定完成时间
+15. While 本次 Fuzzy 验证处于运行状态, the LocalCAT Qt 编辑器 shall 在语言资源设置中持续显示运行状态和上述等待说明；关闭再打开设置仍能看到说明，且不重复启动验证
+16. When 验证完成、失败或未能启动, the LocalCAT Qt 编辑器 shall 用当前真实状态替换运行提示；经过预估时长不得被解释为完成、失败或允许 Fuzzy
 
 ### Requirement 7：统一文本匹配与 TM 设置入口
 

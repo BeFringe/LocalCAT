@@ -263,6 +263,17 @@ canonical service 先返回十条不会使 mixed 全局结果丢失：任何 can
 
 阈值从不作为卡片后过滤。每次变化增加 query epoch，并用新 `TMQuery` 重新查询；是否满足阈值由 Core 使用未舍入 `TMResult.similarity` 判定。
 
+### Fuzzy 验证等待提示
+
+本增补对应 Requirement 6.14–16，延续既有 Controller-only 状态展示。它是 0.5.2 已验收候选之后的 UI 改进，不回溯扩大原候选范围。
+
+- **展示位置与文案**：在 `qt_settings_dialog.py` 的手动验证入口旁放置可换行的常驻说明：“验证可能需要数十分钟，期间可以继续编辑和保存。完成后会自动更新状态。”入口尚可启动时预告等待；运行时保留该说明，并继续显示既有运行状态。文案不能只藏在 tooltip 或短时 status bar 中。
+- **状态消费**：仍经 `EditorController` 消费 `FuzzyValidationDisplay` 和 `TMThresholdDisplay`。设置重新打开时从当前投影重绘；锁争用的延期刷新保留最后完整显示。终态及启动失败按现有分支更新，等待说明不能覆盖具体失败原因或性能警示。
+- **Boundary Commitments**：仅调整 `qt_settings_dialog.py` 及必要的 `qt_tm_threshold.py` 展示和对应 Qt 测试；不增加 Core/Host/Controller DTO、持久字段、轮询器或任务调度。实际功能可用性始终来自 Core 当前资格；预估文案不参与超时、取消或授权判定。
+- **范围外**：逐阶段进度、百分比、动态剩余时间和已用时间计时器。本次以诚实的数量级预告解决无等待预期的问题，不从资格文件、目录时间或 UI 自建时钟推导后台进度。
+- **验证与退出条件**：Qt 定向测试覆盖启动前、RUNNING、设置重开、锁争用延期、成功含性能警示、失败和启动失败；核对窄窗口换行与 accessible name。实际打包窗口确认说明持续可见且编辑/保存继续可用；不修改真实报告或重签 0.5.2 证据，纯展示变更不重跑未受影响的完整 Gate C/D。
+- **Governance Impact**：沿用 ADR-009/011/029 与本规格既有状态、准入和关闭边界，无新 ADR 或 Steering 变更。新增 R/D/T 的审批与任务状态由本规格记录，既有完成项保持原范围。
+
 ### Canonical 激活与更新
 
 ```mermaid
