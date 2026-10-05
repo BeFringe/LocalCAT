@@ -4,7 +4,7 @@
 
 > **WA-03 Windows compatibility amendment（current R2）**：以下 `a` 后缀任务把 Workspace/ProjectPackage 的 root、lock 与 publication 接到 ADR-020及ADR-025的`WindowsDocumentedPublishV1`；ADR-018/019 的 logical/physical carrier authority 不变，`R1`只保留在dispatch历史。
 
-本计划把 brief 的四个 Promotion Cluster 保持为 Cluster 1–4；Cluster 0 只完成治理、current-source characterization 与人工批准门。Cluster 0 未获项目 owner 明确批准前，业务代码一律 **NO-GO**。
+本计划把 brief 的四个 Promotion Cluster 保持为 Cluster 1–4；Cluster 0 只完成治理、current-source characterization 与人工批准门。Cluster 0 未获项目 owner 明确批准前，业务代码一律 **NO-GO**。Cluster 5 复用该闭环增加目录选择与单文件 profile。
 
 固定顺序：
 
@@ -30,12 +30,12 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 - [x] 0.2 完成中文 Design 并复核已采纳 ADR-018
   - 设计 immutable contracts、聚合边界、稳定身份、dirty/save/reconciliation、逻辑 manifest、package 事务、Controller 与 Qt 投影。
   - ADR-018 记录 ProjectPackage authority、`codec_private_member` 不透明边界与 package/import/apply 事务；Cluster 0 必须证明 R/D/T/border 与该已采纳决策一致。
-  - 不在 Cluster 0 决定 ProjectPackage 是目录、单文件 archive 或其他物理 carrier；该决策留到 2C 实现前的人工门。
+  - 物理 carrier 决策须经过 2C 实现前的人工门；现行 carrier 由 ADR-019 定义，2C 实现须保持同一逻辑合同。
 
 - [x] 0.3 冻结 Tasks、review clustering、border 与所有权
   - 保持 brief 的 Cluster 1–4 编号和依赖；Cluster 2 明确拆为 2A/2B/2C。
   - 每 Cluster 一次提交、一次独立对抗 review；失败时只做窄 remediation，不重写已审计的前序 Cluster。
-  - `feature/multi-document-project-workspace` 只写 owning Spec、经批准的 ADR-018/review/border 与精确 Steering 同步。
+  - `feature/multi-document-project-workspace` 只写 owning Spec；共享 ADR、review/border 与 Steering 由治理 owner 同步。
 
 - [x] 0.4 建立 current-source characterization
   - 枚举 `editor_contracts.py`、`editor_project.py`、`editor_controller.py`、`project_search.py`、`workspace_state.py`、`parser_contracts.py`、`parser_composition.py`、`parser_source.py`、`qt_editor.py`、`qt_editor_window.py` 的 import/constructor/call/patch/serialization consumer。
@@ -48,9 +48,8 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ### Cluster 0 完成门
 
-- 0.1–0.5 全部完成且人工批准记录可追踪。
+- 0.1–0.5 全部完成且人工批准范围可从 `spec.json` 核对。
 - production、产品 UI 与 current-source evidence payload 零变化。
-- 独立提交：`docs(multi-document): 冻结 workspace 治理与基线`。
 
 ## Cluster 1：身份与 Origin（brief Promotion Cluster 1）
 
@@ -74,7 +73,6 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 ### Cluster 1 完成门
 
 - immutable identity 与三类 origin 通过 current-source compatibility 和 hostile fixtures。
-- 独立提交：`feat(workspace): 建立多文档身份与 origin`。
 - Cluster 1 独立对抗 review 通过后才进入 Cluster 2A。
 
 ## Cluster 2：聚合、持久化与手工 ProjectPackage 闭环（brief Promotion Cluster 2）
@@ -126,8 +124,8 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 - [x] 2.6 在任何 2C production 实现前批准 ProjectPackage 物理 carrier 决策
   - 用 current-source prototype/fixture 比较目录、单文件 archive 或其他候选的确定性、原子替换、路径安全、流式校验与恢复语义。
-  - 把选定 carrier、版本迁移和拒绝方案写入 owner 批准的 C2C decision record；若治理门判定需新 ADR，则新增后继 ADR，不改写已采纳 ADR-018；未批准时 2C implementation NO-GO。
-  - 人工已批准 ADR-019：v1 唯一 carrier 为严格闭集的 `localcat-project-package-zip-v1`/`ZIP_STORED`；拒绝 ZIP64、压缩、宽松 `zipfile` 读取和并行 directory reader/writer。
+  - carrier、版本兼容与输入拒绝边界须经 owner 审阅批准后才能进入 C2C 实现；若需新 ADR，则新增后继 ADR，不改写 ADR-018 的逻辑包权威。未批准时 2C implementation NO-GO。
+  - 依据 ADR-019：v1 唯一 carrier 为严格闭集的 `localcat-project-package-zip-v1`/`ZIP_STORED`；拒绝 ZIP64、压缩、宽松 `zipfile` 读取和并行 directory reader/writer。
 
 - [x] 2.7 实现手工 export / validate / preview / import / apply / receipt
   - export 只在完整 staging、member digest 和 readback validation 成功后发布，不完整导出不得覆盖旧包。
@@ -148,7 +146,6 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 - 2A/2B/2C 各自通过定点对抗检查，累计 diff 再通过 Cluster 2 独立 reviewer。
 - `collaborative-job-chunks` 的统一进入门位于完整 Cluster 2 之后；不得在仅有 Cluster 1 identity 时开始 chunk schema/权限实现。
 - Cluster 2 后恢复/确认 `language-resource-portability` brief，再提升 TM JSONL 与术语 CSV/v1 ResourcePackage R/D/T；`tmx-context-interchange` 未来只拥有可选 TMX export profile。两项不得互相冒充或抽取 ProjectPackage 共同 authority。
-- 独立提交：`feat(workspace): 闭合 ProjectPackage 手工包事务`。
 
 ## Cluster 3：应用服务（brief Promotion Cluster 3）
 
@@ -170,9 +167,8 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ### Cluster 3 完成门
 
-- application 只消费 Cluster 1–2 已批准 contracts；失败不丢失 dirty、identity 或恢复信息。
+- application 只消费 Cluster 1–2 contracts；失败不丢失 dirty、identity 或恢复信息。
 - 历史 C0 runtime source digest 的漂移已由当时的 C4 final-roots 验收收束。
-- 独立提交：`feat(workspace): 接入多文档应用会话`。
 - Cluster 3 独立对抗 review 通过后才进入 Cluster 4。
 
 ## Cluster 4：Qt 与 Current-source Acceptance（brief Promotion Cluster 4）
@@ -217,13 +213,12 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 - 至少两个 Document 的真实 ProjectPackage 冷重开与 Qt current-source journeys 全部通过；directory/workbook 产品 profile 继续保持未启用的负向边界。
 - evidence 绑定同一 final runtime tree；任一 package、identity、保存或兼容失败均为 NO-GO。
-- 独立提交：`test(workspace): 重签多文档 current-source 证据`。
 
-## Cluster 5：显式根目录选择与嵌套导航（待批准增量）
+## Cluster 5：显式根目录选择与嵌套导航
 
-Requirement 13 与对应 Design 尚待批准；以下条件式任务不改变 Cluster 0–4 的完成状态，也不授权平台/Qt 相邻实现。平台观察端口和非 legacy 单文件 profile 必须先获相邻 owner 批准；RPY 格式能力另按独立规格推进。
+Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格式能力由独立规格提供。
 
-- [ ] 5.1 实现经平台 owner 批准的只读观察合同
+- [ ] 5.1 实现平台 owner 的只读观察合同
   - 定义受限 metadata、retained-root 下钻、取消/资源预算和结构化失败；只读能力不借用 live ledger 或写 authority。
   - 完成时，平台 fake 能验证 handle 生命周期和超限/取消行为，Project 不需要裸路径枚举。
   - _Requirements: 13.1, 13.3_
@@ -281,17 +276,17 @@ Requirement 13 与对应 Design 尚待批准；以下条件式任务不改变 Cl
   - _Boundary: Project / Platform / Qt acceptance integration_
   - _Depends: 5.7, 5.8, 5.9_
 - [ ] 5.11 闭合实际治理同步与下游消费
-  - 由治理 owner 同步已批准且实际实现的目录/单文件边界；RPY 消费此 profile 与选择服务，不复制枚举或持久化。
-  - 完成时，实际 diff 与批准增量一致、平台/Parser/Qt 相关回归可核查；未批准/未实现项不列为完成，不改写历史验收。
+  - 由治理 owner 同步实际实现的目录/单文件边界；RPY 消费此 profile 与选择服务，不复制枚举或持久化。
+  - 完成时，实际 diff 与现行合同一致、平台/Parser/Qt 相关回归可核查；未实现项不列为完成，不改写历史验收。
   - _Requirements: 13.4, 13.6_
   - _Boundary: Governance / downstream integration closure_
   - _Depends: 5.10_
 
 ## 相邻规格边界
 
-- 恢复/确认 `language-resource-portability` brief 后，提升独立 R/D/T，拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告和冷重开；sync 分别消费已批准 ProjectPackage/ResourcePackage，不复制 live SQLite、journal、sidecar 或 staging residue。
+- 恢复/确认 `language-resource-portability` brief 后，提升独立 R/D/T，拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告和冷重开；sync 分别消费ProjectPackage/ResourcePackage，不复制 live SQLite、journal、sidecar 或 staging residue。
 - `tmx-context-interchange` 只拥有 ResourcePackage 未来可增加的 TMX export profile、TMX context/provenance 与有损取舍；TMX 不是 ProjectDocument，也不由本规格开放 TMX writer。
-- `rpy-project-codec` 独立拥有 RPY token/sidecar/占位符与 writer；folder 接入依赖本规格，但产品排期仍在 sync 后。
+- `rpy-project-codec` 独立拥有 RPY token/sidecar/占位符与 writer；folder 接入依赖本规格，但手工包闭环按 ADR-030 先于 sync。
 - PO/POT reader 或未来 canonical writer 归独立 format codec；本规格的 `single_file`/`directory` origin 不自动赋予 PO/POT writer 能力。
 - CONTEXT 精确语义及“上下文一致”UI 投影归 `feature5-ui-integration`（Integration TM surface）；本规格不增加 evidence 字段或匹配判定。
 - `collaborative-job-chunks` 在完整 Cluster 2 后才可开始，只引用稳定 segment membership，不拥有文档身份、项目保存或远程传输。
@@ -311,6 +306,7 @@ Requirement 13 与对应 Design 尚待批准；以下条件式任务不改变 Cl
 - Cluster 0 人工批准前修改任何 production/runtime/UI/evidence payload。
 - 用显示名、sheet 名、文件枚举顺序、列表索引或临时绝对路径充当稳定身份。
 - 让通用 workspace、chunk、sync provider 或 Qt 解释 `codec_private_member`。
-- 在 2C carrier 决策获批前实现或暗定 archive/directory 物理形态。
+- 在 2C carrier 决策获批前实现或暗定 archive/directory 物理形态，或使用 ADR-019 之外的 carrier。
 - 把 ResourcePackage 与 ProjectPackage 抽象成共同 authority，或让 sync 直接复制 live canonical store。
 - 抢跑 TMX export、RPY product rollout、PO/POT writer、CONTEXT UI、chunk 权限或 remote provider。
+

@@ -4,24 +4,20 @@
 
 LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平段落。这个模型能服务现有单 JSON/TXT 工作流，却无法安全表达“一个项目包含多个章节文档”：章节显示名、排序和路径变化不应重写身份，一个文档的保存失败也不应被项目级“已保存”掩盖。
 
-本规格引入稳定的 `Project → Document → Segment` 层级，并以版本化 ProjectPackage 作为首个可持久、可冷重开的 canonical 多文档 substrate。显式文件 intake 可以先 stage 多个 Document，但只有 ProjectPackage 保存 manifest、document members、编辑 overlay、摘要、preview/apply 与 receipt 后才形成 durable 项目；自动目录聚合、multi-sheet XLSX 与 RPY 产品入口后置。
+本规格引入稳定的 `Project → Document → Segment` 层级，并以版本化 ProjectPackage 作为首个可持久、可冷重开的 canonical 多文档 substrate。显式文件 intake 可以先 stage 多个 Document，但只有 ProjectPackage 保存 manifest、document members、编辑 overlay、摘要、preview/apply 与 receipt 后才形成 durable 项目；目录入口采用显式选根、递归预览后勾选；multi-sheet XLSX 不在当前 profile 中，RPY 语法与格式导出由独立 codec 规格拥有。
 
 ## 范围边界
 
-- **范围内**：Project/Document/Segment 不可变合同；项目、文档和复合段落身份；ProjectOrigin 叶合同与 ProjectPackage canonical persistence；用户显式选择多个 JSON/TXT/PO/POT 单文档输入并逐个经 Parser 验证的有界 intake；版本化 `ProjectPackageManifest`、document member、target/state overlay 和 opaque `codec_private_member`；member digest、路径安全和 stale binding；手工 export/validate/preview/import/apply/receipt；source reconciliation；文档/项目 dirty、保存报告与恢复；章节顺序、切换、连续导航、当前章节/全部章节搜索范围和 Qt 反馈；现有单 JSON 兼容适配。
-- **范围外**：直接扫描多 JSON/TXT 目录；multi-sheet XLSX project profile；RPY codec 或 RPY 项目入口；PO/POT canonical/source-round-trip writer；TMX 项目文档；ResourcePackage 及 TM/术语资源导入导出；chunk 拆分/分配/权限；provider/远程列举/凭据/加密/同步冲突；TM CONTEXT、provenance/evidence 字段、Fuzzy 授权或 speaker display profile。
-- **相邻期望**：Parser/Codec 只产生单文档内容、局部 ID、能力和诊断；workspace 聚合项目。`collaborative-job-chunks` 在 Cluster 2 通过后只引用稳定 segment identity。`cross-device-sync-plugin` 未来在项目侧只传输已批准 ProjectPackage、在资源侧只传输已批准 ResourcePackage，并分别复用各自的 import/apply 交易。现有 `language-resource-portability` brief 在本规格 Cluster 2 冻结后提升 JSONL/CSV ResourcePackage R/D/T；`tmx-context-interchange` 未来只增加可选 TMX export profile。
+- **范围内**：Project/Document/Segment 不可变合同；项目、文档和复合段落身份；ProjectOrigin 叶合同与 ProjectPackage canonical persistence；用户显式选择一个或多个已配置 project_document 输入并逐个经 Parser 验证的有界 intake、根目录 metadata 预览；版本化 `ProjectPackageManifest`、document member、target/state overlay 和 opaque `codec_private_member`；member digest、路径安全和 stale binding；手工 export/validate/preview/import/apply/receipt；source reconciliation；文档/项目 dirty、保存报告与恢复；章节顺序、切换、连续导航、当前章节/全部章节搜索范围和 Qt 反馈；现有单 JSON 兼容适配。
+- **范围外**：后台目录扫描或自动收录；multi-sheet XLSX project profile；RPY codec 语法与格式发布；PO/POT canonical/source-round-trip writer；TMX 项目文档；ResourcePackage 及 TM/术语资源导入导出；chunk 拆分/分配/权限；provider/远程列举/凭据/加密/同步冲突；TM CONTEXT、provenance/evidence 字段、Fuzzy 授权或 speaker display profile。
+- **相邻期望**：Parser/Codec 只产生单文档内容、局部 ID、能力和诊断；workspace 聚合项目。`collaborative-job-chunks` 在 Cluster 2 通过后只引用稳定 segment identity。`cross-device-sync-plugin` 未来在项目侧只传输ProjectPackage、在资源侧只传输ResourcePackage，并分别复用各自的 import/apply 交易。现有 `language-resource-portability` brief 在本规格 Cluster 2 冻结后提升 JSONL/CSV ResourcePackage R/D/T；`tmx-context-interchange` 未来只增加可选 TMX export profile。
 
 ### Scope Lineage（范围沿革）
 
-- 本文是 `multi-document-project-workspace` 的首份正式 Requirements；同目录 `brief.md` 继续作为需求来源，不再单独授权实施。
-- 已完成的 `parser-subsystem-extraction` 只是上游单输入契约；本规格不回溯修改 Parser 的 purpose、grammar、terminal 或 writer capability。
-- 经用户批准的范围收敛将首个真实多文档 substrate 从“直接 directory/workbook 聚合”调整为 ProjectPackage-first。`directory` 与 `workbook` 保留为后续 origin adapter/profile，不是本规格当前可验收输入。
-- 新增 Cluster 0 只做治理、边界和可执行 inventory；原 Promotion Cluster 1–4 的编号和产品责任保持。
-- ADR-018 只采纳项目 owner 已明确作出的 ProjectPackage/ResourcePackage 分权、`codec_private_member`、Chunk/Sync/RPY 顺序与 reader-only writer 边界；它不等于批准本文的详细 Requirements/Design/Tasks。`spec.json` 在 Cluster 0 人工门前继续保持三阶段 `approved=false`。
-- Cluster 2 同时冻结聚合/持久化/source reconciliation 和手工 ProjectPackage 闭环。这是 Chunk 开始实施的硬门；只完成 Cluster 1 身份类型不足以开始 Chunk。
-- ProjectPackage 与后续 ResourcePackage 是两个正交的持久/交换单元：前者拥有项目内容和编辑状态，后者拥有 TM/术语资源可移植产物。本规格不建立两者的共同 authority。
-- RPY 产品实施排在 Sync 主线之后；TMX 仍只是 language resource；PO/POT writer 需等待后续 codec 规格批准。这些后置项不得以预留产品控件或格式专属字段的方式进入本规格。
+- **Owning spec**：本规格拥有 Project/Document/Segment、ProjectPackage、source reconciliation、目录选择和章节导航；Parser 仍为单输入契约，不聚合项目。
+- **范围差异**：ProjectPackage-first 保持单/多文件的 canonical 持久面。ADR-030 增加显式根目录 metadata 预览和 `explicit-single-file-v1`，RPY 手工包闭环先于 Sync；workbook profile、PO/POT writer 与后台扫描不在范围内。
+- **相邻合同**：配置 codec 只在 verified terminal 后交付中立 records/source/opaque private member；ADR-031 的同步只消费受限整包 artifact，再交回本 owner 导入。ProjectPackage 与 ResourcePackage 保持独立 authority。
+- **依赖**：Chunk 消费完整项目聚合、保存/恢复和手工包闭环后的稳定 segment identity；单独身份类型不足以提供此能力。
 
 ### Windows Compatibility Amendment WA-03（current R2）
 
@@ -44,7 +40,7 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 - **ProjectPackage**：由版本化 manifest、项目/document members、摘要和编辑 overlay 组成的项目导入导出单元。
 - **ProjectPackageManifest**：以稳定 ID、member 引用、摘要、顺序和能力描述完整项目的版本化逻辑清单；物理容器形态不是身份。
 - **codec_private_member**：由格式 codec 拥有的可选 opaque member 引用；workspace、chunk、sync provider 与 Qt 均不解释内容。
-- **Editing_Overlay**：ProjectPackage 拥有的 target、确认/需复核与其他获批准编辑状态；对 reader-only source，overlay 是唯一可持久编辑面。
+- **Editing_Overlay**：ProjectPackage 拥有的 target、确认/需复核与合同定义的其他编辑状态；对 reader-only source，overlay 是唯一可持久编辑面。
 - **Reconciliation**：用稳定复合身份和 source fingerprint 对新旧 source 状态分类，产生显式 preview，再由用户决定如何 apply。
 
 ## 需求
@@ -84,14 +80,14 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 #### 验收标准
 
 1. The 现有单文档兼容适配 shall 投影 `single_file` ProjectOrigin，且首个 durable/reopenable canonical 多文档 persistence 与 import substrate shall 是 ProjectPackage，不得将 ProjectPackage 伪造为第四种 source origin；显式文件列表只产生未发布的 creation/staging candidate。
-2. When ProjectPackage 成功导入时, the workspace shall 从 manifest 和 verified members 建立两个或以上 Documents，不得从当前文件系统枚举顺序反推文档身份。
-3. While 直接 directory origin 的后续 profile 尚未批准, the product shall 不得扫描目录并自动创建多 JSON/TXT 项目。
-4. While multi-sheet XLSX project profile 尚未批准, the product shall 不得将术语 XLSX codec 的 active worksheet 能力提升为 workbook ProjectOrigin，也不得将任意 worksheet 当作 Document。
-5. While RPY 实施尚未在 Sync 主线后获得独立批准, the product shall 不得打开、聚合或写回 RPY 项目，也不得在通用合同中预埋 RPY 语法。
-6. If 包声明未知或未批准的 ProjectOrigin/profile, the workspace shall 返回结构化 unsupported 失败并保持当前项目不变。
-7. When 用户首次创建多文档项目时, the product shall 只接受用户显式选择且位于一个已验证 portable root 下的 JSON、TXT、PO 或 POT 文件列表，逐个通过既有 `project_document` Parser surface 获得 verified terminal 后聚合，并将完整 workspace 保存为 ProjectPackage。
-8. The 显式文件 intake shall 在同一 retained rooted binding 下保留用户选择顺序，拒绝重复/hardlink alias/越界/非 regular/symlink/root 或文件 drift 输入并设置 `directory/explicit-selected-files-v1` origin profile；未选择文件不得被 Core 枚举、读取、自动吸收或影响 binding，也不得据此授予 source writer。
-9. While `directory/explicit-selected-files-v1` 是当前 origin profile, the workspace shall 只允许保存 ProjectPackage，不得对所选 JSON/TXT/PO/POT 执行多文件 origin write-back；既有单文件 LocalCAT JSON writer 仅保留在 legacy `single_file` compatibility path。
+2. When ProjectPackage 成功导入时, the workspace shall 按 manifest origin profile 建立 Documents：single_file 恰有一个，explicit-selected-files-v1 至少两个；不得从文件系统枚举顺序反推身份。
+3. When 用户显式选择根目录, the product shall 按 Requirement 13 有界观察 metadata、待勾选确认后读取所选文件，不后台扫描或自动收录。
+4. The product shall 不支持 multi-sheet XLSX project profile，不得将术语 XLSX codec 的 active worksheet 能力提升为 workbook ProjectOrigin。
+5. When 接入 RPY 项目, the workspace shall 只消费独立 codec 的中立输入及能力；RPY 格式语法与导出归 `rpy-project-codec`，手工包闭环按 ADR-030 先于 Sync。
+6. If 包声明未知或不受支持的 ProjectOrigin/profile, the workspace shall 返回结构化 unsupported 失败并保持当前项目不变。
+7. When 用户创建项目时, the product shall 只接受一个已验证 portable root 下用户显式选择的文件，逐个通过配置的 `project_document` Parser surface 获得 verified terminal 后聚合，保存为 ProjectPackage；内建 JSON/TXT/PO/POT 与启用的格式 codec 遵守同一 intake 合同。
+8. The 显式文件 intake shall 在同一 retained rooted binding 下保留用户选择顺序及最初根，拒绝重复/hardlink alias/越界/非 regular/symlink/root 或文件 drift；按 Requirement 13 选择单/多文件 profile。未选文件不得读取正文、解析、自动吸收或授予 source writer，目录 metadata 仅用于显式预览。
+9. The workspace shall 用 ProjectPackage 保存非 legacy 项目，不对所选 JSON/TXT/PO/POT 执行 origin write-back；legacy 单 JSON writer 保持原路径，独立格式导出须另验证 exact live codec writer，不能由 origin profile 推导。
 
 ### Requirement 4：版本化 ProjectPackageManifest 与 member 边界
 
@@ -107,6 +103,8 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 6. The ProjectPackageManifest shall 不得收编 live canonical TM SQLite、sidecar、journal、stage residue、device qualification 或凭据。
 7. The ProjectPackage contract shall 不得声明自己是 ResourcePackage，也不得把 TMX、TM JSONL 或术语 CSV/v1 资源成员提升为 Project Document authority。
 8. While exact matching live codec 不可用, the package shall 仍允许离线打开、导入、target编辑与ProjectPackage保存，并只投影body-safe `PROJECT.PACKAGE.CODEC_UNAVAILABLE` warning；source write-back与`codec_private_member`读取shall fail closed，且availability不得铸造writer authority。
+9. When 配置 codec 向 intake 交付格式私有数据, the workspace shall 只在同一 retained source snapshot 的 verified terminal 后接收 records/source/opaque private handoff，并验证外层 size、digest 与 member closure，不解释格式内容。
+
 
 ### Requirement 5：路径安全与包内引用
 
@@ -130,7 +128,7 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 2. When 用户修改 reader-only Document 的 target 或确认状态时, the workspace shall 只更新内存工作区与后续 package-owned overlay，不得修改原 source member 或外部源文件字节。
 3. When 导出并冷重开包含 reader-only Documents 的 ProjectPackage 时, the workspace shall 恢复每个 Segment_Identity 对应的 target 和编辑状态，同时证明 source member 字节未被改写。
 4. If overlay 引用不存在的 Segment_Identity、对同一段落重复赋值，或与绑定的 source fingerprint 不一致, the importer shall 在产生可 apply preview 前 fail closed。
-5. While PO/POT writer 未由后续 codec 规格批准, the workspace shall 不得声明或提供 PO/POT source write-back；TXT 亦 shall 保持 reader-only。
+5. While PO/POT codec 不提供 writer, the workspace shall 不得声明或提供 PO/POT source write-back；TXT 亦 shall 保持 reader-only。
 6. The Editing_Overlay shall 不得存储 TM CONTEXT、retrieval evidence、speaker alias/avatar 或 chunk permission。
 
 ### Requirement 7：Source reconciliation 与无法重关联的处理
@@ -160,10 +158,13 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 4. When validation 成功时, the importer shall 产生一个不修改当前 workspace 的 preview，至少说明项目身份、文档/段落数、编辑状态数、reconciliation 类别、warning 和阻断原因。
 5. The import preview shall 绑定输入包身份、manifest/member digests、codec versions 和当前 workspace revision。
 6. If 输入包或当前 workspace 在 preview 后发生任何绑定变化, the importer shall 将 preview 判为 stale，拒绝 apply 并保持当前 workspace 不变。
-7. When 用户显式批准一个仍有效的 preview 时, the importer shall 在同一 import/apply 交易中完成全成员 stage、终态验证与 workspace 发布。
+7. When 用户显式确认一个仍有效的 preview 时, the importer shall 在同一 import/apply 交易中完成全成员 stage、终态验证与 workspace 发布。
 8. If import/apply 中任何文档、member、overlay、reconciliation 或发布步骤失败, the importer shall 保留 last-known-good workspace、当前 dirty 与源字节，不得发布部分新项目。
 9. When import/apply 完整成功时, the importer shall 返回结构化 receipt，绑定操作 ID、包/manifest digest、新 workspace revision、处理数量、warning 和发布结果。
 10. When 从 receipt 指向的已发布包冷重开时, the workspace shall 恢复同一 Project/Document/Segment identity、顺序、target/state overlay 和 dirty baseline。
+11. When 外部消费者请求完整包, the Project owner shall 只从已完成 export/save 结果提供独立 retained、bounded artifact、安全 metadata、SHA-256/byte_count 与内容 fingerprint，不暴露 path、member 能力或未完成包。
+12. When 下载包进入本地项目, the Project owner shall 复用 validate/preview/apply、未保存保护与 durable receipt，导入后重新导出复证内容；传输完成不等于本地提交。
+
 
 ### Requirement 9：Dirty、保存报告与恢复状态
 
@@ -171,7 +172,7 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 
 #### 验收标准
 
-1. When 一个 segment target 或获批准的编辑状态变化时, the workspace shall 将所属 Document 标记为 dirty，并由所有 document dirty 状态派生 project dirty。
+1. When 一个 segment target 或合同定义的编辑状态变化时, the workspace shall 将所属 Document 标记为 dirty，并由所有 document dirty 状态派生 project dirty。
 2. When 只保存一个 Document 时, the save operation shall 只清除终态验证且发布成功的该 Document dirty，不得清除其他 Documents 的 dirty。
 3. When 执行项目级保存或导出时, the save service shall 返回结构化项目/文档报告，明确标记 `saved`、`unchanged`、`failed`、`rolled_back` 和需恢复状态。
 4. If 一个或多个文档无法安全发布, the save service shall 保留所有未被证明已保存的 dirty，并为每个受影响文档返回可重试/恢复信息。
@@ -225,17 +226,17 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 3. When 验收 reader-only 文档时, the acceptance shall 编辑 target、导出、冷重开并核对 source 字节不变；仅看到 UI target 更新不算通过。
 4. When 验收 stale 和失败语义时, the acceptance shall 覆盖 manifest/member 篡改、路径逸出/冲突、preview 后包变化、preview 后 workspace 变化、部分 stage 失败、发布故障与冷启动恢复。
 5. If 任一阻断故障发生, the acceptance shall 证明 last-known-good workspace/包、原 source、当前 target、dirty 与导航位置符合各自的零非授权修改语义。
-6. The implementation shall 在本机完成项目解析、package 处理、reconciliation、导航与保存，不得向网络发送项目、资源或诊断。
+6. The implementation shall 在本机完成项目解析、package 处理、reconciliation、导航与保存；网络传输仅由用户显式启动的 Sync 消费完整 artifact，workspace 不发送项目、资源或诊断。
 7. The Project/Document/Segment 与 ProjectPackage shall 不得增加 TM CONTEXT/evidence、TMX export profile、ResourcePackage authority、chunk permission、provider 凭据、RPY token 或 speaker display 字段。
 8. When 输入 TMX 或将 TMX 声明为 Project Document 时, the registry/workspace shall 在创建 Project/Document identity 前拒绝该用途组合。
 
 9. 架构验收 shall 直接检查当前源码的 owner 依赖、权威与对应行为，不以源码 SHA、文件数量、调用次数或跨快照摘要链代替合同断言；注释、无关测试与合法实现重构不应要求重新签发历史验收。
 
-### Requirement 13：显式根目录预览、选择与嵌套导航（待批准增量）
+### Requirement 13：显式根目录预览、选择与嵌套导航
 
 **目标：** 作为处理嵌套章节的译者，我希望选择一个根目录、递归预览并勾选文件，保留目录关系而不把未选择内容导入项目。
 
-**范围修订：** 本增量获批后，仅在用户显式选择根目录的流程中修订 3.3、3.7、3.8 的枚举限制，允许有界 metadata discovery；3.2 的两个以上 Documents 限制对新增单文件 profile 例外，11.1、11.9 增加根选择与树导航。既有文件单选/多选流程、其他后置 profile 和审批范围保留；RPY 格式资格仍由独立 codec 规格批准，不由目录发现授予。当前旧批准不覆盖 Requirement 13。
+**范围：** 本流程落实 Requirements 3 的 metadata discovery、单/多文件 profile 与 Requirement 11 的章节导航；格式资格只来自独立 codec，不由目录发现授予。
 
 #### 验收标准
 
