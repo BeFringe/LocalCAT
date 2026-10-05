@@ -15,7 +15,7 @@ from pathlib import Path, PurePath
 import stat
 import sys
 import time
-from typing import Any, Callable, Iterator, cast
+from typing import Any, Callable, Generator, Iterator, cast
 
 from platform_fs_contracts import (
     BoundContentFacts,
@@ -25,6 +25,12 @@ from platform_fs_contracts import (
     BoundSynchronizedRegularFile,
     CandidateFile,
     CandidateContentFacts,
+    DirectoryEntryKind,
+    DirectoryEntryMetadata,
+    DirectoryEntryUnavailableReason,
+    DirectoryHandleBudget,
+    DirectoryHandleReservation,
+    DirectoryObservationCancellation,
     EntrySnapshot,
     ExistingFileDurability,
     ExistingFileMutationGuard,
@@ -43,11 +49,13 @@ from platform_fs_contracts import (
     PrivateAccessEvidence,
     PrivateStorageProof,
     ProcessFileLock,
+    ReadOnlyDirectoryObservation,
     PublishFacts,
     PublishMode,
     RootedDirectoryAuthority,
     RootedFileSystem,
     RetainedRetirement,
+    RetainedObservationDirectory,
     RetirementDirectoryAuthority,
     validate_relative_name,
 )
@@ -1842,7 +1850,293 @@ class _PosixPrivateEvidence(PrivateAccessEvidence):
         _close_fd(self._descriptor)
 
 
+def _observation_directory_identity(result: os.stat_result) -> FileObjectIdentity:
+    if stat.S_ISLNK(result.st_mode):
+        raise _platform_error(PlatformFileErrorCode.REPARSE_REJECTED, retryable=False)
+    if not stat.S_ISDIR(result.st_mode):
+        raise _platform_error(PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+    return _identity_from_stat(result)
+
+
+def _close_observation_fd(descriptor: int) -> None:
+    # Unlike writer cleanup, an uncertain close must keep its budget charged.
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        raise _map_os_error(
+            error, fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+        ) from None
+
+
+class _PosixObservationDirectory(RetainedObservationDirectory):
+    """One native directory; retained parents supply lineage without fd copies."""
+
+    def __init__(
+        self, descriptor: int, reservation: DirectoryHandleReservation,
+        identity: FileObjectIdentity, cancellation: DirectoryObservationCancellation,
+        *, parent: _PosixObservationDirectory | None = None, name: str = "",
+    ) -> None:
+        super().__init__(reservation)
+        self._descriptor = descriptor
+        self._native_identity = identity
+        self._cancellation = cancellation
+        self._native_parent = parent
+        self._name = name
+        self._root_namespace: tuple[tuple[Path, FileObjectIdentity], ...] = ()
+
+    def _close_authority(self) -> None:
+        _close_observation_fd(self._descriptor)
+
+    def _reprove_identity(self) -> FileObjectIdentity:
+        self._require_open()
+        self._cancellation.check()
+        try:
+            actual = _observation_directory_identity(os.fstat(self._descriptor))
+            if actual != self._native_identity:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            if self._native_parent is not None:
+                self._native_parent._require_open()
+                named = _observation_directory_identity(os.stat(
+                    self._name, dir_fd=self._native_parent._descriptor, follow_symlinks=False,
+                ))
+                if named != actual:
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            # These paths only reprove the original namespace. All acquisitions
+            # use retained dirfds and O_NOFOLLOW, never these absolute paths.
+            for path, expected in self._root_namespace:
+                self._cancellation.check()
+                named = _observation_directory_identity(os.stat(path, follow_symlinks=False))
+                if not _same_identity(named, expected):
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            self._cancellation.check()
+            return actual
+        except OSError as error:
+            raise _map_os_error(
+                error, fallback=PlatformFileErrorCode.IDENTITY_STALE, retryable=True,
+            ) from None
+
+
+def _open_observation_directory(
+    name: str, resources: DirectoryHandleBudget,
+    cancellation: DirectoryObservationCancellation,
+    *, parent: _PosixObservationDirectory | None = None,
+    expected: FileObjectIdentity | None = None,
+) -> _PosixObservationDirectory:
+    """Acquire a single component and prove the before/open/after identities."""
+    descriptor: int | None = None
+    reservation: DirectoryHandleReservation | None = None
+    try:
+        cancellation.check()
+        parent_fd = parent._descriptor if parent is not None else None
+        before = _observation_directory_identity(os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False,
+        ))
+        if expected is not None and before != expected:
+            raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+        cancellation.check()
+        reservation = resources.reserve()
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        cancellation.check()
+        actual = _observation_directory_identity(os.fstat(descriptor))
+        after = _observation_directory_identity(os.stat(
+            name, dir_fd=parent_fd, follow_symlinks=False,
+        ))
+        if before != actual or after != actual:
+            raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+        cancellation.check()
+        result = _PosixObservationDirectory(
+            descriptor, reservation, actual, cancellation, parent=parent, name=name,
+        )
+        descriptor = None
+        reservation = None
+        return result
+    except OSError as error:
+        raise _map_os_error(
+            error,
+            fallback=(PlatformFileErrorCode.IDENTITY_STALE if expected is not None
+                      else PlatformFileErrorCode.ENTRY_UNAVAILABLE),
+            retryable=expected is not None,
+        ) from None
+    finally:
+        if descriptor is not None:
+            _close_observation_fd(descriptor)
+        if reservation is not None:
+            reservation.close()
+
+
+def _observation_metadata(name: str, result: os.stat_result) -> DirectoryEntryMetadata:
+    reason: DirectoryEntryUnavailableReason | None = None
+    snapshot: EntrySnapshot | None = None
+    if stat.S_ISDIR(result.st_mode):
+        kind = DirectoryEntryKind.DIRECTORY
+        snapshot = _snapshot_from_stat(result)
+    elif stat.S_ISREG(result.st_mode):
+        kind = DirectoryEntryKind.REGULAR
+        snapshot = _snapshot_from_stat(result)
+    elif stat.S_ISLNK(result.st_mode):
+        kind, reason = DirectoryEntryKind.SYMLINK, DirectoryEntryUnavailableReason.LINK
+    else:
+        kind, reason = DirectoryEntryKind.OTHER, DirectoryEntryUnavailableReason.NOT_REGULAR
+    try:
+        validate_relative_name(name)
+        name.encode("utf-8", errors="strict")
+    except (ValueError, UnicodeError):
+        reason = DirectoryEntryUnavailableReason.UNSAFE_NAME
+    return DirectoryEntryMetadata(name, kind, snapshot, reason)
+
+
+class _DarwinDirent(ctypes.Structure):
+    # Apple XNU bsd/sys/dirent.h, __DARWIN_STRUCT_DIRENTRY (64-bit inode ABI).
+    _fields_ = [("ino", ctypes.c_uint64), ("seek", ctypes.c_uint64),
+                ("reclen", ctypes.c_uint16), ("namlen", ctypes.c_uint16),
+                ("kind", ctypes.c_uint8), ("name", ctypes.c_char * 1)]
+
+
+class _LinuxDirent64(ctypes.Structure):
+    # glibc sysdeps/unix/sysv/linux/bits/dirent.h, struct dirent64.
+    _fields_ = [("ino", ctypes.c_uint64), ("seek", ctypes.c_int64),
+                ("reclen", ctypes.c_uint16), ("kind", ctypes.c_uint8),
+                ("name", ctypes.c_char * 1)]
+
+
+class _DarwinStatfs(ctypes.Structure):
+    # Apple XNU bsd/sys/mount.h, __DARWIN_STRUCT_STATFS64.
+    _fields_ = [("bsize", ctypes.c_uint32), ("iosize", ctypes.c_int32),
+                ("blocks", ctypes.c_uint64), ("bfree", ctypes.c_uint64),
+                ("bavail", ctypes.c_uint64), ("files", ctypes.c_uint64),
+                ("ffree", ctypes.c_uint64), ("fsid", ctypes.c_int32 * 2),
+                ("owner", ctypes.c_uint32), ("type", ctypes.c_uint32),
+                ("flags", ctypes.c_uint32), ("subtype", ctypes.c_uint32),
+                ("fstypename", ctypes.c_char * 16), ("mntonname", ctypes.c_char * 1024),
+                ("mntfromname", ctypes.c_char * 1024), ("reserved", ctypes.c_uint32 * 8)]
+
+
+class _ObservationDirectoryAPI:
+    """Explicit native ABI, including closedir's otherwise-hidden result."""
+
+    def __init__(self) -> None:
+        try:
+            machine = os.uname().machine
+            if ctypes.sizeof(ctypes.c_void_p) != 8:
+                raise OSError(errno.ENOTSUP, "directory ABI")
+            library = ctypes.CDLL(None, use_errno=True)
+            self.statfs = None
+            if sys.platform == "darwin" and machine in {"arm64", "x86_64"}:
+                self.record_type = _DarwinDirent
+                suffix = "$INODE64" if machine == "x86_64" else ""
+                self.fdopendir = getattr(library, "fdopendir" + suffix)
+                self.readdir = getattr(library, "readdir" + suffix)
+                self.statfs = getattr(library, "fstatfs" + suffix)
+                self.statfs.argtypes = (ctypes.c_int, ctypes.POINTER(_DarwinStatfs))
+                self.statfs.restype = ctypes.c_int
+            elif sys.platform.startswith("linux") and machine in {"x86_64", "aarch64"}:
+                # Only glibc's documented dirent64 ABI is consumed here.
+                getattr(library, "gnu_get_libc_version")
+                self.record_type = _LinuxDirent64
+                self.fdopendir = library.fdopendir
+                self.readdir = library.readdir64
+            else:
+                raise OSError(errno.ENOTSUP, "directory ABI")
+            self.closedir = library.closedir
+            self.fdopendir.argtypes = (ctypes.c_int,)
+            self.fdopendir.restype = ctypes.c_void_p
+            self.readdir.argtypes = (ctypes.c_void_p,)
+            self.readdir.restype = ctypes.c_void_p
+            self.closedir.argtypes = (ctypes.c_void_p,)
+            self.closedir.restype = ctypes.c_int
+        except (AttributeError, OSError):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False) from None
+
+    def check_mount(self, descriptor: int) -> None:
+        if self.statfs is not None:
+            result = _DarwinStatfs()
+            if self.statfs(descriptor, ctypes.byref(result)) != 0:
+                raise OSError(ctypes.get_errno(), "fstatfs")
+            # Darwin fdopendir preloads union stacks with a hidden extra fd.
+            # Such mounts cannot satisfy this stream's resource bound.
+            if result.flags & 0x20:  # MNT_UNION in XNU bsd/sys/mount.h.
+                raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+
+    def decode(self, pointer: int) -> tuple[str, int]:
+        record = ctypes.cast(pointer, ctypes.POINTER(self.record_type)).contents
+        offset = self.record_type.name.offset
+        length = record.reclen - offset
+        if not 1 <= length <= 4097:
+            raise _platform_error(PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+        raw = ctypes.string_at(pointer + offset, length)
+        end = raw.find(b"\0")
+        if end < 0 or (self.record_type is _DarwinDirent and end != record.namlen):
+            raise _platform_error(PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+        name = raw[:end]
+        if not name or b"/" in name:
+            raise _platform_error(PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+        return os.fsdecode(name), record.ino
+
+
+class _PosixDirectoryStream:
+    """A separate no-follow cursor fd whose native close result is checked."""
+
+    def __init__(
+        self, parent_fd: int, resources: DirectoryHandleBudget,
+        cancellation: DirectoryObservationCancellation,
+    ) -> None:
+        self._api = _ObservationDirectoryAPI()
+        self._cancellation = cancellation
+        self._pointer: int | None = None
+        self._reservation = resources.reserve()
+        descriptor: int | None = None
+        try:
+            cancellation.check()
+            descriptor = os.open(".", _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            cancellation.check()
+            self._api.check_mount(descriptor)
+            cancellation.check()
+            ctypes.set_errno(0)
+            self._pointer = self._api.fdopendir(descriptor)
+            if not self._pointer:
+                raise OSError(ctypes.get_errno(), "fdopendir")
+            descriptor = None  # fdopendir owns the same fd; it does not dup it.
+            cancellation.check()
+        except BaseException:
+            if self._pointer:
+                self.close()
+            else:
+                if descriptor is not None:
+                    _close_observation_fd(descriptor)
+                self._reservation.close()
+            raise
+
+    def __iter__(self) -> _PosixDirectoryStream:
+        return self
+
+    def __next__(self) -> tuple[str, int]:
+        while self._pointer is not None:
+            self._cancellation.check()
+            ctypes.set_errno(0)
+            pointer = self._api.readdir(self._pointer)
+            if not pointer:
+                error = ctypes.get_errno()
+                if error:
+                    raise OSError(error, "readdir")
+                raise StopIteration
+            name, inode = self._api.decode(pointer)
+            if name not in {".", ".."}:
+                return name, inode
+        raise StopIteration
+
+    def close(self) -> None:
+        pointer, self._pointer = self._pointer, None
+        if pointer is None:
+            return
+        # Mark terminal before calling libc: failed closedir may already free
+        # DIR and close/reuse its fd. Retrying it is not safe.
+        if self._api.closedir(pointer) != 0:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        self._reservation.close()
+
+
 class PosixPlatformAdapter(
+    ReadOnlyDirectoryObservation,
     RootedFileSystem,
     MutableFileReservationService,
     OwnedNamespaceRetirement,
@@ -1857,6 +2151,86 @@ class PosixPlatformAdapter(
         if _fault_injector is not None and not callable(_fault_injector):
             raise TypeError("_fault_injector must be callable")
         self._fault_injector = _fault_injector
+
+    def _bind_observation_root(
+        self, root: Path, resources: DirectoryHandleBudget,
+        cancellation: DirectoryObservationCancellation,
+    ) -> RetainedObservationDirectory:
+        directory: _PosixObservationDirectory | None = None
+        try:
+            # Walk from the filesystem anchor without resolving symlink aliases.
+            # Each rolling predecessor is closed after its child has been proved.
+            directory = _open_observation_directory(root.anchor, resources, cancellation)
+            prefix = Path(root.anchor)
+            namespace = [(prefix, directory._native_identity)]
+            for component in root.parts[1:]:
+                child = _open_observation_directory(
+                    component, resources, cancellation, parent=directory,
+                )
+                previous, directory = directory, child
+                directory._native_parent = None
+                previous.close()
+                prefix = prefix / component
+                namespace.append((prefix, directory._native_identity))
+            directory._root_namespace = tuple(namespace)
+            directory._reprove_identity()
+            result, directory = directory, None
+            return result
+        finally:
+            if directory is not None:
+                directory.close()
+
+    def _iter_observed_children(
+        self, retained_directory: RetainedObservationDirectory,
+        resources: DirectoryHandleBudget, cancellation: DirectoryObservationCancellation,
+    ) -> Generator[DirectoryEntryMetadata, None, None]:
+        if not isinstance(retained_directory, _PosixObservationDirectory):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        cancellation.check()
+        stream = None
+        try:
+            generation = _snapshot_from_stat(os.fstat(retained_directory._descriptor))
+            stream = _PosixDirectoryStream(retained_directory._descriptor, resources, cancellation)
+            cancellation.check()
+            for name, inode in stream:
+                cancellation.check()
+                before = os.stat(name, dir_fd=retained_directory._descriptor, follow_symlinks=False)
+                after = os.stat(
+                    name, dir_fd=retained_directory._descriptor, follow_symlinks=False,
+                )
+                if (inode != before.st_ino
+                        or (before.st_dev, before.st_ino, before.st_mode, before.st_nlink,
+                            before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                        != (after.st_dev, after.st_ino, after.st_mode, after.st_nlink,
+                            after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                cancellation.check()
+                yield _observation_metadata(name, after)
+            cancellation.check()
+            if _snapshot_from_stat(os.fstat(retained_directory._descriptor)) != generation:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+        except OSError as error:
+            raise _map_os_error(
+                error, fallback=PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False,
+            ) from None
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError as error:
+                    raise _map_os_error(
+                        error, fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+                    ) from None
+
+    def _retain_observed_directory(
+        self, parent: RetainedObservationDirectory, entry: DirectoryEntryMetadata,
+        resources: DirectoryHandleBudget, cancellation: DirectoryObservationCancellation,
+    ) -> RetainedObservationDirectory:
+        if not isinstance(parent, _PosixObservationDirectory) or entry.snapshot is None:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        return _open_observation_directory(
+            entry.name, resources, cancellation, parent=parent, expected=entry.snapshot.identity,
+        )
 
     def _bind_root(self, root: Path) -> RootedDirectoryAuthority:
         descriptor: int | None = None
