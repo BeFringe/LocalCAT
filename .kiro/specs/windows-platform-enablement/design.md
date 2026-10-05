@@ -60,10 +60,10 @@ source 的平台与业务设计已完成 Task 6.6b 验收。依据已采纳 [ADR
 
 ## Governance Impact
 - **Applicable Steering**: `product.md`、`tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md`、`delivery-boundaries.md`、`repository-safety.md`。
-- **Applicable ADRs**: ADR-007/008/009/011/012/013/016/018/019 及 ADR-020～028，按各自已有取代关系适用。
+- **Applicable ADRs**: ADR-007/008/009/011/012/013/016/018/019 及 ADR-020～029，按各自已有取代关系适用。
 - **ADR disposition**: Follow adopted ADR-028；移除 ADR-022 决策 3–8、10 和 9/12 的强证明派生门，以及 ADR-023 决策 6 的完整 pre-authority native closure。保留构建可追溯、真实 packaged E2E、LOCK-first、`PendingPublication`、MIC 和数据协议；不新立 ADR，也不更改已有 ADR 正文。
 - **Scope amendment**: Approved，范围见 [跨规格修订登记](cross-spec-amendments.md)。平台只拥有构建/入口/transport/发行汇总；三种身份分别在既有 owning Design 定义，不建立治理层或第二 publisher。原 source/W3 完成事实保留原验收范围。
-- **Steering sync**: Approved；Governance owner 同步 `spec-ownership.md`、`roadmap.md` 和长期技术边界；`structure.md` 等待真实 runtime/build 文件落地后再按实际结构更新。本 feature branch 不产生重复 Steering 提交。
+- **Steering sync**: Completed；已继承 Governance owner 的 `spec-ownership.md`、长期技术边界及 `04a3585` 的实际普通入口结构/路线图同步。本 feature branch 不产生重复 Steering 提交。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
 
 ### ADR-027 输出锁收尾修订
