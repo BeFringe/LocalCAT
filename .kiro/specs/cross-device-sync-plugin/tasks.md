@@ -1,6 +1,6 @@
 # 实施计划
 
-实施前置：RPY/手工包闭环、Design 中网络/状态候选决策与 Project/平台/Qt amendment 获批。当前为 NO-GO 的条件式计划，不通过实施任务代替审批。子任务默认顺序执行，按单一结果安排约 1–3 小时；真实 provider 验收必须在用户批准的测试前缀进行。
+实施前置：完成 RPY/手工包闭环后执行同步任务；相邻合同与唯一任务归属见 [Design 相邻合同](design.md#相邻合同与执行依赖)。子任务默认顺序执行，按单一结果安排约 1–3 小时；真实 provider 验收必须在用户批准的测试前缀进行。
 
 - [ ] 1. 建立明确的 runtime 与 owner 接缝
 - [ ] 1.1 固定可选依赖和可信 composition
@@ -13,7 +13,7 @@
   - 完成时，fake provider 可模拟成功/冲突/未知，接口不能接收 active 项目路径或 manifest。
   - _Requirements: 3.1, 3.4, 5.3, 6.2_
   - _Boundary: SyncContracts_
-- [ ] 1.3 实现 Project owner 批准的整包传输端口
+- [ ] 1.3 实现 Project owner 的整包传输端口
   - 从已完成出口提供独立 retained bounded stream 与安全 metadata（含 owner 内容 fingerprint），不暴露 path/member。
   - 完成时，文件身份变化、截断、关闭后读取均失败，只有 durable 完成 artifact 可交付。
   - _Requirements: 3.1, 3.2_
@@ -132,8 +132,9 @@
   - _Depends: 2.1, 2.2, 3.2, 7.2_
 
 - [ ] 8. 闭合实际治理影响与下游回归
-  - 由治理 owner 同步已批准的 opt-in 网络边界、依赖/模块和 ownership，Project/Resource owner 验证端口及 receipt 生命周期未被绕过。
-  - 完成时，实际 tree 与批准协议一致，R2 与 InfiniCLOUD 能力结果及 Qt/秘密/恢复回归可审阅；必要真实验收或 amendment 未闭合时不声明 Feature GO。
+- [ ] 8.1 验证实际边界、依赖与下游消费
+  - 由治理 owner 同步opt-in 网络边界、依赖/模块和 ownership，Project/Resource owner 验证端口及 receipt 生命周期未被绕过。
+  - 完成时，实际 tree 与协议一致，R2 与 InfiniCLOUD 能力结果及 Qt/秘密/恢复回归可审阅；必要真实验收或 amendment 未闭合时不声明 Feature GO。
   - _Requirements: 1.2, 2.4, 3.3, 3.4, 6.4, 7.4, 8.4_
   - _Boundary: Governance / downstream integration closure_
   - _Depends: 6.3, 7.3, 7.4_
