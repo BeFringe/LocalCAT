@@ -8,7 +8,7 @@
   - 完成时，每个 fixture 有确定的输入分类与期望中立记录，单独 checkout 可运行，不读取外部项目目录。
   - _Requirements: 1.2, 1.4, 2.1, 2.2, 7.4_
   - _Boundary: RpyCodec fixtures_
-- [ ] 1.2 实现 Parser owner 的 round-trip 准备合同
+- [x] 1.2 实现 Parser owner 的 round-trip 准备合同
   - 接通可选 factory、live codec/token 验证与受限准备结果；缺失能力返回明确 unsupported。
   - 完成时，伪 codec 可验证调用顺序，foreign/stale token 在目标打开前失败，既有 canonical codec 契约不变。
   - _Requirements: 1.3, 4.4, 7.2_
@@ -150,3 +150,7 @@
   - _Requirements: 1.4, 3.4, 6.4, 7.4_
   - _Boundary: Governance / downstream integration closure_
   - _Depends: 6.1, 6.2_
+
+## Implementation Notes
+
+- round-trip prepare 的 `format_state_fingerprint` 为 opaque payload 的 SHA-256；codec 仍须从 source 重建并核对私有映射。`RoundTripLimits` 分别约束 private/output，独立于输入限额；Application 必须保持 issuing `OpenedParserInput` 存活直到 prepared 结果消费或丢弃，关闭源后准备结果不可发布。

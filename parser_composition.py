@@ -8,9 +8,11 @@ without importing codec, registry, or Source Boundary internals.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 from pathlib import Path
 from typing import Callable
+from weakref import WeakKeyDictionary, WeakSet
 
 from platform_fs import compose_platform_file_backend as _compose_platform_file_backend
 from platform_fs_contracts import PlatformFileBackend, PlatformFileError
@@ -20,11 +22,19 @@ from parser_contracts import (
     CanonicalBytes as _CanonicalBytes,
     CanonicalSerializeRequest,
     CodecDescriptor,
+    CodecIdentity,
     CodecProvider,
     ContractViolation,
     EffectivePurpose,
     FOUNDATION_GUARDED_ISSUE_CODES,
+    FormatId,
+    IssueSeverity,
+    ParseIssue,
+    PreparedFormatBytes,
     ReadRequest,
+    RoundTripRequest,
+    RoundTripSegmentEdit,
+    RoundTripTokenEnvelope,
     SelectionFailure,
     SelectionRequest,
     SourceReference,
@@ -33,9 +43,11 @@ from parser_contracts import (
     TermbaseColumnPreview,
     TermbaseColumnPreviewCodec,
     TermbaseColumnPreviewRequest,
+    TerminalSuccess,
     ValidationReport,
     WriteReceipt,
     builtin_purpose_for_format,
+    validate_round_trip_token,
 )
 from parser_gettext_codec import gettext_descriptors as _gettext_descriptors
 from parser_localcat_codec import localcat_descriptors as _localcat_descriptors
@@ -68,6 +80,16 @@ class ProviderConfigurationError(ContractViolation):
 
 class ParserApplicationError(ContractViolation):
     """Body-safe failure at the composition-owned Application surface."""
+
+
+class RoundTripPreparationError(ParserApplicationError):
+    """Rejected preparation with bounded, body-safe positional diagnostics."""
+
+    def __init__(
+        self, code: str, safe_summary: str, diagnostics: tuple[ParseIssue, ...] = (),
+    ) -> None:
+        self.diagnostics = diagnostics
+        super().__init__(code, safe_summary)
 
 
 def _rooted_backend(
@@ -232,7 +254,10 @@ def create_parser_application_surface(
 class ParserApplicationSurface:
     """Coordinate selection, sealed reads, guarded views, and canonical writes."""
 
-    __slots__ = ("_registry", "_platform_backend_factory")
+    __slots__ = (
+        "_registry", "_platform_backend_factory", "_opened_inputs",
+        "_prepared_round_trips",
+    )
 
     def __init__(
         self,
@@ -252,6 +277,10 @@ class ParserApplicationSurface:
             raise TypeError("platform backend factory must be callable")
         self._registry = registry
         self._platform_backend_factory = _platform_backend_factory
+        self._opened_inputs: WeakSet[OpenedParserInput] = WeakSet()
+        self._prepared_round_trips: WeakKeyDictionary[
+            PreparedRoundTripWrite, _RoundTripPreparation,
+        ] = WeakKeyDictionary()
 
     def select(
         self,
@@ -299,7 +328,7 @@ class ParserApplicationSurface:
                 reference.safe_root,
             ),
         )
-        return OpenedParserInput(
+        opened = OpenedParserInput(
             self._registry,
             descriptor,
             snapshot,
@@ -308,6 +337,8 @@ class ParserApplicationSurface:
             primed_reader,
             _authority=_COMPOSITION_AUTHORITY,
         )
+        self._opened_inputs.add(opened)
+        return opened
 
     def preview_termbase_columns(
         self,
@@ -360,6 +391,143 @@ class ParserApplicationSurface:
             )
         finally:
             snapshot.close()
+
+    def prepare_round_trip(
+        self,
+        opened: OpenedParserInput,
+        token: RoundTripTokenEnvelope | None,
+        edits: tuple[RoundTripSegmentEdit, ...],
+    ) -> PreparedRoundTripWrite:
+        """Verify one live sealed input, then prepare bounded format bytes.
+
+        No caller-provided source bytes, source digest, terminal, or ordinary
+        PreparedFormatBytes can confer this authority. The input must remain
+        open until the preparation is consumed or discarded. Token hashing
+        binds opaque state; only the codec can verify that state's grammar.
+        """
+
+        if type(opened) is not OpenedParserInput or opened not in self._opened_inputs:
+            raise ParserApplicationError(
+                "PARSER.SOURCE.UNVERIFIED",
+                "round-trip preparation requires a live input issued by this surface",
+            )
+        opened._require_open()
+        descriptor = opened.descriptor
+        self._registry._require_registered_descriptor(descriptor)
+        if (
+            descriptor.round_trip_serializer_factory is None
+            or not descriptor.capabilities.source_round_trip_write
+        ):
+            raise ParserApplicationError(
+                "PARSER.CAPABILITY.WRITE_UNSUPPORTED",
+                "the selected codec does not publish a round-trip serializer factory",
+            )
+        limits = descriptor.round_trip_limits
+        assert limits is not None
+        _round_trip_checkpoint(opened)
+        if token is not None and type(token) is not RoundTripTokenEnvelope:
+            raise TypeError("token must be exact RoundTripTokenEnvelope or None")
+        if token is not None and len(token.opaque_payload) > limits.max_opaque_payload_bytes:
+            raise ParserApplicationError(
+                "PARSER.LIMIT.OPAQUE_PAYLOAD",
+                "round-trip opaque payload exceeds its declared byte limit",
+            )
+        validated_token = validate_round_trip_token(
+            token,
+            expected_codec_identity=descriptor.identity,
+            expected_source_fingerprint=opened.source_identity.content_sha256,
+            expected_format_state_fingerprint=hashlib.sha256(
+                token.opaque_payload if token is not None else b"",
+            ).hexdigest(),
+        )
+        _validate_round_trip_edits(edits, descriptor)
+        # Run the full guarded grammar; a caller-supplied terminal is not proof.
+        report = opened.validate()
+        if report.terminal is None:
+            diagnostics = _safe_round_trip_diagnostics(report.issues, descriptor)
+            code = next(
+                (item.code for item in diagnostics if item.severity is IssueSeverity.FATAL),
+                "PARSER.SOURCE.UNVERIFIED",
+            )
+            raise RoundTripPreparationError(
+                code, "round-trip source verification did not reach a successful terminal",
+                diagnostics,
+            )
+        terminal = report.terminal
+        _round_trip_checkpoint(opened, terminal)
+        serializer = self._registry.create_round_trip_serializer(descriptor)
+        _round_trip_checkpoint(opened, terminal)
+        lease = opened._snapshot.lease(descriptor, cancellation=opened._cancellation)
+        try:
+            request = RoundTripRequest(
+                descriptor.identity, descriptor.format_id, lease, terminal,
+                validated_token, edits, limits, descriptor.limit_profile,
+            )
+            try:
+                serialized = serializer.prepare(request)
+            except ContractViolation as exc:
+                code = exc.code
+                if code not in descriptor.declared_issue_codes:
+                    code = "PARSER.PLUGIN.ISSUE_UNDECLARED"
+                raise RoundTripPreparationError(
+                    code, "round-trip serializer rejected preparation before target open",
+                ) from None
+            except Exception:
+                raise RoundTripPreparationError(
+                    "PARSER.SOURCE.WRITE_FAILED",
+                    "round-trip serializer failed before target open",
+                ) from None
+            _round_trip_checkpoint(opened, terminal)
+            if lease.closed or not lease.consumption_proved:
+                raise ParserApplicationError(
+                    "PARSER.SOURCE.UNVERIFIED",
+                    "round-trip serializer did not consume its complete live source lease",
+                )
+            serialized = _validate_round_trip_output(serialized, descriptor, terminal)
+            _round_trip_checkpoint(opened, terminal)
+            prepared = PreparedRoundTripWrite(
+                descriptor, terminal.source, serialized,
+                _discard=self._discard_round_trip_preparation,
+                _authority=_COMPOSITION_AUTHORITY,
+            )
+            self._prepared_round_trips[prepared] = _RoundTripPreparation(
+                opened, descriptor, terminal, validated_token, serialized,
+            )
+            return prepared
+        finally:
+            lease.close()
+
+    def _require_round_trip_preparation(
+        self, prepared: PreparedRoundTripWrite,
+    ) -> _RoundTripPreparation:
+        """Owner-private reproof seam for the separate prepared publish task."""
+
+        if type(prepared) is not PreparedRoundTripWrite:
+            binding = None
+        else:
+            binding = self._prepared_round_trips.get(prepared)
+        if binding is None or prepared.closed:
+            raise ParserApplicationError(
+                "PARSER.CAPABILITY.INVALID_PREPARATION",
+                "preparation is not a live result issued by this surface",
+            )
+        self._registry._require_registered_descriptor(binding.descriptor)
+        _round_trip_checkpoint(binding.opened, binding.terminal)
+        if binding.opened.descriptor is not binding.descriptor:
+            raise ParserApplicationError(
+                "PARSER.CAPABILITY.INVALID_PREPARATION", "prepared codec authority has changed",
+            )
+        validate_round_trip_token(
+            binding.token,
+            expected_codec_identity=binding.descriptor.identity,
+            expected_source_fingerprint=binding.terminal.source.content_sha256,
+            expected_format_state_fingerprint=hashlib.sha256(binding.token.opaque_payload).hexdigest(),
+        )
+        _validate_round_trip_output(binding.serialized, binding.descriptor, binding.terminal)
+        return binding
+
+    def _discard_round_trip_preparation(self, prepared: PreparedRoundTripWrite) -> None:
+        self._prepared_round_trips.pop(prepared, None)
 
     def write_canonical(
         self,
@@ -423,6 +591,194 @@ class ParserApplicationSurface:
         )
 
 
+def _round_trip_checkpoint(
+    opened: OpenedParserInput, terminal: TerminalSuccess | None = None,
+) -> None:
+    opened._require_open()
+    if opened._snapshot.release_requested or opened._snapshot.released:
+        raise _ParserSourceError(
+            "PARSER.SOURCE.SNAPSHOT_RELEASED",
+            "round-trip preparation requires a live sealed source",
+        )
+    if opened._cancellation is not None:
+        opened._cancellation.raise_if_cancelled()
+    if terminal is not None and opened.source_identity != terminal.source:
+        raise ParserApplicationError(
+            "PARSER.SOURCE.STALE", "prepared source identity has changed",
+        )
+
+
+def _validate_round_trip_edits(
+    edits: tuple[RoundTripSegmentEdit, ...], descriptor: CodecDescriptor,
+) -> None:
+    if type(edits) is not tuple:
+        raise TypeError("round-trip edits must be an exact tuple")
+    profile = descriptor.limit_profile
+    if len(edits) > profile.max_records:
+        raise ParserApplicationError(
+            "PARSER.LIMIT.RECORD", "round-trip edits exceed the record limit",
+        )
+    local_ids: set[str] = set()
+    for edit in edits:
+        if type(edit) is not RoundTripSegmentEdit:
+            raise TypeError("round-trip edits must contain exact RoundTripSegmentEdit values")
+        if max(len(edit.local_id), len(edit.target)) > profile.max_decoded_field_chars:
+            raise ParserApplicationError(
+                "PARSER.LIMIT.FIELD", "round-trip edit exceeds the decoded field limit",
+            )
+        if edit.local_id in local_ids:
+            raise ParserApplicationError(
+                "PARSER.SYNTAX.DUPLICATE_LOCAL_ID", "round-trip edits contain duplicate local identities",
+            )
+        local_ids.add(edit.local_id)
+
+
+def _safe_round_trip_diagnostics(
+    diagnostics: tuple[ParseIssue, ...], descriptor: CodecDescriptor,
+) -> tuple[ParseIssue, ...]:
+    if len(diagnostics) > descriptor.limit_profile.max_retained_issues:
+        raise ParserApplicationError(
+            "PARSER.LIMIT.DIAGNOSTICS", "round-trip diagnostics exceed the retained issue limit",
+        )
+    if any(issue.code not in descriptor.declared_issue_codes for issue in diagnostics):
+        raise ParserApplicationError(
+            "PARSER.PLUGIN.ISSUE_UNDECLARED", "round-trip diagnostics contain an undeclared issue code",
+        )
+    # A plugin's printable summary is not proof it is body-safe. Preserve the
+    # machine-readable reason and location, never arbitrary provider text.
+    return tuple(replace(
+        issue, safe_summary="the selected codec reported a round-trip diagnostic",
+    ) for issue in diagnostics)
+
+
+def _validate_round_trip_output(
+    serialized: PreparedFormatBytes,
+    descriptor: CodecDescriptor,
+    terminal: TerminalSuccess,
+) -> PreparedFormatBytes:
+    if type(serialized) is not PreparedFormatBytes:
+        raise ParserApplicationError(
+            "PARSER.SELECTION.FACTORY_MISMATCH", "round-trip serializer returned a non-contract result",
+        )
+    limits = descriptor.round_trip_limits
+    assert limits is not None
+    if len(serialized.payload) > limits.max_output_bytes:
+        raise ParserApplicationError(
+            "PARSER.LIMIT.OUTPUT", "round-trip output exceeds its declared byte limit",
+        )
+    if (
+        serialized.codec_identity != descriptor.identity
+        or serialized.format_id != descriptor.format_id
+        or serialized.source_fingerprint != terminal.source.content_sha256
+        or serialized.output_fingerprint != hashlib.sha256(serialized.payload).hexdigest()
+    ):
+        raise ParserApplicationError(
+            "PARSER.SELECTION.FACTORY_MISMATCH",
+            "round-trip output does not match its selected codec, source, or output fingerprint",
+        )
+    diagnostics = _safe_round_trip_diagnostics(serialized.diagnostics, descriptor)
+    fatal = next((issue for issue in diagnostics if issue.severity is IssueSeverity.FATAL), None)
+    if fatal is not None:
+        raise RoundTripPreparationError(
+            fatal.code, "round-trip output contains blocking diagnostics", diagnostics,
+        )
+    return replace(serialized, diagnostics=diagnostics)
+
+
+@dataclass(frozen=True, slots=True)
+class _RoundTripPreparation:
+    """Surface-private bytes and live source binding; not a public DTO."""
+
+    opened: OpenedParserInput
+    descriptor: CodecDescriptor
+    terminal: TerminalSuccess
+    token: RoundTripTokenEnvelope
+    serialized: PreparedFormatBytes
+
+
+class PreparedRoundTripWrite:
+    """Read-only preparation facts; publication is a separate surface operation.
+
+    Closing discards the surface's private payload immediately. Keeping this
+    object does not keep a closed input valid; its issuing input must stay open.
+    """
+
+    __slots__ = (
+        "__codec_identity", "__format_id", "__source_identity", "__output_fingerprint",
+        "__byte_count", "__diagnostics", "__closed", "__discard", "__weakref__",
+    )
+
+    def __init__(
+        self,
+        descriptor: CodecDescriptor | None = None,
+        source: SourceSnapshotIdentity | None = None,
+        serialized: PreparedFormatBytes | None = None,
+        *,
+        _discard: Callable[[PreparedRoundTripWrite], None] | None = None,
+        _authority: object = None,
+    ) -> None:
+        if _authority is not _COMPOSITION_AUTHORITY:
+            raise ParserApplicationError(
+                "PARSER.SELECTION.COMPOSITION_REQUIRED",
+                "round-trip preparations must be issued by the Application surface",
+            )
+        assert descriptor is not None and source is not None and serialized is not None
+        assert _discard is not None
+        for name, value in (
+            ("codec_identity", descriptor.identity), ("format_id", descriptor.format_id),
+            ("source_identity", source), ("output_fingerprint", serialized.output_fingerprint),
+            ("byte_count", len(serialized.payload)), ("diagnostics", serialized.diagnostics),
+            ("closed", False), ("discard", _discard),
+        ):
+            object.__setattr__(self, f"_PreparedRoundTripWrite__{name}", value)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("prepared round-trip facts are immutable")
+
+    @property
+    def codec_identity(self) -> CodecIdentity:
+        return self.__codec_identity
+
+    @property
+    def format_id(self) -> FormatId:
+        return self.__format_id
+
+    @property
+    def source_identity(self) -> SourceSnapshotIdentity:
+        return self.__source_identity
+
+    @property
+    def output_fingerprint(self) -> str:
+        return self.__output_fingerprint
+
+    @property
+    def byte_count(self) -> int:
+        return self.__byte_count
+
+    @property
+    def diagnostics(self) -> tuple[ParseIssue, ...]:
+        return self.__diagnostics
+
+    @property
+    def closed(self) -> bool:
+        return self.__closed
+
+    def close(self) -> None:
+        if not self.__closed:
+            object.__setattr__(self, "_PreparedRoundTripWrite__closed", True)
+            self.__discard(self)
+
+    def __enter__(self) -> PreparedRoundTripWrite:
+        if self.closed:
+            raise ParserApplicationError(
+                "PARSER.CAPABILITY.INVALID_PREPARATION", "preparation was already discarded",
+            )
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+
 class PreparedCanonicalWrite:
     """Opaque, factory-issued canonical payload authorized only for rooted writes."""
 
@@ -484,6 +840,7 @@ class OpenedParserInput:
         "_cancellation",
         "_primed_reader",
         "_closed",
+        "__weakref__",
     )
 
     def __init__(
