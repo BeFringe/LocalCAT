@@ -1,0 +1,1996 @@
+{
+  "schema_version": 1,
+  "profile": "renpy-tl-v1",
+  "provider_id": "localcat.rpy",
+  "codec_id": "renpy-tl",
+  "expectation_kind": "specification-oracle",
+  "provenance": {
+    "origin": "localcat-synthetic",
+    "contains_user_content": false,
+    "external_inputs": [],
+    "requires_renpy": false
+  },
+  "cases": [
+    {
+      "case_id": "mixed_dialogue_strings",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/mixed_dialogue_strings.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 640,
+        "sha256": "e57af09e021bee0f4593f293766940a40b2490a1a7b45a0f7730637855d3a858",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "supported",
+        "language": "zh_Hans",
+        "records": [
+          {
+            "source": "The lantern glows.",
+            "target": "灯笼亮着。",
+            "speaker": "guide",
+            "confirmed": false
+          },
+          {
+            "source": "Open",
+            "target": "",
+            "speaker": null,
+            "confirmed": false
+          },
+          {
+            "source": "Open{#verb}",
+            "target": "开启{#verb}",
+            "speaker": null,
+            "confirmed": false
+          },
+          {
+            "source": "The bridge is quiet.",
+            "target": "桥上很安静。",
+            "speaker": null,
+            "confirmed": false
+          },
+          {
+            "source": "Close",
+            "target": "关闭",
+            "speaker": null,
+            "confirmed": false
+          },
+          {
+            "source": "The lantern glows.",
+            "target": "",
+            "speaker": "guide",
+            "confirmed": false
+          }
+        ],
+        "slots": [
+          {
+            "record_index": 0,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "intro_aa1"
+            },
+            "header_line": 2,
+            "source_anchor": {
+              "line": 3,
+              "prefix": "    # guide thinking ",
+              "literal": "\"The lantern glows.\"",
+              "suffix": " with dissolve",
+              "literal_byte_span": [
+                114,
+                134
+              ]
+            },
+            "target_anchor": {
+              "line": 5,
+              "prefix": "    guide -thinking @ happy ",
+              "literal": "\"灯笼亮着。\"",
+              "suffix": " with fade",
+              "literal_byte_span": [
+                217,
+                234
+              ]
+            }
+          },
+          {
+            "record_index": 1,
+            "identity_basis": {
+              "kind": "strings",
+              "language": "zh_Hans",
+              "old_sha256": "ed077f3d8125d60dca1979c7133601bd187d47c73ed9975028f677e49e709942"
+            },
+            "header_line": 8,
+            "source_anchor": {
+              "line": 10,
+              "prefix": "    old ",
+              "literal": "\"Open\"",
+              "suffix": "",
+              "literal_byte_span": [
+                352,
+                358
+              ]
+            },
+            "target_anchor": {
+              "line": 11,
+              "prefix": "    new ",
+              "literal": "\"\"",
+              "suffix": "",
+              "literal_byte_span": [
+                367,
+                369
+              ]
+            }
+          },
+          {
+            "record_index": 2,
+            "identity_basis": {
+              "kind": "strings",
+              "language": "zh_Hans",
+              "old_sha256": "16eb8918d7cd1b923ff47c127e6dfc82dc35e03bc55d6f40d1160aa426babd67"
+            },
+            "header_line": 8,
+            "source_anchor": {
+              "line": 12,
+              "prefix": "    old ",
+              "literal": "\"Open{#verb}\"",
+              "suffix": "",
+              "literal_byte_span": [
+                378,
+                391
+              ]
+            },
+            "target_anchor": {
+              "line": 13,
+              "prefix": "    new ",
+              "literal": "\"开启{#verb}\"",
+              "suffix": "",
+              "literal_byte_span": [
+                400,
+                415
+              ]
+            }
+          },
+          {
+            "record_index": 3,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "narrator_bb2"
+            },
+            "header_line": 15,
+            "source_anchor": {
+              "line": 16,
+              "prefix": "    # ",
+              "literal": "\"The bridge is quiet.\"",
+              "suffix": "",
+              "literal_byte_span": [
+                455,
+                477
+              ]
+            },
+            "target_anchor": {
+              "line": 17,
+              "prefix": "    ",
+              "literal": "\"桥上很安静。\"",
+              "suffix": "",
+              "literal_byte_span": [
+                482,
+                502
+              ]
+            }
+          },
+          {
+            "record_index": 4,
+            "identity_basis": {
+              "kind": "strings",
+              "language": "zh_Hans",
+              "old_sha256": "7d9eb7acb13e24625c404401d8e88b2350e32162455885f18276cf802f7701ed"
+            },
+            "header_line": 19,
+            "source_anchor": {
+              "line": 20,
+              "prefix": "    old ",
+              "literal": "\"Close\"",
+              "suffix": "",
+              "literal_byte_span": [
+                539,
+                546
+              ]
+            },
+            "target_anchor": {
+              "line": 21,
+              "prefix": "    new ",
+              "literal": "\"关闭\"",
+              "suffix": "",
+              "literal_byte_span": [
+                555,
+                563
+              ]
+            }
+          },
+          {
+            "record_index": 5,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "outro_cc3"
+            },
+            "header_line": 23,
+            "source_anchor": {
+              "line": 24,
+              "prefix": "    # guide ",
+              "literal": "\"The lantern glows.\"",
+              "suffix": "",
+              "literal_byte_span": [
+                606,
+                626
+              ]
+            },
+            "target_anchor": {
+              "line": 25,
+              "prefix": "    guide ",
+              "literal": "\"\"",
+              "suffix": "",
+              "literal_byte_span": [
+                637,
+                639
+              ]
+            }
+          }
+        ],
+        "diagnostics": [],
+        "preserved_lines": [
+          {
+            "line": 1,
+            "kind": "comment",
+            "text": "# Synthetic fixture: comments may contain \"quotes\" and # marks."
+          },
+          {
+            "line": 2,
+            "kind": "header",
+            "text": "translate zh_Hans intro_aa1:"
+          },
+          {
+            "line": 4,
+            "kind": "control",
+            "text": "    voice \"audio/synthetic_lantern.ogg\""
+          },
+          {
+            "line": 6,
+            "kind": "control",
+            "text": "    nvl clear"
+          },
+          {
+            "line": 7,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 8,
+            "kind": "header",
+            "text": "translate zh_Hans strings:"
+          },
+          {
+            "line": 9,
+            "kind": "comment",
+            "text": "    # \"#\" is a quoted hash inside a comment, not a slot."
+          },
+          {
+            "line": 14,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 15,
+            "kind": "header",
+            "text": "translate zh_Hans narrator_bb2:"
+          },
+          {
+            "line": 18,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 19,
+            "kind": "header",
+            "text": "translate zh_Hans strings:"
+          },
+          {
+            "line": 22,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 23,
+            "kind": "header",
+            "text": "translate zh_Hans outro_cc3:"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "special_say",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/special_say.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 420,
+        "sha256": "7b970fa20c9a3e410ef3240f7a9461d8b96bceba1003f07b576ac25bde97191d",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "supported",
+        "language": "zh_Hans",
+        "records": [
+          {
+            "source": "And the bell rings.",
+            "target": "钟声接着响起。",
+            "speaker": "extend",
+            "confirmed": false
+          },
+          {
+            "source": "Synthetic interlude",
+            "target": "合成幕间",
+            "speaker": "centered",
+            "confirmed": false
+          },
+          {
+            "source": "A small signal.",
+            "target": "一个小小的信号。",
+            "speaker": "guide",
+            "confirmed": false
+          }
+        ],
+        "slots": [
+          {
+            "record_index": 0,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "extend_11"
+            },
+            "header_line": 2,
+            "source_anchor": {
+              "line": 3,
+              "prefix": "    # extend ",
+              "literal": "\"And the bell rings.\"",
+              "suffix": "",
+              "literal_byte_span": [
+                117,
+                138
+              ]
+            },
+            "target_anchor": {
+              "line": 4,
+              "prefix": "    extend ",
+              "literal": "\"钟声接着响起。\"",
+              "suffix": "",
+              "literal_byte_span": [
+                150,
+                173
+              ]
+            }
+          },
+          {
+            "record_index": 1,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "centered_22"
+            },
+            "header_line": 6,
+            "source_anchor": {
+              "line": 7,
+              "prefix": "    # centered ",
+              "literal": "\"Synthetic interlude\"",
+              "suffix": "",
+              "literal_byte_span": [
+                221,
+                242
+              ]
+            },
+            "target_anchor": {
+              "line": 8,
+              "prefix": "    centered ",
+              "literal": "\"合成幕间\"",
+              "suffix": "",
+              "literal_byte_span": [
+                256,
+                270
+              ]
+            }
+          },
+          {
+            "record_index": 2,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "attributes_33"
+            },
+            "header_line": 10,
+            "source_anchor": {
+              "line": 11,
+              "prefix": "    # guide thinking calm -sad @ happy bright ",
+              "literal": "\"A small signal.\"",
+              "suffix": " with dissolve",
+              "literal_byte_span": [
+                351,
+                368
+              ]
+            },
+            "target_anchor": {
+              "line": 12,
+              "prefix": "    guide ",
+              "literal": "\"一个小小的信号。\"",
+              "suffix": "",
+              "literal_byte_span": [
+                393,
+                419
+              ]
+            }
+          }
+        ],
+        "diagnostics": [],
+        "preserved_lines": [
+          {
+            "line": 1,
+            "kind": "comment",
+            "text": "# Synthetic special say identifiers are preserved without game evaluation."
+          },
+          {
+            "line": 2,
+            "kind": "header",
+            "text": "translate zh_Hans extend_11:"
+          },
+          {
+            "line": 5,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 6,
+            "kind": "header",
+            "text": "translate zh_Hans centered_22:"
+          },
+          {
+            "line": 9,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 10,
+            "kind": "header",
+            "text": "translate zh_Hans attributes_33:"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "literal_escapes",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/literal_escapes.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 623,
+        "sha256": "63f4616f88a921b6b37d4e446df79c1202342437239eeaa88bec21c2d1b67ff8",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "supported",
+        "language": "zh_Hans",
+        "records": [
+          {
+            "source": "It's a \"sample\" # path \\ folder\nnext\rrow\tend.",
+            "target": "这是 '样例' \"引号\" # 路径 \\ 目录\n下一行\r回车\t结尾。",
+            "speaker": null,
+            "confirmed": false
+          },
+          {
+            "source": "A \"quoted\" # marker.",
+            "target": "一个 \"引用\" # 标记。",
+            "speaker": null,
+            "confirmed": false
+          },
+          {
+            "source": "Hello [visitor!t], {b}bright{/b} {{glyph [[token.",
+            "target": "你好 [visitor!t]，{b}明亮{/b} {{glyph [[token。",
+            "speaker": "guide",
+            "confirmed": false
+          },
+          {
+            "source": "A {localtoken=quiet}signal{/localtoken}.",
+            "target": "一个{localtoken=quiet}信号{/localtoken}。",
+            "speaker": null,
+            "confirmed": false
+          }
+        ],
+        "slots": [
+          {
+            "record_index": 0,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "escapes_11"
+            },
+            "header_line": 2,
+            "source_anchor": {
+              "line": 3,
+              "prefix": "    # ",
+              "literal": "'It\\'s a \"sample\" # path \\\\ folder\\nnext\\rrow\\tend.'",
+              "suffix": "",
+              "literal_byte_span": [
+                94,
+                146
+              ]
+            },
+            "target_anchor": {
+              "line": 4,
+              "prefix": "    ",
+              "literal": "'这是 \\'样例\\' \"引号\" # 路径 \\\\ 目录\\n下一行\\r回车\\t结尾。'",
+              "suffix": "",
+              "literal_byte_span": [
+                151,
+                228
+              ]
+            }
+          },
+          {
+            "record_index": 1,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "quotes_22"
+            },
+            "header_line": 6,
+            "source_anchor": {
+              "line": 7,
+              "prefix": "    # ",
+              "literal": "\"A \\\"quoted\\\" # marker.\"",
+              "suffix": "",
+              "literal_byte_span": [
+                265,
+                289
+              ]
+            },
+            "target_anchor": {
+              "line": 8,
+              "prefix": "    ",
+              "literal": "\"一个 \\\"引用\\\" # 标记。\"",
+              "suffix": "",
+              "literal_byte_span": [
+                294,
+                325
+              ]
+            }
+          },
+          {
+            "record_index": 2,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "tokens_33"
+            },
+            "header_line": 10,
+            "source_anchor": {
+              "line": 11,
+              "prefix": "    # guide ",
+              "literal": "\"Hello [visitor!t], {b}bright{/b} {{glyph [[token.\"",
+              "suffix": "",
+              "literal_byte_span": [
+                368,
+                419
+              ]
+            },
+            "target_anchor": {
+              "line": 12,
+              "prefix": "    guide ",
+              "literal": "\"你好 [visitor!t]，{b}明亮{/b} {{glyph [[token。\"",
+              "suffix": "",
+              "literal_byte_span": [
+                430,
+                485
+              ]
+            }
+          },
+          {
+            "record_index": 3,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "unknown_tag_44"
+            },
+            "header_line": 14,
+            "source_anchor": {
+              "line": 15,
+              "prefix": "    # ",
+              "literal": "\"A {localtoken=quiet}signal{/localtoken}.\"",
+              "suffix": "",
+              "literal_byte_span": [
+                527,
+                569
+              ]
+            },
+            "target_anchor": {
+              "line": 16,
+              "prefix": "    ",
+              "literal": "\"一个{localtoken=quiet}信号{/localtoken}。\"",
+              "suffix": "",
+              "literal_byte_span": [
+                574,
+                622
+              ]
+            }
+          }
+        ],
+        "diagnostics": [],
+        "preserved_lines": [
+          {
+            "line": 1,
+            "kind": "comment",
+            "text": "# Synthetic strings; interpolation tokens are inert text."
+          },
+          {
+            "line": 2,
+            "kind": "header",
+            "text": "translate zh_Hans escapes_11:"
+          },
+          {
+            "line": 5,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 6,
+            "kind": "header",
+            "text": "translate zh_Hans quotes_22:"
+          },
+          {
+            "line": 9,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 10,
+            "kind": "header",
+            "text": "translate zh_Hans tokens_33:"
+          },
+          {
+            "line": 13,
+            "kind": "blank",
+            "text": ""
+          },
+          {
+            "line": 14,
+            "kind": "header",
+            "text": "translate zh_Hans unknown_tag_44:"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "none_language_strings",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/none_language_strings.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 137,
+        "sha256": "785d159ca88eadce93493697b492ed3c4ec00b43c170a7ae3905c65baf958541",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "supported",
+        "language": "None",
+        "records": [
+          {
+            "source": "Badge",
+            "target": "徽章",
+            "speaker": null,
+            "confirmed": false
+          }
+        ],
+        "slots": [
+          {
+            "record_index": 0,
+            "identity_basis": {
+              "kind": "strings",
+              "language": "None",
+              "old_sha256": "002474e368210827e5f71950ba7cb0b2cafa82d71b047c356f46d37dd276a5f3"
+            },
+            "header_line": 2,
+            "source_anchor": {
+              "line": 3,
+              "prefix": "    old ",
+              "literal": "'Badge'",
+              "suffix": "",
+              "literal_byte_span": [
+                112,
+                119
+              ]
+            },
+            "target_anchor": {
+              "line": 4,
+              "prefix": "    new ",
+              "literal": "'徽章'",
+              "suffix": "",
+              "literal_byte_span": [
+                128,
+                136
+              ]
+            }
+          }
+        ],
+        "diagnostics": [],
+        "preserved_lines": [
+          {
+            "line": 1,
+            "kind": "comment",
+            "text": "# Synthetic None-language strings are supported without language normalization."
+          },
+          {
+            "line": 2,
+            "kind": "header",
+            "text": "translate None strings:"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "controls_only",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/controls_only.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 157,
+        "sha256": "f82311240d42bf4ac6b7fd79a57520f50e74009ac321d7d1fad0f56e5697837d",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "supported",
+        "language": "zh_Hans",
+        "records": [],
+        "slots": [],
+        "diagnostics": [],
+        "preserved_lines": [
+          {
+            "line": 1,
+            "kind": "comment",
+            "text": "# A synthetic control-only translation block yields no neutral records."
+          },
+          {
+            "line": 2,
+            "kind": "header",
+            "text": "translate zh_Hans controls_44:"
+          },
+          {
+            "line": 3,
+            "kind": "control",
+            "text": "    voice \"audio/synthetic_control.ogg\""
+          },
+          {
+            "line": 4,
+            "kind": "control",
+            "text": "    nvl clear"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "bom_crlf",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/bom_crlf.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 116,
+        "sha256": "f7e95c0e71b6623664d77f39c729c06ffb8f6c357670c700dda9eb4ee2cc96c8",
+        "valid_utf8": true,
+        "utf8_bom": true,
+        "newline": "CRLF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "supported",
+        "language": "zh_Hans",
+        "records": [
+          {
+            "source": "Snow # lantern",
+            "target": "雪 # 灯笼",
+            "speaker": null,
+            "confirmed": false
+          }
+        ],
+        "slots": [
+          {
+            "record_index": 0,
+            "identity_basis": {
+              "kind": "dialogue",
+              "language": "zh_Hans",
+              "label": "snow_55"
+            },
+            "header_line": 2,
+            "source_anchor": {
+              "line": 3,
+              "prefix": "    # ",
+              "literal": "\"Snow # lantern\"",
+              "suffix": "",
+              "literal_byte_span": [
+                76,
+                92
+              ]
+            },
+            "target_anchor": {
+              "line": 4,
+              "prefix": "    ",
+              "literal": "\"雪 # 灯笼\"",
+              "suffix": "",
+              "literal_byte_span": [
+                98,
+                112
+              ]
+            }
+          }
+        ],
+        "diagnostics": [],
+        "preserved_lines": [
+          {
+            "line": 1,
+            "kind": "comment",
+            "text": "# Synthetic UTF-8 BOM and CRLF bytes."
+          },
+          {
+            "line": 2,
+            "kind": "header",
+            "text": "translate zh_Hans snow_55:"
+          },
+          {
+            "line": 5,
+            "kind": "blank",
+            "text": ""
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "no_final_newline",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/no_final_newline.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 60,
+        "sha256": "5199df85d885219ec62025864417fe2421d80c4577adfff663b30eb020c3cc41",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": false
+      },
+      "expectation": {
+        "classification": "supported",
+        "language": "zh_Hans",
+        "records": [
+          {
+            "source": "Finish",
+            "target": "完成",
+            "speaker": null,
+            "confirmed": false
+          }
+        ],
+        "slots": [
+          {
+            "record_index": 0,
+            "identity_basis": {
+              "kind": "strings",
+              "language": "zh_Hans",
+              "old_sha256": "a6c7a84baa6750fce33f7512acd6793e53def1d228b5f2efb8074b42648424fc"
+            },
+            "header_line": 1,
+            "source_anchor": {
+              "line": 2,
+              "prefix": "    old ",
+              "literal": "\"Finish\"",
+              "suffix": "",
+              "literal_byte_span": [
+                35,
+                43
+              ]
+            },
+            "target_anchor": {
+              "line": 3,
+              "prefix": "    new ",
+              "literal": "\"完成\"",
+              "suffix": "",
+              "literal_byte_span": [
+                52,
+                60
+              ]
+            }
+          }
+        ],
+        "diagnostics": [],
+        "preserved_lines": [
+          {
+            "line": 1,
+            "kind": "header",
+            "text": "translate zh_Hans strings:"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "unsupported_escape",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/unsupported_escape.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 67,
+        "sha256": "f7de4b340b440a7e4afa8dc900519322dbe92d7da24b78f51b948f7ca8bae0b2",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "invalid-escape",
+            "reason": "源文含未声明的反斜杠转义。",
+            "line": 2,
+            "byte_column": 7,
+            "byte_offset": 36,
+            "witness_hex": "22426164205c71206573636170652e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "physical_multiline",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/physical_multiline.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 73,
+        "sha256": "86188ccbbb55029b2c4c28350c7ec243e344be40a94d16c0971c57643b5cb482",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "字符串跨越物理行，超出单行字符串子集。",
+            "line": 3,
+            "byte_column": 5,
+            "byte_offset": 49,
+            "witness_hex": "224163726f73730a2020202074776f206c696e65732e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "triple_quotes",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/triple_quotes.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 66,
+        "sha256": "134e0aa85a3de09a501d891a419ecbae5b097e0ade4c9a8a1833cc18d3c33828",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "三引号字符串不受支持。",
+            "line": 3,
+            "byte_column": 5,
+            "byte_offset": 46,
+            "witness_hex": "22222254687265652071756f7465732e222222"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "pass_target",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/pass_target.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 62,
+        "sha256": "3a9a7a6ab6ad49627ed3aee346c612213f31045d2ef1c03eb86409d89dd84a2b",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "pass 不可替代空译文字符串。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 53,
+            "witness_hex": "2020202070617373"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "multiple_targets",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/multiple_targets.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 106,
+        "sha256": "ac04720bc485bf082e2760f155f55886ad770cb16e7506d09746d28d53d6efe9",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "ambiguous-slot",
+            "reason": "一个源文注释对应两个目标 say。",
+            "line": 4,
+            "byte_column": 1,
+            "byte_offset": 79,
+            "witness_hex": "20202020677569646520225365636f6e64207461726765742e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "multiple_sources",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/multiple_sources.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 109,
+        "sha256": "34c465eb99f22026e87bcf1b745586dcc47e2c3f6862eca3b9c73ffa1a72cf82",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "ambiguous-slot",
+            "reason": "两个源文 say 注释无法唯一关联一个目标。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 55,
+            "witness_hex": "202020202320677569646520225365636f6e6420736f757263652e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "missing_source",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/missing_source.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 69,
+        "sha256": "002aa893ff96622bf247afccd729ad3116acd9d164c575dbffdd9bcc1d2af6c2",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "ambiguous-slot",
+            "reason": "目标 say 缺少源文 say 注释。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 34,
+            "witness_hex": "202020206775696465202254617267657420776974686f757420736f757263652e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "missing_target",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/missing_target.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 71,
+        "sha256": "d38b1177712fbbe1d9efc5a640babf6b1a28af2be739a51a0159538f736f8424",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "ambiguous-slot",
+            "reason": "源文 say 注释缺少目标 say。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 34,
+            "witness_hex": "20202020232067756964652022536f7572636520776974686f7574207461726765742e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "orphan_new",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/orphan_new.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 54,
+        "sha256": "245861f7d03a8cd01e84529f4a09cbfe170bda556ee64577e3fc28ffa1cf3a10",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "ambiguous-slot",
+            "reason": "new 缺少对应 old。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 27,
+            "witness_hex": "202020206e65772022556e706169726564207461726765742e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "orphan_old",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/orphan_old.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 54,
+        "sha256": "088a94223def2be8b26c221370220e19571610ba7f1ab616406e720a64964188",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "ambiguous-slot",
+            "reason": "old 缺少对应 new。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 27,
+            "witness_hex": "202020206f6c642022556e70616972656420736f757263652e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "speaker_mismatch",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/speaker_mismatch.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 90,
+        "sha256": "0667b93b29648b319607e0e0b793501d7d4db13e262e09845114d3fb89467787",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "ambiguous-slot",
+            "reason": "源文与目标的原始角色标识符不同。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 60,
+            "witness_hex": "202020206b656570657220224368616e67656420737065616b65722e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "mixed_languages",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/mixed_languages.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 148,
+        "sha256": "30e465db350796e1c720a3c9b697865c8824ea77e4f7cef602cd16773e3788a1",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "mixed-language",
+            "reason": "单文档包含两个不同的目标语言 token。",
+            "line": 5,
+            "byte_column": 1,
+            "byte_offset": 76,
+            "witness_hex": "7472616e736c6174652066722073796e7468657469635f74776f3a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "duplicate_label",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/duplicate_label.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 153,
+        "sha256": "7f19e8a4de2d5ba2c54fecd68566d26eea384329cdda3ea8b481644c8dac04b5",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "duplicate-identity",
+            "reason": "同一语言出现重复 dialogue label，即使正文不同也冲突。",
+            "line": 5,
+            "byte_column": 1,
+            "byte_offset": 77,
+            "witness_hex": "7472616e736c617465207a685f48616e732072657065617465645f6c6162656c3a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "duplicate_old",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/duplicate_old.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 101,
+        "sha256": "be478a68a499717c01772fb693aba991223e252209c1e7f289534b9a406aacfc",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "duplicate-identity",
+            "reason": "同一 strings block 的 old key 重复。",
+            "line": 4,
+            "byte_column": 1,
+            "byte_offset": 64,
+            "witness_hex": "202020206f6c6420225265706561746564206b657922"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "duplicate_old_across_blocks",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/duplicate_old_across_blocks.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 129,
+        "sha256": "b8106cb32f49336d346ad2d0f29dfe831c0cf278bb372168ba2e61a41a29ab8d",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "duplicate-identity",
+            "reason": "多个 strings block 的解码 old key 重复，引号不同不构成新身份。",
+            "line": 6,
+            "byte_column": 1,
+            "byte_offset": 92,
+            "witness_hex": "202020206f6c6420275265706561746564206b657927"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "none_language_dialogue",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/none_language_dialogue.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 61,
+        "sha256": "aa6199a1800b76c4810277d829cfd4bb70a5b30533094f210da1ade9500c69b4",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "None 语言只允许 strings block。",
+            "line": 1,
+            "byte_column": 1,
+            "byte_offset": 0,
+            "witness_hex": "7472616e736c617465204e6f6e652073796e7468657469635f6e6f6e653a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "python_block",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/python_block.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 199,
+        "sha256": "97d2969cd9c7c8545be2e74c3ee90861b7de12ad7e0e06600a1a31d18ffa9e2a",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "合法段落后的 Python 块仍导致整个文档拒绝，不提交前缀记录。",
+            "line": 6,
+            "byte_column": 1,
+            "byte_offset": 159,
+            "witness_hex": "20202020707974686f6e3a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "style_block",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/style_block.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 53,
+        "sha256": "759fe6dd2954a1f033dc02c7ffab5332c6f5bccfe30e76112f1df4a3f5fe06cc",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "style 块不属于声明的 TL 翻译槽子集。",
+            "line": 1,
+            "byte_column": 1,
+            "byte_offset": 0,
+            "witness_hex": "7472616e736c617465207a685f48616e73207374796c652064656661756c743a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "conditional_block",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/conditional_block.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 82,
+        "sha256": "c265102046e9982501c4a3296298bb1e6ac44f78f3130043a2a85acaae5adafa",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "条件块不属于可确定对应关系的子集。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 31,
+            "witness_hex": "2020202069662073796e7468657469635f636f6e646974696f6e3a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "raw_game_statement",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/raw_game_statement.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 59,
+        "sha256": "cd773f355931bb49b3a027b58b44f9ab47347267311b3ace507f2a38941385a1",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "原始游戏语句不是 translate TL 输入。",
+            "line": 1,
+            "byte_column": 1,
+            "byte_offset": 0,
+            "witness_hex": "6c6162656c2073796e7468657469635f73746172743a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "speaker_expression",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/speaker_expression.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 102,
+        "sha256": "0f575481aa7edd402af141bb7b2bda0c389ba15d3074a9dc10f3e9bc4a2875ff",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "speaker 必须是单个标识符，不能是属性访问表达式。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 67,
+            "witness_hex": "20202020636173742e677569646520224120646f7474656420737065616b65722e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "say_arguments",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/say_arguments.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 96,
+        "sha256": "91d66f9ffc86bf1045d3fd17ac53c2340a6b4a00200905933ab79ee1f0100a96",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "say 调用参数超出受支持 grammar。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 51,
+            "witness_hex": "202020206775696465202243616c6c20617267756d656e74732e222028696e7465726163743d46616c736529"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "transition_expression",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/transition_expression.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 106,
+        "sha256": "f37fa6d9685d00efd48b9899da33f91209df676c1ede3550dec15532add18b86",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "transition 仅允许单个标识符，不能包含调用。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 52,
+            "witness_hex": "202020206775696465202245787072657373696f6e207472616e736974696f6e2e22207769746820446973736f6c766528302e3529"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "empty_source_dialogue",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/empty_source_dialogue.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 76,
+        "sha256": "19cfdb606dc86b26886800d20b714d854801d865396ce9756eb6628f07e9e076",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "invalid-source",
+            "reason": "解码后的 dialogue source 不能为空。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 32,
+            "witness_hex": "2020202023206775696465202222"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "empty_source_strings",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/empty_source_strings.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 65,
+        "sha256": "10f02e9ee769e0896f4871888a24d3e39118e2e191dc8516c6a3365d8bcc7c24",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "invalid-source",
+            "reason": "解码后的 old source 不能为空。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 27,
+            "witness_hex": "202020206f6c64202222"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "tab_indent",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/tab_indent.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 73,
+        "sha256": "0128b16db6c38cb7b619cd76baa28e289e0e4ae228c9426ba46560bd5b19ea2a",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "缩进子集仅接受空格，不接受 tab 缩进。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 52,
+            "witness_hex": "0967756964652022546162207461726765742e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "unbalanced_interpolation",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/unbalanced_interpolation.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 70,
+        "sha256": "3fac83890d73b91a3baa3a39ad4ca93acdd7ba60bc13ece39e20d33d167473ed",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "invalid-source",
+            "reason": "源文 interpolation 未闭合，无法建立保护 token。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 33,
+            "witness_hex": "2020202023202248656c6c6f205b76697369746f7222"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "unterminated_string",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/unterminated_string.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 84,
+        "sha256": "a597fcf86b4135e7df3bff0101cb7ce09a90d6712820b2aaef01d38552876985",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "目标字符串缺少结束引号。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 54,
+            "witness_hex": "2020202067756964652022556e66696e6973686564207461726765742e0a"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "temporary_attribute_without_value",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/temporary_attribute_without_value.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 92,
+        "sha256": "2a44babfd51886fe8a917ed6da8eb551b754eed2943ba81b8b1b672d5848d3d6",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "@ 后必须至少有一个临时属性。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 59,
+            "witness_hex": "202020206775696465204020224d697373696e67206174747269627574652e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "duplicate_temporary_separator",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/duplicate_temporary_separator.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 104,
+        "sha256": "9a511a73ca1552893a7fdcbf9ddd63bd4fd5175f2bb1db6896d5b4d0d5efe076",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "属性列表最多允许一个 @ 分隔符。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 61,
+            "witness_hex": "202020206775696465204020686170707920402063616c6d202254776f20736570617261746f72732e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "malformed_attribute",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/malformed_attribute.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 99,
+        "sha256": "dec3f0e544e7dcd797862c7b49a53e6029c2306c6b824c455bb435b3489452b1",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "负属性的减号后必须有属性标识符。",
+            "line": 3,
+            "byte_column": 1,
+            "byte_offset": 61,
+            "witness_hex": "202020206775696465202d20224d697373696e6720617474726962757465206e616d652e22"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "control_expression",
+      "payload": {
+        "kind": "file",
+        "path": "payloads/control_expression.rpy"
+      },
+      "byte_features": {
+        "size_bytes": 83,
+        "sha256": "c553bd71eb5f514182793a4d8f8d4517f80bd5b393eeb765c6254f7293a5461e",
+        "valid_utf8": true,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "unsupported-syntax",
+            "reason": "voice 控制行只支持单个字符串字面量，不求值表达式。",
+            "line": 2,
+            "byte_column": 1,
+            "byte_offset": 38,
+            "witness_hex": "20202020766f6963652073796e7468657469635f617564696f5f70617468"
+          }
+        ],
+        "preserved_lines": []
+      }
+    },
+    {
+      "case_id": "invalid_utf8",
+      "payload": {
+        "kind": "hex",
+        "path": "payloads/invalid_utf8.hex"
+      },
+      "byte_features": {
+        "size_bytes": 60,
+        "sha256": "24a59cd6db8f9411d40e55b0b081742b2d6ce51001673ffe70f6cee406041a38",
+        "valid_utf8": false,
+        "utf8_bom": false,
+        "newline": "LF",
+        "terminal_newline": true
+      },
+      "expectation": {
+        "classification": "rejected",
+        "language": null,
+        "records": [],
+        "slots": [],
+        "diagnostics": [
+          {
+            "category": "invalid-encoding",
+            "reason": "输入包含损坏的 UTF-8 字节。",
+            "line": 3,
+            "byte_column": 6,
+            "byte_offset": 57,
+            "witness_hex": "ff"
+          }
+        ],
+        "preserved_lines": []
+      }
+    }
+  ]
+}

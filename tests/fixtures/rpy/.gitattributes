@@ -1,0 +1,2 @@
+payloads/*.rpy -text
+payloads/bom_crlf.rpy whitespace=cr-at-eol,-blank-at-eof
