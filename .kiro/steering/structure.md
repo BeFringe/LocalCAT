@@ -103,10 +103,6 @@ Layer 1 resource / termbase / canonical TM storage
 ├── tools/build_windows_ordinary.py # 固定依赖与 owner 驱动的普通 PyInstaller 构建
 ├── requirements-frozen-build.txt # Windows 普通发行构建依赖
 ├── packaging/windows/           # Windows 入口/构建声明、版本资源与保留的 W3 材料
-├── tools/generate_multi_document_current_source_evidence.py # Multi-Document final-roots evidence owner
-├── multi_document_current_source_evidence.json # 19-root canonical current-source evidence
-├── tools/generate_collaborative_chunks_current_source_evidence.py # Chunk overlay evidence owner
-├── collaborative_chunks_current_source_evidence.json # 8-root Chunk current-source overlay
 ├── tools/run_posix_characterization.py # 迁移前 POSIX 业务 oracle runner；非 POSIX 主机只报告 STATIC_ONLY
 ├── tests/                       # unittest、Qt offscreen、QtTest、架构守卫
 ├── .kiro/specs/                 # 需求/设计/任务与验证事实

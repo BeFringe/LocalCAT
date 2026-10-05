@@ -64,6 +64,16 @@
   - _Depends: 5.3a, ADR-028, windows-platform-enablement 7.2, windows-platform-enablement 3.7_
 - [x] 5.5 对照 Requirements/Design 验收，无 silent scope cut 后提交 `feat(tmx): 建立上下文互操作导出`。
 
+## 架构验证维护
+
+- [x] 5.6 用直接架构与行为断言替代本 owner 的静态源码快照
+  - 读取实际 owner 源码检查禁止依赖，使用静态、别名和字面量动态导入反例；保留身份、序列化、权限和发布的既有业务测试。
+  - 删除本 owner 的机械快照、专用生成器及跨 JSON 摘要消费；历史执行报告保留原字节，按原 Git 范围解释引用。
+  - 与 Multi-Document、Chunk、ResourcePackage、TMX 的对应维护项组成一次集成，逐 owner 收束消费者；Parser 架构测试只同步已删除工具和源码枚举，不放宽 owner 规则。
+  - 退出条件：本 owner 直接测试、Parser 源码枚举及已删除工具分类检查通过，活动消费者不再要求旧快照；fixture、Gate 与运行时兼容性依据保持不变。
+  - _Requirements: 11.1、11.4–11.6_
+  - _Boundary: 本 Spec 测试/合同及其静态快照、生成器；跨 owner 仅处理这四项共同的快照消费依赖_
+
 ## 明确禁止
 
 - 用 current row/document/search 或显示顺序替代 exact project/chunk scope。

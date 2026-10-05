@@ -128,3 +128,4 @@ LocalCAT 已有拒绝 DTD/ENTITY、限额流式读取和语言对选择的 TMX L
 3. ResourcePackage TMX shall 完成 managed snapshot export→cold validate→publication→receipt 对账；source resource 与 prior destination 在失败路径保持不变，TMX package import 负向拒绝。
 4. Fault tests shall 覆盖 stale scope、detached/missing/foreign、unsupported metadata、locale、symlink/hardlink/special、parent replacement、stage/fsync/replace/readback/receipt/recovery。
 5. Architecture guards shall 证明 Parser/Resource/Workspace/Chunk/ResourcePackage/TMX/Qt 的 owner 依赖方向未倒置。
+6. 架构验收 shall 直接检查当前源码的 owner 依赖、权威与对应行为，不以源码 SHA、文件数量、调用次数或跨快照摘要链代替合同断言；注释、无关测试与合法实现重构不应要求重新签发历史验收。
