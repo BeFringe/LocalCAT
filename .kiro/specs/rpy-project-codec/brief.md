@@ -10,7 +10,7 @@ LocalCAT 已有中立 Parser/Codec、可配置 provider、稳定的 Project/Docu
 
 ## Desired Outcome
 
-用户可打开受支持的单个 Ren'Py TL，在现有编辑器中翻译、确认并保存为 ProjectPackage，重开后预览并导出 TL。多个 TL 文件沿用同一项目模型，以稳定相对路径、显式顺序和源更新调和管理。
+用户可打开受支持的单个 Ren'Py TL，在现有编辑器中翻译、确认并保存为 ProjectPackage，重开后预览并导出 TL。用户也可选择 TL 根目录，递归预览并勾选文件；嵌套章节沿用同一项目模型，以稳定相对路径、显式顺序和源更新调和管理。
 
 ## Approach
 
@@ -18,8 +18,8 @@ LocalCAT 已有中立 Parser/Codec、可配置 provider、稳定的 Project/Docu
 
 ## Scope
 
-- **In**：TL dialogue/string 子集、speaker、空译文、old/new、结构保真、可定位诊断、ProjectPackage 持久化、导出预览/验证、显式多文件 intake 与 reconciliation。
-- **Out**：任意游戏源码执行/AST、第三方宏、游戏资源打包、Excel 桥、自动目录扫描、网络同步、动态下载并执行第三方插件。
+- **In**：可在同文件混用的 TL dialogue 与 old/new strings、speaker 与属性分离、空译文、结构保真、可定位诊断、ProjectPackage 持久化、导出预览/验证、显式多文件 intake 与 reconciliation。
+- **Out**：任意游戏源码执行/AST、第三方宏、游戏资源打包、Excel 桥、未经用户选择的后台目录发现、网络同步、动态下载并执行第三方插件。
 
 ## Boundary Candidates
 
@@ -51,5 +51,5 @@ LocalCAT 已有中立 Parser/Codec、可配置 provider、稳定的 Project/Docu
 
 1. TL 子集、中立映射、局部身份与 source-round-trip 合同。
 2. 单 Document ProjectPackage 保存、重开、编辑与 TL 导出。
-3. 显式多文件选择、相对路径身份、顺序与源更新调和。
+3. 消费 Project 根目录预览后的显式选择、嵌套相对路径、顺序与源更新调和。
 4. Qt 用户旅程、故障保护与手工包消费验收。

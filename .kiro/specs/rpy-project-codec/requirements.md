@@ -7,7 +7,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 ## 边界说明
 
 - **范围内**：声明支持的 TL dialogue/string 子集、保真导出、单/多文档项目包、源变更调和及中立 UI。
-- **范围外**：任意游戏源码执行、自动扫描目录、游戏资源打包、网络同步、第三方插件下载、TM/术语内部存储与检索算法。
+- **范围外**：任意游戏源码执行、codec 自行扫描目录或后台自动收录文件、游戏资源打包、网络同步、第三方插件下载、TM/术语内部存储与检索算法。
 - **相邻期望**：Project 保有身份/保存/恢复权威；Parser 保有中立 codec 接缝；语言资源使用既有 TM JSONL 与术语 CSV ResourcePackage。
 
 ### Scope Lineage
@@ -34,7 +34,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 **目标：** 作为译者，我希望准确编辑每个翻译槽，并保留已有译文。
 
 #### 验收标准
-1. When 读取受支持的 dialogue block 或 old/new string pair, the LocalCAT shall 显示准确的源文、已有或空译文及可识别的 raw speaker，不把控制行当作翻译段落。
+1. When 读取受支持的 dialogue block 或 old/new string pair, the LocalCAT shall 显示准确的源文、已有或空译文及可识别的 raw speaker；同一文件可同时包含两种形式，say 的角色标识符作为 speaker，显示属性与 transition 不并入 speaker 或可翻译文本，控制行不成为翻译段落。
 2. When 源输入包含空译文、相同显示文本或文本内标签, the LocalCAT shall 保留各翻译槽及其顺序，不过滤空槽、不合并不同身份的段落。
 3. When 用户修改并保存 target 或 confirmed, the LocalCAT shall 在项目中保存精确编辑状态；首次导入的译文默认未确认，不依据非空文本自动确认。
 4. If 身份重复或无法唯一关联, the LocalCAT shall 阻止歧义导入/回填并指出冲突，不使用界面行号、basename 或修改时间猜测对应关系。
@@ -56,7 +56,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 #### 验收标准
 1. When 用户请求导出, the LocalCAT shall 先显示目标、修改段数、空译文与未确认译文数量，以及阻断诊断；默认导出全部当前 target，空译文不回退为源文，confirmed 不写入 TL。
 2. When 项目未修改任何翻译文本, the LocalCAT shall 导出与原 TL 完全相同的字节，包括 BOM、换行、缩进、注释和控制行。
-3. When target 有修改, the LocalCAT shall 仅改写相应译文字符串的内容，保留源文、speaker 及非翻译跨度，并正确处理引号、反斜杠、换行、interpolation 和 text tags。
+3. When target 有修改, the LocalCAT shall 仅改写相应译文字符串的内容，保留源文、speaker、say 属性、transition 及非翻译跨度，并正确处理引号、反斜杠、换行、interpolation 和 text tags。
 4. If 占位符/标签校验不通过、预览已过期、目标被替换或 codec 身份不匹配, the LocalCAT shall 拒绝发布并提供定位诊断，不产生部分成功文件。
 5. When 发布结果不能确定, the LocalCAT shall 显示不确定/需检查结果，不签发虚假成功或承诺已恢复旧文件；导出不会替代项目包保存。
 
@@ -65,10 +65,10 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 **目标：** 作为译者，我希望多个章节复用同一个项目模型，而不会发生文件名碰撞。
 
 #### 验收标准
-1. When 用户显式选择同一 portable root 下的多个受支持 TL, the LocalCAT shall 按选择顺序建立 Document，保留稳定相对路径，并区分不同目录下的同名文件；不得自动发现未选文件。
-2. When 用户切换章节、搜索、保存或重开, the LocalCAT shall 沿用既有复合段落身份、文档顺序、当前章节/全部章节范围与项目持久化行为。
+1. When 用户通过 Project 的 TL 根目录递归预览勾选文件，或使用既有显式文件选择入口, the LocalCAT shall 仅解析确认选择的受支持 TL，按 review 确认顺序建立 Document，保留相对于原选择根目录的路径，并区分嵌套目录下的同名文件；未勾选内容不得读取或纳入项目。
+2. When 用户切换章节、搜索、保存或重开, the LocalCAT shall 沿用既有复合段落身份、文档顺序、当前章节/全部章节范围与项目持久化行为；文件夹导航按相对目录分组且不改变阅读顺序或身份。
 3. When 用户明确重新绑定并调和源更新, the LocalCAT shall 报告 unchanged/source_changed/new/removed/ambiguous，保留 changed 段的已有 target 并撤销 confirmed，rename 只消费显式映射。
-4. When 用户批量导出多个 TL, the LocalCAT shall 先验证所有候选，再报告逐文件结果；失败或取消时明确已发布与未发布文件，不宣称跨文件原子性。
+4. When 用户批量导出多个 TL, the LocalCAT shall 在用户选择的导出根目录下按各 source_ref 保留嵌套路径，先验证全部候选及路径冲突，再报告逐文件结果；失败或取消时明确已发布与未发布文件，不宣称跨文件原子性。
 
 ### Requirement 6：编辑器与资源消费
 
