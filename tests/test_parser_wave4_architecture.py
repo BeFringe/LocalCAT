@@ -135,6 +135,32 @@ _FACADE_CALL_INVENTORY = {
 # migrated grammar primitive must be classified here or rejected by Wave 4.
 _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
     {
+        # Existing Windows delivery (ADR-028) and TM artifact owners use
+        # their own JSON evidence/configuration grammars, not project codecs.
+        "frozen_candidate",
+        "frozen_ordinary_entry",
+        "frozen_product_entry",
+        "frozen_worker_transport",
+        "tm_gate_inputs",
+        "tm_snapshot_recovery",
+        "tmx_bound_artifact_save",
+        "windows_source_guardian",
+        "windows_source_launcher",
+        "tools.build_windows_frozen_spike",
+        "tools.build_windows_ordinary",
+        "tools.check_windows_ordinary",
+        "tools.generate_windows_frozen_manifest",
+        "tools.probe_windows_frozen_custom_runw",
+        "tools.trace_windows_frozen_e9_faults",
+        "tools.trace_windows_frozen_entry",
+        "tools.trace_windows_frozen_source_execution",
+        "tools.validate_windows_tm_current_source_release",
+        "tools.windows_frozen_manifest",
+        "tools.windows_frozen_packaging",
+        "tools.windows_frozen_patch_series",
+        "tools.windows_frozen_producer_inputs",
+        "tools.windows_frozen_release",
+        "tools.windows_frozen_system_profile",
         "backend_scaling_gate",
         "backend_throughput_harness",
         "capability_host",
@@ -210,9 +236,11 @@ _EXPECTED_PARSER_GRAMMAR_MODULES = frozenset(
 )
 
 _EXPECTED_NONLITERAL_DYNAMIC_IMPORT_INVENTORY = {
-    # Capability Host owns two existing runtime-selected validation anchors;
-    # Parser production has no computed dynamic import target.
-    ("capability_host", "importlib.import_module"): 2,
+    # Host: fixed Gate C module, ordinary Gate D allowlist, source Gate D anchors.
+    # Ordinary frozen input locators are checked against candidate module facts.
+    # Parser production still has no computed dynamic import target.
+    ("capability_host", "importlib.import_module"): 3,
+    ("capability_frozen_inputs", "importlib.import_module"): 1,
 }
 
 _EXPECTED_DEFERRED_OWNERS = {
