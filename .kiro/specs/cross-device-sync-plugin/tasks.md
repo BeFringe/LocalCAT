@@ -21,12 +21,12 @@
 
 - [ ] 2. 实现连接和秘密生命周期
 - [ ] 2.1 保存设备连接配置及版本
-  - 校验 endpoint/bucket/prefix 或 DAV URL/username，配置变更撤销旧计划；普通配置不保存秘密。
+  - 校验 S3 endpoint/region/path或virtual/bucket/prefix，或任意合法 DAV base URL/username；预设只填可编辑值，配置变更撤销旧计划；普通配置不保存秘密。
   - 完成时，缺字段明确可见，换连接不能复用旧 base，禁用零网络。
   - _Requirements: 1.1, 1.2, 1.3, 1.4_
   - _Boundary: SyncState config_
 - [ ] 2.2 接入系统秘密后端和环境来源
-  - 仅使用 allowlisted 系统 backend，显式读取 R2_KEY/R2_SECRET；不启用默认 AWS 凭据链或 plaintext fallback。
+  - 仅使用 allowlisted 系统 backend，按字段读取显式环境变量引用，含可选 session token；R2_KEY/R2_SECRET 仅作为用户可选映射；不启用默认 AWS 凭据链或 plaintext fallback。
   - 完成时，backend 缺失/锁定、环境缺半项均有安全结果，秘密不进入配置、repr 或日志。
   - _Requirements: 2.3, 2.4_
   - _Boundary: SecretStore_
@@ -37,17 +37,17 @@
   - _Boundary: Sync Controller / Qt settings integration_
   - _Depends: 2.1, 2.2_
 
-- [ ] 3. 建立 R2 与条件 transport
-- [ ] 3.1 实现有界 R2 列举与读取
+- [ ] 3. 建立 S3-compatible 与条件 transport
+- [ ] 3.1 实现有界 S3-compatible 列举与读取
   - 只访问所选 bucket/prefix，完整分页，读取同一响应的 body/version；施加大小/超时限制。
   - 完成时，截断、漏页、认证失败不会被判定为空远端；连接测试不写对象。
   - _Requirements: 1.3, 4.4, 6.1, 6.2, 7.1_
-  - _Boundary: R2Provider_
+  - _Boundary: S3Provider_
 - [ ] 3.2 实现不可变对象与条件 head 提交
   - PUT 使用 absent/expected version，摘要验证后复用对象；head 最后提交，删除写 tombstone，保留旧 bytes。
-  - 完成时，两个相同旧版本更新只允许一方成功，无条件写不可达，旧 ETag 不能覆盖新内容。
+  - 实现共用的按连接 capability 门，读连通不代表写验证；完成时，相同旧版本竞争仅一方成功，配置/凭据改变撤销能力，无条件写不可达。
   - _Requirements: 5.2, 5.3, 5.4, 7.1_
-  - _Boundary: SyncTransport / R2 integration_
+  - _Boundary: SyncTransport / S3 integration_
 - [ ] 3.3 处理写后超时与安全重试
   - 用 operation ID/head 摘要复证未知结果，限制 SDK/service 重试层数；取消不再发起新提交。
   - 完成时，服务端已写但客户端超时能确认或报告冲突，不会重复无条件覆盖。
@@ -90,7 +90,7 @@
   - _Boundary: SyncService recovery / owner integration_
   - _Depends: 3.3, 5.1, 5.2, 5.3_
 
-- [ ] 6. 完成 R2 手动桌面闭环
+- [ ] 6. 完成 S3 手动桌面闭环并以 R2 验收
 - [ ] 6.1 接入计划、执行、取消与结果界面
   - 仅显示 Controller 安全 DTO，保留编辑保存；过期/关闭 session 不接受晚到提交。
   - 完成时，用户可读地完成选包、预览、冲突、导入确认与部分失败恢复，不暴露内部 authority。
@@ -107,26 +107,33 @@
   - _Requirements: 3.4, 5.3, 7.1, 7.4, 8.4_
   - _Boundary: R2 product acceptance_
 
-- [ ] 7. 接入 InfiniCLOUD WebDAV
+- [ ] 7. 接入通用 WebDAV 并以 InfiniCLOUD 验收
 - [ ] 7.1 实现受限 DAV 列举、读取与认证
-  - 使用 User ID/Apps Password 和账户 DAV URL；Depth 1、逐项 multistatus、限额 XML、同 origin 凭据与根范围校验。
+  - 使用用户配置的完整 DAV base URL 与 Basic over HTTPS，不强制路径或域名；Depth 1、逐项 multistatus、限额 XML、同 origin 凭据与根范围校验。
   - 完成时，实体/越界 href/部分错误/弱 ETag 不被默认为有效完整快照，连接测试保持只读。
   - _Requirements: 2.4, 4.4, 6.1, 6.2, 7.2_
   - _Boundary: WebDAVProvider_
 - [ ] 7.2 实现条件写和 capability 门
-  - 复用同一 transport，明确区分连通、只读与条件写已验证；端点或配置改变撤销能力。
+  - 复用 3.2 的 transport 与按连接 capability 门，适配 DAV 条件请求；端点/路径/凭据等配置改变撤销能力。
   - 完成时，弱/缺失 ETag 或条件被忽略时阻断覆盖/删除，不改为“先读再普通 PUT”。
   - _Requirements: 5.3, 7.2, 7.3_
   - _Boundary: WebDAVProvider capability_
-- [ ] 7.3 执行具名服务的隔离竞争与两设备旅程
+- [ ] 7.3 执行 InfiniCLOUD 隔离竞争与两设备旅程
   - 在批准测试范围验证创建/更新条件、失败不改内容、包导入/冲突/恢复；不自动重置 Apps Password。
   - 完成时，记录实际支持边界，未满足条件则保持只读并明确未通过写同步，不以模拟测试代替实测。
   - _Requirements: 7.2, 7.3, 7.4, 8.4_
   - _Boundary: InfiniCLOUD product acceptance_
+
+- [ ] 7.4 验证协议配置不依赖厂商预设
+  - 使用非厂商测试域名、不同 region、path/virtual、可选 session token、自定义环境变量与非 /dav/ 的嵌套路径运行同一适配器；验证 virtual 初始主机合法而未配置 redirect 被拒绝。
+  - 完成时，移除 preset 不改变协议行为；未验证连接仍只读，配置变化撤销能力/计划，不读取未配置秘密；不把 fake server 结果标记为真实服务通过。
+  - _Requirements: 1.1, 1.4, 2.3, 7.3, 7.5_
+  - _Boundary: S3/WebDAV config and capability validation_
+  - _Depends: 2.1, 2.2, 3.2, 7.2_
 
 - [ ] 8. 闭合实际治理影响与下游回归
   - 由治理 owner 同步已批准的 opt-in 网络边界、依赖/模块和 ownership，Project/Resource owner 验证端口及 receipt 生命周期未被绕过。
   - 完成时，实际 tree 与批准协议一致，R2 与 InfiniCLOUD 能力结果及 Qt/秘密/恢复回归可审阅；必要真实验收或 amendment 未闭合时不声明 Feature GO。
   - _Requirements: 1.2, 2.4, 3.3, 3.4, 6.4, 7.4, 8.4_
   - _Boundary: Governance / downstream integration closure_
-  - _Depends: 6.3, 7.3_
+  - _Depends: 6.3, 7.3, 7.4_

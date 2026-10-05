@@ -24,7 +24,7 @@
 
 - **Sources Consulted**：[Kiss Translator SyncSetting](https://github.com/fishjar/kiss-translator/blob/dev/src/views/Options/SyncSetting.js)、[botocore 教程](https://docs.aws.amazon.com/botocore/latest/tutorial/)、[Cloudflare Python 示例](https://developers.cloudflare.com/r2/examples/aws/boto3/)、[keyring 文档](https://keyring.readthedocs.io/en/latest/)、[defusedxml](https://github.com/tiran/defusedxml)。
 - **Findings**：Kiss 的 secret 输入默认 password，眼睛按钮切换 text；用户名不是密码字段。botocore 可直接使用低层 S3 client，无需引入 boto3 资源层；keyring 有系统秘密后端，也允许第三方 backend，需限制选择。
-- **Implications**：Qt 使用等价密码掩码/显隐按钮；不引入加密字段。采用可选 botocore/keyring/defusedxml，固定发行依赖并验证条件参数。明确环境来源 `R2_KEY`/`R2_SECRET`，不用默认 AWS 凭据链；本轮研究未读取值。
+- **Implications**：Qt 使用等价密码掩码/显隐按钮；不引入加密字段。采用可选 botocore/keyring/defusedxml，固定发行依赖并验证条件参数。按字段配置环境变量引用，`R2_KEY`/`R2_SECRET` 仅为用户现有映射示例，不是通用 provider 必需名；不用默认 AWS 凭据链，不读取未配置值。
 
 以上资料在 2026-10-05 查询；动态 upstream 页面用于说明接口依据，具体发行依赖由实现任务锁定，不能据此宣称真实账号验收通过。
 
@@ -47,9 +47,9 @@ Project 与 Resource 保持独立 artifact/receipt，Sync 仅统一流传输和�
 
 删除是条件提交 tombstone，旧 package bytes 保留；首版不做远端 GC，也不直接删除活跃本地资源。按用户选择，不提供内容加密；HTTPS 和系统秘密存储仍保留。星号显示不替代秘密保护。
 
-### Decision：先 R2，后具名 WebDAV
+### Decision：协议适配与验收厂商分离
 
-R2 低层条件 PUT 为首个可验证实现；InfiniCLOUD 的 capability 为实际连接事实，未知时只读。只读连通性不能证明写安全。公共文档与 fake server 都不代替真实隔离前缀验收。
+实现 S3-compatible 与 WebDAV 两个适配器，以 R2 和 InfiniCLOUD 分别作为首批验收实例。region=auto、Apps Password 帮助等仅属可编辑预设，不固化域名、DAV 路径或凭据变量名。能力为每条配置连接的验证事实，未知时只读；只读连通性不能证明写安全。非厂商地址的配置测试防止硬编码，公共文档与 fake server 均不代替真实隔离前缀验收。
 
 ## Risks & Mitigations
 

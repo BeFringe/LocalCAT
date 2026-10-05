@@ -10,7 +10,7 @@ LocalCAT 已有独立的 ProjectPackage 与 JSONL/CSV ResourcePackage 导出、�
 
 ## Desired Outcome
 
-用户配置自己的远端，手动预览并执行上传、下载和删除。冲突保留双方，失败可恢复，本地项目不依赖网络可用性。先完成 R2，再验收 InfiniCLOUD WebDAV；不引入官方云账号。
+用户配置自己的远端，手动预览并执行上传、下载和删除。冲突保留双方，失败可恢复，本地项目不依赖网络可用性。先实现 S3-compatible，再实现 WebDAV；首批实际验收分别使用 R2 和 InfiniCLOUD；不引入官方云账号。
 
 ## Approach
 
@@ -18,7 +18,7 @@ LocalCAT 已有独立的 ProjectPackage 与 JSONL/CSV ResourcePackage 导出、�
 
 ## Scope
 
-- **In**：R2、InfiniCLOUD WebDAV、用户远程前缀、手动 push/pull/two-way、只读计划、冲突副本、删除保护、逐项恢复、连接设置、凭据遮蔽与显式显示。
+- **In**：可配置 S3-compatible 与 WebDAV、用户远程前缀、手动 push/pull/two-way、只读计划、冲突副本、删除保护、逐项恢复、连接设置、凭据遮蔽与显式显示。
 - **Out**：内容端到端加密、定时/后台同步、实时协作、云端 TM、语义自动合并、动态安装第三方代码、chunk 权限同步。
 
 ## Boundary Candidates
@@ -45,11 +45,11 @@ LocalCAT 已有独立的 ProjectPackage 与 JSONL/CSV ResourcePackage 导出、�
 
 ## Constraints
 
-先验证手工包，再接网络。凭据不进入项目、日志或 Git；实际 endpoint、bucket、用户名和秘密均由用户本机配置。条件更新能力不足时明确禁用危险操作，不冒称兼容。删除和覆盖必须经计划确认，远端超时不等于操作未发生。
+先验证手工包，再接网络。凭据不进入项目、日志或 Git；实际 endpoint、region、寻址方式、bucket、DAV URL、用户名和秘密均由用户本机配置。厂商仅提供可选预设及验收实例，不决定协议类型或写入资格。条件更新能力不足时明确禁用危险操作，不冒称兼容。删除和覆盖必须经计划确认，远端超时不等于操作未发生。
 
 ## Promotion Clusters
 
 1. 本地 artifact 接缝、设备配置/秘密存储与禁用生命周期。
-2. R2 provider、远端版本协议与计划/冲突。
+2. S3 provider、远端版本协议与计划/冲突，以 R2 首批验收。
 3. owner apply、失败恢复与 Qt 手动工作流。
-4. InfiniCLOUD WebDAV 能力验证与两设备闭环。
+4. WebDAV provider、按连接能力验证与两设备闭环，以 InfiniCLOUD 首批验收。
