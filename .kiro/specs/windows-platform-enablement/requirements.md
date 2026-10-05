@@ -15,13 +15,12 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 - **相邻期望**：Feature 5 与 `feature5-ui-integration` 继续拥有 TM/UI 冻结契约；Parser、项目包、资源、TM snapshot/attestation/recovery 与协作分工规格继续拥有各自业务不变量和 consumer 接入实现；本 Spec 只拥有共享跨平台文件系统/锁合同、Windows backend、amendment dispatch/merge ledger、Windows packaging 和最终集成证据。
 
 ### Scope Lineage
-- **Owning spec**：`windows-platform-enablement`；Governance owner 已批准其只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence，并同步到 `.kiro/steering/spec-ownership.md`/`roadmap.md`。
+- **Owning spec**：`windows-platform-enablement`；本规格只拥有共享平台合同/backends、bootstrap/build、amendment merge ledger 与 Windows release evidence，并同步到 `.kiro/steering/spec-ownership.md`/`roadmap.md`。
 - **被修订的既有范围说明**：`parser-subsystem-extraction/design.md` 中尚未落地的 Windows native rooted-handle 规划；`ui-mvp@b925b80` 仅在 POSIX 文件语义下可组合的现状。
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
-- **历史审批状态**：ADR-020～026、owning scope、原 WA-01～08 R/D/T amendment acknowledgement 及当时平台 Requirements/Design/Tasks 已批准；ADR-024/025 的后续取代关系由 Task 0.6 同步，ADR-026 对 Parser 发布状态的收窄由 Task 0.7 同步。它们不批准本轮普通 frozen 修订，也不代替实现或发布证据。
-- **交付路线**：source 已完成用户管理 CPython 3.14 x64、venv、`requirements-ui.txt`、source 与轻量入口的产品验收；它不铸造 frozen authority。frozen 后置独立验收；2026-09-20 项目 owner 批准按 ADR-028 收窄其证明范围，取代原 W3 强证明作为唯一发行前置的安排。
-- **导出输出收尾修订**：ADR-027 已获批准，仅修订 Windows ResourcePackage/TMX 正常完成后留下内部协调锁文件的行为；相邻 `language-resource-portability` 6.7–6.8 与 `tmx-context-interchange` 8.8–8.9 分别承载导出结果。既有 Requirement 3 的并发互斥继续成立，其他持久锁、直接 CSV/JSONL 导出与 POSIX 行为不在本修订范围。
-- **普通 frozen 修订范围**：Requirement 10–12 与相邻 owner 的修订登记见 [cross-spec-amendments.md](cross-spec-amendments.md)，审批状态由各 owning `spec.json` 记录；原验收事实保持原范围。
+- **交付路线**：source 已完成用户管理 CPython 3.14 x64、venv、`requirements-ui.txt`、source 与轻量入口的产品验收；它不铸造 frozen authority。frozen 按 ADR-028 的普通发行边界独立验收，W3 强证明不作为唯一发行前置。
+- **导出输出收尾修订**：ADR-027 仅修订 Windows ResourcePackage/TMX 正常完成后留下内部协调锁文件的行为；相邻 `language-resource-portability` 6.7–6.8 与 `tmx-context-interchange` 8.8–8.9 分别承载导出结果。既有 Requirement 3 的并发互斥继续成立，其他持久锁、直接 CSV/JSONL 导出与 POSIX 行为不在本修订范围。
+- **普通 frozen 修订范围**：Requirement 10–12 与相邻 owner 的修订登记见 [cross-spec-amendments.md](cross-spec-amendments.md)；原验收事实保持原范围。
 
 ## 需求
 
@@ -45,6 +44,9 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 4. While rooted 操作进行中, the rooted authority shall 不依赖当前工作目录、字符串前缀或仅一次 canonical-path 检查作为 containment 证明。
 5. When 目标不存在且调用方获准创建文件, the rooted authority shall 证明目标父目录仍是获授权对象，并确保创建/发布不能跟随后来插入的重定向。
 6. The Parser read/write 公共入口 shall 在 Windows 能力可用时保留现有业务响应，并在能力不可证明时继续返回 `PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE` 或经治理批准的更具体稳定子码。
+7. When 消费者观察目录或下钻, the 平台 shall 提供 retained-root、no-follow 的有界只读 metadata 观察，拒绝 ancestor drift/reparse，取消与超限明确失败，不读取正文或写源目录。
+8. When 消费者准备导出目标, the 平台 shall 在根下只读准备 descendant target，并仅在用户确认后逐组件物化缺失目录、复证祖先与 absent 条件；竞争创建返回 stale，仅同批创建并复证的祖先可复用，失败如实报告已创建目录。
+
 
 ### Requirement 3：Windows 跨进程互斥与 reservation
 **目标：** 作为同时运行多个 LocalCAT 进程的用户，我希望同一资源的锁与 reservation 在 Windows 上真正跨进程互斥，以便不会产生双重 authority、交错写入或并发迁移。
@@ -78,6 +80,8 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 2. If 任一业务模块仍直接依赖 Windows 不可用的 `fcntl`、`flock`、`dir_fd`、`O_DIRECTORY`、`O_NOFOLLOW` 或 POSIX 目录 fsync, the Windows 发布门 shall 失败。
 3. While 平台实现不同, the 上层业务模块 shall 保持其既有 authority、atomicity、recovery、错误映射和 fail-closed 不变量。
 4. The 共享平台边界 shall 为 Windows 与 POSIX 后端运行同一组合同测试，并允许平台专属反例补充验证。
+5. The POSIX/Windows adapters shall 为目录观察和物化提供相同中立语义，不借用 retirement authority；递归选择与格式导出策略由各 Application owner 拥有。
+
 
 ### Requirement 6：Windows Qt 启动与基础运行时
 **目标：** 作为 Windows 用户，我希望从干净环境启动 LocalCAT Qt 主程序，以便能够进入与 macOS/Linux 等价的 UI 工作流。
@@ -89,6 +93,8 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 4. If Qt 平台插件或必要运行时资源缺失, the 应用 shall 给出可诊断失败，而不是无提示终止。
 5. When Windows avatar 功能使用有效的 speaker avatar catalog, the Qt UI shall 能索引并解码匹配头像；If 没有匹配头像, the UI shall 保持“— / 无内置头像”fallback。
 6. When source compatibility 已闭合且用户安装 CPython 3.14 x64、创建专用 venv并按`requirements-ui.txt`安装依赖, the LocalCAT shall 可由轻量 Windows GUI入口使用受验证的绝对`pythonw.exe`与source bootstrap启动；该入口shall不复制或伪装bundled Python，不宣称 packaged/frozen release，并在环境或source失效时返回可诊断失败。
+7. When 组合可选同步能力, the runtime shall 仅使用明确允许的系统秘密 backend、会话或显式环境引用；无 plaintext fallback 或默认 AWS 凭据链，禁用同步不初始化网络或请求秘密。
+
 
 ### Requirement 7：项目保存、重开与并发安全
 **目标：** 作为译者，我希望在 Windows 保存并重开项目，以便译文、元数据和项目 authority 能跨进程重启可靠保留。
@@ -140,6 +146,8 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 3. When 从非仓库当前目录启动 EXE 或传入项目参数, the 应用 shall 保持正常首页/打开项目行为，从发行目录取得只读资源，从用户目录取得可写配置与托管数据，且默认资源仅在缺失时播种、不覆盖既有用户数据。
 4. The Windows 发行物 shall 使用受版本控制的构建配方、`.ico`、产品名称和版本元数据，并 shall 在运行时不消费构建机 checkout、外部 venv、CWD 或未声明的开发依赖。
 5. If 必需资源、插件或声明输入缺失/损坏, the 对应入口 shall 给出可诊断失败且发行验收 shall 列出缺失项；未声明可选头像或无匹配时 shall 保留既有无头像 fallback。
+6. When 发行目录或同步能力, the build shall 将新增模块及可选固定依赖纳入显式闭包，缺失可选同步依赖只禁用同步，保持原 Gate/Core 边界。
+
 
 ### Requirement 12：端到端发布矩阵与可复现证据
 **目标：** 作为发布审批者，我希望在干净 Windows 环境取得完整、可复现的通过证据，以便最终 EXE 的平台等价性可审计而非凭推断接受。

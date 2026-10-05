@@ -16,7 +16,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Requirements: 1.2, 2.1, 2.3, 3.4, 4.1, 4.2, 8.5, 8.6, 10.1, 10.6, 12.3_
   - _Boundary: Governance ADR Ownership_
 
-- [x] 0.2 由 Governance owner批准 Windows owning scope 与 Steering 同步
+- [x] 0.2 由 Governance owner 批准 Windows owning scope 与 Steering 同步
   - 在治理分支把 `windows-platform-enablement` 记录到 `spec-ownership.md`/`roadmap.md`，固定本 Spec 只拥有共享合同/backends/bootstrap/build/release ledger，相邻 Spec 拥有 consumer business invariants
   - 确定 `tmx-context-interchange` 是唯一 owning Spec，并确认 Qt avatar 只作为 Windows 功能回归，不改变现有资源或打包边界
   - 完成时，scope ownership、Steering、Design 与 amendment ledger 无冲突，不产生重复 Steering 提交
@@ -26,16 +26,16 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 
 - [x] 0.3a 派发 startup/source amendments
   - 按 `cross-spec-amendments.md` 向 WA-01 Parser、WA-02 Chunk、WA-07 CapabilityHost owners 派发精确 R/D/T delta；追加既有 task 的 `a` 后缀，不重排原任务。WA-07在本组只提前冻结接口，并与0.3c复用同一request revision、acknowledgement和ledger row，不制造第二次派发
-  - 每个 owner 记录 approval/commit，覆盖 rooted source/writer、无顶层 `fcntl`、bootstrap-before-import、stable body-safe errors
-  - 完成时，三项 dispatch 均有 owning Spec acknowledgement与可追踪commit；缺一项不得进入任务 4
+  - 每个 owner 在对应 R/D/T 中定义 rooted source/writer、无顶层 `fcntl`、bootstrap-before-import、stable body-safe errors；审批状态与范围记录于各自 `spec.json`
+  - 完成时，三项 dispatch 均须取得 owning Spec 确认并形成可追踪提交，合同及实现依赖明确；缺一项不得进入任务 4
   - _Requirements: 1.1, 1.2, 2.1, 2.6, 5.1, 5.2, 10.6_
   - _Boundary: Cross-Spec Dispatch Group A_
   - _Depends: 0.1, 0.2_
 
 - [x] 0.3b 派发 persistence/recovery amendments
-  - WA-03 Project、WA-04 Resource、WA-05 TMX 的原dispatch已获acknowledgement；WA-06当时因ADR-023把private profile从V1接管为V2，以`R2` superseding request重新派发并获acknowledgement，后由Task 0.6的`R3`完整取代；不得静默改写已批准历史
-  - 当前活动交付按Task 0.6采用publish mode、owner lease、`WindowsDocumentedPublishV1`、owner-specific receipt + nested W2 proof和FileId reuse反例，并明确每项 R/D/T suffix、integration dependency、zero-mutation/recovery evidence；已被ADR-025取代的registry/硬断电条款不得驱动实现，WA-05保持任务0.2批准的唯一owner
-  - 完成时，WA-03/04/05与当时WA-06 revision均有owning Spec acknowledgement；后续superseding request由Task 0.6和ledger记录，缺一项不得进入任务5/6
+  - WA-03 Project、WA-04 Resource、WA-05 TMX 保持各自持久化合同；WA-06 的 private profile 与发布语义按 ADR-024/025 的取代关系解释。
+  - 当前活动交付按Task 0.6采用publish mode、owner lease、`WindowsDocumentedPublishV1`、owner-specific receipt + nested W2 proof和FileId reuse反例，并明确每项 R/D/T suffix、integration dependency、zero-mutation/recovery evidence；已被ADR-025取代的registry/硬断电条款不得驱动实现，WA-05保持任务 0.2 定义的唯一 owner
+  - 完成时，WA-03/04/05/06 的合同差异、owner 和依赖明确并须取得 owning Spec 确认；缺一项不得进入任务 5/6，后续任务只消费现行合同。
   - _Requirements: 3.1, 4.1, 4.3, 5.1, 7.1, 8.1, 8.4, 9.1_
   - _Boundary: Cross-Spec Dispatch Group B_
   - _Depends: 0.1, 0.2, 0.4a_
@@ -43,15 +43,15 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 - [x] 0.3c 派发 UI/frozen journey amendments与 revalidation-only manifest
   - 完成0.3a同一WA-07 Feature5/UI request并派发 WA-08 Qt increment；将 WR-01 TM store、WR-02 termbase、WR-03 old Qt 标为 revalidation-only/no-amendment，不制造重复dispatch或空洞任务
   - 固定 qwindows/visible window、avatar catalog解码与无匹配头像fallback、clean-user/non-repository CWD 与 source-proof failure diagnostics
-  - 完成时，UI/frozen dispatch 与 revalidation理由均获 owning Spec确认；缺少 WA-07/08 批准实现与证据不得进入最终 EXE gate
+  - 完成时，UI/frozen dispatch 与 revalidation理由均获 owning Spec确认；缺少 WA-07/08 的 owner 批准、实现或证据不得进入最终 EXE gate
   - _Requirements: 6.2, 6.4, 6.5, 10.1, 10.5, 11.2, 11.3, 12.1_
   - _Boundary: Cross-Spec Dispatch Group C_
   - _Depends: 0.1, 0.2_
 
 - [x] 0.4 冻结 amendment integration ledger 与实现依赖图
-  - ledger schema、WA-01～08唯一current dispatch request revisions与owning Spec acknowledgement已批准；Task 0.6后WA-03 `R2`与WA-06 `R3`是各自唯一current request，WA-03 `R1`及WA-06 `R1`/`R2`只作`SUPERSEDED`历史且不得驱动实现或evidence。本任务不预填尚未发生的 amendment commit、artifact 或终态 disposition
+  - 明确 WA-01～08 的 owning 合同、实现依赖及现行取代关系；旧请求不驱动后续实现，也不代表新候选验收。
   - 验证集成顺序为 platform → Parser/Chunk → Project/Resource/TMX → TM Core → Feature5/UI → Qt journey；commit可直接位于Windows线或从其他工作树形成，拓扑不构成authority
-  - 完成时，ledger schema/dispatch identity获批且每个实现 cluster都有fail-closed dependency gate；实际 commit/evidence/disposition由任务4.1/5.1/6.1/6.5/7.5逐行追加，禁止用`SKIPPED`放行required row
+  - 完成时，ledger schema/dispatch identity 须获批准且每个实现 cluster都有fail-closed dependency gate；实际 commit/evidence/disposition由任务4.1/5.1/6.1/6.5/7.5逐行追加，禁止用`SKIPPED`放行required row
   - _Requirements: 5.1, 5.3, 12.3, 12.4, 12.5_
   - _Boundary: Amendment Integration Ledger_
   - _Depends: 0.3a, 0.3b, 0.3c_
@@ -59,7 +59,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 - [x] 0.4a 由Governance owner审阅并采纳ADR-023 pre-authority proof-order补充决策
   - 审阅Task 0.5发现的四个跨既有ADR执行缺口：`ERROR_FILE_EXISTS`后的LOCK-first初始化分流、W1/W2 exact medium mandatory-integrity表示、W1 durability registry到W3 bundle authority、pre-authority dynamic native roots的manifest/pre-load proof
   - ADR-023必须区分补充与取代：LOCK-first、`PendingPublication`、durability registry和dynamic native closure只细化既有owner/authority；仅V1 DACL-only security profile由V2窄范围取代。已采纳ADR可更新状态、同步结果和不改变语义的勘误，但不得把后来发现的长期约束静默写成初始决策；不新增evidence审批门
-  - 完成时，ADR状态/README/补充与精确profile取代关系与本Spec Governance Impact一致；当前已获人工批准
+  - 完成时，ADR状态/README/补充与精确profile取代关系与本Spec Governance Impact一致
   - _Requirements: 3.6, 4.2, 8.6, 10.6, 11.2_
   - _Boundary: Supplemental Windows Pre-Authority ADR_
   - _Depends: 0.1, 0.2_
@@ -137,9 +137,9 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 1.4_
 
 - [x] 1.6 在W1 rooted contract冻结后完成custom entry最小W3 spike
-  - 按已批准的 `w3-e9-path-amendment.md` 接入早期路径隔离、interpreter source 与唯一兼容 ABI 增量；初始化后复证不得追认先前路径访问
+  - 按 `w3-e9-path-amendment.md` 接入早期路径隔离、interpreter source 与唯一兼容 ABI 增量；初始化后复证不得追认先前路径访问
   - 依 `w3-custom-entry-plan.md` §5.2 验证应用 dispatcher、系统 API 入口及其搜索策略，覆盖首次加载前的应用 DLL 重定向反例
-  - 仅构建已批准完整Boot TCB、一个source-only critical module和一个fixture；在首次Python DLL/非KnownDLL load前闭合搜索、递归native closure与retained-handle proof，load后复核actual module identity并完成不可伪造handoff
+  - 仅构建完整 Boot TCB、一个source-only critical module和一个fixture；在首次Python DLL/非KnownDLL load前闭合搜索、递归native closure与retained-handle proof，load后复核actual module identity并完成不可伪造handoff
   - `TrustedSourceLoader`只从retained verified handle读取manifest匹配的exact bytes并直接编译执行，attestation/digest与metadata一致且无`.pyc`/`__pycache__`/PYZ duplicate；覆盖未声明dynamic load、顶层/传递DLL注入、非仓库CWD、reparse/swap/manifest/source tamper
   - 生成applied patch/source digest、resulting PE、realized Python C API绑定表、实际native dependency inventory与PE/system allowlist并写入candidate-input digest绑定的realized-build lock；任一结果偏离1.5合同即回到W3
   - 完成时全部mandatory断言PASS并保存content-addressed toolchain/dist inventory；任一失败继续保持W3、frozen WA与Task 7 NO-GO，不影响source milestone
