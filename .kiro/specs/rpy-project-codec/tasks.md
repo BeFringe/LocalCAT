@@ -13,7 +13,7 @@
   - 完成时，伪 codec 可验证调用顺序，foreign/stale token 在目标打开前失败，既有 canonical codec 契约不变。
   - _Requirements: 1.3, 4.4, 7.2_
   - _Boundary: Parser owner amendment_
-- [ ] 1.3 实现 Parser owner 的 prepared 发布能力
+- [x] 1.3 实现 Parser owner 的 prepared 发布能力
   - 绑定准备结果与 issuing surface/source/output 摘要、目标条件及消费状态，调用平台原子发布并返回明确结果；不经过 canonical serializer 重编码。
   - 完成时，伪造/复用/过期准备结果不能写入，现有父目录下可发布受限 round-trip bytes，故障返回 failed/uncertain 而非成功，不新增 journal/LKG。
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
@@ -154,3 +154,4 @@
 ## Implementation Notes
 
 - round-trip prepare 的 `format_state_fingerprint` 为 opaque payload 的 SHA-256；codec 仍须从 source 重建并核对私有映射。`RoundTripLimits` 分别约束 private/output，独立于输入限额；Application 必须保持 issuing `OpenedParserInput` 存活直到 prepared 结果消费或丢弃，关闭源后准备结果不可发布。
+- prepared 结果须先只读绑定目标条件，一次消费后失败或不确定也不可复用。Windows 已有目标的 SOURCE 句柄须在锁内复证后、命名前释放，root/parent/lease 保留至 terminal；后续目录集成不得将协作协议锁误当作对非协作进程的 CAS。

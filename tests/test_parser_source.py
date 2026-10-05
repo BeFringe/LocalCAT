@@ -916,6 +916,62 @@ class GuardedSessionTests(_FixtureMixin, unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "rooted dirfd contract is POSIX-specific")
 class AtomicWriterTests(_FixtureMixin, unittest.TestCase):
+    def test_canonical_parent_close_failure_after_publish_returns_stable_uncertain_error(self):
+        from parser_source import ParserSourceError
+        from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+        import platform_fs_posix as posix
+
+        original_close = posix._PosixBoundDirectory._close_authority
+
+        def close_then_raise(parent):
+            original_close(parent)
+            raise PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+            )
+
+        receipts = []
+        with mock.patch.object(posix._PosixBoundDirectory, "_close_authority", close_then_raise):
+            with self.assertRaises(ParserSourceError) as caught:
+                receipts.append(atomic_test_write_bytes(
+                    self.target_reference(), b"new-target", backend=posix.PosixPlatformAdapter(),
+                ))
+        self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED")
+        self.assertEqual(self.target.read_bytes(), b"new-target")
+        self.assertEqual(receipts, [])
+        self.assertEqual(tuple((self.root / "output").glob(".parser-*.tmp")), ())
+
+    def test_canonical_parent_close_error_cannot_replace_existing_failure_or_uncertainty(self):
+        from parser_source import ParserSourceError
+        from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
+        import platform_fs_posix as posix
+
+        original_close = posix._PosixBoundDirectory._close_authority
+
+        def close_then_raise(parent):
+            original_close(parent)
+            raise PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+            )
+
+        cases = (
+            (posix._PosixCandidateFile, "_write_chunks", "PARSER.SOURCE.WRITE_FAILED", b"old-target"),
+            (posix._PosixBoundRegularFile, "read_all", "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED", b"new-target"),
+        )
+        for owner, seam, code, expected in cases:
+            with self.subTest(seam=seam):
+                self.target.write_bytes(b"old-target")
+                receipts = []
+                with mock.patch.object(posix._PosixBoundDirectory, "_close_authority", close_then_raise), \
+                     mock.patch.object(owner, seam, side_effect=OSError("primary writer failure")):
+                    with self.assertRaises(ParserSourceError) as caught:
+                        receipts.append(atomic_test_write_bytes(
+                            self.target_reference(), b"new-target", backend=posix.PosixPlatformAdapter(),
+                        ))
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(self.target.read_bytes(), expected)
+                self.assertEqual(receipts, [])
+                self.assertEqual(tuple((self.root / "output").glob(".parser-*.tmp")), ())
+
     def test_atomic_write_returns_digest_bound_receipt(self) -> None:
         from parser_source import atomic_write_bytes
 
@@ -1463,6 +1519,89 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED")
         readback.assert_called_once()
         self.assertEqual(self.target.read_bytes(), b"new-target")
+
+
+class PreparedWriterStrictSharingTests(unittest.TestCase):
+    def test_final_existing_source_handle_closes_under_lock_before_naming(self):
+        from parser_source import BoundWriteTarget, atomic_write_bound_bytes
+        from platform_fs_contracts import EntrySnapshot, FileObjectIdentity, PublishFacts, PublishMode
+        from tests.test_platform_fs_contracts import _Candidate, _Directory, _Lease, _Pending, _Regular
+
+        events = []
+        testcase = self
+        payload = b"exact prepared bytes\r\n"
+
+        class File(_Regular):
+            def __init__(self, content, identity_byte):
+                super().__init__(content)
+                self.identity_byte = identity_byte
+
+            def _identity(self):
+                return FileObjectIdentity("windows", b"volume", self.identity_byte * 16, "regular", 1)
+
+            def _snapshot(self):
+                events.append("source-proof" if self.identity_byte == b"o" else "destination-proof")
+                return EntrySnapshot(self._identity(), len(self.payload), b"token", True)
+
+            def _close_authority(self):
+                events.append("source-close" if self.identity_byte == b"o" else "destination-close")
+
+        source = File(b"old", b"o")
+        expected = source.snapshot()
+        lease = _Lease()
+
+        class Pending(_Pending):
+            def _terminal_reproof(self, retained, preliminary):
+                testcase.assertFalse(lease.closed)
+                testcase.assertFalse(parent.closed)
+                testcase.assertFalse(retained.closed)
+                events.append("terminal")
+                return preliminary
+
+        class Parent(_Directory):
+            def _inspect_entry(self, name):
+                testcase.assertEqual(name, "output")
+                return expected
+
+            def _rename_candidate(self, candidate, destination, *, mode, lease):
+                # Emulate Windows SOURCE sharing: a live source denies DELETE.
+                testcase.assertTrue(source.closed, "strict sharing prevents replacement")
+                testcase.assertFalse(lease.closed)
+                testcase.assertFalse(self.closed)
+                testcase.assertEqual(mode, PublishMode.REPLACE_UNDER_LOCK)
+                testcase.assertTrue(candidate.flushed)
+                events.append("rename")
+                self.content = candidate.payload
+                return PublishFacts(mode, File(self.content, b"n").identity(), hashlib.sha256(self.content).digest(), len(self.content), True)
+
+            def _open_published_destination(self, destination, preliminary_facts):
+                events.append("reopen")
+                return File(self.content, b"n")
+
+            def _create_pending_publication(self, facts, destination):
+                return Pending(facts.mode, preliminary_facts=facts, destination=destination)
+
+        class Backend:
+            def acquire(self, parent, name, payload, policy):
+                testcase.assertFalse(source.closed)
+                events.append("lock")
+                return lease
+
+        parent = Parent()
+        bound = BoundWriteTarget(Backend(), parent, "output", expected, source)
+        try:
+            receipt = atomic_write_bound_bytes(bound, payload)
+            self.assertEqual(parent.content, payload)
+            self.assertEqual(receipt.content_sha256, hashlib.sha256(payload).hexdigest())
+            self.assertEqual(events.count("source-close"), 1)
+            self.assertLess(events.index("lock"), events.index("source-close"))
+            self.assertLess(events.index("source-close"), events.index("rename"))
+            self.assertLess(events.index("rename"), events.index("reopen"))
+            self.assertLess(events.index("reopen"), events.index("terminal"))
+            self.assertTrue(lease.closed)
+        finally:
+            bound.close()
+        self.assertTrue(parent.closed)
 
 
 if __name__ == "__main__":

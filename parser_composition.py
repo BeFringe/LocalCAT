@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
+import threading
 from typing import Callable
 from weakref import WeakKeyDictionary, WeakSet
 
@@ -31,6 +32,8 @@ from parser_contracts import (
     IssueSeverity,
     ParseIssue,
     PreparedFormatBytes,
+    PreparedWriteOutcome,
+    PreparedWriteResult,
     ReadRequest,
     RoundTripRequest,
     RoundTripSegmentEdit,
@@ -53,12 +56,15 @@ from parser_gettext_codec import gettext_descriptors as _gettext_descriptors
 from parser_localcat_codec import localcat_descriptors as _localcat_descriptors
 from parser_registry import ParserRegistry as _ParserRegistry
 from parser_source import (
+    BoundWriteTarget as _BoundWriteTarget,
     CancellationToken as _CancellationToken,
     GuardedParseSession as _GuardedParseSession,
     MaterializedParseResult as _MaterializedParseResult,
     ParserSourceError as _ParserSourceError,
     SealedSourceSnapshot as _SealedSourceSnapshot,
     atomic_write_bytes as _atomic_write_bytes,
+    atomic_write_bound_bytes as _atomic_write_bound_bytes,
+    bind_write_target as _bind_write_target,
     create_sealed_snapshot as _create_sealed_snapshot,
     materialize as _materialize,
     validate as _validate,
@@ -257,6 +263,7 @@ class ParserApplicationSurface:
     __slots__ = (
         "_registry", "_platform_backend_factory", "_opened_inputs",
         "_prepared_round_trips",
+        "_preparation_lock",
     )
 
     def __init__(
@@ -281,6 +288,7 @@ class ParserApplicationSurface:
         self._prepared_round_trips: WeakKeyDictionary[
             PreparedRoundTripWrite, _RoundTripPreparation,
         ] = WeakKeyDictionary()
+        self._preparation_lock = threading.RLock()
 
     def select(
         self,
@@ -490,9 +498,16 @@ class ParserApplicationSurface:
                 _discard=self._discard_round_trip_preparation,
                 _authority=_COMPOSITION_AUTHORITY,
             )
-            self._prepared_round_trips[prepared] = _RoundTripPreparation(
-                opened, descriptor, terminal, validated_token, serialized,
-            )
+            with self._preparation_lock:
+                self._prepared_round_trips[prepared] = _RoundTripPreparation(
+                    opened, descriptor, terminal, validated_token, serialized,
+                )
+                opened._round_trip_preparations.add(prepared)
+                # Closing an input concurrently cannot leave a newly issued
+                # preparation alive after the close traversal.
+                if opened._closed:
+                    prepared.close()
+                    opened._require_open()
             return prepared
         finally:
             lease.close()
@@ -500,7 +515,7 @@ class ParserApplicationSurface:
     def _require_round_trip_preparation(
         self, prepared: PreparedRoundTripWrite,
     ) -> _RoundTripPreparation:
-        """Owner-private reproof seam for the separate prepared publish task."""
+        """Owner-private reproof of an unconsumed round-trip preparation."""
 
         if type(prepared) is not PreparedRoundTripWrite:
             binding = None
@@ -511,9 +526,22 @@ class ParserApplicationSurface:
                 "PARSER.CAPABILITY.INVALID_PREPARATION",
                 "preparation is not a live result issued by this surface",
             )
+        self._verify_round_trip_binding(prepared, binding)
+        return binding
+
+    def _verify_round_trip_binding(
+        self, prepared: PreparedRoundTripWrite, binding: _RoundTripPreparation,
+    ) -> None:
         self._registry._require_registered_descriptor(binding.descriptor)
         _round_trip_checkpoint(binding.opened, binding.terminal)
-        if binding.opened.descriptor is not binding.descriptor:
+        if (
+            binding.opened.descriptor is not binding.descriptor
+            or prepared.codec_identity != binding.descriptor.identity
+            or prepared.source_identity != binding.terminal.source
+            or prepared.format_id != binding.descriptor.format_id
+            or prepared.output_fingerprint != binding.serialized.output_fingerprint
+            or prepared.byte_count != len(binding.serialized.payload)
+        ):
             raise ParserApplicationError(
                 "PARSER.CAPABILITY.INVALID_PREPARATION", "prepared codec authority has changed",
             )
@@ -524,10 +552,124 @@ class ParserApplicationSurface:
             expected_format_state_fingerprint=hashlib.sha256(binding.token.opaque_payload).hexdigest(),
         )
         _validate_round_trip_output(binding.serialized, binding.descriptor, binding.terminal)
-        return binding
 
     def _discard_round_trip_preparation(self, prepared: PreparedRoundTripWrite) -> None:
-        self._prepared_round_trips.pop(prepared, None)
+        with self._preparation_lock:
+            binding = self._prepared_round_trips.pop(prepared, None)
+            if binding is not None and binding.target is not None:
+                binding.target.close()
+
+    def bind_round_trip_target(
+        self, prepared: PreparedRoundTripWrite, target: TargetReference,
+    ) -> None:
+        """Bind a preparation once to an existing parent and expected target.
+
+        This is read-only, retaining the parent and any existing target handle.
+        Publication rechecks this exact existing/absent condition under the
+        platform protocol; it does not promise CAS against noncooperating writers.
+        Closing the preparation or its source releases these retained handles.
+        """
+
+        with self._preparation_lock:
+            try:
+                binding = self._require_round_trip_preparation(prepared)
+            except BaseException:
+                if type(prepared) is PreparedRoundTripWrite and prepared in self._prepared_round_trips:
+                    prepared.close()
+                raise
+            if binding.target is not None:
+                raise ParserApplicationError(
+                    "PARSER.CAPABILITY.INVALID_PREPARATION",
+                    "a preparation cannot be rebound to another target condition",
+                )
+            if type(target) is not TargetReference:
+                raise TypeError("target must be exact TargetReference")
+            try:
+                binding.target = _bind_write_target(
+                    target, backend=_rooted_backend(
+                        self._platform_backend_factory, target.safe_root,
+                    ),
+                )
+                self._require_round_trip_preparation(prepared)
+            except BaseException:
+                prepared.close()
+                raise
+
+    def write_prepared(self, prepared: PreparedRoundTripWrite) -> PreparedWriteResult:
+        """Consume once, publish exact prepared bytes, and report physical proof.
+
+        Every attempt on an issued result consumes it, including stale, failed
+        and uncertain attempts. Concurrent reuse cannot start another writer.
+        Retry requires a fresh preparation and target preview. An already issued
+        system call is allowed to finish proof after cancellation; no new write
+        stage starts after a cancellation checkpoint rejects the operation.
+        """
+
+        with self._preparation_lock:
+            binding = (
+                self._prepared_round_trips.pop(prepared, None)
+                if type(prepared) is PreparedRoundTripWrite else None
+            )
+            if binding is None:
+                return PreparedWriteResult(
+                    PreparedWriteOutcome.FAILED, code="PARSER.CAPABILITY.INVALID_PREPARATION",
+                    safe_summary="preparation is not an unconsumed result of this surface",
+                )
+            already_closed = prepared.closed
+            object.__setattr__(prepared, "_PreparedRoundTripWrite__closed", True)
+
+        receipt = None
+        result = None
+        writer_started = False
+        try:
+            if already_closed or binding.target is None:
+                raise ParserApplicationError(
+                    "PARSER.CAPABILITY.INVALID_PREPARATION",
+                    "publication requires an unconsumed preparation bound to a target",
+                )
+
+            def checkpoint() -> None:
+                self._verify_round_trip_binding(prepared, binding)
+                binding.opened._snapshot.reprove_content(
+                    binding.terminal.source, cancellation=binding.opened._cancellation,
+                )
+
+            checkpoint()
+            writer_started = True
+            receipt = _atomic_write_bound_bytes(
+                binding.target, binding.serialized.payload, checkpoint=checkpoint,
+            )
+            result = PreparedWriteResult(PreparedWriteOutcome.PUBLISHED, receipt=receipt)
+        except ContractViolation as error:
+            uncertain = error.code == "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED"
+            result = PreparedWriteResult(
+                PreparedWriteOutcome.UNCERTAIN if uncertain else PreparedWriteOutcome.FAILED,
+                code=error.code,
+                safe_summary="publication requires inspection; no success was proved"
+                if uncertain else "prepared publication was rejected before publishing",
+            )
+        except Exception:
+            result = PreparedWriteResult(
+                PreparedWriteOutcome.UNCERTAIN if writer_started else PreparedWriteOutcome.FAILED,
+                code="PARSER.SOURCE.WRITE_RECOVERY_REQUIRED" if writer_started
+                else "PARSER.SOURCE.WRITE_FAILED",
+                safe_summary="prepared publication failed before a receipt was issued",
+            )
+        finally:
+            if binding.target is not None:
+                try:
+                    binding.target.close()
+                except Exception:
+                    # Cleanup must not escape and turn an already published or
+                    # uncertain result into an apparent prepublication failure.
+                    if receipt is not None:
+                        result = PreparedWriteResult(
+                            PreparedWriteOutcome.UNCERTAIN,
+                            code="PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+                            safe_summary="publication cleanup could not be proved",
+                        )
+        assert result is not None
+        return result
 
     def write_canonical(
         self,
@@ -685,7 +827,7 @@ def _validate_round_trip_output(
     return replace(serialized, diagnostics=diagnostics)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _RoundTripPreparation:
     """Surface-private bytes and live source binding; not a public DTO."""
 
@@ -694,6 +836,7 @@ class _RoundTripPreparation:
     terminal: TerminalSuccess
     token: RoundTripTokenEnvelope
     serialized: PreparedFormatBytes
+    target: _BoundWriteTarget | None = None
 
 
 class PreparedRoundTripWrite:
@@ -778,6 +921,15 @@ class PreparedRoundTripWrite:
     def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
         self.close()
 
+    def __del__(self) -> None:
+        try:
+            if hasattr(self, "_PreparedRoundTripWrite__closed"):
+                self.close()
+        except Exception:
+            # Explicit close reports cleanup errors; finalization cannot report
+            # or retry a physical operation during garbage collection.
+            pass
+
 
 class PreparedCanonicalWrite:
     """Opaque, factory-issued canonical payload authorized only for rooted writes."""
@@ -840,6 +992,7 @@ class OpenedParserInput:
         "_cancellation",
         "_primed_reader",
         "_closed",
+        "_round_trip_preparations",
         "__weakref__",
     )
 
@@ -866,6 +1019,7 @@ class OpenedParserInput:
         self._cancellation = cancellation
         self._primed_reader = primed_reader
         self._closed = False
+        self._round_trip_preparations: WeakSet[PreparedRoundTripWrite] = WeakSet()
 
     @property
     def descriptor(self) -> CodecDescriptor:
@@ -942,7 +1096,17 @@ class OpenedParserInput:
             return
         self._closed = True
         self._primed_reader = None
-        self._snapshot.close()
+        close_error = None
+        try:
+            for prepared in tuple(self._round_trip_preparations):
+                try:
+                    prepared.close()
+                except Exception as error:
+                    close_error = error
+        finally:
+            self._snapshot.close()
+        if close_error is not None:
+            raise close_error
 
     def _require_open(self) -> None:
         if self._closed:

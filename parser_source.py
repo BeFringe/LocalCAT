@@ -19,9 +19,10 @@ import secrets
 import struct
 import tempfile
 import threading
-from typing import Iterator
+from typing import Callable, Iterator
 
 from platform_fs_contracts import (
+    BoundDirectoryAuthority,
     BoundRegularFile,
     EntrySnapshot,
     FileObjectIdentity,
@@ -547,6 +548,36 @@ class SealedSourceSnapshot:
                 "the sealed snapshot cursor returned a non-byte payload",
             )
         return payload
+
+    def reprove_content(
+        self, expected: SourceSnapshotIdentity,
+        *, cancellation: CancellationToken | None = None,
+    ) -> None:
+        """Reprove the bounded sealed bytes, independently of the original path."""
+
+        if self.release_requested or self.released or self.identity != expected:
+            raise ParserSourceError(
+                "PARSER.SOURCE.STALE", "the prepared source snapshot is no longer live",
+            )
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < expected.byte_count:
+            _check_cancellation(cancellation)
+            chunk = self._read_at(offset, min(_COPY_CHUNK_BYTES, expected.byte_count - offset))
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset += len(chunk)
+        _check_cancellation(cancellation)
+        if (
+            offset != expected.byte_count
+            or self._read_at(offset, 1)
+            or digest.hexdigest() != expected.content_sha256
+            or self.identity != expected
+        ):
+            raise ParserSourceError(
+                "PARSER.SOURCE.STALE", "the sealed source bytes no longer match preparation",
+            )
 
     def __enter__(self) -> SealedSourceSnapshot:
         return self
@@ -1550,6 +1581,112 @@ def _cleanup_unpublished_candidate(
         pass
 
 
+@dataclass(slots=True)
+class BoundWriteTarget:
+    """Retained parent and expected entry for one existing-parent publication.
+
+    Reproof compares the original observation; it never adopts a later entry.
+    Replacement uses the platform's cooperative protocol lock, not an atomic
+    compare-and-swap against writers which ignore that lock.
+    """
+
+    backend: PlatformFileBackend
+    parent: BoundDirectoryAuthority
+    relative_path: str
+    expected: EntrySnapshot | None
+    existing: BoundRegularFile | None
+
+    def reprove(self) -> None:
+        self.reprove_name()
+        try:
+            if self.existing is not None and self.existing.snapshot() != self.expected:
+                raise ParserSourceError(
+                    "PARSER.SOURCE.STALE", "the retained target identity has changed",
+                )
+        except PlatformFileError:
+            raise ParserSourceError(
+                "PARSER.SOURCE.STALE", "the retained target binding is no longer valid",
+            ) from None
+
+    def reprove_name(self) -> None:
+        """Recheck the original named condition, including after SOURCE release."""
+
+        try:
+            self.parent.reprove()
+            if self.parent.inspect_entry(self.target_name) != self.expected:
+                raise ParserSourceError(
+                    "PARSER.SOURCE.STALE", "the prepared target condition has changed",
+                )
+        except PlatformFileError:
+            raise ParserSourceError(
+                "PARSER.SOURCE.STALE", "the prepared target binding is no longer valid",
+            ) from None
+
+    @property
+    def target_name(self) -> str:
+        return self.relative_path.rsplit("/", 1)[-1]
+
+    def close(self) -> None:
+        try:
+            if self.existing is not None:
+                self.existing.close()
+        finally:
+            self.parent.close()
+
+    def release_existing_for_publish(self) -> None:
+        """Release the final SOURCE handle after locked reproof, before rename.
+
+        Windows SOURCE handles deny DELETE sharing. Keeping one through rename
+        would block replacement of our own target. Parent and protocol lease
+        stay live; the platform's cooperative locking guarantees are unchanged.
+        """
+
+        if self.existing is not None:
+            self.existing.close()
+
+
+def bind_write_target(
+    reference: TargetReference, *, backend: PlatformFileBackend,
+) -> BoundWriteTarget:
+    """Read-only target preparation; parents must already exist under the root."""
+
+    if type(reference) is not TargetReference:
+        raise TypeError("reference must be exact TargetReference")
+    if not isinstance(backend, PlatformFileBackend):
+        raise TypeError("backend must implement PlatformFileBackend")
+    parts = _relative_parts(reference.safe_root, reference.selected_path)
+    relative = _platform_relative_path(parts)
+    parent = existing = None
+    try:
+        with backend.bind_root(Path(reference.safe_root)) as root:
+            parent = backend.bind_parent(root, relative)
+            current = parent.inspect_entry(parts[-1])
+            if current is not None:
+                if (
+                    current.identity.kind != "regular"
+                    or current.identity.link_count != 1
+                    or not current.reparse_free
+                ):
+                    raise ParserSourceError(
+                        "PARSER.SOURCE.NOT_REGULAR",
+                        "the rooted target is not a single-link regular file",
+                    )
+                existing = backend.open_regular(root, relative)
+            bound = BoundWriteTarget(backend, parent, "/".join(parts), current, existing)
+            bound.reprove()
+        parent = existing = None
+        return bound
+    except PlatformFileError as error:
+        raise _map_platform_writer_error(error) from None
+    finally:
+        try:
+            if existing is not None:
+                existing.close()
+        finally:
+            if parent is not None:
+                parent.close()
+
+
 def atomic_write_bytes(
     reference: TargetReference,
     payload: bytes,
@@ -1562,40 +1699,62 @@ def atomic_write_bytes(
         raise TypeError("reference must be exact TargetReference")
     if type(payload) is not bytes:
         raise TypeError("payload must be exact bytes")
-    relative_parts = _relative_parts(reference.safe_root, reference.selected_path)
-    relative_path = "/".join(relative_parts)
-    root_path = Path(reference.safe_root)
-    if not isinstance(backend, PlatformFileBackend):
-        raise TypeError("backend must implement PlatformFileBackend")
+    bound = bind_write_target(reference, backend=backend)
+    write_completed = False
+    try:
+        receipt = atomic_write_bound_bytes(bound, payload)
+        write_completed = True
+        return receipt
+    finally:
+        try:
+            bound.close()
+        except Exception:
+            # Preserve any primary writer failure, including uncertainty. If
+            # publishing completed, final close failure still denies a receipt
+            # and must stay inside Parser's stable postpublication error family.
+            if write_completed:
+                raise ParserSourceError(
+                    "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+                    "published target binding cleanup could not be proved",
+                ) from None
 
-    root = None
-    parent = None
+
+def atomic_write_bound_bytes(
+    bound: BoundWriteTarget,
+    payload: bytes,
+    *,
+    checkpoint: Callable[[], None] | None = None,
+) -> WriteReceipt:
+    """Publish already authorized bytes through an unchanged retained target.
+
+    Both canonical and prepared writes share this physical writer. The caller
+    owns and closes the binding. A failed post-naming proof is always uncertain;
+    it cannot be reported as a proved prepublication failure or successful undo.
+    """
+
+    if type(bound) is not BoundWriteTarget or type(payload) is not bytes:
+        raise TypeError("bound publication requires a BoundWriteTarget and exact bytes")
+    parent, backend = bound.parent, bound.backend
+    relative_path, target_name = bound.relative_path, bound.target_name
+
+    def reprove() -> None:
+        if checkpoint is not None:
+            checkpoint()
+        bound.reprove()
+
     lease = None
     candidate = None
     pending = None
     candidate_name: str | None = None
     candidate_identity: FileObjectIdentity | None = None
     cleanup_candidate = False
+    publication_attempted = False
+    publication_proved_absent = False
     digest = hashlib.sha256(payload).digest()
-    target_name = relative_parts[-1]
     family_token = hashlib.sha256(relative_path.encode("utf-8", "strict")).hexdigest()
     try:
-        root = backend.bind_root(root_path)
-        parent = backend.bind_parent(root, _platform_relative_path(relative_parts))
-        root.close()
-        root = None
-
-        current = parent.inspect_entry(target_name)
-        if current is not None and (
-            current.identity.kind != "regular"
-            or current.identity.link_count != 1
-            or not current.reparse_free
-        ):
-            raise ParserSourceError(
-                "PARSER.SOURCE.NOT_REGULAR",
-                "the rooted target is not a single-link regular file",
-            )
-        if current is None:
+        reprove()
+        if bound.expected is None:
             mode = PublishMode.CREATE_IF_ABSENT
         else:
             mode = PublishMode.REPLACE_UNDER_LOCK
@@ -1607,6 +1766,7 @@ def atomic_write_bytes(
             )
 
         for _attempt in range(32):
+            reprove()
             candidate_name = f".parser-{family_token[:16]}-{secrets.token_hex(8)}.tmp"
             try:
                 candidate = parent.create_candidate(candidate_name, private=False)
@@ -1621,20 +1781,41 @@ def atomic_write_bytes(
             )
         candidate_identity = candidate.identity()
         cleanup_candidate = True
+        reprove()
         candidate.write_all(payload)
+        reprove()
         candidate.flush_content()
 
+        reprove()
+        bound.release_existing_for_publish()
+        if checkpoint is not None:
+            checkpoint()
+        bound.reprove_name()
         try:
+            publication_attempted = True
             pending = parent.begin_publish(
                 candidate,
                 target_name,
                 mode=mode,
                 lease=lease,
             )
-        except PlatformFileError as error:
-            candidate = None
-            if error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value:
-                cleanup_candidate = False
+        except Exception as error:
+            # begin_publish includes post-rename callbacks. An error code by
+            # itself cannot prove which side of naming failed. Only a still
+            # present exclusive candidate proves naming did not consume it.
+            # A platform RECOVERY_REQUIRED explicitly denies that inference.
+            if not (
+                isinstance(error, PlatformFileError)
+                and error.code == PlatformFileErrorCode.RECOVERY_REQUIRED.value
+            ):
+                try:
+                    retained = parent.inspect_entry(candidate_name)
+                    publication_proved_absent = (
+                        retained is not None and retained.identity == candidate_identity
+                    )
+                except Exception:
+                    pass
+            cleanup_candidate = publication_proved_absent
             raise
         candidate = None
         cleanup_candidate = False
@@ -1664,39 +1845,52 @@ def atomic_write_bytes(
             schema_version=_WRITE_RECEIPT_SCHEMA_VERSION,
         )
     except ParserSourceError:
+        if publication_attempted and not publication_proved_absent:
+            raise ParserSourceError(
+                "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+                "published target proof failed; the result requires inspection",
+            ) from None
         raise
     except PlatformFileError as error:
+        if publication_attempted and not publication_proved_absent:
+            raise ParserSourceError(
+                "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED",
+                "published target proof failed; the result requires inspection",
+            ) from None
         raise _map_platform_writer_error(error) from None
     except Exception:
         raise ParserSourceError(
-            "PARSER.SOURCE.WRITE_FAILED",
-            "rooted canonical publication failed before a receipt was issued",
+            "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED"
+            if publication_attempted and not publication_proved_absent
+            else "PARSER.SOURCE.WRITE_FAILED",
+            "rooted publication could not be proved before a receipt was issued",
         ) from None
     finally:
+        cleanup_failed = False
         if candidate is not None:
             try:
                 candidate.close()
-            except PlatformFileError:
-                pass
+            except Exception:
+                cleanup_failed = True
         if cleanup_candidate and parent is not None:
-            _cleanup_unpublished_candidate(parent, candidate_name, candidate_identity)
+            try:
+                _cleanup_unpublished_candidate(parent, candidate_name, candidate_identity)
+            except Exception:
+                cleanup_failed = True
         if pending is not None:
             try:
                 pending.close()
-            except PlatformFileError:
-                pass
+            except Exception:
+                cleanup_failed = True
         if lease is not None:
             try:
                 lease.close()
-            except PlatformFileError:
-                pass
-        if parent is not None:
-            try:
-                parent.close()
-            except PlatformFileError:
-                pass
-        if root is not None:
-            try:
-                root.close()
-            except PlatformFileError:
-                pass
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise ParserSourceError(
+                "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED"
+                if publication_attempted and not publication_proved_absent
+                else "PARSER.SOURCE.WRITE_FAILED",
+                "rooted publication cleanup could not be proved",
+            ) from None
