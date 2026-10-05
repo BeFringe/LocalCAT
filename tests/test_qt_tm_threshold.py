@@ -22,7 +22,7 @@ from editor_contracts import (
     TMPreferences,
     TMThresholdDisplay,
 )
-from editor_controller import EditorController
+from editor_controller import EditorController, EditorControllerError
 from editor_tm_adapter import EditorTMAdapter
 from qt_editor_window import QtEditorWindow
 from qt_settings_dialog import QtSettingsDialog
@@ -45,6 +45,101 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
     def _events() -> None:
         QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
 
+    def _wait_notice(self, dialog: QtSettingsDialog) -> QLabel:
+        notice = dialog.findChild(QLabel, "fuzzyValidationWaitNotice")
+        self.assertIsNotNone(notice)
+        assert notice is not None
+        self.assertTrue(notice.isVisible())
+        self.assertEqual(
+            notice.text(),
+            "验证可能需要数十分钟，期间可以继续编辑和保存。完成后会自动更新状态。",
+        )
+        self.assertTrue(notice.wordWrap())
+        self.assertEqual(notice.accessibleName(), notice.text())
+        return notice
+
+    def test_wait_notice_survives_validation_reopen_and_deferred_refresh(self) -> None:
+        with worker_temporary_directory() as temporary:
+            controller, _adapter, _runtime, _repository = _legacy_fixture(Path(temporary))
+            closed = RetrievalDisplayState(
+                context_available=True, fuzzy_available=False,
+                safe_codes=("TM.RETRIEVAL.FUZZY_BENCHMARK_MISSING",),
+            )
+            idle = FuzzyValidationDisplay(FuzzyValidationState.IDLE, None)
+            running = FuzzyValidationDisplay(FuzzyValidationState.RUNNING, None)
+            with (
+                patch.object(controller, "poll_tm_threshold_display", return_value=TMThresholdDisplay(TMPreferences(), closed, idle)) as poll,
+                patch.object(controller, "revalidate_tm_fuzzy", return_value=running) as start,
+            ):
+                dialog = QtSettingsDialog(controller)
+                dialog.resize(860, 560)
+                dialog.show()
+                self._events()
+                try:
+                    notice = self._wait_notice(dialog)
+                    self.assertTrue(dialog.fuzzy_revalidate_button.isEnabled())
+                    self.assertGreaterEqual(notice.height(), notice.heightForWidth(notice.width()))
+                    self.assertGreater(
+                        notice.heightForWidth(notice.width() // 2),
+                        notice.fontMetrics().height(),
+                    )
+                    self.assertLess(notice.geometry().bottom(), notice.parentWidget().height())
+
+                    poll.return_value = TMThresholdDisplay(TMPreferences(), closed, running)
+                    dialog.fuzzy_revalidate_button.click()
+                    start.assert_called_once_with()
+                    self._wait_notice(dialog)
+                    self.assertEqual(dialog.tm_threshold_state.text(), "Fuzzy 性能验证中")
+                    self.assertFalse(dialog.fuzzy_revalidate_button.isEnabled())
+
+                    poll.return_value = None
+                    dialog._refresh_tm_threshold_entry()
+                    self._wait_notice(dialog)
+                    self.assertEqual(dialog.tm_threshold_state.text(), "Fuzzy 性能验证中")
+                    self.assertIs(dialog.tm_threshold_chip.property("fuzzyAvailable"), False)
+                    dialog.close()
+                    self.assertFalse(dialog._tm_threshold_timer.isActive())
+
+                    poll.return_value = TMThresholdDisplay(TMPreferences(), closed, running)
+                    dialog = QtSettingsDialog(controller)
+                    dialog.show()
+                    self._events()
+                    self._wait_notice(dialog)
+                    self.assertEqual(dialog.tm_threshold_state.text(), "Fuzzy 性能验证中")
+                    self.assertFalse(dialog.fuzzy_revalidate_button.isEnabled())
+                    start.assert_called_once_with()
+
+                    poll.return_value = TMThresholdDisplay(
+                        TMPreferences(), closed,
+                        FuzzyValidationDisplay(FuzzyValidationState.FAILED, "GATE_D.BENCHMARK_FAILED"),
+                    )
+                    dialog._refresh_tm_threshold_entry()
+                    self._wait_notice(dialog)
+                    self.assertEqual(dialog.tm_threshold_state.text(), "Fuzzy 不可用：Fuzzy 性能验证未通过")
+                    self.assertTrue(dialog.fuzzy_revalidate_button.isEnabled())
+                    self.assertFalse(dialog._tm_threshold_timer.isActive())
+                finally:
+                    dialog.close()
+
+    def test_wait_notice_keeps_start_failure_visible(self) -> None:
+        with worker_temporary_directory() as temporary:
+            controller, _adapter, _runtime, _repository = _legacy_fixture(Path(temporary))
+            dialog = QtSettingsDialog(controller)
+            dialog.show()
+            self._events()
+            try:
+                self._wait_notice(dialog)
+                with patch.object(controller, "revalidate_tm_fuzzy", side_effect=EditorControllerError("private validation detail")) as start:
+                    dialog.fuzzy_revalidate_button.click()
+                start.assert_called_once_with()
+                self._wait_notice(dialog)
+                self.assertEqual(dialog.status_label.text(), "Fuzzy 性能验证未能启动。")
+                self.assertNotIn("验证中", dialog.tm_threshold_state.text())
+                self.assertTrue(dialog.fuzzy_revalidate_button.isEnabled())
+                self.assertFalse(dialog._tm_threshold_timer.isActive())
+            finally:
+                dialog.close()
+
     def test_core_time_warning_reaches_both_entries_and_retains_threshold_editing(self):
         from tests.test_capability_host_performance_warning import (
             _compose_warning_host, _publish_warning_bundle, _warning_bundle,
@@ -60,6 +155,7 @@ class QtTMThresholdIntegrationTests(unittest.TestCase):
             dialog.show()
             self._events()
             try:
+                self._wait_notice(dialog)
                 self.assertIs(window.tm_threshold_chip.property("fuzzyAvailable"), False)
                 _publish_warning_bundle(composition, _warning_bundle(rss_blocked=True))
                 window._poll_fuzzy_validation()

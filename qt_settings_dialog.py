@@ -1166,21 +1166,23 @@ class QtSettingsDialog(QDialog):
 
         threshold_panel = QFrame()
         threshold_panel.setObjectName("settingsTmThresholdPanel")
-        threshold_layout = QHBoxLayout(threshold_panel)
+        threshold_layout = QVBoxLayout(threshold_panel)
         threshold_layout.setContentsMargins(12, 8, 12, 8)
         threshold_layout.setSpacing(10)
+        threshold_row = QHBoxLayout()
+        threshold_row.setSpacing(10)
         threshold_title = QLabel("Fuzzy 建议阈值")
         threshold_title.setObjectName("settingsTmThresholdTitle")
-        threshold_layout.addWidget(threshold_title)
+        threshold_row.addWidget(threshold_title)
         self.tm_threshold_state = QLabel()
         self.tm_threshold_state.setObjectName("settingsTmThresholdState")
         self.tm_threshold_state.setWordWrap(True)
-        threshold_layout.addWidget(self.tm_threshold_state, 1)
+        threshold_row.addWidget(self.tm_threshold_state, 1)
         self.tm_threshold_chip = TMThresholdButton()
         self.tm_threshold_chip.setObjectName("settingsTmThresholdChip")
         self.tm_threshold_chip.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.tm_threshold_chip.clicked.connect(self._request_tm_threshold_update)
-        threshold_layout.addWidget(self.tm_threshold_chip)
+        threshold_row.addWidget(self.tm_threshold_chip)
         self.fuzzy_revalidate_button = QPushButton("重新验证 Fuzzy")
         self.fuzzy_revalidate_button.setObjectName("fuzzyRevalidateButton")
         self.fuzzy_revalidate_button.setAccessibleName(
@@ -1192,7 +1194,15 @@ class QtSettingsDialog(QDialog):
         self.fuzzy_revalidate_button.clicked.connect(
             self._request_fuzzy_revalidation
         )
-        threshold_layout.addWidget(self.fuzzy_revalidate_button)
+        threshold_row.addWidget(self.fuzzy_revalidate_button)
+        threshold_layout.addLayout(threshold_row)
+        wait_notice = QLabel(
+            "验证可能需要数十分钟，期间可以继续编辑和保存。完成后会自动更新状态。"
+        )
+        wait_notice.setObjectName("fuzzyValidationWaitNotice")
+        wait_notice.setWordWrap(True)
+        wait_notice.setAccessibleName(wait_notice.text())
+        threshold_layout.addWidget(wait_notice)
         content_layout.addWidget(threshold_panel)
 
         self.resource_tables_scroll = QScrollArea()

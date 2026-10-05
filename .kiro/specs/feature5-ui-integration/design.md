@@ -220,7 +220,7 @@ sequenceDiagram
 - **Boundary Commitments / Allowed Dependencies**：Core 判定功能准入与时间警示；Feature5 只在现有 `capability_host.py`、`editor_contracts.py`、`editor_tm_adapter.py`、`editor_controller.py` 和两个 Qt TM 入口消费。Qt 不读取 evidence、不合成失败集合，不以 `SUCCEEDED` 或用户开关授权。
 - **File Structure Plan**：Host 从同一 Core snapshot 复制逐路径警示，在既有 `RetrievalDisplayState` 增加独立的不可变 `performance_warning_codes`；克隆和精确类型校验覆盖该字段。Controller 的配对阈值展示带出该值；`qt_tm_threshold.py`、`qt_editor_window.py`、`qt_settings_dialog.py` 仅做统一的有限中文提示。没有旁路缓存或第二 publisher。
 - **跨路径语义**：全局 `fuzzy_available` 仍受 Gate C correctness 及至少一个可用路径约束；只聚合已开放路径的时间警示。全局提示采用“部分模糊检索未达性能目标，结果可能较慢”，不声称每个资源均可用。资源/实际查询继续消费对应路径的原能力决定；一路 RSS 拒绝、另一路时间超限可用时，不能用全局 OR 放开被拒绝路径。Gate C 关闭时不得显示“Fuzzy 可用”。
-- **三个独立阶段**：启动只恢复兼容资格，缺失/失配保留手动按钮；后台验证期间轮询非阻塞、主体编辑保存及各自有效的 Exact/Context 继续工作；完成后按同一 capability snapshot 显示可用性与警示。`SUCCEEDED` 仅表示发布完成，报告 FAIL 与功能可用可以同时成立。
+- **三个独立阶段**：启动只恢复兼容资格，缺失/失配保留手动按钮；后台验证期间轮询非阻塞、主体编辑保存及各自有效的 Exact/Context 继续工作；完成后按同一 capability snapshot 显示可用性与警示。`SUCCEEDED` 仅表示发布完成，报告 FAIL 与功能可用可以同时成立。 语言资源设置在手动验证入口旁常驻显示“验证可能需要数十分钟，期间可以继续编辑和保存。完成后会自动更新状态。”，支持换行和可访问读取；设置重开仍可见，验证状态、失败原因和性能警示继续独立更新。
 - **Revalidation Triggers / 退出条件**：新增字段触发 Host 克隆、Layer 4 DTO、双入口、资源局部路径、手动重验与冷恢复回归；用实际候选验证等待时编辑/保存/切段、关闭、完成后警示和建议消费。source/offscreen 轮询测试不替代该产品旅程。
 - **Out of Boundary / Governance Impact**：不改变触发方式、不取消首次验证、不修改 Core 数值或数据保护；遵循 ADR-009/011/029。平台只汇总候选事实，不取得 Core authority。日常建议异步与 Phase 1 优化独立处理，不是本轮准入实现的依赖。
 
