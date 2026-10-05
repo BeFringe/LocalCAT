@@ -2,7 +2,7 @@
 
 ## 概述
 
-本设计在 Parser/Codec 的单输入结果与 `EditorController` 之间建立格式中立的 `Project → Document → Segment` 工作区，并以版本化 `ProjectPackage` 作为首个真实多文档持久载体。目标不是让当前编辑器一次扫描整个文件夹，也不是提前实现 multi-sheet XLSX 或 RPY；目标是先冻结可移植身份、聚合、source reconciliation、保存/恢复和手工包闭环，让后续 origin adapter、协作 chunk 与同步只能消费这些已验证合同。
+本设计在 Parser/Codec 的单输入结果与 `EditorController` 之间建立格式中立的 `Project → Document → Segment` 工作区，并以版本化 `ProjectPackage` 作为首个真实多文档持久载体。可移植身份、聚合、source reconciliation、保存/恢复和手工包闭环为目录选择、格式 codec、协作 chunk 与同步提供中立合同。根目录仅作 metadata 预览，确认后读取所选文件；multi-sheet XLSX 不在当前范围。
 
 当前单 JSON 路径继续可用。Cluster 1 通过 compatibility adapter 把一个 LocalCAT JSON 映射为一个 Project/Document，不要求用户先迁移，也不改变 `load_project()` / `save_project()` 的公开行为。Cluster 2 才建立多文档聚合与 `ProjectPackage`；第一种真正承载多个 Document 的生产 substrate 是 ProjectPackage import，不是 folder scan、workbook sheet 枚举或 RPY folder。
 
@@ -20,7 +20,7 @@ Project workspace ───────────────> ProjectPackage
     │  confirmation/reconcile
     │
     ├── explicit source write-back ─> single file / directory / workbook
-    │                                  仅在 live writer capability 获批时
+    │                                  仅在 exact live writer capability 验证后
     ├── Controller / Qt
     ├── future Chunk（只引用 segment identity）
     └── future Sync（只传输已验证 package bytes/receipt）
@@ -42,14 +42,14 @@ Project workspace ───────────────> ProjectPackage
 
 ### 非目标
 
-- 不在本规格实现 directory discovery、多 JSON folder、multi-sheet workbook profile、RPY 或 XLIFF codec。
+- 不实现后台目录扫描、multi-sheet workbook profile、RPY 或 XLIFF codec 语法；显式根目录 metadata 选择由本规格提供。
 - 不给 TXT、PO、POT 或其他 reader-only 格式补 source writer；它们的 target 只能由 ProjectPackage 工作区持久。
 - 不实现 TMX project opening、TMX context/provenance/export，也不改变 TMX 的 `language_resource` purpose；任何TMX-as-project组合必须在铸造project/document identity前拒绝。
 - 不实现 CONTEXT evidence 字段或 “上下文一致” UI；该表面仍归 Integration TM owner。
 - 不实现 chunk membership、split/merge、assignment、permission 或 `current_chunk` UI。
 - 不实现 provider、S3/WebDAV、remote listing、凭据、加密、同步 planner 或冲突自动合并。
 - 不建立 ProjectPackage/ResourcePackage 的共同 manifest、identity、authority 或 merge layer。
-- 不在同步主线前实现 `rpy-project-codec`；RPY 的 token/sidecar/writer 继续由后续 codec/ACL 独占。
+- 按 ADR-030，RPY 手工包闭环先于同步；RPY 的 token/private payload/writer 由独立 codec/ACL 拥有。
 - 不修改 canonical TM、Fuzzy qualification、TM Store、术语资源或 live SQLite。
 
 ## Boundary Commitments（边界承诺）
@@ -91,11 +91,11 @@ Project workspace ───────────────> ProjectPackage
 ## Governance Impact（治理影响）
 
 - **Applicable Steering**：`product.md`、`structure.md`、`tech.md`、`roadmap.md`、`spec-ownership.md` 与本规格 border。
-- **Applicable ADRs**：ADR-014（设备本地偏好不污染项目包）、ADR-015（Parser/Codec 中立边界）；新增 ADR-018。
+- **Applicable ADRs**：ADR-014（设备本地偏好不污染项目包）、ADR-015（Parser/Codec 中立边界）；ADR-018/019 的包权威与物理 profile，ADR-030/031 的目录及 artifact 接缝。
 - **ADR disposition**：ADR-018 冻结 ProjectPackage/workspace 的多文档持久权威、origin/write-back 边界与 ProjectPackage/ResourcePackage 分离；不取代 ADR-014/015。
-- **Scope amendment**：不修改已完成 Parser 的单输入合同；本规格接续 Parser 明确延期的 multi-document/ProjectPackage scope。folder/workbook/RPY 仍须各自规格批准。
+- **Contract changes**：不修改已完成 Parser 的单输入合同；本规格接续 Parser 明确延期的 multi-document/ProjectPackage scope。目录选择由本规格定义；workbook 仍无产品 profile，RPY 语法归独立 codec。
 - **Steering sync**：C0 只建立 ADR、Requirements、Design、Tasks 与 border，不修改 runtime。真实模块落地并通过对应 Cluster gate 后，`structure.md` / `tech.md` 只同步已实现事实；Feature GO 再一次闭合 roadmap/ownership disposition。
-- **Downstream revalidation**：Cluster 2 完成后，`language-resource-portability` 才可借鉴已验证的原子写、digest、preview、receipt 原语起草独立 R/D/T；Chunk 必须等待 C2A/C2B/C2C，Sync 必须消费 ProjectPackage/ResourcePackage，RPY 产品顺序在 Sync 后。
+- **Downstream revalidation**：Cluster 2 完成后，`language-resource-portability` 才可借鉴已验证的原子写、digest、preview、receipt 原语起草独立 R/D/T；Chunk 必须等待 C2A/C2B/C2C，Sync 必须消费 ProjectPackage/ResourcePackage，RPY 手工包闭环按 ADR-030 先于 Sync。
 
 ### Windows Compatibility Amendment WA-03
 
@@ -114,7 +114,7 @@ C0 规格/ADR
   → C1 identity/origin/single-JSON adapter
     → C2A aggregation/reconciliation
       → C2B save/recovery
-        → ADR-019 批准 deterministic ZIP v1
+        → ADR-019 deterministic ZIP v1
           → C2C ProjectPackage logical + physical closure
 
 C2C 完成后分成三条后续线
@@ -126,16 +126,16 @@ C2C 完成后分成三条后续线
 
 未来可选扩展
   → tmx-context-interchange 提供 TMX export profile
-    → 接入已批准的 ResourcePackage container/preview/apply/receipt
+    → 接入ResourcePackage container/preview/apply/receipt
 
 cross-device-sync-plugin
-  ← 已批准的 ProjectPackage
-  ← 已批准的 ResourcePackage
+  ← ProjectPackage
+  ← ResourcePackage
 ```
 
 这里的“三条后续线”以完整 C2C 通过为门，不以“只选定 ZIP profile”替代真实 exporter/importer、冷重开与 fault matrix。三条线也不是共同 authority：Chunk 只消费稳定复合 segment identity；`language-resource-portability` 独立拥有 JSONL/CSV ResourcePackage，并只借鉴已经验证的原子发布、digest、preview、receipt 与恢复原语。它们均不得反向拥有 ProjectPackage。C3/C4 继续完成 Multi-Document 自身的 Controller/Qt 产品面。
 
-“恢复/确认 Brief”是复读 83526a1 已提交的 handoff，并重新把它放入实施顺序；当前分支已经包含该文件，不需要把旧 evidence JSON 或一次性 worktree 倒灌回来。Brief 只确认 JSONL/CSV ResourcePackage 的问题、范围、owner、上下游和启动门，没有 approved Requirements/Design/Tasks，也没有 runtime 能力。“ResourcePackage 收尾”才是随后把该 Brief 提升为独立 R/D/T，经人工门后实现并验收 TM JSONL 与术语 CSV/v1 的 export/validate/preview/import/apply/receipt。`tmx-context-interchange` 是未来可选 TMX profile owner，不替代这条首轮收尾线，也不取得 ResourcePackage container authority。
+ResourcePackage 独立拥有 JSONL/CSV 包的 export/validate/preview/import/apply/receipt；`tmx-context-interchange` 只增加可选 TMX profile，不取得容器 authority。RPY 手工项目包闭环先于 Sync；两种包保持独立 authority。
 
 每簇验证前必须锚定以下现象：
 
@@ -329,7 +329,7 @@ SHA256("localcat.document.single-json.v1\0" || normalized_source_ref)
 5. normalization 输出只能作为 rooted handle 下的相对引用。运行时打开/写入仍须逐 component no-follow 证明；lexical normalization 不能代替安全文件绑定。
 6. 后续 workbook profile中的多个 Document可以共享同一 workbook `source_ref`；稳定 document_id必须来自manifest。sheet/display name永远不进入source_ref identity；本规格不据此启用workbook origin。
 
-C1 只批准 legacy single JSON 的 `SINGLE_FILE/localcat-json-v1` 实际入口；`DIRECTORY/explicit-selected-files-v1` 留给 C2A，`WORKBOOK` 在 C1 仅是可构造的 origin 叶类型，没有获批产品 profile、扫描或 writer。叶合同接受规范的版本 token 不等于启用对应产品能力；C2C package validator仍须按已批准 profile allowlist fail closed。
+C1 兼容适配提供 legacy single JSON 的 `SINGLE_FILE/localcat-json-v1` 实际入口；`DIRECTORY/explicit-selected-files-v1` 留给 C2A，`WORKBOOK` 在 C1 仅是可构造的 origin 叶类型，没有产品 profile、扫描或 writer。叶合同接受规范的版本 token 不等于启用对应产品能力；C2C package validator仍须按支持的 profile allowlist fail closed。
 
 设备本地 `OriginBinding` 另行保存已验证 absolute root、规范化 source_ref → document_id 映射、binding revision 与最近一次 observed source identity；只存在 Application session 或设备本地 workspace state，不进入 package，也不随 sync 搬运。换设备后必须由用户显式重新绑定 origin。最近一次 source identity 是变更/preview-stale 事实，不参与稳定 document ID 回接键。
 
@@ -357,7 +357,7 @@ SHA256(
 - `EditorSegment.id` 原样映射为 `local_segment_id`；旧 project 内唯一约束保持。
 - legacy `EditorProject.segments` 是单 Document 的 projection；C1 不改变 Controller 当前 index、dirty、recent path、save error 或 JSON writer。
 - 从 workspace 投影回 legacy EditorProject 只允许 `documents` 恰好一个且为 LocalCAT JSON；多 Document 必须拒绝，不能静默 flatten 后交给旧 saver。
-- TXT 的既有 load/save-as-JSON 路径继续回归，但 C1 不宣称 TXT 已由 workspace adapter 接管；任何迁移须在后续 task 显式批准。
+- TXT 的既有 load/save-as-JSON 路径继续回归，但 C1 不宣称 TXT 已由 workspace adapter 接管；其他格式通过独立 intake 接入。
 - 用户显式 export 为 ProjectPackage 后，包保留同一 project/document/segment identity与`SINGLE_FILE` source-origin描述；原JSON不被覆盖或删除。ProjectPackage成为canonical persistence，但不重写成第四种origin，也不让原single-file来源成为第二workspace authority。
 - legacy `load_project()` / `save_project()` 的 accepted domain 与行为保持 exact，adapter 不改它们。但“提升为 Workspace”是一个显式的 v1 eligibility boundary：超过 name/ID 限制、含 control 的 opaque local ID 或不具备 portable `source_ref` 的旧文件必须返回 body-safe `PROJECT.WORKSPACE.LIMIT_EXCEEDED` / `CONTRACT_INVALID` / `PATH_INVALID`，且不修改原文件、不发布部分 workspace。用户仍可继续使用 legacy 单项目路径；不得为了提升而截断、转义或重铸 ID。
 
@@ -365,13 +365,13 @@ SHA256(
 
 ### Explicit selected-files intake
 
-首个产品可达的多文档 workspace 不依赖预制 fixture，也不扫描目录。Application-owned `project_workspace_intake.py` 提供 `stage_selected_project_documents(root, selected_paths, request)`；`project_workspace.py` 只接收它已验证并私有复制的 immutable Document facts，不导入 Parser 或打开 source：
+显式文件 intake 消费用户选择，不自行扫描目录；根目录预览由下述选择服务提供。Application-owned `project_workspace_intake.py` 提供 `stage_selected_project_documents(root, selected_paths, request)`；`project_workspace.py` 只接收它已验证并私有复制的 immutable Document facts，不导入 Parser 或打开 source：
 
-1. `root` 的 final component 通过 `O_DIRECTORY | O_NOFOLLOW` 绑定并保留同一 root fd 到整批完成，冻结设备本地 dev/inode；`selected_paths` 必须是 exact tuple、至少两个、顺序即初始 document order；
-2. 每个 path 必须是 root 内用户明确选择的 regular file，从 retained root fd 逐 component no-follow 预绑定；拒绝重复、hardlink alias、symlink、越界与 non-regular。未选择文件无论何时出现都不得被 Core 枚举、读取、自动纳入或影响 selection binding；
-3. 首批 suffix/format 闭集为 LocalCAT JSON、TXT、PO、POT，且每个输入都经现有 `ParserApplicationSurface.open_input()`、自然 EOF 与 verified terminal；TMX、CSV/XLSX termbase、normalized TM JSON 不可作为 ProjectDocument；
+1. `root` 通过平台 retained-root no-follow authority 绑定并保留到整批完成；`selected_paths` 必须是非空 exact tuple，顺序即初始 document order；
+2. 每个 path 必须是 root 内用户明确选择的 regular file，从 retained root authority 逐 component no-follow 预绑定；拒绝重复、hardlink alias、symlink、越界与 non-regular。未选文件不得读取正文、解析或自动纳入；根目录流程只可有界观察 metadata，不能改变已签发 selection binding；
+3. 内建 LocalCAT JSON、TXT、PO、POT 与配置启用的 project_document codec 均经 `ParserApplicationSurface.open_input()`、自然 EOF 与 verified terminal；TMX、CSV/XLSX termbase、normalized TM JSON 不可作为 ProjectDocument；
 4. 每个 Parser source snapshot 必须与预绑定 regular identity/size/mtime 和 normalized relative-ref digest 精确对账；末尾再经 retained file/root fd 复验 status 与 content digest。任一输入、terminal、limit、identity、duplicate-local-id 或 root/file drift 失败时，整个 intake 不发布 workspace；
-5. 成功后产生 `DIRECTORY` origin、profile `explicit-selected-files-v1` 和规范化 relative source refs。该 profile只记录用户明确选择的一组 source，不递归 discovery、不监视目录、不授予 source write-back；
+5. 成功后按一个文件的 `SINGLE_FILE/explicit-single-file-v1` 或多个文件的 `DIRECTORY/explicit-selected-files-v1` 产生 origin 和规范化 relative source refs。该 profile只记录用户明确选择的一组 source，不递归 discovery、不监视目录、不授予 source write-back；
 6. `directory/explicit-selected-files-v1` 在本规格中只允许保存 ProjectPackage，不允许多文件 origin write-back。JSON live writer是未来回写的必要但不充分条件；只有 legacy `single_file` LocalCAT JSON 继续使用既有 writer。TXT/PO/POT 的 target/confirmed只写package overlay。
 
 这个 intake 只建立 carrier-neutral `StagedSelectedProjectDocuments(durable=False, source_write_back_authorized=False)`。只有 C2C ProjectPackage 成功发布并 cold reopen 后，它才成为 durable 多文档项目；失败时原 source bytes与当前session均不变。`revalidate_staged_selected_documents()` 只对同一 exact binding 重开新 sealed snapshots 供 preview/apply 比对，不发布或修改原 staged workspace。
@@ -444,6 +444,61 @@ service 私下保留 exact staged candidate，public dataclass本身不能授权
 
 任一变化返回 `PROJECT.RECONCILE.PREVIEW_STALE` 或更精确 stable code，零 workspace mutation，operation capability随失败消费或显式关闭；不得“尽量应用剩余项”。
 
+## 显式根目录选择与单文件项目
+
+本节对应 Requirement 13，精确扩展既有 C2A intake 与 C4 打开/导航，不追认历史实现或完成门。单文件 profile 同时供 RPY 消费；RPY grammar/private handoff/导出仍归相邻规格。
+
+### Ownership
+
+Project 拥有发现策略、预览/选择合同、intake 和树投影。平台拥有安全的只读目录观察；retained-root 观察使用 [平台中立合同](../windows-platform-enablement/design.md#只读目录观察与受控目标物化)，live-lock/ledger 枚举不能冒充任意用户目录发现；Application 不使用 `rglob`、裸路径递归绕过平台。Parser 只消费确认的单文件源；Controller/Qt 不枚举或解释文件内容。
+
+
+### 文件与端口计划
+
+| 文件 | 责任 |
+| --- | --- |
+| 新增 `project_workspace_discovery.py` | Project 递归策略、候选树、限额、选择与 stale 校验 |
+| 新增 `project_directory_contracts.py` | frozen preview/entry/selection/rejection DTO，无 Qt/codec 私有类型 |
+| 修改 `platform_fs_contracts.py`、`platform_fs_posix.py`、`platform_fs_windows.py` | 平台 owner 的有界 retained-root 只读观察 port |
+| 修改 `project_workspace_contracts.py`、`project_workspace_intake.py`、`project_package.py` | 单文件 profile cardinality、OriginBinding、验证与冷重开；复用现有 package schema |
+| 修改 `editor_controller.py`、`qt_editor_window.py` | 统一打开入口内的根目录动作、勾选/排序 review、异步生命周期和章节树 |
+| 新增 `tests/test_project_workspace_discovery.py` 及对应平台/Qt 测试 | 合成目录、no-follow/drift/取消、single profile、包与导航旅程 |
+| 修改普通 frozen 的模块声明与构建组合 | 纳入新增模块，不扩张 Core/Host/Gate 合同 |
+
+平台端口 `observe_children(retained_directory, limits, cancellation)` 返回受限不可变条目及同一观察的身份事实；目录下钻取得 no-follow 的 retained descendant handle。目录不加业务写锁、不建 ledger、不写源目录；平台分别处理 POSIX symlink 与 Windows reparse/ancestor drift。观察不是内容读取或永久 authority，所选文件仍经现有 sealed read 与 verified terminal。
+
+Project 的 `DirectorySelectionPreview` 含 issued preview ID、generation、root binding reference、规范化相对树、候选类型/大小及阻断原因，不含绝对路径权限或正文。可选择格式来自配置 Parser registry 的中立 suffix/capability 投影，真正格式资格由 intake 验证；扩展名匹配不能宣告 parse 成功。Qt 只返回 issued entry IDs 与显式顺序，不能回传任意拼接路径。
+
+### 根目录发现与确认流
+
+1. 用户从既有“打开本地项目”流程选择“选择文件”或“选择文件夹”，根目录动作不占用常驻顶栏。直接文件选择/拖入仍按原有规则分流；目录拖入首版不自动处理。现有文件夹按钮只导航。
+2. 用户选定根后平台 bind，Project 有界递归只读 metadata。最多深度 32、10,000 个总条目（含目录/不可选文件）、同时至多 33 个目录 handle；沿深度优先遍历及时释放非祖先 handle。继承更小的平台路径限制。到深度/条目/资源上限或读取目录失败时，标记预览不完整并禁止确认，提示选更小的根重试，不把截断当完整结果。
+3. 普通文件根据配置能力可选；默认未勾选。链接/reparse、非 regular、非法 portable ref 均显示不可选且不跟随；所选 hardlink alias、大小写/规范化碰撞在确认时拒绝。目录本身不作为 Document。未知/不可选格式可显示但不打开正文；用户取消不发布候选。最长 source_ref 和路径组件继续沿用 owner 限额，不把“二级”写成硬性深度。
+4. 候选以规范化相对路径的 Unicode code-point 顺序稳定显示；所选列表初始采用该顺序，用户在 review 中显式调整成为 manifest order。未选内容不读取/parse、不自动加入新发现文件。刷新/换根撤销旧 preview 和确认状态，重新勾选；不后台刷新后静默改变集合。
+5. 确认携带 preview ID、generation 和有序 entry IDs。Project 复证 retained root 与所选文件身份，使用原根生成 source_ref；任一选择失效全部拒绝。确认前的 metadata 不替代 verified terminal。首包发布继续保持绑定并消费原 intake 原子候选/保存结果。取消、关窗、换项目或新请求均撤销 generation，晚到结果丢弃并释放 handle；错误不切换当前项目。
+
+### 单文件 profile 与持久化
+
+零文件禁止确认；一个文件建立 `SINGLE_FILE + explicit-single-file-v1`，OriginBinding 恰有一个文档；两个及以上使用既有 `DIRECTORY + explicit-selected-files-v1`（原至少两个的验证不放宽）。两者均保留最初选择根及相对 source_ref，单选 `script/Chapters/intro.rpy` 不降为 `intro.rpy`。新 profile 通用于配置支持的 project_document codec，不假装 legacy JSON，不提供 RPY 或其他格式语法能力。
+
+初次 document ID 继续由原 owner 的规范化 source_ref 规则派生，之后 manifest identity 为权威；原根与顺序不会因筛选重新计算。包内仍保存既有 source/document/opaque private members，不增加新 carrier 或私有语法字段；ProjectPackage decoder/validator 明确识别新 profile 与一文档 cardinality，冷重开不需要原根路径。配置 surface/private handoff 的通用增量由 RPY Task 1.4 集成，避免两份 profile 实现。源 writer 仍须独立 live capability，目录发现和 ProjectPackage save 均不授予源文件覆盖权限。
+
+### 章节树只作导航投影
+
+Controller 从 manifest source_ref 生成目录组件，Qt 在既有文件夹菜单展示嵌套组与文件叶项。组按其中叶项在 manifest 的首次出现顺序排列，同组叶项遵守 manifest 相对顺序；树结构允许聚合跨组交错文档，但不反写 manifest 或改变连续阅读/搜索次序。目录项只展开/折叠，叶项继续持有 issued Document identity，支持键盘跳转、current/dirty 状态和现有 Chunk 可见性过滤；无可见叶项的目录不显示。
+
+导航不检查源目录存在性，包移动/离线冷重开后仍可用。同名文件通过路径分组区分；编辑左栏与浏览分隔可提供相对路径提示而不创造新身份。单文件包仍遵循当前文档导航规则。
+
+### 增量验证与追踪
+
+| 需求 | 设计 | 验证 |
+| --- | --- | --- |
+| 13.1, 13.2 | retained-root discovery、issued selection、确定顺序 | 二层及更深目录、同名文件、未勾选零内容读取、根不重算 |
+| 13.3 | 平台 no-follow/drift、上限、generation | 超限/不可读目录、取消/晚到、root/所选文件替换、alias |
+| 13.4 | 单文件 profile、原 intake 与 package | 零/一/多文件、非 legacy、无原根冷重开、既有 profile 负向 |
+| 13.5 | manifest 章节树投影 | 交错目录顺序、键盘/current/dirty/Chunk、离线导航 |
+| 13.6 | 原 Controller/Qt 与正常发行集成 | 合成包端到端、原 TXT/JSON 文件单选/多选回归 |
+
 ## C2B：保存、回写与恢复
 
 C2B先建立carrier-neutral的candidate/LKG、逐Document baseline、structured report与cold recovery协议，供C2C获批物理carrier消费。它不在当前规格启用directory discovery、workbook project profile或任何新source writer。下面的directory/workbook段落是后续origin adapter必须遵守的冻结原子性红线，不是本Cluster的产品支持声明。
@@ -501,7 +556,7 @@ validate immutable workspace snapshot
 
 ### 后续 Directory profile 的冻结红线
 
-directory是多个独立文件的保存范围，不承诺跨文件原子性。未来profile只有在独立R/D/T批准后才可实现，且必须遵守：
+本节仅约束未来将源目录作为保存目标的 Project save/recovery，不适用于 ADR-030 的独立格式导出。当前目录 origin 只保存 ProjectPackage；格式导出逐文件报告发布结果，不建立本节的项目级 journal/rollback。后续 directory save 不承诺跨文件原子性，并须保持下列合同：
 
 1. 为全部待写 Document在各自目标同目录完成 staging、codec validation与 stale check。
 2. 写入 durable recovery journal，记录 operation id、每个 document id、目标 identity、stage/backup digest与 phase；journal不含正文。
@@ -517,7 +572,7 @@ directory是多个独立文件的保存范围，不承诺跨文件原子性。�
 
 ### 后续 Workbook profile 的冻结红线
 
-workbook是一个物理文件保存单元，即使逻辑上包含多个Document。未来profile只有在独立R/D/T批准后才可实现，且必须遵守：
+workbook是一个物理文件保存单元，即使逻辑上包含多个Document。此 profile 不提供 origin write-back；后续实现必须保持下列合同：
 
 - matching workbook codec必须从全部相关 Document与opaque private state生成一个完整新 workbook；
 - 在同目录 temp上执行全部 sheet/profile/unknown-content round-trip validation；
@@ -525,7 +580,7 @@ workbook是一个物理文件保存单元，即使逻辑上包含多个Document�
 - 单次原子 replace + parent fsync发布；失败保留旧 workbook与所有dirty状态；
 - 不允许按 sheet逐个写回并声称项目原子；也不把“workbook origin”解释为任意 Office 表格支持。
 
-本规格不以fake directory/workbook writer宣称这些产品origin可用；只通过contract/fault model证明carrier-neutral coordinator没有预设虚假原子性。真实directory discovery、multi-sheet XLSX profile与codec均由后续规格提供并重新做current-source acceptance。
+本规格不以fake directory/workbook writer宣称这些产品origin可用；只通过contract/fault model证明carrier-neutral coordinator没有预设虚假原子性。显式 directory discovery 由本规格的根目录选择服务提供；multi-sheet XLSX profile 与其 codec 仍属后续独立范围。
 
 ### Save report 与恢复合同
 
@@ -586,13 +641,13 @@ ProjectPackage v1 是多文档 workspace 的 canonical persistence：
 }
 ```
 
-这是说明性shape；`explicit-selected-files-v1`只说明这些Document最初来自用户在同一portable root下明确选择的一组文件，ProjectPackage已把受管source members收入清单；它不授权扫描外部directory。实现的exact key集合、排序、版本与canonical encoder由contract tests冻结。未知或未批准origin/profile、未知required字段、重复key、非canonical number、NaN/Infinity、错误type、额外root/document字段在v1 fail closed；不得last-key-wins。未来可选字段只能通过新schema/version或明确的namespaced extension机制批准，v1不预埋chunk/sync/resource字段。
+这是说明性shape；`explicit-selected-files-v1`只说明这些Document最初来自用户在同一portable root下明确选择的一组文件，ProjectPackage已把受管source members收入清单；它不授权扫描外部directory。实现的exact key集合、排序、版本与canonical encoder由contract tests冻结。未知或不受支持origin/profile、未知required字段、重复key、非canonical number、NaN/Infinity、错误type、额外root/document字段在v1 fail closed；不得last-key-wins。未来可选字段只能通过新schema/version或明确的namespaced extension机制定义，v1不预埋chunk/sync/resource字段。
 
 每个document member保存该Document的format/codec identity、writer capability snapshot、source binding、source segments和逻辑Editing Overlay。overlay在逻辑模型中独立于source-owned facts，但v1不强制它成为独立物理member；所选carrier可以把两者编码在同一个受摘要绑定的document member中。reader-only Document还必须绑定原source bytes的managed source member或等价carrier blob；overlay变化不得改写该source member。manifest不复制segment正文，只引用带digest的document member和全部受管blob。每个Document最多一个`codec_private_member`；其bytes独立存放，manifest只记录path/digest/byte count/codec identity/profile version。
 
-### C2C Physical carrier 人工决策门
+### C2C Physical carrier
 
-C0只冻结logical manifest/member/receipt与carrier必须保持的安全/事务语义，当时不批准具体物理容器。C2C current-source spike与独立对抗审查完成后，项目 owner已在ADR-019批准严格闭集的单文件`localcat-project-package-zip-v1`/`ZIP_STORED`为v1唯一production carrier。未选的versioned-directory与裸目录不保留并行runtime；扩展名仍不参与格式或身份判定。
+ADR-019 定义严格闭集的单文件 `localcat-project-package-zip-v1`/`ZIP_STORED` 为 v1 唯一 production carrier。versioned-directory 与裸目录不提供并行 runtime；扩展名不参与格式或身份判定。
 
 所有候选carrier必须证明：
 
@@ -605,7 +660,7 @@ C0只冻结logical manifest/member/receipt与carrier必须保持的安全/事务
 
 候选比较已完成：单文件deterministic ZIP对手工搬运和未来provider只暴露一个immutable artifact；versioned directory + atomic current pointer虽可实现，但手工复制与provider listing可见pointer/generation不一致，并扩大跨平台path、durability、orphan GC和TOCTOU状态面。ADR-019因此选定前者并拒绝并行directory reader/writer。
 
-已批准profile为`localcat-project-package-zip-v1`，布局为：
+支持的 profile 为`localcat-project-package-zip-v1`，布局为：
 
 ```text
 manifest.json
@@ -624,20 +679,26 @@ versioned-directory候选已被ADR-019拒绝作为v1；不得将实验性generat
 
 1. exact validate workspace、limits、live session/revision和全部opaque member handles；
 2. canonical encode document members和manifest，计算member digests；
-3. 由C2C获批carrier在隔离位置生成完整candidate；
+3. 由 C2C carrier在隔离位置生成完整candidate；
 4. 关闭candidate后用独立cold carrier reader执行完整physical + logical validation并重算workspace content digest；
-5. revalidate target parent/destination baseline，按获批carrier的单一publication point发布并做durability proof；
+5. revalidate target parent/destination baseline，按 carrier的单一publication point发布并做durability proof；
 6. 返回 `ProjectPackageExportReceipt`，含operation id、schema/profile、project id、artifact/content digest、document/segment/member/byte counts与before-destination digest；
 7. 任一步失败保留旧target，删除可安全删除的temp；若无法证明cleanup，返回body-safe recovery path token而不是绝对路径。
 
 只有第5步完成才可用receipt更新package persistence baseline。
+
+### 受限整包 artifact
+
+`ProjectPackageArtifact` 只由完成 export/save 的 Project owner 结果签发，保留独立文件身份，提供安全 metadata（SHA-256、byte_count、workspace_content_digest）、`open_bounded_stream()` 与 `close()`。它不暴露 path、`open_member`、private payload 或未完成 candidate；关闭、截断或身份漂移后读取失败。stream 受 owner 限额约束，不给 provider 任意路径访问能力。
+
+外部下载先形成独立候选，再经本 owner 的 validate/preview/apply、未保存保护和 durable receipt；网络传输结果不能清除 dirty 或签发本地提交。apply 后重新导出，核对内容 fingerprint 后才供调用方推进对应基线。`export_copy` 不改变 save baseline；`save_workspace` 仍须已提交 save report 和 durable receipt。
 
 ### Validate
 
 `validate_project_package(source)` 是只读操作：
 
 - 通过rooted no-follow source boundary建立sealed snapshot；不进行hash-then-reopen；
-- 验证获批physical carrier、manifest、member set/digest、nested contracts、identity/ref collisions和limits；
+- 验证 physical carrier、manifest、member set/digest、nested contracts、identity/ref collisions和limits；
 - materialize前先完成carrier/member/JSON lexical limits；
 - 返回body-safe `ProjectPackageValidationReport`：artifact identity/digest、profile/schema、project id、counts、safe issues；
 - 不返回source/target/speaker/private bytes，不打开origin，不查询codec registry，不授予writer或apply。
@@ -700,6 +761,8 @@ receipt不包含正文、private bytes、absolute path、credential、device key
 - export必须bit-for-bit保留未修改document的private member；document source reconciliation需要新private member时，由codec产生完整replacement，workspace不合并旧新bytes；
 - Chunk与Sync只见member reference/digest或整个package bytes，不读取payload。
 
+配置的 Parser surface 在同一 retained source snapshot 上完成 verified terminal 后，以中立 records/source/opaque private bytes 单次 handoff 进入 intake；Project 只验证外层大小、digest、identity 与 closure。codec 缺失时中立编辑和包保存继续可用，格式导出返回 unavailable。
+
 该名称不等于通用sidecar authority，也不允许ResourcePackage复用其schema。未来RPY、XLSX或XLIFF可各自定义private payload，但必须通过独立codec规格与golden round-trip验证。
 
 ## C3：Controller、搜索与导航
@@ -761,7 +824,7 @@ UI文案为“当前章节 / 搜索全部章节”。为保持既有单 JSON pub
 | Retained safe issues | 256 |
 | JSON nesting depth | 64 |
 
-若C2C人工批准deterministic ZIP候选，则其profile必须另外冻结compression/ZIP64与对应输入限制；C0不把stored member或“拒绝所有compressed member”预先写成已批准合同。所有carrier的计数和byte limits都用exact non-bool integer与checked addition，超限即停止读取并清理private staging。未来调高/降低数值必须发布新profile version与兼容策略，不能静默改变v1。
+ZIP v1 按上述 carrier 合同拒绝 compression/ZIP64，并遵守对应输入限制。所有carrier的计数和byte limits都用exact non-bool integer与checked addition，超限即停止读取并清理private staging。未来调高/降低数值必须发布新profile version与兼容策略，不能静默改变v1。
 
 ### Body-safe error contract
 
@@ -892,62 +955,6 @@ public error/report/log不得包含source/target/speaker/private bytes、carrier
 - target 非空时固定 source 1 行 + target 最多 3 行；target 为空时 source 最多 4 行。最后可见行用字体度量后省略，不以字符数猜测宽度。
 - 每组只携带首段的 issued identity；点击后回到 Controller 现有 `go_to` / `go_to_workspace_segment` 入口。分组顺序、命名和大小都不参与 Project/Document/Segment identity、dirty、save、TM 或 chunk membership。
 - Browse/Review 标题行不展开显示方式、分组大小、阈值或启用复选框；只放置单一设置入口按钮。自动收起式仅在主页保留 Codex 风格的窄刻度轨道，并在标记 hover/focus 时浮出四行预览；固定式则在主页常驻同一四行预览列表。全部设置归属弹窗；跨 Document 浏览或文件夹选择只重建当前 Document 的轮次投影。
-
-## 显式根目录选择增量（待批准）
-
-本节对应 Requirement 13，精确扩展既有 C2A intake 与 C4 打开/导航，不追认历史实现或完成门。单文件 profile 同时供 RPY 消费；RPY grammar/private handoff/导出仍归相邻规格。
-
-### Ownership 与实施前置
-
-Project 拥有发现策略、预览/选择合同、intake 和树投影。平台拥有安全的只读目录观察；现有 `RootedFileSystem` 仅有 bind/open，live-lock/ledger 枚举不能冒充任意用户目录发现。平台 owner 必须批准 retained-root 只读观察端口及 POSIX/Windows 实现；此节提出合同，不默许 Application 使用 `rglob`、裸路径递归绕过平台。Parser 只消费确认的单文件源；Controller/Qt 不枚举或解释文件内容。
-
-相邻审批包括平台观察端口、Project 单文件 OriginBinding/包验证和 Qt 统一入口。当前增量 `ready_for_implementation=false`；原 Tasks Cluster 0–4 的已完成状态不证明新能力存在。原 RPY/Sync 顺序条款的修订继续由 RPY Design 的治理前置处理，本增量不改写 adopted ADR 或后置格式资格。
-
-### 文件与端口计划
-
-| 文件 | 责任 |
-| --- | --- |
-| 新增 `project_workspace_discovery.py` | Project 递归策略、候选树、限额、选择与 stale 校验 |
-| 新增 `project_directory_contracts.py` | frozen preview/entry/selection/rejection DTO，无 Qt/codec 私有类型 |
-| 修改 `platform_fs_contracts.py`、`platform_fs_posix.py`、`platform_fs_windows.py` | 经平台 owner 批准的有界 retained-root 只读观察 port |
-| 修改 `project_workspace_contracts.py`、`project_workspace_intake.py`、`project_package.py` | 单文件 profile cardinality、OriginBinding、验证与冷重开；复用现有 package schema |
-| 修改 `editor_controller.py`、`qt_editor_window.py` | 统一打开入口内的根目录动作、勾选/排序 review、异步生命周期和章节树 |
-| 新增 `tests/test_project_workspace_discovery.py` 及对应平台/Qt 测试 | 合成目录、no-follow/drift/取消、single profile、包与导航旅程 |
-| 修改普通 frozen 的模块声明与构建组合 | 纳入新增模块，不扩张 Core/Host/Gate 合同 |
-
-拟议平台端口 `observe_children(retained_directory, limits, cancellation)` 返回受限不可变条目及同一观察的身份事实；目录下钻取得 no-follow 的 retained descendant handle。目录不加业务写锁、不建 ledger、不写源目录；平台分别处理 POSIX symlink 与 Windows reparse/ancestor drift。观察不是内容读取或永久 authority，所选文件仍经现有 sealed read 与 verified terminal。
-
-Project 的 `DirectorySelectionPreview` 含 issued preview ID、generation、root binding reference、规范化相对树、候选类型/大小及阻断原因，不含绝对路径权限或正文。可选择格式来自配置 Parser registry 的中立 suffix/capability 投影，真正格式资格由 intake 验证；扩展名匹配不能宣告 parse 成功。Qt 只返回 issued entry IDs 与显式顺序，不能回传任意拼接路径。
-
-### 根目录发现与确认流
-
-1. 用户从既有“打开本地项目”流程选择“选择文件”或“选择文件夹”，根目录动作不占用常驻顶栏。直接文件选择/拖入仍按原有规则分流；目录拖入首版不自动处理。现有文件夹按钮只导航。
-2. 用户选定根后平台 bind，Project 有界递归只读 metadata。最多深度 32、10,000 个总条目（含目录/不可选文件）、同时至多 33 个目录 handle；沿深度优先遍历及时释放非祖先 handle。继承更小的平台路径限制。到深度/条目/资源上限或读取目录失败时，标记预览不完整并禁止确认，提示选更小的根重试，不把截断当完整结果。
-3. 普通文件根据配置能力可选；默认未勾选。链接/reparse、非 regular、非法 portable ref 均显示不可选且不跟随；所选 hardlink alias、大小写/规范化碰撞在确认时拒绝。目录本身不作为 Document。未知/不可选格式可显示但不打开正文；用户取消不发布候选。最长 source_ref 和路径组件继续沿用 owner 限额，不把“二级”写成硬性深度。
-4. 候选以规范化相对路径的 Unicode code-point 顺序稳定显示；所选列表初始采用该顺序，用户在 review 中显式调整成为 manifest order。未选内容不读取/parse、不自动加入新发现文件。刷新/换根撤销旧 preview 和确认状态，重新勾选；不后台刷新后静默改变集合。
-5. 确认携带 preview ID、generation 和有序 entry IDs。Project 复证 retained root 与所选文件身份，使用原根生成 source_ref；任一选择失效全部拒绝。确认前的 metadata 不替代 verified terminal。首包发布继续保持绑定并消费原 intake 原子候选/保存结果。取消、关窗、换项目或新请求均撤销 generation，晚到结果丢弃并释放 handle；错误不切换当前项目。
-
-### 单文件 profile 与持久化
-
-零文件禁止确认；一个文件建立 `SINGLE_FILE + explicit-single-file-v1`，OriginBinding 恰有一个文档；两个及以上使用既有 `DIRECTORY + explicit-selected-files-v1`（原至少两个的验证不放宽）。两者均保留最初选择根及相对 source_ref，单选 `script/Chapters/intro.rpy` 不降为 `intro.rpy`。新 profile 通用于获批准的 project_document codec，不假装 legacy JSON，也不批准 RPY 或其他格式本身。
-
-初次 document ID 继续由原 owner 的规范化 source_ref 规则派生，之后 manifest identity 为权威；原根与顺序不会因筛选重新计算。包内仍保存既有 source/document/opaque private members，不增加新 carrier 或私有语法字段；ProjectPackage decoder/validator 明确识别新 profile 与一文档 cardinality，冷重开不需要原根路径。配置 surface/private handoff 的通用增量由 RPY Task 1.4 集成，避免两份 profile 实现。源 writer 仍须独立 live capability，目录发现和 ProjectPackage save 均不授予源文件覆盖权限。
-
-### 章节树只作导航投影
-
-Controller 从 manifest source_ref 生成目录组件，Qt 在既有文件夹菜单展示嵌套组与文件叶项。组按其中叶项在 manifest 的首次出现顺序排列，同组叶项遵守 manifest 相对顺序；树结构允许聚合跨组交错文档，但不反写 manifest 或改变连续阅读/搜索次序。目录项只展开/折叠，叶项继续持有 issued Document identity，支持键盘跳转、current/dirty 状态和现有 Chunk 可见性过滤；无可见叶项的目录不显示。
-
-导航不检查源目录存在性，包移动/离线冷重开后仍可用。同名文件通过路径分组区分；编辑左栏与浏览分隔可提供相对路径提示而不创造新身份。单文件包仍遵循当前文档导航规则。
-
-### 增量验证与追踪
-
-| 需求 | 设计 | 验证 |
-| --- | --- | --- |
-| 13.1, 13.2 | retained-root discovery、issued selection、确定顺序 | 二层及更深目录、同名文件、未勾选零内容读取、根不重算 |
-| 13.3 | 平台 no-follow/drift、上限、generation | 超限/不可读目录、取消/晚到、root/所选文件替换、alias |
-| 13.4 | 单文件 profile、原 intake 与 package | 零/一/多文件、非 legacy、无原根冷重开、既有 profile 负向 |
-| 13.5 | manifest 章节树投影 | 交错目录顺序、键盘/current/dirty/Chunk、离线导航 |
-| 13.6 | 原 Controller/Qt 与正常发行集成 | 合成包端到端、原 TXT/JSON 文件单选/多选回归 |
 
 ## Requirements Traceability
 

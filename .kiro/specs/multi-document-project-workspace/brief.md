@@ -39,7 +39,7 @@ MateCat 参考中的 file navigation 与本规格的 Document/Chapter 接近；M
 
 - 当前单 JSON 项目继续由既有路径打开和保存，不依赖本规格，也不因本规格阻塞 Parser Foundation；
 - 多 JSON folder、multi-sheet XLSX 与 RPY 项目支持均后置，并显式依赖本规格与各自 codec；
-- XLSX 只可由后续规格批准明确的工作表 profile，不因 `workbook` origin 自动支持任意表格；
+- XLSX 只可由独立规格定义明确的工作表 profile，不因 `workbook` origin 自动支持任意表格；
 - TMX 始终是 `language_resource` 互操作格式，不是 `project_document`，未来如需编辑应属于独立 TM Resource Editor；
 - 不把 `confirmed`、speaker 显示名或头像强制写入不拥有这些字段的源格式。
 
@@ -71,6 +71,6 @@ MateCat 参考中的 file navigation 与本规格的 Document/Chapter 接近；M
 
 每簇按人工阶段门推进；在 identity cluster 通过前不得开始 chunk，且不得把当前单 JSON segment id 改写为临时路径/列表索引。
 
-## Pending Increment：根目录预览与章节树
+## 根目录预览与章节树增量
 
-现有文件单选/多选与 ProjectPackage 路径模型之上，增加用户选择根目录、递归预览、勾选并排序的打开流程，支持嵌套目录及单选文件。现有文件夹按钮按相对目录分组导航，保持文档身份和阅读顺序。范围、平台端口及单文件 profile 的待批准增量见 Requirements 13、Design 对应节和 Tasks Cluster 5；不扩大格式 codec 资格或后台扫描范围。
+现有文件单选/多选与 ProjectPackage 路径模型之上，增加用户选择根目录、递归预览、勾选并排序的打开流程，支持嵌套目录及单选文件。现有文件夹按钮按相对目录分组导航，保持文档身份和阅读顺序。范围、平台端口及单文件 profile 的合同见 Requirements 13、Design 对应节和 Tasks Cluster 5；不扩大格式 codec 资格或后台扫描范围。
