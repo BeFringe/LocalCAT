@@ -1,0 +1,132 @@
+# 实施计划
+
+实施前置：RPY/手工包闭环、Design 中网络/状态候选决策与 Project/平台/Qt amendment 获批。当前为 NO-GO 的条件式计划，不通过实施任务代替审批。子任务默认顺序执行，按单一结果安排约 1–3 小时；真实 provider 验收必须在用户批准的测试前缀进行。
+
+- [ ] 1. 建立明确的 runtime 与 owner 接缝
+- [ ] 1.1 固定可选依赖和可信 composition
+  - 选择兼容稳定版 botocore/keyring/defusedxml，锁定 source/frozen 依赖；验证条件 PUT 参数，禁用时不构造 client。
+  - 完成时，新环境可复现安装，缺依赖仅禁用同步，本地工作流不受影响。
+  - _Requirements: 1.2, 2.4, 7.1_
+  - _Boundary: Sync composition / Platform dependency integration_
+- [ ] 1.2 实现中立 provider、artifact 与安全结果合同
+  - 固定有界流、版本条件、capability、OutcomeUnknown 和脱敏结果；provider 不导入 package owner。
+  - 完成时，fake provider 可模拟成功/冲突/未知，接口不能接收 active 项目路径或 manifest。
+  - _Requirements: 3.1, 3.4, 5.3, 6.2_
+  - _Boundary: SyncContracts_
+- [ ] 1.3 实现 Project owner 批准的整包传输端口
+  - 从已完成出口提供独立 retained bounded stream 与安全 metadata（含 owner 内容 fingerprint），不暴露 path/member。
+  - 完成时，文件身份变化、截断、关闭后读取均失败，只有 durable 完成 artifact 可交付。
+  - _Requirements: 3.1, 3.2_
+  - _Boundary: Project owner amendment_
+
+- [ ] 2. 实现连接和秘密生命周期
+- [ ] 2.1 保存设备连接配置及版本
+  - 校验 endpoint/bucket/prefix 或 DAV URL/username，配置变更撤销旧计划；普通配置不保存秘密。
+  - 完成时，缺字段明确可见，换连接不能复用旧 base，禁用零网络。
+  - _Requirements: 1.1, 1.2, 1.3, 1.4_
+  - _Boundary: SyncState config_
+- [ ] 2.2 接入系统秘密后端和环境来源
+  - 仅使用 allowlisted 系统 backend，显式读取 R2_KEY/R2_SECRET；不启用默认 AWS 凭据链或 plaintext fallback。
+  - 完成时，backend 缺失/锁定、环境缺半项均有安全结果，秘密不进入配置、repr 或日志。
+  - _Requirements: 2.3, 2.4_
+  - _Boundary: SecretStore_
+- [ ] 2.3 实现设置中的密码显隐
+  - 默认遮蔽、当前字段显式显示、关窗/重开恢复；用户名为普通字段，无加密开关。
+  - 完成时，Qt 可访问标签/键盘交互可用，显示动作不复制秘密、不持久化 reveal 值。
+  - _Requirements: 2.1, 2.2, 2.4, 8.1_
+  - _Boundary: Sync Controller / Qt settings integration_
+  - _Depends: 2.1, 2.2_
+
+- [ ] 3. 建立 R2 与条件 transport
+- [ ] 3.1 实现有界 R2 列举与读取
+  - 只访问所选 bucket/prefix，完整分页，读取同一响应的 body/version；施加大小/超时限制。
+  - 完成时，截断、漏页、认证失败不会被判定为空远端；连接测试不写对象。
+  - _Requirements: 1.3, 4.4, 6.1, 6.2, 7.1_
+  - _Boundary: R2Provider_
+- [ ] 3.2 实现不可变对象与条件 head 提交
+  - PUT 使用 absent/expected version，摘要验证后复用对象；head 最后提交，删除写 tombstone，保留旧 bytes。
+  - 完成时，两个相同旧版本更新只允许一方成功，无条件写不可达，旧 ETag 不能覆盖新内容。
+  - _Requirements: 5.2, 5.3, 5.4, 7.1_
+  - _Boundary: SyncTransport / R2 integration_
+- [ ] 3.3 处理写后超时与安全重试
+  - 用 operation ID/head 摘要复证未知结果，限制 SDK/service 重试层数；取消不再发起新提交。
+  - 完成时，服务端已写但客户端超时能确认或报告冲突，不会重复无条件覆盖。
+  - _Requirements: 6.1, 6.2, 6.4_
+  - _Boundary: SyncTransport execution_
+
+- [ ] 4. 实现计划与冲突保护
+- [ ] 4.1 实现三方比较和模式过滤
+  - 覆盖 base/local/remote 相同、改变、显式删除、unavailable/unselected、tombstone 与无 base；push/pull 不隐含强制胜者。
+  - 完成时，纯矩阵测试给出确定操作，单边/双方删除及删除对修改有明确结果；deleted参与比较，mtime不参与，缺失/未选不推断删除。
+  - _Requirements: 4.1, 4.2, 4.4, 5.1_
+  - _Boundary: SyncPlanner_
+- [ ] 4.2 签发预览、冲突选择与删除确认
+  - 绑定 config/owner/remote revision，选择胜者或副本重新出计划，应用批量阈值。
+  - 完成时，任一事实变化导致 stale；未确认删除/覆盖不能进入执行，双方副本均可恢复；确认删除只解除同步绑定，保留的本地内容不会在下次预览自动复活。
+  - _Requirements: 4.3, 5.1, 5.2, 5.3, 5.4_
+  - _Boundary: SyncService planning_
+
+- [ ] 5. 接通 owner artifact 和逐项恢复
+- [ ] 5.1 接入 Project 上传与下载验证
+  - 消费整包 port；下载仅进入受限 candidate，再走 Project validate/preview/apply 与未保存保护。
+  - 完成时，下载成功未被误报为已应用，拒绝 preview 不改活跃项目，缺 RPY codec 的包仍可中立编辑；导入后重新导出，调和造成的内容差异显示待对齐，不直接推进共同基线。
+  - _Requirements: 3.1, 3.2, 3.3, 8.2, 8.3_
+  - _Boundary: ProjectArtifactAdapter integration_
+  - _Depends: 1.3, 4.2_
+- [ ] 5.2 接入 JSONL/CSV Resource artifact 事务
+  - 复用现有 ResourcePackageArtifact，本地选择 create/replace 与生命周期复证；不消费 TMX import 或 live store 文件。
+  - 完成时，外来 receipt/资源 ID 无法自动选择本地目标，成功由本地 owner receipt 确认；以 payload fingerprint 比较应用后的内容，包外壳变化不触发无限重传。
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 8.2_
+  - _Boundary: ResourceArtifactAdapter integration_
+- [ ] 5.3 实现每项 intent 和 base 的持久化
+  - 按 connection 加锁，先写 intent，再传输/owner 提交、导入后内容复证，最后推进成对 base；保存显式删除/待对齐状态及恢复副本引用。
+  - 完成时，每个持久化故障点都能拒绝新操作或恢复，失败项不推进 base，多包不伪称全局事务。
+  - _Requirements: 5.2, 6.3, 6.4_
+  - _Boundary: SyncState persistence_
+- [ ] 5.4 实现上传/下载中断后的复证与 owner 恢复
+  - 上传查询 operation ID/head；下载仅消费 owner 实际 pending recovery，缺失已返回结果时标未知，不依赖不存在的冷 receipt 查询。用户通过 owner 重新 open/validate/export 后出新预览。
+  - 完成时，注入“远端已提交/base未写”和“owner已提交/结果未记录即退出”不会重复替换；未知结果需用户确认新观测，内容不同维持待对齐而不伪造历史成功。
+  - _Requirements: 6.2, 6.3, 6.4_
+  - _Boundary: SyncService recovery / owner integration_
+  - _Depends: 3.3, 5.1, 5.2, 5.3_
+
+- [ ] 6. 完成 R2 手动桌面闭环
+- [ ] 6.1 接入计划、执行、取消与结果界面
+  - 仅显示 Controller 安全 DTO，保留编辑保存；过期/关闭 session 不接受晚到提交。
+  - 完成时，用户可读地完成选包、预览、冲突、导入确认与部分失败恢复，不暴露内部 authority。
+  - _Requirements: 1.3, 6.1, 6.4, 8.1, 8.2_
+  - _Boundary: Sync Controller / Qt workflow integration_
+- [ ] 6.2 验证正常发行的可选模块闭包
+  - 纳入 SDK service data、系统 backend 和 XML parser，保持 source 与普通 frozen 的禁用/启用路径。
+  - 完成时，实际产品能打开同步设置与执行合成 mock 流，Core/Host/DTO/轮询边界无扩张。
+  - _Requirements: 1.2, 2.4, 6.1_
+  - _Boundary: Platform build composition_
+- [ ] 6.3 建立并运行 R2 隔离前缀验收
+  - 工具先做只读连接，再在明确批准的测试 prefix 验证双创建/双更新竞争、超时、完整包冷重开和逻辑删除。
+  - 完成时，两设备 Project 与 Resource 旅程有真实结果；缺配置报告未运行，秘密不进入输出，清理仅作用于本次测试对象且不降级条件规则。
+  - _Requirements: 3.4, 5.3, 7.1, 7.4, 8.4_
+  - _Boundary: R2 product acceptance_
+
+- [ ] 7. 接入 InfiniCLOUD WebDAV
+- [ ] 7.1 实现受限 DAV 列举、读取与认证
+  - 使用 User ID/Apps Password 和账户 DAV URL；Depth 1、逐项 multistatus、限额 XML、同 origin 凭据与根范围校验。
+  - 完成时，实体/越界 href/部分错误/弱 ETag 不被默认为有效完整快照，连接测试保持只读。
+  - _Requirements: 2.4, 4.4, 6.1, 6.2, 7.2_
+  - _Boundary: WebDAVProvider_
+- [ ] 7.2 实现条件写和 capability 门
+  - 复用同一 transport，明确区分连通、只读与条件写已验证；端点或配置改变撤销能力。
+  - 完成时，弱/缺失 ETag 或条件被忽略时阻断覆盖/删除，不改为“先读再普通 PUT”。
+  - _Requirements: 5.3, 7.2, 7.3_
+  - _Boundary: WebDAVProvider capability_
+- [ ] 7.3 执行具名服务的隔离竞争与两设备旅程
+  - 在批准测试范围验证创建/更新条件、失败不改内容、包导入/冲突/恢复；不自动重置 Apps Password。
+  - 完成时，记录实际支持边界，未满足条件则保持只读并明确未通过写同步，不以模拟测试代替实测。
+  - _Requirements: 7.2, 7.3, 7.4, 8.4_
+  - _Boundary: InfiniCLOUD product acceptance_
+
+- [ ] 8. 闭合实际治理影响与下游回归
+  - 由治理 owner 同步已批准的 opt-in 网络边界、依赖/模块和 ownership，Project/Resource owner 验证端口及 receipt 生命周期未被绕过。
+  - 完成时，实际 tree 与批准协议一致，R2 与 InfiniCLOUD 能力结果及 Qt/秘密/恢复回归可审阅；必要真实验收或 amendment 未闭合时不声明 Feature GO。
+  - _Requirements: 1.2, 2.4, 3.3, 3.4, 6.4, 7.4, 8.4_
+  - _Boundary: Governance / downstream integration closure_
+  - _Depends: 6.3, 7.3_
