@@ -218,7 +218,7 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格式能力由独立规格提供。
 
-- [ ] 5.1 实现平台 owner 的只读观察合同
+- [x] 5.1 实现平台 owner 的只读观察合同
   - 定义受限 metadata、retained-root 下钻、取消/资源预算和结构化失败；只读能力不借用 live ledger 或写 authority。
   - 完成时，平台 fake 能验证 handle 生命周期和超限/取消行为，Project 不需要裸路径枚举。
   - _Requirements: 13.1, 13.3_
@@ -310,3 +310,7 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
 - 把 ResourcePackage 与 ProjectPackage 抽象成共同 authority，或让 sync 直接复制 live canonical store。
 - 抢跑 TMX export、RPY product rollout、PO/POT writer、CONTEXT UI、chunk 权限或 remote provider。
 
+
+## Implementation Notes
+
+- 目录观察 backend 须在获取原生目录 handle 前通过 `DirectoryHandleBudget` 按实际数量预留，包含复制的祖先链与临时枚举资源；不能只按 authority 对象计数。原生关闭未证实成功时保留占用，不因 authority 已终止而归还额度。

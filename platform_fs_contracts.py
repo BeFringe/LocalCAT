@@ -10,7 +10,7 @@ import json
 import math
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import threading
-from typing import Callable, Iterable, Iterator, Protocol, runtime_checkable
+from typing import Callable, Generator, Iterable, Iterator, Protocol, runtime_checkable
 
 
 class PlatformFileErrorCode(str, Enum):
@@ -19,6 +19,8 @@ class PlatformFileErrorCode(str, Enum):
     OUTSIDE_ROOT = "PLATFORM.FS.OUTSIDE_ROOT"
     REPARSE_REJECTED = "PLATFORM.FS.REPARSE_REJECTED"
     IDENTITY_STALE = "PLATFORM.FS.IDENTITY_STALE"
+    OBSERVATION_CANCELLED = "PLATFORM.FS.OBSERVATION_CANCELLED"
+    OBSERVATION_LIMIT_EXCEEDED = "PLATFORM.FS.OBSERVATION_LIMIT_EXCEEDED"
     LOCK_CONTENDED = "PLATFORM.FS.LOCK_CONTENDED"
     LOCK_UNAVAILABLE = "PLATFORM.FS.LOCK_UNAVAILABLE"
     PRIVATE_STORAGE_UNPROVEN = "PLATFORM.FS.PRIVATE_STORAGE_UNPROVEN"
@@ -33,6 +35,8 @@ _FIXED_RETRYABILITY = {
     PlatformFileErrorCode.OUTSIDE_ROOT: False,
     PlatformFileErrorCode.REPARSE_REJECTED: False,
     PlatformFileErrorCode.IDENTITY_STALE: True,
+    PlatformFileErrorCode.OBSERVATION_CANCELLED: False,
+    PlatformFileErrorCode.OBSERVATION_LIMIT_EXCEEDED: False,
     PlatformFileErrorCode.LOCK_CONTENDED: True,
     PlatformFileErrorCode.PRIVATE_STORAGE_UNPROVEN: False,
     PlatformFileErrorCode.DURABILITY_UNAVAILABLE: False,
@@ -635,6 +639,505 @@ class OpaqueAuthority(ABC):
     def __deepcopy__(self, memo: dict[int, object]) -> object:
         del memo
         raise TypeError(f"{type(self).__name__} is an opaque authority")
+
+
+class DirectoryEntryKind(str, Enum):
+    REGULAR = "regular"
+    DIRECTORY = "directory"
+    SYMLINK = "symlink"
+    REPARSE = "reparse"
+    OTHER = "other"
+
+
+class DirectoryEntryUnavailableReason(str, Enum):
+    LINK = "link"
+    REPARSE = "reparse"
+    NOT_REGULAR = "not_regular"
+    UNSAFE_NAME = "unsafe_name"
+
+
+def _observation_identity(identity: FileObjectIdentity) -> FileObjectIdentity:
+    if type(identity) is not FileObjectIdentity:
+        raise TypeError("observation identity must be exact FileObjectIdentity")
+    if len(identity.volume_id) > 256 or len(identity.file_id) > 256:
+        raise ValueError("observation identity exceeds the metadata limit")
+    return identity
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryEntryMetadata(_LiveOnlyValue):
+    """Bounded metadata, never file content or authority to open a source.
+
+    Unsafe names may be represented verbatim with UNSAFE_NAME, but cannot be
+    used for descent. Project owns full portable-ref normalization, collisions
+    and format eligibility; adapters must label links without following them.
+    """
+
+    name: str
+    kind: DirectoryEntryKind
+    snapshot: EntrySnapshot | None
+    unavailable_reason: DirectoryEntryUnavailableReason | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str:
+            raise TypeError("metadata name must be exact str")
+        if not self.name or len(self.name.encode("utf-8", errors="surrogatepass")) > 4096:
+            raise ValueError("metadata name is empty or exceeds the bounded name limit")
+        if type(self.kind) is not DirectoryEntryKind:
+            raise TypeError("metadata kind must be exact DirectoryEntryKind")
+        reason = self.unavailable_reason
+        if reason is not None and type(reason) is not DirectoryEntryUnavailableReason:
+            raise TypeError("unavailable reason must be exact DirectoryEntryUnavailableReason")
+        try:
+            validate_relative_name(self.name)
+            self.name.encode("utf-8", errors="strict")
+        except (ValueError, UnicodeError):
+            if reason is not DirectoryEntryUnavailableReason.UNSAFE_NAME:
+                raise ValueError("unsafe metadata names must be marked unavailable") from None
+        if self.kind in {DirectoryEntryKind.REGULAR, DirectoryEntryKind.DIRECTORY}:
+            if type(self.snapshot) is not EntrySnapshot:
+                raise ValueError("regular and directory metadata require an exact snapshot")
+            _observation_identity(self.snapshot.identity)
+            if self.snapshot.identity.kind != self.kind.value or not self.snapshot.reparse_free:
+                raise ValueError("snapshot contradicts no-follow metadata kind")
+            if len(self.snapshot.modified_token) > 256:
+                raise ValueError("metadata modified token exceeds its limit")
+            if reason not in {None, DirectoryEntryUnavailableReason.UNSAFE_NAME}:
+                raise ValueError("unavailable reason contradicts metadata kind")
+        else:
+            expected = {
+                DirectoryEntryKind.SYMLINK: DirectoryEntryUnavailableReason.LINK,
+                DirectoryEntryKind.REPARSE: DirectoryEntryUnavailableReason.REPARSE,
+                DirectoryEntryKind.OTHER: DirectoryEntryUnavailableReason.NOT_REGULAR,
+            }[self.kind]
+            if self.snapshot is not None or reason not in {
+                expected, DirectoryEntryUnavailableReason.UNSAFE_NAME,
+            }:
+                raise ValueError("special entries require unavailable metadata without a snapshot")
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryObservationLimits:
+    maximum_depth: int = 32
+    maximum_entries: int = 10000
+    maximum_directory_handles: int = 33
+
+    def __post_init__(self) -> None:
+        for name, value, minimum, maximum in (
+            ("maximum_depth", self.maximum_depth, 0, 32),
+            ("maximum_entries", self.maximum_entries, 1, 10000),
+            ("maximum_directory_handles", self.maximum_directory_handles, 1, 33),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be exact int")
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{name} is outside the supported observation range")
+
+
+class DirectoryObservationCancellation(_LiveOnlyValue):
+    """Thread-safe, one-way cancellation for one caller-owned discovery run."""
+
+    __slots__ = ("__event",)
+
+    def __init__(self) -> None:
+        self.__event = threading.Event()
+
+    def cancel(self) -> None:
+        self.__event.set()
+
+    def check(self) -> None:
+        if self.__event.is_set():
+            raise PlatformFileError(PlatformFileErrorCode.OBSERVATION_CANCELLED, retryable=False)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryObservation(_LiveOnlyValue):
+    """A complete direct-child observation; no partial success representation.
+
+    Identity facts are live-only. Selected file content still requires the
+    existing sealed-read and verified-terminal protocol.
+    """
+
+    root_identity: FileObjectIdentity
+    directory_identity: FileObjectIdentity
+    entries: tuple[DirectoryEntryMetadata, ...]
+
+    def __post_init__(self) -> None:
+        for identity in (self.root_identity, self.directory_identity):
+            if _observation_identity(identity).kind != "directory":
+                raise ValueError("observation identity must describe a directory")
+        if type(self.entries) is not tuple:
+            raise TypeError("observed entries must be an exact tuple")
+        if len(self.entries) > 10000:
+            raise ValueError("observed entries exceed the hard limit")
+        if any(type(entry) is not DirectoryEntryMetadata for entry in self.entries):
+            raise TypeError("observed entries must be exact DirectoryEntryMetadata")
+
+
+_DIRECTORY_RESOURCE_RESERVATION_KEY = object()
+
+
+class DirectoryHandleBudget(_LiveOnlyValue):
+    """Shared budget for actual native directory handles, including temporaries.
+
+    Adapters reserve before acquiring resources. A copied ancestor chain costs
+    every copied handle, not one authority object. Temporary enumeration handles
+    use a separate reservation and close it only after native cleanup.
+    """
+
+    __slots__ = ("__maximum", "__active", "__lock")
+
+    def __init__(self, maximum: int) -> None:
+        if type(maximum) is not int or not 1 <= maximum <= 33:
+            raise ValueError("directory handle maximum must be an integer from 1 through 33")
+        self.__maximum = maximum
+        self.__active = 0
+        self.__lock = threading.RLock()
+
+    @property
+    def active_handles(self) -> int:
+        with self.__lock:
+            return self.__active
+
+    def reserve(self, count: int = 1) -> DirectoryHandleReservation:
+        if type(count) is not int or count < 1:
+            raise ValueError("directory handle reservation must be a positive exact integer")
+        with self.__lock:
+            if count > self.__maximum - self.__active:
+                raise PlatformFileError(PlatformFileErrorCode.OBSERVATION_LIMIT_EXCEEDED, retryable=False)
+            self.__active += count
+            return DirectoryHandleReservation(self, count, _DIRECTORY_RESOURCE_RESERVATION_KEY)
+
+    def _release(self, count: int) -> None:
+        with self.__lock:
+            self.__active -= count
+
+
+class DirectoryHandleReservation(OpaqueAuthority):
+    """Backend-only resource accounting, with no filesystem access authority."""
+
+    __slots__ = ("_budget", "_count", "_claimed", "_close_lock")
+
+    def __init__(self, budget: DirectoryHandleBudget, count: int, issuer: object) -> None:
+        if issuer is not _DIRECTORY_RESOURCE_RESERVATION_KEY:
+            raise TypeError("directory handle reservations must be issued by the budget")
+        super().__init__()
+        self._budget = budget
+        self._count = count
+        self._claimed = False
+        self._close_lock = threading.RLock()
+
+    def _close_authority(self) -> None:
+        self._budget._release(self._count)
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._claimed:
+                raise PlatformFileError(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+            super().close()
+
+    def _close_owned(self) -> None:
+        with self._close_lock:
+            self._claimed = False
+            self.close()
+
+
+class _DirectoryObservationScope:
+    def __init__(
+        self, issuer: object, limits: DirectoryObservationLimits,
+        cancellation: DirectoryObservationCancellation,
+    ) -> None:
+        self.issuer = issuer
+        self.limits = limits
+        self.cancellation = cancellation
+        self.entries = 0
+        self.resources = DirectoryHandleBudget(limits.maximum_directory_handles)
+        self.lock = threading.RLock()
+
+
+class RetainedObservationDirectory(OpaqueAuthority, ABC):
+    """Read-only retained root/descendant, separate from writer/ledger authority.
+
+    Closing an ancestor closes its retained descendants, including after
+    cancellation. Project chooses traversal and closes non-ancestors promptly.
+    Backends implement only close and identity reproof, with no-follow lineage
+    revalidation against the original bound namespace, never pathname rebinding.
+    Failed native cleanup leaves its reservation charged, even though the
+    authority is terminally closed; uncertain release cannot create capacity.
+    """
+
+    __slots__ = ("_observation_scope", "_observation_parent", "_observation_children",
+                 "_observation_identity", "_observation_depth", "_last_observation",
+                 "_handle_reservation")
+
+    def __init__(self, reservation: DirectoryHandleReservation) -> None:
+        super().__init__()
+        if type(reservation) is not DirectoryHandleReservation:
+            raise TypeError("reservation must be exact DirectoryHandleReservation")
+        reservation._require_open()
+        if reservation._claimed:
+            raise ValueError("a directory handle reservation already has an owner")
+        reservation._claimed = True
+        self._handle_reservation = reservation
+        self._observation_scope: _DirectoryObservationScope | None = None
+        self._observation_parent: RetainedObservationDirectory | None = None
+        self._observation_children: set[RetainedObservationDirectory] = set()
+        self._observation_identity: FileObjectIdentity | None = None
+        self._observation_depth = 0
+        self._last_observation: DirectoryObservation | None = None
+
+    @property
+    def depth(self) -> int:
+        self._require_open()
+        return self._observation_depth
+
+    def identity(self) -> FileObjectIdentity:
+        self._require_open()
+        if self._observation_scope is None or self._observation_identity is None:
+            raise PlatformFileError(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        return self._observation_identity
+
+    def reprove(self) -> FileObjectIdentity:
+        expected = self.identity()
+        ancestor: RetainedObservationDirectory | None = self
+        while ancestor is not None:
+            ancestor._require_open()
+            actual = _observation_identity(ancestor._reprove_identity())
+            if actual != ancestor._observation_identity:
+                raise PlatformFileError(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            ancestor = ancestor._observation_parent
+        return expected
+
+    @abstractmethod
+    def _reprove_identity(self) -> FileObjectIdentity:
+        """Reprove this retained no-follow directory and its namespace binding."""
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        scope = self._observation_scope
+        # Fresh, rejected handles have no scope and remain backend-owned until
+        # returned. Bound operations and close are serialized by the root lock.
+        if scope is None:
+            super().close()
+            self._handle_reservation._close_owned()
+            return
+        with scope.lock:
+            if self.closed:
+                return
+            failure: BaseException | None = None
+            for child in tuple(self._observation_children):
+                try:
+                    child.close()
+                except BaseException as error:
+                    failure = failure or error
+            try:
+                super().close()
+                self._handle_reservation._close_owned()
+                if self._observation_parent is not None:
+                    self._observation_parent._observation_children.discard(self)
+            finally:
+                self._last_observation = None
+            if failure is not None:
+                raise failure
+
+
+def _check_observation_arguments(
+    limits: DirectoryObservationLimits,
+    cancellation: DirectoryObservationCancellation,
+) -> None:
+    if type(limits) is not DirectoryObservationLimits:
+        raise TypeError("limits must be exact DirectoryObservationLimits")
+    if type(cancellation) is not DirectoryObservationCancellation:
+        raise TypeError("cancellation must be exact DirectoryObservationCancellation")
+    cancellation.check()
+
+
+def _observation_scope(
+    issuer: object, directory: RetainedObservationDirectory,
+    limits: DirectoryObservationLimits, cancellation: DirectoryObservationCancellation,
+) -> _DirectoryObservationScope:
+    if not isinstance(directory, RetainedObservationDirectory):
+        raise TypeError("directory must be RetainedObservationDirectory")
+    directory._require_open()
+    scope = directory._observation_scope
+    if scope is None or scope.issuer is not issuer or scope.cancellation is not cancellation:
+        raise PlatformFileError(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+    if limits != scope.limits:
+        raise ValueError("limits are fixed for the retained root lifetime")
+    return scope
+
+
+def _fresh_observation_directory(
+    value: object, resources: DirectoryHandleBudget,
+) -> RetainedObservationDirectory:
+    if not isinstance(value, RetainedObservationDirectory):
+        raise TypeError("backend must return RetainedObservationDirectory")
+    value._require_open()
+    value._handle_reservation._require_open()
+    if value._observation_scope is not None or value._handle_reservation._budget is not resources:
+        raise PlatformFileError(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+    return value
+
+
+@runtime_checkable
+class ReadOnlyDirectoryObservation(Protocol):
+    """Optional narrow capability; not part of PlatformFileBackend's baseline.
+
+    Native adapters own no-follow opens, OS failure translation, iterator
+    cleanup and smaller native path limits. Hooks must not read bodies, lock,
+    create ledger files, or use writer/retirement authorities. No recursive
+    discovery policy or format filtering belongs here.
+
+    A root fixes its limits and cancellation token for its lifetime. Start a new
+    root for a new discovery run; replacing a token cannot revive a cancelled run.
+    """
+
+    def bind_observation_root(
+        self, root: Path, limits: DirectoryObservationLimits,
+        cancellation: DirectoryObservationCancellation,
+    ) -> RetainedObservationDirectory:
+        checked_root = validate_root_path(root)
+        _check_observation_arguments(limits, cancellation)
+        scope = _DirectoryObservationScope(self, limits, cancellation)
+        directory = _fresh_observation_directory(
+            self._bind_observation_root(checked_root, scope.resources, cancellation), scope.resources,
+        )
+        try:
+            cancellation.check()
+            identity = _observation_identity(directory._reprove_identity())
+            if identity.kind != "directory":
+                raise PlatformFileError(PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+            directory._observation_identity = identity
+            directory._observation_scope = scope
+            cancellation.check()
+            return directory
+        except BaseException:
+            directory.close()
+            raise
+
+    @abstractmethod
+    def _bind_observation_root(
+        self, root: Path, resources: DirectoryHandleBudget,
+        cancellation: DirectoryObservationCancellation,
+    ) -> RetainedObservationDirectory:
+        """Reserve actual handle cost before no-follow acquisition; clean on failure."""
+        ...
+
+    def observe_children(
+        self, retained_directory: RetainedObservationDirectory,
+        limits: DirectoryObservationLimits, cancellation: DirectoryObservationCancellation,
+    ) -> DirectoryObservation:
+        _check_observation_arguments(limits, cancellation)
+        scope = _observation_scope(self, retained_directory, limits, cancellation)
+        with scope.lock:
+            directory_identity = retained_directory.reprove()
+            retained_directory._last_observation = None
+            entries: list[DirectoryEntryMetadata] = []
+            names: set[str] = set()
+            stream = self._iter_observed_children(retained_directory, scope.resources, cancellation)
+            if not callable(getattr(stream, "close", None)):
+                raise TypeError("backend metadata iterator must support close")
+            try:
+                iterator = iter(stream)
+                while True:
+                    cancellation.check()
+                    try:
+                        entry = next(iterator)
+                    except StopIteration:
+                        break
+                    cancellation.check()
+                    # Consume budget for every observed item, including directories
+                    # and unavailable entries; a failed attempt never resets it.
+                    if scope.entries >= limits.maximum_entries:
+                        raise PlatformFileError(PlatformFileErrorCode.OBSERVATION_LIMIT_EXCEEDED, retryable=False)
+                    scope.entries += 1
+                    if type(entry) is not DirectoryEntryMetadata:
+                        raise TypeError("backend must yield exact DirectoryEntryMetadata")
+                    if entry.name in names:
+                        raise PlatformFileError(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                    names.add(entry.name)
+                    entries.append(entry)
+            finally:
+                stream.close()
+            cancellation.check()
+            retained_directory.reprove()
+            cancellation.check()
+            root = retained_directory
+            while root._observation_parent is not None:
+                root = root._observation_parent
+            result = DirectoryObservation(root.identity(), directory_identity, tuple(entries))
+            retained_directory._last_observation = result
+            return result
+
+    @abstractmethod
+    def _iter_observed_children(
+        self, retained_directory: RetainedObservationDirectory,
+        resources: DirectoryHandleBudget, cancellation: DirectoryObservationCancellation,
+    ) -> Generator[DirectoryEntryMetadata, None, None]:
+        """Yield direct no-follow metadata lazily, with a finally-based close.
+
+        The adapter must check cancellation during native work, reprove metadata
+        from the same observation, and raise PlatformFileError on any incomplete
+        enumeration. Exhaustion alone means complete. No extra retained directory
+        handles may be hidden outside the root's budget.
+        """
+        ...
+
+    def retain_observed_directory(
+        self, parent: RetainedObservationDirectory, observation: DirectoryObservation,
+        entry: DirectoryEntryMetadata, limits: DirectoryObservationLimits,
+        cancellation: DirectoryObservationCancellation,
+    ) -> RetainedObservationDirectory:
+        _check_observation_arguments(limits, cancellation)
+        scope = _observation_scope(self, parent, limits, cancellation)
+        with scope.lock:
+            parent.reprove()
+            if (observation is not parent._last_observation
+                    or type(observation) is not DirectoryObservation
+                    or not any(entry is item for item in observation.entries)):
+                raise PlatformFileError(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            if entry.kind is not DirectoryEntryKind.DIRECTORY or entry.unavailable_reason is not None:
+                raise PlatformFileError(PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+            validate_relative_name(entry.name)
+            if parent.depth >= limits.maximum_depth:
+                raise PlatformFileError(PlatformFileErrorCode.OBSERVATION_LIMIT_EXCEEDED, retryable=False)
+            child: RetainedObservationDirectory | None = None
+            attached = False
+            try:
+                child = _fresh_observation_directory(
+                    self._retain_observed_directory(parent, entry, scope.resources, cancellation),
+                    scope.resources,
+                )
+                cancellation.check()
+                actual = _observation_identity(child._reprove_identity())
+                if entry.snapshot is None or actual != entry.snapshot.identity:
+                    raise PlatformFileError(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                parent.reprove()
+                cancellation.check()
+                child._observation_identity = actual
+                child._observation_scope = scope
+                child._observation_parent = parent
+                child._observation_depth = parent.depth + 1
+                parent._observation_children.add(child)
+                attached = True
+                return child
+            finally:
+                if not attached:
+                    if child is not None:
+                        child.close()
+
+    @abstractmethod
+    def _retain_observed_directory(
+        self, parent: RetainedObservationDirectory, entry: DirectoryEntryMetadata,
+        resources: DirectoryHandleBudget, cancellation: DirectoryObservationCancellation,
+    ) -> RetainedObservationDirectory:
+        """Open only this direct no-follow child, reprove its observed identity.
+
+        Return a fresh handle; release new acquisitions if this hook raises.
+        Neither a name nor a metadata value grants independent path authority.
+        """
+        ...
 
 
 class MutableFileReservation(OpaqueAuthority, ABC):
