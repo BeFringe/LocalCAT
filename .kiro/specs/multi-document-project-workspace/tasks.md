@@ -223,7 +223,7 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - 完成时，平台 fake 能验证 handle 生命周期和超限/取消行为，Project 不需要裸路径枚举。
   - _Requirements: 13.1, 13.3_
   - _Boundary: Platform observation contracts_
-- [ ] 5.2 实现 POSIX 只读目录观察
+- [x] 5.2 实现 POSIX 只读目录观察
   - 从 retained root 观察和下钻，拒绝 symlink/ancestor drift，及时关闭非祖先 handle，不写源目录。
   - 完成时，POSIX 合成目录的替换、深度/条目/handle 限额及取消返回明确结果。
   - _Requirements: 13.1, 13.3_
@@ -314,3 +314,4 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
 ## Implementation Notes
 
 - 目录观察 backend 须在获取原生目录 handle 前通过 `DirectoryHandleBudget` 按实际数量预留，包含复制的祖先链与临时枚举资源；不能只按 authority 对象计数。原生关闭未证实成功时保留占用，不因 authority 已终止而归还额度。
+- POSIX 观察从文件系统锚点逐组件 no-follow 绑定，根的命名祖先也不接受符号链接别名；发现服务不得静默 resolve 来绕过拒绝。目录流使用可检查 `closedir` 结果的私有原语，避免标准库吞掉关闭错误；目录 generation 变化即作废本次观察。
