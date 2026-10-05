@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
+from contextlib import chdir, redirect_stdout
+import tempfile
 import unittest
 from unittest import mock
 
@@ -8,6 +11,70 @@ from tools import validate_windows_tm_current_source_release as validator
 
 
 class WindowsTMCurrentSourceValidatorTests(unittest.TestCase):
+    def test_relative_c3b_input_uses_invocation_directory_for_output_protection(self) -> None:
+        (validator.ROOT / "artifacts" / "windows").mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=validator.ROOT / "artifacts" / "windows") as temporary:
+            run = Path(temporary)
+            matrix = run / "matrix.json"
+            matrix.write_bytes(b"input\n")
+            argv = [
+                "--repository-commit", "a" * 40,
+                "--benchmark-evidence", "benchmark_tm_evidence.json",
+                "--c3b-matrix-sha256", "b" * 64,
+                "--temp-root", str(run), "--emit", str(matrix),
+            ]
+            with (
+                chdir(run),
+                mock.patch.object(validator, "_validate_runtime", return_value={}),
+                mock.patch.object(validator, "_validate_temp_root", return_value=run),
+                mock.patch.object(validator, "_validate_benchmark_input", side_effect=AssertionError("input checks must precede execution")) as benchmark,
+                mock.patch.object(validator, "_run_row_process") as worker,
+                mock.patch.object(validator, "_atomic_write") as publish,
+            ):
+                for spelling in (matrix.name, str(Path("..") / run.name / matrix.name)):
+                    with self.subTest(spelling=spelling), self.assertRaisesRegex(ValueError, "replace an input"):
+                        validator.main([*argv, "--c3b-matrix", spelling])
+                benchmark.assert_not_called()
+                worker.assert_not_called()
+                publish.assert_not_called()
+            self.assertEqual(matrix.read_bytes(), b"input\n")
+
+    def test_worker_mode_does_not_require_parent_artifact_arguments(self) -> None:
+        row = next(iter(validator._ROW_BY_ID))
+        with (
+            mock.patch.object(validator, "_worker_result", return_value=({"row": row}, 1)) as worker,
+            mock.patch.object(validator, "_validate_runtime") as parent,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(validator.main(["--worker-row", row]), 1)
+            worker.assert_called_once_with(validator._ROW_BY_ID[row])
+            parent.assert_not_called()
+
+    def test_parent_output_cannot_replace_either_input_before_workers(self) -> None:
+        (validator.ROOT / "artifacts" / "windows").mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=validator.ROOT / "artifacts" / "windows") as temporary:
+            run = Path(temporary)
+            benchmark = run / "benchmark.json"
+            matrix = run / "matrix.json"
+            for path in (benchmark, matrix):
+                path.write_bytes(b"input\n")
+            argv = [
+                "--repository-commit", "a" * 40,
+                "--benchmark-evidence", str(benchmark),
+                "--c3b-matrix", str(matrix), "--c3b-matrix-sha256", "b" * 64,
+                "--temp-root", str(run),
+            ]
+            with (
+                mock.patch.object(validator, "_validate_runtime", return_value={}),
+                mock.patch.object(validator, "_validate_temp_root", return_value=run),
+                mock.patch.object(validator, "_run_row_process") as worker,
+            ):
+                for path in (benchmark, matrix):
+                    with self.subTest(path=path), self.assertRaisesRegex(ValueError, "replace an input"):
+                        validator.main([*argv, "--emit", str(path)])
+                    self.assertEqual(path.read_bytes(), b"input\n")
+                worker.assert_not_called()
+
     def test_registry_and_source_inventory_are_bounded(self) -> None:
         self.assertRegex(validator.registry_digest(), r"^[0-9a-f]{64}$")
         paths = validator.source_paths()
@@ -96,7 +163,7 @@ class WindowsTMCurrentSourceValidatorTests(unittest.TestCase):
                 return_value="b" * 64,
             ),
         ):
-            facts, observed = validator._validate_benchmark_input(validator.ROOT)
+            facts, observed = validator._validate_benchmark_input(validator.ROOT, "benchmark_tm_evidence.json")
         self.assertIs(observed, bundle)
         self.assertEqual(facts["benchmark_suite_decision"], "NO_GO")
 
@@ -133,7 +200,7 @@ class WindowsTMCurrentSourceValidatorTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(ValueError, "not Windows CPython 3.14"),
         ):
-            validator._validate_benchmark_input(validator.ROOT)
+            validator._validate_benchmark_input(validator.ROOT, "benchmark_tm_evidence.json")
 
 
 if __name__ == "__main__":

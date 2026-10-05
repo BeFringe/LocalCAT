@@ -11,7 +11,7 @@ from tests.windows_tm_current_source_registry import (
 
 
 class WindowsTMCurrentSourceRegistryTests(unittest.TestCase):
-    def test_registry_resolves_the_closed_220_test_inventory(self) -> None:
+    def test_registry_resolves_the_closed_current_test_inventory(self) -> None:
         self.assertEqual(
             tuple(row.row_id for row in WINDOWS_TM_CURRENT_SOURCE_ROWS),
             (
@@ -34,7 +34,7 @@ class WindowsTMCurrentSourceRegistryTests(unittest.TestCase):
                 )
                 observed_total += len(tests)
                 all_test_ids.extend(test.id() for test in tests)
-        self.assertEqual(observed_total, 220)
+        self.assertEqual(observed_total, 241)
         self.assertEqual(len(all_test_ids), len(set(all_test_ids)))
 
     def test_strict_result_validation_never_counts_skip_as_pass(self) -> None:
