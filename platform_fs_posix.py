@@ -1898,9 +1898,10 @@ class PosixPlatformAdapter(
         retained_directories: tuple[int, ...] | None = directories
         descriptor: int | None = None
         try:
+            # Reject a FIFO by retained fstat without waiting for a writer.
             descriptor = os.open(
                 components[-1],
-                _READ_FLAGS,
+                _READ_FLAGS | os.O_NONBLOCK,
                 dir_fd=retained_directories[-1],
             )
             transferred_directories = retained_directories
