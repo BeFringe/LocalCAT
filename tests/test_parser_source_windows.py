@@ -463,7 +463,10 @@ class WindowsParserSourceTests(unittest.TestCase):
         original_begin = BoundDirectoryAuthority.begin_publish
         original_preliminary = PendingPublication.preliminary_facts
         original_retained = PendingPublication.retained_destination
-        original_read_all = BoundRegularFile.read_all
+        # Windows overrides read_all; observing the abstract base misses the
+        # actual native readback. Keep the concrete implementation delegated.
+        readback_type = platform_fs_windows._WindowsBoundRegularFile
+        original_read_all = readback_type.read_all
         original_terminal = PendingPublication.terminal_reproof
 
         def tracked_write(authority: CandidateFile, payload: bytes) -> None:
@@ -528,6 +531,7 @@ class WindowsParserSourceTests(unittest.TestCase):
             receipt = atomic_test_write_bytes(self._target(target), payload, backend=adapter)
             events.append("receipt.return")
             self.assertEqual(receipt.content_sha256, hashlib.sha256(payload).hexdigest())
+            self.assertEqual(events.count("parser.readback"), 1)
             return tuple(events)
 
         with mock.patch.object(CandidateFile, "write_all", new=tracked_write), mock.patch.object(
@@ -547,7 +551,7 @@ class WindowsParserSourceTests(unittest.TestCase):
             "retained_destination",
             new=tracked_retained,
         ), mock.patch.object(
-            BoundRegularFile,
+            readback_type,
             "read_all",
             new=tracked_read_all,
         ), mock.patch.object(
