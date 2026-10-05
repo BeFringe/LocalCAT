@@ -2,11 +2,11 @@
 
 ## 简介
 
-LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户使用自己的 R2 或 InfiniCLOUD WebDAV，在操作前检查计划，发生冲突时保留双方，并通过本地项目/资源事务继续工作。本次不提供内容加密或自动后台同步。
+LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户使用自己的 S3-compatible 或 WebDAV 服务，在操作前检查计划，发生冲突时保留双方，并通过本地项目/资源事务继续工作。本次不提供内容加密或自动后台同步。
 
 ## 边界说明
 
-- **范围内**：R2 先行、随后 InfiniCLOUD WebDAV；连接配置、凭据遮蔽/显式显示；手动上传/下载/双向计划、删除保护、冲突及恢复。
+- **范围内**：S3-compatible 先行、随后 WebDAV，以 R2 和 InfiniCLOUD 作为首批实际验收服务；连接配置、凭据遮蔽/显式显示；手动上传/下载/双向计划、删除保护、冲突及恢复。
 - **范围外**：内容加密、定时同步、账号系统、实时协作、翻译语义合并、chunk 权限搬运、live SQLite/journal/stage 同步。
 - **相邻期望**：先完成 RPY 与手工包闭环；ProjectPackage 和 JSONL/CSV ResourcePackage 各自保有验证、导入、资源选择和 receipt 权威。
 
@@ -15,7 +15,7 @@ LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户�
 - **Owning spec**：`cross-device-sync-plugin`。
 - **被修订的既有范围说明**：产品的纯本地默认行为通过显式可选同步扩展；Multi/Resource 的网络传输延期项仅在各自批准的包出口之外编排。
 - **相邻规格 / 契约**：`multi-document-project-workspace`、`language-resource-portability`、`rpy-project-codec`、平台文件/秘密后端、Qt Controller。
-- **审批状态**：用户已选择 R2 先行、InfiniCLOUD WebDAV 后续、不加密、凭据默认遮蔽且可显示，并要求自动生成 R/D/T；新传输/持久状态/依赖边界与相邻 owner amendment 待独立治理闭合，尚未授权运行实现。
+- **审批状态**：用户已选择 S3-compatible 先行、WebDAV 后续，R2/InfiniCLOUD 仅为实际验收服务、不加密、凭据默认遮蔽且可显示，并要求自动生成 R/D/T；新传输/持久状态/依赖边界与相邻 owner amendment 待独立治理闭合，尚未授权运行实现。
 
 ## 需求
 
@@ -24,7 +24,7 @@ LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户�
 **目标：** 作为译者，我希望只有在主动配置和执行时才使用远端。
 
 #### 验收标准
-1. When 用户启用同步, the LocalCAT shall 允许配置 R2 的 endpoint/bucket/prefix 或 InfiniCLOUD 的 WebDAV URL/账户与远程目录，并显示尚缺信息。
+1. When 用户启用同步, the LocalCAT shall 允许配置 S3-compatible 的 endpoint/region/寻址方式/bucket/prefix，或 WebDAV 的完整 base URL/账户与远程目录，并显示尚缺信息。
 2. While 同步未启用或已禁用, the LocalCAT shall 不建立网络连接，保持本地项目及资源完整可用。
 3. When 用户手动测试连接或同步, the LocalCAT shall 只访问所选连接与范围，并明确显示该动作及结果；本次不自动定时执行。
 4. If 连接配置变更, the LocalCAT shall 使旧计划失效并要求重新预览，不把一个远端的基线用于另一远端。
@@ -36,7 +36,7 @@ LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户�
 #### 验收标准
 1. When 凭据字段显示时, the LocalCAT shall 默认以星号或等价密码遮蔽显示，并提供带明确标签的显示/隐藏按钮。
 2. When 用户显式点击显示, the LocalCAT shall 仅在当前设置视图显示该字段；隐藏、关闭或重新打开设置时恢复遮蔽，不自动复制秘密。
-3. When 用户保存连接, the LocalCAT shall 将秘密与普通连接设置分开存放；支持使用本机环境变量提供 R2 凭据而不自动持久化其值。
+3. When 用户保存连接, the LocalCAT shall 将秘密与普通连接设置分开存放；支持为凭据字段显式配置本机环境变量引用而不自动持久化其值，不要求通用连接使用某厂商的变量名。
 4. The LocalCAT shall 不将秘密写入项目、资源包、错误、日志、测试 fixture、Git 或同步对象；不提供内容加密选项，传输仍使用校验证书的 HTTPS。
 
 ### Requirement 3：只同步完成的包
@@ -79,15 +79,16 @@ LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户�
 3. When 一个同步项完成, the LocalCAT shall 仅在该方向所需的传输确认及本地 owner 提交完成后推进该项基线；其他失败项保留原状态。
 4. When 应用重启或插件被禁用, the LocalCAT shall 停止旧会话继续提交；恢复时区分可复证完成、待处理、冲突和需 owner 恢复，不把多个包描述为全局原子事务。
 
-### Requirement 7：R2 与 InfiniCLOUD provider 验收
+### Requirement 7：通用协议适配与按连接验收
 
 **目标：** 作为译者，我希望被列为支持的 provider 具有实际验证过的行为。
 
 #### 验收标准
-1. When 首批交付 R2, the LocalCAT shall 验证指定 prefix 内的列举、读取、创建、条件更新、受保护的逻辑删除以及重试结果，不承诺所有 S3-compatible 服务均兼容。
-2. When 接入 InfiniCLOUD WebDAV, the LocalCAT shall 使用用户实际分配的 DAV URL 与独立连接凭据，按服务限制列举，并在能力验证通过后才开放写同步。
+1. When 首批交付 S3-compatible 适配器, the LocalCAT shall 以 R2 验证指定 prefix 内的列举、读取、创建、条件更新、受保护的逻辑删除及重试结果，同时允许自定义连接配置，不承诺所有兼容服务都已验收。
+2. When 接入 WebDAV 适配器, the LocalCAT shall 使用用户提供的完整 base URL 与独立连接凭据，按连接能力受限列举，并在验证通过后开放写同步；首批使用 InfiniCLOUD 验收，不强制厂商域名或固定 DAV 路径。
 3. If 某项 provider 能力尚未验证或服务器返回不兼容语义, the LocalCAT shall 显示未验证/不支持状态，保留安全的只读或导出途径，不宣称完整同步通过。
 4. When 进行真实环境验收, the LocalCAT shall 只在明确的测试前缀使用合成包，证明两设备冷重开、冲突、失败恢复与凭据脱敏，不改动用户无关远端内容。
+5. When 用户配置其他 S3-compatible 或 WebDAV 服务, the LocalCAT shall 使用同一协议适配器与能力验证规则，不通过厂商域名、名称、固定 region 或固定凭据变量名决定资格；预设仅填充可编辑设置。
 
 ### Requirement 8：一致的桌面工作流
 
@@ -97,4 +98,4 @@ LocalCAT 为个人译者提供显式、可禁用的跨设备包同步。用户�
 1. When 用户打开同步设置或计划, the LocalCAT shall 显示连接状态、选定包、操作和阻断原因，不暴露包内部 manifest、token 或执行权限。
 2. When 用户取消计划或拒绝导入, the LocalCAT shall 保持当前项目、资源选择和未保存编辑，不自动替换活跃会话。
 3. When 下载的 RPY 项目缺失对应 codec, the LocalCAT shall 保持 Project 的中立编辑/包保存能力，明确禁止 TL 导出。
-4. When 完成首个同步版本, the LocalCAT shall 提供 R2 完整手动旅程和 InfiniCLOUD 的实际能力结果，不以模拟 provider 测试替代真实 endpoint 验收。
+4. When 完成首个同步版本, the LocalCAT shall 提供 S3-compatible 的 R2 完整手动旅程和 WebDAV 的 InfiniCLOUD 实际能力结果，不以模拟 provider 测试替代真实 endpoint 验收。
