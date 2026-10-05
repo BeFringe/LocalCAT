@@ -18,6 +18,9 @@ from parser_contracts import (
     RawParseEvent,
     RawReaderCodec,
     ReadRequest,
+    PreparedFormatBytes,
+    RoundTripRequest,
+    RoundTripSerializer,
     SelectionFailure,
     SelectionHintSummary,
     SelectionRequest,
@@ -93,6 +96,30 @@ class _PinnedCanonicalSerializer:
         request: CanonicalSerializeRequest,
     ) -> CanonicalBytes:
         return self._serialize_canonical(request)
+
+
+class _PinnedRoundTripSerializer:
+    """Pin the selected descriptor and method without trusting later mutation."""
+
+    __slots__ = ("_descriptor", "_prepare")
+
+    def __init__(
+        self,
+        descriptor: CodecDescriptor,
+        prepare: Callable[[RoundTripRequest], PreparedFormatBytes],
+    ) -> None:
+        object.__setattr__(self, "_descriptor", descriptor)
+        object.__setattr__(self, "_prepare", prepare)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Foundation round-trip serializer adapter is immutable")
+
+    @property
+    def descriptor(self) -> CodecDescriptor:
+        return self._descriptor
+
+    def prepare(self, request: RoundTripRequest) -> PreparedFormatBytes:
+        return self._prepare(request)
 
 
 class _PinnedSeekablePreflightReader(_PinnedRawReader):
@@ -457,6 +484,40 @@ class ParserRegistry:
                 "PARSER.SELECTION.DESCRIPTOR_UNREGISTERED",
                 "factory lookup requires the descriptor selected from this registry",
             )
+
+    def create_round_trip_serializer(
+        self,
+        descriptor: CodecDescriptor,
+    ) -> RoundTripSerializer:
+        self._require_registered_descriptor(descriptor)
+        factory = descriptor.round_trip_serializer_factory
+        if factory is None or not descriptor.capabilities.source_round_trip_write:
+            raise RegistryConfigurationError(
+                "PARSER.CAPABILITY.WRITE_UNSUPPORTED",
+                "the selected codec does not publish a round-trip serializer factory",
+            )
+        try:
+            serializer = factory()
+        except Exception:
+            raise RegistryConfigurationError(
+                "PARSER.SELECTION.FACTORY_FAILED",
+                "the selected round-trip serializer factory failed",
+            ) from None
+        try:
+            published_descriptor = serializer.descriptor
+            prepare = serializer.prepare
+            behavior_matches = isinstance(serializer, RoundTripSerializer)
+        except Exception:
+            raise RegistryConfigurationError(
+                "PARSER.SELECTION.FACTORY_MISMATCH",
+                "round-trip serializer does not match its registered descriptor contract",
+            ) from None
+        if published_descriptor is not descriptor or not behavior_matches or not callable(prepare):
+            raise RegistryConfigurationError(
+                "PARSER.SELECTION.FACTORY_MISMATCH",
+                "round-trip serializer does not match its registered descriptor contract",
+            )
+        return _PinnedRoundTripSerializer(descriptor, prepare)
 
     def _selection_failure(
         self,
