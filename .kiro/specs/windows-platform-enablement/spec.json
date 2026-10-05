@@ -1,7 +1,7 @@
 {
   "feature_name": "windows-platform-enablement",
   "created_at": "2026-08-25T07:18:58Z",
-  "updated_at": "2026-10-05T01:09:14Z",
+  "updated_at": "2026-10-05T09:30:00+00:00",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -26,5 +26,15 @@
   },
   "approval_scope": {
     "fuzzy_time_admission": "2026-10-05 批准 ADR-029 下 R12 对 Core/Feature5 准入与性能结论的消费、对应 Design 及 Task 7.4/8.1 的汇总依赖。下一实际候选合并准入旅程和既有轮询补验；真实 Gate C/D 按准入策略变化的 owner 合同执行。保留 7.3 和旧候选的原验收范围，不授予发行或 Gate PASS；纯 Git 父节点或消息变化不触发全量重验。"
+  },
+  "approved_amendments": {
+    "directory_rpy_manual_sync": {
+      "adrs": [
+        "ADR-030",
+        "ADR-031"
+      ],
+      "scope": "Requirements 2.7–2.8、5.5、6.7、11.6；Design「只读目录观察与受控目标物化」「同步的可选依赖与秘密组合」。",
+      "approved": true
+    }
   }
 }

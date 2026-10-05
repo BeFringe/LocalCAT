@@ -62,12 +62,12 @@ source 的平台与业务设计已完成 Task 6.6b 验收。依据已采纳 [ADR
 - **Applicable Steering**: `product.md`、`tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md`、`delivery-boundaries.md`、`repository-safety.md`。
 - **Applicable ADRs**: ADR-007/008/009/011/012/013/016/018/019 及 ADR-020～029，按各自已有取代关系适用。
 - **ADR disposition**: Follow adopted ADR-028；移除 ADR-022 决策 3–8、10 和 9/12 的强证明派生门，以及 ADR-023 决策 6 的完整 pre-authority native closure。保留构建可追溯、真实 packaged E2E、LOCK-first、`PendingPublication`、MIC 和数据协议；不新立 ADR，也不更改已有 ADR 正文。
-- **Scope amendment**: Approved，范围见 [跨规格修订登记](cross-spec-amendments.md)。平台只拥有构建/入口/transport/发行汇总；三种身份分别在既有 owning Design 定义，不建立治理层或第二 publisher。原 source/W3 完成事实保留原验收范围。
-- **Steering sync**: Completed；已继承 Governance owner 的 `spec-ownership.md`、长期技术边界及 `04a3585` 的实际普通入口结构/路线图同步。本 feature branch 不产生重复 Steering 提交。
+- **Contract changes**: 范围见 [跨规格修订登记](cross-spec-amendments.md)。平台只拥有构建/入口/transport/发行汇总；三种身份分别在既有 owning Design 定义，不建立治理层或第二 publisher。原 source/W3 完成事实保留原验收范围。
+- **Steering sync**: `spec-ownership.md`、tech/structure 与 roadmap 的普通入口、依赖和发行边界；共享治理只形成一份变更。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
 
 ### ADR-027 输出锁收尾修订
-- **Scope amendment**：已批准；仅取代 ADR-020 决策 7、ADR-023 决策 1 在 Windows ResourcePackage/TMX 输出 owner 已终结时的永久载体限制。普通持锁、初始化、安全 profile、业务发布/恢复、POSIX 和 frozen 信任启动不变。
+- **Contract changes**：仅取代 ADR-020 决策 7、ADR-023 决策 1 在 Windows ResourcePackage/TMX 输出 owner 已终结时的永久载体限制。普通持锁、初始化、安全 profile、业务发布/恢复、POSIX 和 frozen 信任启动不变。
 - **Steering sync**：由 Governance owner 在治理分支闭合 ADR-027、ADR 索引及 ADR-020/023 取代关系元数据，再由本分支继承；不重复修改长期层级规则。
 - **Downstream revalidation**：平台 Task 3.3a 交付可选能力；`language-resource-portability` Task 3.3a 与 `tmx-context-interchange` Task 3.4b 分别验证自身终结条件和原始异常语义。三项通过独立评审前不得标记该修订完成。
 
@@ -321,6 +321,16 @@ class PersistentPrivateProof(Protocol):
 - 所有 relative names 拒绝空值、`.`、`..`、separator、NUL；Windows 另拒绝 ADS/device namespace、ambiguous trailing dot/space 和 reserved device forms。
 - `PublishMode` 只有 `CREATE_IF_ABSENT` 与 `REPLACE_UNDER_LOCK`。平台层提供 handle-bound naming facts，不提供 expected-target 原子 CAS；replace 的 stale/concurrency 语义由持有同一 resource-family 排他 lease 的 business journal/LKG owner 决定。
 
+### 只读目录观察与受控目标物化
+
+`observe_children(retained_directory, limits, cancellation)` 只返回有界、不可变 metadata 条目与本次观察的身份事实；下钻取得 no-follow retained descendant handle。目录不加业务写锁、不建 ledger、不写源目录。平台拒绝 symlink/reparse 与 ancestor drift；观察不是内容读取或永久 authority，后续文件读取仍须 sealed read 与 verified terminal。Project 拥有递归选择策略；本合同允许的上限为深度 32、总条目 10,000、同时目录 handle 33，并继承更小的平台路径限制。
+
+`prepare_descendant_target(retained_export_root, portable_ref)` 只读验证相对引用、根/已有祖先身份、既有目标身份或缺失事实，将已有 lineage、缺失目录后缀与目标 absent 条件封装为不可变 plan；不存在的父目录不产生虚构 handle。Application 在确认前排除重复、大小写冲突和文件/祖先冲突，并把 plan 与其 session、revision 和输出事实绑定。
+
+`materialize_target(directory_plan, cancellation)` 仅在用户确认后复证祖先，逐组件 no-follow 创建缺失目录并保留新 handle/身份。预览中 absent 的目录或目标被其他执行者创建时返回 stale，不收养该对象；仅同批成功创建且复证的共享祖先可复用。已有目标必须匹配预览身份。完成后签发 Parser 可消费的 rooted target binding，再按原条件执行 prepared write。
+
+替换、取消或失败时关闭本次 handle；取消后不启动新目录或文件写入，已发出系统调用的结果仍须复证。目录创建失败不发布该目标文件，如实返回本批已创建目录，不承诺删除空目录或将其计为已导出文件。逐目标物化及时释放非必要 handle，保留本批新目录身份事实至批次结束。POSIX/Windows 原语分别归本 owner adapter，观察与创建都不得复用 retirement/ledger authority。
+
 ## Windows Native Adapter
 
 ### Supported Host Gate
@@ -474,7 +484,7 @@ stateDiagram-v2
 
 ### 普通 frozen 路线
 
-0.5.2 只有一个完整交付：已批准的普通消费合同 → 首条真实 packaged Core/worker 调用链 → 本机资格闭环 → 同候选产品验收。小样本和 smoke 是诊断步骤，不形成独立发行。原最小 spike、Core 9.6c/9.6d、Feature5 3.6a、平台 7.0/7.1 保留历史范围，不是普通输入来源已实现的证明，也不要求重新完成 W3。
+0.5.2 只有一个完整交付：普通消费合同 → 首条真实 packaged Core/worker 调用链 → 本机资格闭环 → 同候选产品验收。小样本和 smoke 是诊断步骤，不形成独立发行。原最小 spike、Core 9.6c/9.6d、Feature5 3.6a、平台 7.0/7.1 保留历史范围，不是普通输入来源已实现的证明，也不要求重新完成 W3。
 
 ## Frozen Distribution Design
 
@@ -545,6 +555,12 @@ flowchart TD
 ### 资源与用户目录
 
 只读资源相对发行目录解析；可写配置与托管数据继续使用现有用户目录 owner，项目仍在用户选择的位置。默认 tm/terms 只在目标不存在时播种，不能覆盖用户修改。logo/icon/metadata/qwindows/必要 plugins 和 Gate 输入缺失为候选失败；avatar catalog 可选，声明后检查索引/解码，无匹配保留 fallback。清除 PYTHONPATH 与 Qt 开发路径，在非仓库 CWD、无 Python/Qt 安装的环境验收实际首页和项目参数。
+
+### 同步的可选依赖与秘密组合
+
+可信 composition 延迟加载固定版本的 `botocore`、`keyring`、`defusedxml`；普通发行在显式 module closure 与依赖 lock/hash 中声明它们。缺失可选依赖只禁用同步，不影响编辑和包保存，也不改变 Core/Host/Gate 合同。
+
+秘密仅来自 allowlisted 系统 backend（Windows Credential Locker、macOS Keychain、Linux Secret Service）、会话或显式环境引用；不启用第三方 backend、plaintext fallback 或默认 AWS 凭据链。禁用同步不创建 SDK client、不请求秘密。协议和连接配置由 [Sync Design](../cross-device-sync-plugin/design.md) 拥有；真实 backend 与发行验证分别进行，fake contract 或 POSIX 通过不替代 Windows 原生验收。
 
 ## Error Handling
 
