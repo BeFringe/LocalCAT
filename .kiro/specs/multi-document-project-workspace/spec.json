@@ -1,9 +1,9 @@
 {
   "feature_name": "multi-document-project-workspace",
   "created_at": "2026-08-22T03:04:32+08:00",
-  "updated_at": "2026-10-05T08:45:36+00:00",
+  "updated_at": "2026-10-05T09:30:00+00:00",
   "language": "zh-CN",
-  "phase": "tasks-generated",
+  "phase": "tasks-approved",
   "approvals": {
     "requirements": {
       "generated": true,
@@ -18,16 +18,26 @@
       "approved": true
     }
   },
-  "ready_for_implementation": false,
+  "ready_for_implementation": true,
   "approval_scope": "原有 Requirements/Design/Tasks 的审批范围保留。本次静态源码快照维护增量：以当前 owner 架构与行为断言替代机械 SHA/数量/跨 JSON 摘要链，移除本 owner 快照和生成器；真实历史报告、fixture、Gate roots 与运行时兼容性依据不变。",
   "pending_amendments": {
     "root_directory_selection": {
-      "scope": "Requirement 13、Design 显式根目录选择增量、Tasks Cluster 5 已批准实施；治理继承前不开放相关 runtime。",
+      "scope": "Requirement 13、Design「显式根目录选择与单文件项目」、Tasks Cluster 5；在 ADR-030 边界内按依赖实施。",
       "requirements_generated": true,
       "design_generated": true,
       "tasks_generated": true,
       "approved": true,
-      "ready_for_implementation": false
+      "ready_for_implementation": true
+    }
+  },
+  "approved_amendments": {
+    "directory_rpy_manual_sync": {
+      "adrs": [
+        "ADR-030",
+        "ADR-031"
+      ],
+      "scope": "Requirements 3、4.9、8.11–8.12、13；Design「显式根目录选择与单文件项目」「Opaque codec_private_member」「受限整包 artifact」。",
+      "approved": true
     }
   }
 }
