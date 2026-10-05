@@ -1567,8 +1567,108 @@ class CanonicalSerializerCodec(Protocol):
     ) -> CanonicalBytes: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RoundTripLimits:
+    """Explicit writer bounds, independent of the source input byte limit."""
+
+    max_output_bytes: int
+    max_opaque_payload_bytes: int
+
+    def __post_init__(self) -> None:
+        _require_positive_int(self.max_output_bytes, field_name="max_output_bytes")
+        _require_positive_int(
+            self.max_opaque_payload_bytes, field_name="max_opaque_payload_bytes",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RoundTripSegmentEdit:
+    """Current target for a codec-local slot; no project or confirmation state."""
+
+    local_id: str
+    target: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_text(self.local_id, field_name="RoundTripSegmentEdit.local_id")
+        if type(self.target) is not str:
+            raise TypeError("RoundTripSegmentEdit.target must be exact string")
+
+
+@dataclass(frozen=True, slots=True)
+class RoundTripRequest:
+    """Invocation facts, not publication authority.
+
+    Composition supplies a live, read-only lease and a Foundation terminal for
+    the same sealed source. In this prepare protocol, format_state_fingerprint
+    is SHA-256 of the exact opaque_payload bytes. That binding detects drift;
+    the codec must still rebuild and validate its private mapping from source.
+    The generic validate_round_trip_token helper keeps its earlier semantics.
+    The lease expires as soon as prepare returns (including on failure).
+    """
+
+    codec_identity: CodecIdentity
+    format_id: FormatId
+    source: SnapshotCursorLease
+    terminal: TerminalSuccess
+    token: RoundTripTokenEnvelope
+    edits: tuple[RoundTripSegmentEdit, ...]
+    limits: RoundTripLimits
+    limit_profile: LimitProfile
+
+    def __post_init__(self) -> None:
+        _require_exact_instance(self.codec_identity, CodecIdentity, "codec_identity")
+        _require_exact_instance(self.format_id, FormatId, "format_id")
+        if not isinstance(self.source, SnapshotCursorLease):
+            raise TypeError("source must satisfy SnapshotCursorLease")
+        _require_exact_instance(self.terminal, TerminalSuccess, "terminal")
+        _require_exact_instance(self.token, RoundTripTokenEnvelope, "token")
+        _require_tuple(self.edits, field_name="edits")
+        for edit in self.edits:
+            _require_exact_instance(edit, RoundTripSegmentEdit, "edit")
+        _require_exact_instance(self.limits, RoundTripLimits, "limits")
+        _require_exact_instance(self.limit_profile, LimitProfile, "limit_profile")
+        if (
+            self.source.source_identity != self.terminal.source
+            or self.terminal.codec_identity != self.codec_identity
+            or self.terminal.limit_profile != self.limit_profile
+            or self.source.closed
+        ):
+            raise ValueError("round-trip request requires matching live source facts")
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedFormatBytes:
+    """Codec-produced data only; never a writable or publishable capability."""
+
+    codec_identity: CodecIdentity
+    format_id: FormatId
+    source_fingerprint: str
+    output_fingerprint: str
+    payload: bytes
+    diagnostics: tuple[ParseIssue, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_exact_instance(self.codec_identity, CodecIdentity, "codec_identity")
+        _require_exact_instance(self.format_id, FormatId, "format_id")
+        _require_sha256(self.source_fingerprint, field_name="source_fingerprint")
+        _require_sha256(self.output_fingerprint, field_name="output_fingerprint")
+        if type(self.payload) is not bytes:
+            raise TypeError("PreparedFormatBytes.payload must be exact bytes")
+        _require_tuple(self.diagnostics, field_name="diagnostics")
+        for issue in self.diagnostics:
+            _require_exact_instance(issue, ParseIssue, "diagnostic")
+
+
+@runtime_checkable
+class RoundTripSerializer(Protocol):
+    descriptor: "CodecDescriptor"
+
+    def prepare(self, request: RoundTripRequest) -> PreparedFormatBytes: ...
+
+
 ReaderFactory = Callable[[], RawReaderCodec]
 CanonicalSerializerFactory = Callable[[], CanonicalSerializerCodec]
+RoundTripSerializerFactory = Callable[[], RoundTripSerializer]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1586,6 +1686,8 @@ class CodecDescriptor:
     input_consumption_policy: InputConsumptionPolicy
     reader_factory: ReaderFactory | None
     canonical_serializer_factory: CanonicalSerializerFactory | None
+    round_trip_serializer_factory: RoundTripSerializerFactory | None = None
+    round_trip_limits: RoundTripLimits | None = None
 
     def __post_init__(self) -> None:
         _require_exact_instance(self.identity, CodecIdentity, "CodecDescriptor.identity")
@@ -1654,6 +1756,17 @@ class CodecDescriptor:
             raise ValueError(
                 "descriptor without canonical-write capability cannot carry a serializer"
             )
+        if self.round_trip_limits is not None:
+            _require_exact_instance(self.round_trip_limits, RoundTripLimits, "round_trip_limits")
+        if self.round_trip_serializer_factory is not None:
+            if not callable(self.round_trip_serializer_factory):
+                raise TypeError("round-trip serializer factory must be callable")
+            if not self.capabilities.source_round_trip_write:
+                raise ValueError("round-trip serializer requires its declared capability")
+            if not self.capabilities.validatable or not self.capabilities.readable:
+                raise ValueError("round-trip serializer requires source verification")
+            if self.round_trip_limits is None:
+                raise ValueError("round-trip serializer requires explicit output and opaque limits")
         if self.capabilities.validatable and not self.capabilities.readable:
             raise ValueError("validatable descriptor must also be readable")
         if self.capabilities.termbase_column_preview and (
