@@ -1837,6 +1837,35 @@ class WriteReceipt:
         _require_positive_int(self.schema_version, field_name="WriteReceipt.schema_version")
 
 
+class PreparedWriteOutcome(Enum):
+    PUBLISHED = "published"
+    FAILED = "failed"
+    UNCERTAIN = "uncertain"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedWriteResult:
+    """One format publication result; only proved publication carries a receipt."""
+
+    outcome: PreparedWriteOutcome
+    receipt: WriteReceipt | None = None
+    code: str | None = None
+    safe_summary: str = ""
+
+    def __post_init__(self) -> None:
+        _require_exact_instance(self.outcome, PreparedWriteOutcome, "outcome")
+        if type(self.safe_summary) is not str:
+            raise TypeError("safe_summary must be exact string")
+        if self.outcome is PreparedWriteOutcome.PUBLISHED:
+            _require_exact_instance(self.receipt, WriteReceipt, "receipt")
+            if self.code is not None:
+                raise ValueError("published result cannot carry a failure code")
+        else:
+            if self.receipt is not None:
+                raise ValueError("unproved publication cannot carry a receipt")
+            _require_nonempty_text(self.code, field_name="code")
+
+
 def _validate_metadata_value(value: object) -> None:
     pending = [value]
     while pending:
