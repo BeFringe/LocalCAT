@@ -12,7 +12,7 @@
 
 ### Non-Goals
 
-不执行 Ren'Py、不提供完整游戏 parser、不安装第三方可执行插件、不自动扫描文件夹、不改变 TM/术语权威。无网络依赖；不提供脚本原地自动保存。
+不执行 Ren'Py，不提供完整游戏 parser、第三方可执行插件安装或 TM/术语权威变更。codec 不扫描文件夹；根目录发现由 Project 的显式预览提供。无网络依赖；不提供脚本原地自动保存。
 
 ## Boundary Commitments
 
@@ -39,7 +39,7 @@ TL profile/token 版本变化重验 RPY golden fixtures 与旧包缺失/不兼�
 - **Applicable Steering**：product、tech、structure、spec-ownership、repository-safety；以 roadmap 的 RPY→Sync 产品顺序为目标。
 - **Applicable ADRs**：ADR-015 的 Parser/codec 分权、ADR-018 的项目/codec 分权、ADR-019 的严格 ProjectPackage、ADR-020/025/026 的平台与无状态 Parser 写入。
 - **ADR disposition**：待治理线最小取代 ADR-018 决策 13 中“RPY 在 Sync 后”的顺序。保留其身份、包、权限决定；不静默改写 adopted 历史。
-- **Scope amendment**：Pending。Parser 扩展中立 round-trip prepare；Multi 增加单 TL 的非 legacy origin profile、配置 codec intake、private payload handoff 与导出协调；Qt 增加中立入口。下表给出精确提案，不把生成视为批准。
+- **Scope amendment**：Pending。Parser 扩展中立 round-trip prepare；Multi 增加单 TL 的非 legacy origin profile、配置 codec intake、private payload handoff、根目录递归预览/显式选择与导出协调；Qt 增加中立入口；平台增加导出根下受控子目录准备/创建/绑定端口。下表给出精确提案，不把生成视为批准。
 - **Steering sync**：治理 owner 同步 Multi border/review-clustering 的旧顺序及 spec-ownership；交付时依据实际能力更新 product/tech/structure/roadmap。
 - **Downstream revalidation**：Parser canonical 路径、Multi 单/多文档与包恢复、Qt/Chunk mutation guards、ResourcePackage 手工消费、Sync 的 RPY 包冷重开。
 
@@ -49,7 +49,8 @@ TL profile/token 版本变化重验 RPY golden fixtures 与旧包缺失/不兼�
 | --- | --- | --- |
 | Parser | 可选 `round_trip_serializer_factory`；surface 的 `prepare_round_trip`/`write_prepared`；codec 在源/token 复证后产生受限输出 | canonical API、八个内建组合与 verified terminal；不加入 RPY 字段 |
 | Multi | `explicit-single-file-v1` 非 legacy profile；允许一个 Document 的 OriginBinding；intake 接收配置 surface 与中立 private bytes；单独的 source export 协调 | strict ZIP v1 的既有键、成员 closure、identity 与包事务；`LEGACY_SINGLE_JSON` 不扩宽 |
-| Controller/Qt | RPY 选择分流、项目包另存、导出预览/逐文件报告 | Qt 不取得 provider、token、path authority 或 package handle；Chunk 权限继续生效 |
+| Platform | 受控 descendant-directory prepare/create/bind；绑定已存在祖先与缺失后缀的 absent 条件 | 不借用 retirement/ledger authority；不授予 codec 路径访问 |
+| Controller/Qt | 消费 Multi 根目录选择/章节树投影、RPY 选择分流、项目包另存、导出预览/逐文件报告 | Qt 不取得 provider、token、path authority 或 package handle；Chunk 权限继续生效 |
 
 ## Architecture
 
@@ -97,6 +98,7 @@ flowchart LR
 | `tests/fixtures/rpy/` | 合成 TL、期望中立记录与导出；无外部目录依赖 |
 | 修改 `parser_contracts.py`、`parser_composition.py`、`parser_source.py` | Parser owner 的通用 prepare/publish amendment |
 | 修改 `project_workspace_contracts.py`、`project_workspace_intake.py` | Multi owner 的单文件 profile、注入 surface 与 private payload 通道 |
+| 修改 `platform_fs_contracts.py`、`platform_fs_posix.py`、`platform_fs_windows.py` | 平台 owner 批准的导出子目录准备/创建/绑定；与 Multi 只读观察端口分别验收 |
 | 修改 `editor_controller.py`、`qt_editor_window.py`、`qt_editor.py` | 明确的跨 owner composition/命令集成；codec 只在 composition 注册 |
 | 修改 `tools/build_windows_ordinary.py`、`packaging/windows/frozen_roots.json` | 将新模块纳入正常发行；不改变 Core/Gate 输入合同 |
 
@@ -128,7 +130,7 @@ stateDiagram-v2
 
 预览绑定 session、workspace revision、选定 Document identities、codec identity、source/private digest、输出目标身份和导出策略。导出全部当前 target；空/未确认是可见警示，不自动填源文或丢段。用户编辑、重开、换 provider 或重选路径使预览失效。TL 导出不清除 package dirty，也不更新 package baseline。
 
-多文件先准备/验证所有文件，确认后按顺序独立发布；取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
+多文件导出由用户选择一个导出根目录，按已验证的 source_ref 重建相对目录，不按 basename 展平。先准备/验证所有输出及目录/大小写/同名冲突，再确认并按顺序独立发布；root 与每个目标 ancestor 在发布前复证，拒绝符号链接/reparse、逸出和替换。缺失子目录仅由平台在批准根内受控创建；预览不建目录，目录创建失败列为未发布，已创建空目录不宣称回滚。取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
 
 ## Components and Interfaces
 
@@ -138,10 +140,12 @@ stateDiagram-v2
 
 支持 UTF-8（可带 BOM）、LF/CRLF、空行、注释和空格缩进。支持的 grammar 明确限定为：
 
-- `translate <language> <label>:`，其中一个源文注释 say 与一个目标 say 一一对应；speaker 为省略或单个标识符，目标与源 speaker 必须一致。可保留已识别的 `voice <quoted-string>` 与 `nvl clear` 控制行；纯控制 block 不产生段落。
-- `translate <language> strings:` 中一一对应的 `old <quoted-string>` / `new <quoted-string>`；可有多个 pair 和多个 strings block，但同一语言的重复 old key 拒绝。
-- 字符串为单行单/双引号文本，允许声明的反斜杠转义（反斜杠、相应引号、n/r/t）；未声明转义、物理多行字符串、三引号、say attributes、`pass` 代替译文、多 say 对一 source、Python/style/条件块、原始游戏语句均整文档 unsupported。不保留无法确定边界的“未知代码”。
+- `translate <language> <label>:`，其中一个源文注释 say 与一个目标 say 一一对应；支持 narrator 的单字符串，或 `speaker [attributes] <quoted-string> [with transition]`。speaker 为单个标识符，属性为零个或多个标识符/负属性（`-name`），可有一个 `@` 分隔临时属性（其后至少一个属性）；transition 限单个标识符，不求值。源/目标的 speaker 必须一致，属性及 transition 各自保留，不要求翻译前后显示效果相同。可保留 `voice <quoted-string>` 与 `nvl clear`；纯控制 block 不产生段落。
+- `translate <language> strings:` 中一一对应的 `old <quoted-string>` / `new <quoted-string>`；可有多个 pair 和多个 strings block，但同一文档同一语言的重复 old key 拒绝。dialogue 与 strings 按块状态区分，可在同一文档交替出现；strings 无 speaker，不从相邻 dialogue 继承角色。
+- 字符串为单行单/双引号文本，允许声明的反斜杠转义（反斜杠、相应引号、n/r/t）；未声明转义、物理多行字符串、三引号、上述有限属性/transition 以外的 say 表达式或调用参数、`pass` 代替译文、多 say 对一 source、Python/style/条件块、原始游戏语句均整文档 unsupported。不保留无法确定边界的“未知代码”。
 - 一文档仅一个目标语言 token；language 按原 token 保存，不强制 BCP 47。`None` 只允许 strings。空目标、评论中的引号/井号按词法识别，不靠行过滤。
+
+speaker 映射示例：`guide thinking "Source"` 的中立 speaker 是 `guide`，`thinking` 只保留在 codec 的结构跨度中；`guide -thinking @ happy "Source" with dissolve` 采用同一规则。narrator 没有 speaker；`extend`、`centered` 按原始特殊 say 标识保留，不执行游戏去推断前一角色或显示别名。属性不会因未显示在 speaker 列而从导出文件删除。翻译单元 label 的摘要样式后缀是身份线索，不视为加密文本。
 
 局部 ID：dialogue 使用 language+label 的无歧义编码；strings 使用 language+完整解码 old（含 `{#...}`）的 SHA-256 派生值，若碰撞或重复直接拒绝。ID 不使用当前序号。dialogue 的 label 不变而源文改变时 ID 保持，交给 Project 判定 source_changed、保留 target 并清除 confirmed；label 改变或 strings 的 old key 改变时产生 new/removed，交给显式调和，不靠相似文本自动合并。source 相同而显示/顺序变化不改变 ID。
 
@@ -169,9 +173,19 @@ class RoundTripSerializer(Protocol):
 
 `prepare_round_trip` 先验证现有 `RoundTripTokenEnvelope`，再调用 exact provider factory；factory 缺失等同 unsupported。Application 选定目标后使用 Parser/平台受控发布 surface；复用 `atomic_write_bytes` 的安全原语及 `PreparedCanonicalWrite` 的准备/提交模式，不复用 canonical serializer 的格式语义。不得直接使用 `open(path,'w')`。发布前 source/target身份失效零发布，发布后 durability 不确定返回结构化不确定结果；codec 无 journal/LKG。
 
+### 嵌套导出的平台目录合同（提案）
+
+现有 rooted bind/open 只覆盖已存在的父目录；retirement 专用目录 authority 不用于导出。平台新增 `prepare_descendant_target(retained_export_root, portable_ref)` 与 `materialize_target(directory_plan, cancellation)` 的中立端口；仅 Application 消费，codec 不知道目录或目标路径。限额继承 portable ref、深度 32、RPY 批量 256 文件和更小的 owner 限制；逐目标物化及时释放非必要 handle，保留本批新目录身份事实至批次结束。
+
+prepare 只读：验证 portable_ref、根/已有祖先身份、既有目标身份或缺失事实，并把缺失目录后缀及目标的 absent 条件封装为不可变 plan。Project 导出 preview 绑定此 plan、session/revision、source/private/输出摘要；父目录不存在时不虚构目标 handle。所有候选路径的重复、大小写冲突以及“某目标文件同时是另一目标祖先”的冲突在确认前拒绝。
+
+用户确认后才允许 materialize：复证已有祖先，按组件 no-follow 创建缺失子目录并保留新 handle/身份，逐层确认仍在原根内。预览中 absent 的目录或目标若被其他进程创建，不收养该对象，返回 stale；仅本批已成功创建并复证的共享祖先可供后续目标复用。既有目标必须匹配预览身份。完成后返回 Parser 受控发布能消费的 rooted target binding，再按原条件执行 prepared write。并发替换、取消或错误关闭全部本次 handle；取消后不启动新目录或文件写入，已发出的系统调用结果仍须复证。创建失败不发布该目标文件，不承诺删除本批已创建空目录，也不把它们报成已导出文件。
+
+Parser owner 的 `write_prepared` 是独立实现任务：验证准备结果的 issuing surface、source/output fingerprint、有效目标绑定与消费状态，再调用既有平台原子发布，投影 published/failed/uncertain。canonical serializer 不重新编码 round-trip bytes，不能把 `PreparedFormatBytes` 直接当作任意可写 bytes；该接口不引入 codec journal/LKG 或 Project receipt。RPY Application 的发布任务仅编排此能力，不假设接口已存在。
+
 ### RpyProjectAdapter 与 UI
 
-intake amendment 把“已验证 records + opaque payload”作为单次 handoff，在一个 retained source snapshot 下完成；codec 不能提交 workspace。单文件 profile 与多文件 profile 都保留准确 RPY CodecIdentity/FormatId，不能设置 legacy JSON codec 来规避校验。多文件选择语言必须一致，全部验证后才发布新 workspace。
+intake amendment 把“已验证 records + opaque payload”作为单次 handoff，在一个 retained source snapshot 下完成；codec 不能提交 workspace。单文件 profile 与多文件 profile 都保留准确 RPY CodecIdentity/FormatId，不能设置 legacy JSON codec 来规避校验。多文件选择语言必须一致，全部验证后才发布新 workspace。目录发现归 Multi 的 Requirement 13 增量，RPY 只消费其确认后的有序选择与 retained root，不自行递归或在筛选后重算共同父目录。0 文件不得提交，1 文件使用 explicit-single-file-v1，多个使用 explicit-selected-files-v1；单选嵌套文件也保留最初根下的 source_ref。章节树仅消费 Controller 的路径投影，不读取文件系统；分组不修改 manifest 顺序。
 
 Controller 继续校验 issued identity、session/revision 与 Chunk mutation permission。新增导出命令只接受 Controller-issued Document selection 和用户选择的目标；Qt 不自行构造 token。异步 result 带 session/request generation，关闭/换项目后丢弃迟到结果并释放 handle。单文件到多文件保持同一 package 权威；不改变最近项目或恢复断点语义。
 
@@ -199,10 +213,10 @@ codec 使用 Parser 既有安全诊断容器，RPY 错误 namespace 区分 unsup
 
 ## Testing Strategy
 
-- 词法与 golden：每个支持 grammar 正/反例；引号、井号、空目标、BOM/CRLF、Unicode、多 strings block、控制行；验证 1、2、4、7。
+- 词法与 golden：每个支持 grammar 正/反例；引号、井号、空目标、BOM/CRLF、Unicode、dialogue/strings 同文件、多 strings block、speaker/属性分离、extend/centered、with transition 与控制行；验证 1、2、4、7。
 - 私有数据攻击/失效：越界/重叠 span、重复 ID、foreign/version/stale token、错误摘要；核对拒绝发生在目标打开前，覆盖 3.3、4.4、7.2。
-- 项目集成：真实单 Document 包冷重开、无原路径导出、无 codec 编辑保存；多文件同 basename、rename/source change 与 Chapter/Chunk 稳定身份，覆盖 3、5。
-- 故障：读取失败、取消、目标替换、发布前/后平台失败、多文件部分发布与迟到 UI 结果，分别验证 owner 语义，覆盖 3.4、4.5、5.4、6.3。
+- 项目集成：真实单 Document 包冷重开、无原路径导出、无 codec 编辑保存；根目录预览后单选/多选、至少两层目录与同 basename、树导航不改变阅读顺序、按原目录导出、rename/source change 与 Chapter/Chunk 稳定身份，覆盖 3、5。
+- 故障：读取失败、取消、目标/祖先替换、缺失目录创建竞争与失败、跨文件祖先冲突、发布前/后平台失败、多文件部分发布与迟到 UI 结果，分别验证 owner 语义，覆盖 3.4、4.5、5.4、6.3。
 - 产品验收：source 支持环境与实际普通 Windows frozen 的单/多 TL 编辑保存导出、手工 JSONL/CSV 资源使用；只声明实际验证的平台/子集，覆盖 1.4、6、7.4。新模块打包不隐含重签历史 Gate。
 
 ## Supporting References

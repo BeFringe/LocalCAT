@@ -4,7 +4,7 @@
 
 - [ ] 1. 建立已批准的中立接缝与可重现输入
 - [ ] 1.1 建立受支持与拒绝输入的合成夹具
-  - 覆盖 dialogue/string、空目标、BOM/换行、控制行及明确不支持的语法。
+  - 覆盖同文件 dialogue/old-new、narrator、speaker/属性分离、extend/centered、with transition、空目标、BOM/换行与拒绝语法；使用合成内容。
   - 完成时，每个 fixture 有确定的输入分类与期望中立记录，单独 checkout 可运行，不读取外部项目目录。
   - _Requirements: 1.2, 1.4, 2.1, 2.2, 7.4_
   - _Boundary: RpyCodec fixtures_
@@ -13,21 +13,27 @@
   - 完成时，伪 codec 可验证调用顺序，foreign/stale token 在目标打开前失败，既有 canonical codec 契约不变。
   - _Requirements: 1.3, 4.4, 7.2_
   - _Boundary: Parser owner amendment_
-- [ ] 1.3 实现 Project owner 批准的单文件 intake 与私有数据通道
-  - 支持非 legacy 单 Document profile、配置 surface 与 verified private handoff，保留 rooted source 至首包发布。
+- [ ] 1.3 实现 Parser owner 批准的 prepared 发布能力
+  - 绑定准备结果与 issuing surface/source/output 摘要、目标条件及消费状态，调用平台原子发布并返回明确结果；不经过 canonical serializer 重编码。
+  - 完成时，伪造/复用/过期准备结果不能写入，现有父目录下可发布受限 round-trip bytes，故障返回 failed/uncertain 而非成功，不新增 journal/LKG。
+  - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
+  - _Boundary: Parser owner publication amendment_
+  - _Depends: 1.2_
+- [ ] 1.4 接入已批准单文件 profile 与私有数据通道
+  - 消费 Multi 增量 5.6 提供的非 legacy 单 Document profile；本任务只接入配置 surface 与 verified private handoff，保留 rooted source 至首包发布，不重复实现 profile。
   - 完成时，中立伪 codec 可创建/重开一个 Document 的包；原 legacy 与多文件 profile 拒绝规则不变。
   - _Requirements: 3.1, 3.2, 3.4, 7.2_
   - _Boundary: Multi owner amendment_
-  - _Depends: 1.2_
+  - _Depends: 1.2；multi-document-project-workspace 5.6_
 
 - [ ] 2. 实现独立 TL codec
 - [ ] 2.1 识别有界字符串、缩进和 TL block
-  - 支持声明的编码、注释、引号/转义、header 与控制行，拒绝执行型/多行/不确定语法及空 source。
+  - 支持声明的编码、注释、引号/转义、混合两类 header、有限 say 属性/transition 与控制行，拒绝执行型/多行/不确定语法及空 source。
   - 完成时，正反 fixture 全部分类正确，超限/截断不会输出可提交候选。
   - _Requirements: 1.1, 1.2, 2.1, 7.1, 7.2, 7.3_
   - _Boundary: RpyCodec_
 - [ ] 2.2 映射翻译槽、speaker 与稳定局部身份
-  - 构造中立 source/target，保留空槽和字符串消歧标签，首次导入 confirmed=false。
+  - 构造中立 source/target，speaker 只取角色标识符；属性及 transition 留在结构跨度，strings 不继承角色，extend/centered 不展开求值，首次导入 confirmed=false。
   - 完成时，重复 label/old key 明确失败，显示顺序不改变身份，控制行不成为段落。
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
   - _Boundary: RpyCodec_
@@ -54,7 +60,7 @@
   - 完成时，无原始路径仍能从包重开保留 target/confirmed；禁用 codec 后可编辑保存包但不可导出 TL。
   - _Requirements: 2.3, 3.1, 3.2, 3.3, 3.4_
   - _Boundary: RpyProjectAdapter / Project integration_
-  - _Depends: 1.3, 3.1_
+  - _Depends: 1.4, 3.1_
 - [ ] 3.3 接入绑定当前编辑的导出预览
   - 展示空/未确认数量、目标和诊断，绑定 session/revision、codec/source/private/目标身份；导出全部 target。
   - 完成时，修改译文、切换项目/codec 或替换目标使 preview stale；取消无发布。
@@ -62,29 +68,52 @@
   - _Boundary: RpyProjectAdapter / ProjectExportView_
   - _Depends: 2.4, 3.2_
 - [ ] 3.4 接入受控发布和不确定结果
-  - 使用批准的 Parser/平台发布 surface，不加入 codec journal；导出不替代 package 保存。
+  - 消费 1.3 产出的 Parser prepared 发布能力，绑定项目预览与用户选定目标；不加入 codec journal，导出不替代 package 保存。
   - 完成时，发布前故障保留目标，发布后不确定不返回成功，project dirty/baseline 不被导出错误清除。
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
   - _Boundary: Parser publishing / RpyProjectAdapter integration_
+  - _Depends: 1.3, 3.3_
+- [ ] 3.5 实现经平台 owner 批准的嵌套导出目录合同
+  - 准备已有祖先身份、缺失后缀及 absent 条件；定义确认后的逐组件物化与发布目标绑定，预览零目录写入。
+  - 完成时，fake 平台证明目录/目标竞争会 stale，本批创建祖先才可复用，retirement authority 不能冒充目标绑定。
+  - _Requirements: 4.4, 5.4, 7.2_
+  - _Boundary: Platform export-directory contracts_
+- [ ] 3.6 实现 POSIX 导出子目录物化
+  - 在批准根内按组件 no-follow 创建并复证，返回 Parser 可消费的目标绑定；取消/失败释放 handle，不收养竞争创建对象。
+  - 完成时，缺失目录导出可用，symlink/祖先替换/创建失败不发布目标，已建空目录如实报告。
+  - _Requirements: 4.4, 4.5, 5.4, 7.2_
+  - _Boundary: Platform POSIX export-directory backend_
+- [ ] 3.7 实现 Windows 导出子目录物化
+  - 实现相同的创建/绑定合同，处理 reparse/祖先替换及 Windows 创建竞争，保持同一取消与失败语义。
+  - 完成时，Windows 合成嵌套目录成功发布，竞争/reparse/失败不写错误目标，不宣称回滚已创建目录。
+  - _Requirements: 4.4, 4.5, 5.4, 7.2_
+  - _Boundary: Platform Windows export-directory backend_
+  - _Depends: 3.5_
+- [ ] 3.8 验证目录准备到 Parser 发布的集成
+  - 验证 absent 条件、已有目标身份、本批共享祖先与文件/目录交叉冲突，发布仍使用已签发 prepared 内容。
+  - 完成时，两个 backend 均拒绝 preview 后替换/并发创建；部分失败保留准确逐文件结果，handle 全部按生命周期释放。
+  - _Requirements: 4.4, 4.5, 5.4, 6.3, 7.2_
+  - _Boundary: Platform / Parser / Project export integration validation_
+  - _Depends: 1.3, 3.4, 3.6, 3.7_
 
 - [ ] 4. 扩展多文件与源调和
 - [ ] 4.1 接入显式多 TL 选择与稳定路径
-  - 所选文件全量验证后形成 workspace，保持 root 下 source_ref/顺序，拒绝混合语言，不扫描目录。
-  - 完成时，不同子目录同名 TL 同时打开、导航、保存和重开而不碰撞。
+  - 消费 Multi 递归预览已确认的有序选择；保持原 root 下 source_ref，所选文件全量验证后形成 workspace，拒绝混合语言；codec 不负责枚举。
+  - 完成时，根目录下单选、多选、两层以上目录和同名 TL 均保留路径；未勾选内容不读取，树导航、保存和重开不改变阅读顺序。
   - _Requirements: 1.2, 5.1, 5.2, 7.1_
   - _Boundary: RpyProjectAdapter / Multi intake integration_
-  - _Depends: 3.2_
+  - _Depends: 3.2；multi-document-project-workspace 5.5, 5.6, 5.7, 5.8_
 - [ ] 4.2 接入已验证源更新与完整私有映射替换
   - 复用 Project reconciliation、显式 rename 与 unresolved 处理，不按行号猜测。
   - 完成时，同 dialogue label 改源文得到 source_changed、保留 target 并清 confirmed；label 或 strings old key 改变得到 new/removed，ambiguous 可见；新 private payload 与新 source 匹配。
   - _Requirements: 2.4, 5.2, 5.3_
   - _Boundary: RpyProjectAdapter / Project reconciliation integration_
 - [ ] 4.3 协调批量准备与逐文件导出结果
-  - 先准备所有候选再发布，取消停止未发布项，显示 published/failed/uncertain/not_attempted。
+  - 按 source_ref 保留嵌套目录，先准备所有候选并检查目录/路径冲突再发布；受控创建子目录及逐次复证，取消停止未发布项。
   - 完成时，第二个文件发布失败不会被报告为全批成功或全批回滚，重试要求新预览。
   - _Requirements: 4.5, 5.4, 6.3_
   - _Boundary: RpyProjectAdapter export coordination_
-  - _Depends: 3.4, 4.1_
+  - _Depends: 3.8, 4.1_
 
 - [ ] 5. 完成中立桌面入口与发行组合
 - [ ] 5.1 接入项目打开、包另存与导出对话框
@@ -111,7 +140,7 @@
   - _Requirements: 1.2, 3.2, 3.3, 3.4, 4.2, 4.3, 4.4, 4.5, 7.1, 7.2, 7.3_
   - _Boundary: RPY / Project / Parser integration validation_
 - [ ] 6.2 执行多文件编辑和手工包用户旅程
-  - 验证相对路径、顺序/调和、部分导出、TM/术语建议与两个设备的包验证/本地资源选择。
+  - 验证根目录预览选择、嵌套相对路径、树导航与阅读顺序/调和、混合两类 TL、同名分目录导出、TM/术语建议与两个设备的包验证/本地资源选择。
   - 完成时，Project 与 JSONL/CSV ResourcePackage 分别完成冷重开/导入，设备资格未被搬运，未引入 TMX 前置。
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 6.1, 6.2, 6.4, 7.4_
   - _Boundary: Product acceptance integration_
