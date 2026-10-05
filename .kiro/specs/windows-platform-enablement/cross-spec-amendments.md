@@ -213,7 +213,7 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 ### 普通候选已验收范围
 
-验收按实际候选保留范围，已勾选任务不自动覆盖后续产物。原逐项结果、执行命令、环境、日志摘要与失败记录保留在 Git 标签 [`evidence/ordinary-frozen-c462dd0`](https://github.com/BeFringe/LocalCAT/tree/evidence/ordinary-frozen-c462dd0)；原构建提交 `8589e19` 和 `4d8276f` 由既有标签 [`evidence/ordinary-frozen-e3e731b`](https://github.com/BeFringe/LocalCAT/tree/evidence/ordinary-frozen-e3e731b) 保留。历史摘要不是运行时 Gate、资格或发布 authority。本节只登记集成结论，原始过程材料继续留在忽略的 `artifacts/windows/`，不逐次追加为产品规格或新验收门。
+验收按实际候选保留范围，已勾选任务不自动覆盖后续产物。原逐项结果、执行命令、环境、失败记录及未变 owner 的有限复用依据保留在 Git 标签 [`evidence/ordinary-frozen-c462dd0`](https://github.com/BeFringe/LocalCAT/tree/evidence/ordinary-frozen-c462dd0)。原构建 SHA 按实际构建记录保留，不用整理后的提交改签构建或资格。历史摘要不是运行时 Gate、资格或发布 authority。本节只登记集成结论，原始过程材料继续留在忽略的 `artifacts/windows/`，不逐次追加为产品规格或新验收门。
 
 #### 初始候选 3c20
 
@@ -234,7 +234,7 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 #### 已验收候选 8fae
 
-候选 `8faeee03e1dd31d1162ce1d3447602a7af09fd1b20ac3313fa19bb321f51f5ad` 来自原构建提交 `4d8276f90417927bf329b879239cb9722238b131`；Core fingerprint 为 `4912f458ddf5c009683d319dd97bec959cc6f1b6ec4a4ae3367b102d93c836ab`。后续测试与文档修订未改变产物。原构建血缘由保留标签追溯，不以整理后的提交重签构建或资格。
+候选 `8faeee03e1dd31d1162ce1d3447602a7af09fd1b20ac3313fa19bb321f51f5ad` 来自原构建提交 `4d8276f90417927bf329b879239cb9722238b131`；Core fingerprint 为 `4912f458ddf5c009683d319dd97bec959cc6f1b6ec4a4ae3367b102d93c836ab`。后续测试与文档修订未改变产物，不以整理后的提交重签构建或资格。
 
 交付候选为 `LocalCAT-0.5.2-candidate-8faeee03e1dd-windows-x64.zip`（55,606,410 bytes、189 files），SHA-256 `8080c25542e60617788a02e06258ed6ddae18af181f61dabaf39210449bb8951`；EXE SHA-256 `7a60477e75aa9e1295d650382e7147abb89090559691e310fd0e8ea12a0e0de6`。ZIP 与原 payload 逐文件一致，不携带设备密钥或资格。
 
@@ -266,7 +266,7 @@ WA-01/02/03/04/05/08 原 source 证据及历史锚保持不变。平台 7.2a–c
 
 #### 时间准入修订候选 681a
 
-候选 `681a898d51c7093ab75fe2bfd5ea41efe729b5099f1be5ce5413794ca132c3b3` 由 `f5c76e8b00819ae6081b07f44e91703ed0d42891` 构建；后续任务登记不改变该产物。交付包 `LocalCAT-0.5.2-candidate-681a898d51c7-windows-x64.zip` 为 55,618,931 bytes、189 files，SHA-256 `5ce8b9cbcb496af80a96a037cf5291e0353ccfc333056924c15ebf08e1848ef5`；EXE SHA-256 为 `2e4ee917e3ce587c4b020802e98ce7fe54bd4997e2f1bea4de068832669a7e76`。
+候选 `681a898d51c7093ab75fe2bfd5ea41efe729b5099f1be5ce5413794ca132c3b3` 由 `f5c76e8b00819ae6081b07f44e91703ed0d42891` 构建；后续任务登记不改变该产物。对应产品源码及构建输入由发行标签 `v0.5.2-windows-frozen` 保留，原构建提交号仍按产物记录记载。交付包 `LocalCAT-0.5.2-candidate-681a898d51c7-windows-x64.zip` 为 55,618,931 bytes、189 files，SHA-256 `5ce8b9cbcb496af80a96a037cf5291e0353ccfc333056924c15ebf08e1848ef5`；EXE SHA-256 为 `2e4ee917e3ce587c4b020802e98ce7fe54bd4997e2f1bea4de068832669a7e76`。
 
 两台 Windows 设备实际运行相同候选与 Core fingerprint `0d98ec8c497d2dbc55056d96610162533cf55a81c23f10450573e64701b93767`，均完成正式 Gate C、5000/200 oracle 及 100k 双路径。验证机未安装用户 Python/Qt，产品从包内加载 CPython 3.14.7、Qt 6.11.1、SQLite 3.50.4，经正常入口、独立数据目录与非仓库 CWD 运行；Codex 自用运行时未参与产品逻辑。
 
