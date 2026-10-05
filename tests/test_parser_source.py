@@ -4,6 +4,8 @@ import gc
 import hashlib
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -251,8 +253,6 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
         link.symlink_to(outside)
         linked_directory = self.root / "input" / "linked-directory"
         linked_directory.symlink_to(outside.parent, target_is_directory=True)
-        fifo = self.root / "input" / "named-pipe"
-        os.mkfifo(fifo)
         cases = (
             (
                 SourceReference(str(self.root), str(outside), "outside"),
@@ -275,10 +275,6 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
                 "PARSER.SOURCE.NOT_REGULAR",
             ),
             (
-                SourceReference(str(self.root), str(fifo), "fifo"),
-                "PARSER.SOURCE.NOT_REGULAR",
-            ),
-            (
                 SourceReference(
                     str(self.root),
                     str(self.root / "input" / ".." / "nested" / "chapter.txt"),
@@ -293,12 +289,54 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
             self.assertEqual(caught.exception.code, code)
             self.assertNotIn("secret", str(caught.exception))
 
+    def test_rooted_fifo_rejection_is_bounded_and_does_not_consume_body(self) -> None:
+        fifo = self.root / "input" / "named-pipe"
+        os.mkfifo(fifo)
+        script = """
+import sys
+from unittest import mock
+from parser_contracts import SourceReference
+from parser_source import ParserSourceError
+from tests.parser_io_test_support import open_test_rooted_regular_file
+
+reference = SourceReference(sys.argv[1], sys.argv[2], "fifo")
+with mock.patch("platform_fs_posix.os.pread") as read:
+    try:
+        open_test_rooted_regular_file(reference)
+    except ParserSourceError as error:
+        if error.code != "PARSER.SOURCE.NOT_REGULAR":
+            raise AssertionError(error.code)
+    else:
+        raise AssertionError("FIFO unexpectedly accepted")
+    read.assert_not_called()
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(self.root), str(fifo)],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
     def test_rooted_open_fails_closed_when_platform_binding_is_unavailable(self) -> None:
         from parser_source import ParserSourceError, open_rooted_regular_file
+        from platform_fs import compose_platform_file_backend
+        from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
 
-        with mock.patch("parser_source._rooted_handles_available", return_value=False):
+        backend = compose_platform_file_backend(self.root)
+        with mock.patch.object(
+            backend,
+            "_bind_root",
+            side_effect=PlatformFileError(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False
+            ),
+        ) as bind_root, mock.patch("platform_fs_posix.os.pread") as read:
             with self.assertRaises(ParserSourceError) as caught:
-                open_test_rooted_regular_file(self.source_reference())
+                open_rooted_regular_file(self.source_reference(), file_system=backend)
+        bind_root.assert_called_once()
+        read.assert_not_called()
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.ROOT_BINDING_UNAVAILABLE")
 
     def test_snapshot_rejects_input_limit_and_fstat_drift_and_cleans_temp(self) -> None:
@@ -330,22 +368,42 @@ class RootedSourceAndSnapshotTests(_FixtureMixin, unittest.TestCase):
     def test_snapshot_rejects_real_source_mutation_during_its_single_copy(self) -> None:
         from parser_source import ParserSourceError, create_sealed_snapshot
 
-        original_read = os.read
+        original_pread = os.pread
+        original_temporary_file = tempfile.TemporaryFile
+        source_identity = self.source.stat()
+        temporaries = []
         mutated = False
 
-        def mutate_after_read(descriptor: int, size: int) -> bytes:
+        def capture_temporary(*args, **kwargs):
+            temporary = original_temporary_file(*args, **kwargs)
+            temporaries.append(temporary)
+            return temporary
+
+        def mutate_after_read(descriptor: int, size: int, offset: int) -> bytes:
             nonlocal mutated
-            chunk = original_read(descriptor, size)
-            if chunk and not mutated:
+            chunk = original_pread(descriptor, size, offset)
+            opened_identity = os.fstat(descriptor)
+            is_source = (
+                opened_identity.st_dev,
+                opened_identity.st_ino,
+            ) == (source_identity.st_dev, source_identity.st_ino)
+            if is_source and chunk and not mutated:
                 mutated = True
                 self.source.write_bytes(b"concurrent replacement with another size")
             return chunk
 
-        with mock.patch("parser_source.os.read", side_effect=mutate_after_read):
+        with mock.patch(
+            "platform_fs_posix.os.pread", side_effect=mutate_after_read
+        ) as read, mock.patch(
+            "parser_source.tempfile.TemporaryFile", side_effect=capture_temporary
+        ):
             with self.assertRaises(ParserSourceError) as caught:
                 create_test_sealed_snapshot(self.source_reference(), limit_profile=self.profile())
+        read.assert_called()
         self.assertTrue(mutated)
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.STALE")
+        self.assertEqual(len(temporaries), 1)
+        self.assertTrue(temporaries[0].closed)
 
     def test_sequential_leases_are_independent_offset_zero_and_non_seekable(self) -> None:
         from parser_source import create_sealed_snapshot
@@ -878,13 +936,13 @@ class AtomicWriterTests(_FixtureMixin, unittest.TestCase):
         from platform_fs_posix import PosixPlatformAdapter
 
         payload = b"new-target"
-        candidate_faults = ("_write_all", "_flush_content")
+        candidate_faults = ("_write_chunks", "_flush_content")
         for method_name in candidate_faults:
             with self.subTest(method_name=method_name), mock.patch.object(
                 platform_fs_posix._PosixCandidateFile,
                 method_name,
                 side_effect=OSError("candidate fault"),
-            ):
+            ) as fault:
                 self.target.write_bytes(b"old-target")
                 with self.assertRaises(ParserSourceError) as caught:
                     atomic_test_write_bytes(
@@ -893,6 +951,7 @@ class AtomicWriterTests(_FixtureMixin, unittest.TestCase):
                         backend=PosixPlatformAdapter(),
                     )
                 self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
+                fault.assert_called_once()
                 self.assertEqual(self.target.read_bytes(), b"old-target")
                 self.assertEqual(tuple((self.root / "output").glob(".parser-*.tmp")), ())
 
@@ -1378,28 +1437,31 @@ class ReviewerRemediationTests(_FixtureMixin, unittest.TestCase):
 
         with mock.patch.object(
             platform_fs_posix._PosixCandidateFile,
-            "_write_all",
+            "_write_chunks",
             side_effect=OSError("short write"),
-        ), self.assertRaises(ParserSourceError) as caught:
+        ) as write, self.assertRaises(ParserSourceError) as caught:
             atomic_test_write_bytes(
                 self.target_reference(),
                 b"new-target",
                 backend=PosixPlatformAdapter(),
             )
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_FAILED")
+        write.assert_called_once()
         self.assertEqual(self.target.read_bytes(), b"old-target")
+        self.assertEqual(tuple((self.root / "output").glob(".parser-*.tmp")), ())
 
         with mock.patch.object(
             platform_fs_posix._PosixBoundRegularFile,
             "read_all",
             return_value=b"wrong-readback",
-        ), self.assertRaises(ParserSourceError) as caught:
+        ) as readback, self.assertRaises(ParserSourceError) as caught:
             atomic_test_write_bytes(
                 self.target_reference(),
                 b"new-target",
                 backend=PosixPlatformAdapter(),
             )
         self.assertEqual(caught.exception.code, "PARSER.SOURCE.WRITE_RECOVERY_REQUIRED")
+        readback.assert_called_once()
         self.assertEqual(self.target.read_bytes(), b"new-target")
 
 
