@@ -666,6 +666,14 @@ Port 不暴露 path、member lookup、manifest parser 或 apply handle。Provide
 
 ## Testing Strategy
 
+### 当前源码边界检查
+
+`test_language_resource_portability_current_source_evidence.py` 直接检查七个 ResourcePackage owner 的依赖边界并提供变异反例；`test_resource_portability_architecture.py` 继续证明独立 carrier、payload handler 和 Qt 边界。JSONL/CSV grammar、owner receipt、create/replace 与冷重开依然使用既有真实行为测试。
+
+静态守卫只读取明确的 owner 文件；需要全仓库检查的 Parser architecture 使用 Git 可见的 Python 源文件，包含新增源码但不扫描 ignored artifacts/venv。禁止依赖直接失败，合法改动不因字节摘要或调用数量变化失败。四个 owner 的静态快照及专用生成器退出活动树，取消 Multi-Document → Chunk → ResourcePackage → TMX 的整份 JSON 摘要依赖；各 owner 的合同与行为测试保持独立。
+
+旧快照保留在 `v0.5.2-windows-frozen` 的 Git 历史，真实执行报告中对它们的引用只表达当时的验证范围，不修改报告原字节或 SHA。fixture、业务内容/receipt digest、Gate roots、运行时兼容性依据和随产物保存的构建清单不属于此次退出范围。
+
 ### Contracts / Canonical Codecs
 
 - exact type/subclass/bool-as-int、tuple/private copy、digest/count closure；

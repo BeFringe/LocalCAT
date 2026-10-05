@@ -229,6 +229,8 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 7. The Project/Document/Segment 与 ProjectPackage shall 不得增加 TM CONTEXT/evidence、TMX export profile、ResourcePackage authority、chunk permission、provider 凭据、RPY token 或 speaker display 字段。
 8. When 输入 TMX 或将 TMX 声明为 Project Document 时, the registry/workspace shall 在创建 Project/Document identity 前拒绝该用途组合。
 
+9. 架构验收 shall 直接检查当前源码的 owner 依赖、权威与对应行为，不以源码 SHA、文件数量、调用次数或跨快照摘要链代替合同断言；注释、无关测试与合法实现重构不应要求重新签发历史验收。
+
 ## 非功能约束
 
 - 所有跨层契约使用不可变值、tuple 集合和结构化 report；任何 preview/receipt 不嵌入 source/target 正文。

@@ -1,7 +1,7 @@
 {
   "feature_name": "language-resource-portability",
   "created_at": "2026-08-22T17:48:16+08:00",
-  "updated_at": "2026-09-20T14:55:15Z",
+  "updated_at": "2026-10-05T03:11:20Z",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -19,5 +19,5 @@
     }
   },
   "ready_for_implementation": true,
-  "approval_scope": "用户明确批准 reassessment@3e41130 中本 Spec 普通 frozen Requirements 来源、Design 适用范围与 Tasks 依赖/验收修订，按已列明 owner 依赖实施。未修改的业务合同及 8890813 以前已完成 source/实现成果保留原审批和证据范围；本批准不重签验收，不预填候选或正式 Gate PASS。"
+  "approval_scope": "用户明确批准 reassessment@3e41130 中本 Spec 普通 frozen Requirements 来源、Design 适用范围与 Tasks 依赖/验收修订，按已列明 owner 依赖实施。未修改的业务合同及 8890813 以前已完成 source/实现成果保留原审批和证据范围；本批准不重签验收，不预填候选或正式 Gate PASS。 静态源码快照维护：以当前 owner 架构与行为断言替代机械 SHA/数量/跨 JSON 摘要链，移除本 owner 快照和生成器；真实历史报告、fixture、Gate roots 与运行时兼容性依据不变。"
 }

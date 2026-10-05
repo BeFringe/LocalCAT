@@ -699,7 +699,7 @@ public error/report/log 只允许 stable code、opaque project/plan/chunk/segmen
 - 仅在 Multi-Document C4 批准后增加 chunk selector/manager/progress/read-only/conflict/undo 投影。
 - 用真实双 Document ProjectPackage + 真实 local chunk metadata 冷重开验收跨文档连续/离散分工。
 - 完成键盘/窄宽布局、越界只读、stale/conflict/fault 和无 active plan 兼容验收。
-- 在 final roots 重签 current-source evidence，只同步真实落地的 Steering 事实。
+- 历史 C4 的 current-source 验收保留当时范围；后续源码边界按下述直接测试维护，只同步真实落地的 Steering 事实。
 
 ### WA-02 Windows Source 两阶段交付
 
@@ -709,12 +709,20 @@ public error/report/log 只允许 stable code、opaque project/plan/chunk/segmen
 
 ## 验证设计
 
+### 当前源码边界检查
+
+`test_collaborative_chunks_current_source_evidence.py` 直接读取八个 Chunk owner 的当前源码，检查 Parser、ProjectPackage、资源/TM/TMX 及 provider/sync 禁止依赖；静态、别名与字面量动态导入反例验证规则有效。metadata codec、composite membership、权限复验和零正文泄漏继续由既有业务测试证明。
+
+静态守卫只读取明确的 owner 文件；需要全仓库检查的 Parser architecture 使用 Git 可见的 Python 源文件，包含新增源码但不扫描 ignored artifacts/venv。禁止依赖直接失败，合法改动不因字节摘要或调用数量变化失败。四个 owner 的静态快照及专用生成器退出活动树，取消 Multi-Document → Chunk → ResourcePackage → TMX 的整份 JSON 摘要依赖；各 owner 的合同与行为测试保持独立。
+
+旧快照保留在 `v0.5.2-windows-frozen` 的 Git 历史，真实执行报告中对它们的引用只表达当时的验证范围，不修改报告原字节或 SHA。fixture、业务内容/receipt digest、Gate roots、运行时兼容性依据和随产物保存的构建清单不属于此次退出范围。
+
 ### Contract / Architecture
 
 - exact frozen nested DTO、tuple/private copy、unknown enum/schema/version 拒绝；
 - closed-world import allowlist：chunk contracts/domain/store 不导入 ProjectPackage physical carrier、Parser/codec、TM/Store、Qt/provider；
 - ProjectPackage v1 schema/golden bytes 在仅 chunk 变更后 exact 不变；
-- AST/patch inventory 证明没有 source/target/private payload 进入 chunk codec/report/log。
+- 直接检查当前导入边界，codec/report/log 的真实输出与反例证明没有 source/target/private payload 泄漏，不以 AST/patch 次数代替行为。
 
 ### Identity / Membership / Topology
 

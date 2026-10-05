@@ -1,17 +1,13 @@
-"""Cluster 0 current-source baseline for the future project workspace.
+"""直接验证 Workspace 架构与既有单文档产品行为。
 
-This file deliberately characterizes the brownfield single-document product.
-Later clusters must update the closed inventories when authority moves; they
-must not weaken the guards merely to keep this baseline green.
+源码边界由当前 AST 和行为断言检查，不固定源码摘要、文件数量或调用次数。
 """
 
 from __future__ import annotations
 
 import ast
-from collections import Counter
 from dataclasses import fields
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,13 +52,9 @@ from qt_editor import _compose_editor_controller
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
 from tm_contracts import SearchOptions
-from tools.generate_multi_document_current_source_evidence import (
-    EvidenceValidationError,
-    KEY_AUTHORITY_CALLS,
-    KEY_CONSTRUCTORS,
-    KEY_SERIALIZATION_CALLS,
-    load_evidence,
-    parse_evidence_bytes,
+from tests.parser_architecture_test_support import (
+    collect_import_references,
+    collect_imported_calls,
 )
 
 
@@ -71,32 +63,6 @@ _FIXTURE_ROOT = _ROOT / "tests" / "fixtures" / "parser" / "project" / "payloads"
 _GENERATED_AT = datetime(2030, 1, 1, tzinfo=timezone.utc)
 _VALID_UNTIL = datetime(2030, 1, 2, tzinfo=timezone.utc)
 _EVALUATED_AT = datetime(2030, 1, 1, 12, tzinfo=timezone.utc)
-
-_LEGACY_SOURCE_ROOTS = (
-    "editor_project",
-    "editor_controller",
-    "project_search",
-    "workspace_state",
-    "parser_source",
-    "qt_editor",
-    "qt_editor_window",
-    "qt_browse_group_dialog",
-    "qt_localized_message_box",
-    "editor_contracts",
-    "parser_contracts",
-    "parser_composition",
-)
-_WORKSPACE_SOURCE_ROOTS = (
-    "project_workspace_identity",
-    "project_workspace_contracts",
-    "editor_project_workspace_adapter",
-    "project_workspace_intake",
-    "project_workspace",
-    "project_save",
-    "project_package",
-)
-_CURRENT_SOURCE_ROOTS = (*_LEGACY_SOURCE_ROOTS, *_WORKSPACE_SOURCE_ROOTS)
-_CURRENT_SOURCE_FILES = tuple(f"{module}.py" for module in _CURRENT_SOURCE_ROOTS)
 
 _EXPECTED_PARSER_DOCUMENT_FACTS = {
     "localcat-json-v1": {
@@ -316,205 +282,90 @@ _CRITICAL_PRODUCTION_IMPORTS = frozenset(
     }
 )
 
-_KEY_CONSTRUCTORS = KEY_CONSTRUCTORS
-_KEY_AUTHORITY_CALLS = KEY_AUTHORITY_CALLS
-_KEY_SERIALIZATION_CALLS = KEY_SERIALIZATION_CALLS
-
-_INVENTORY_MODULES = frozenset(_CURRENT_SOURCE_ROOTS)
-_LEGACY_CONSUMER_MODULES = frozenset(_LEGACY_SOURCE_ROOTS)
-_WORKSPACE_CONSUMER_MODULES = frozenset(_WORKSPACE_SOURCE_ROOTS)
-_CLOSED_CONSUMER_MODULES = _INVENTORY_MODULES
-_SEMANTIC_SOURCE_FILES = _CURRENT_SOURCE_FILES
-
-
-_EVIDENCE = load_evidence()
-
-
-def _object(value: object) -> dict[str, object]:
-    return cast(dict[str, object], value)
-
-
-def _inventory_counter(value: object) -> Counter[tuple[str, str]]:
-    inventory = _object(value)
-    return Counter(
-        {
-            (cast(str, record["path"]), cast(str, record["symbol"])): cast(
-                int, record["count"]
-            )
-            for record in cast(list[dict[str, object]], inventory["records"])
-        }
-    )
-
-
-_RUNTIME_SOURCE_DIGESTS = {
-    cast(str, record["path"]): cast(str, record["sha256"])
-    for record in cast(list[dict[str, object]], _EVIDENCE["runtime_sources"])
+_WORKSPACE_FORBIDDEN_IMPORTS = {
+    "project_workspace_identity.py": (
+        "parser_", "editor_", "qt_", "project_save", "project_package",
+        "workspace_state", "resource_", "tm_", "collaborative_",
+    ),
+    "project_workspace_contracts.py": (
+        "parser_composition", "parser_source", "parser_registry", "parser_localcat_codec",
+        "editor_", "qt_", "project_save", "project_package", "resource_", "tm_", "collaborative_",
+    ),
+    "editor_project_workspace_adapter.py": (
+        "parser_source", "parser_registry", "parser_localcat_codec",
+        "project_package", "resource_", "tm_", "qt_", "PySide6",
+    ),
+    "project_workspace_intake.py": (
+        "parser_source", "parser_registry", "parser_localcat_codec",
+        "project_package", "resource_", "tm_", "qt_", "PySide6",
+    ),
+    "project_workspace.py": (
+        "parser_", "project_save", "project_package", "editor_", "qt_",
+        "resource_", "tm_", "collaborative_", "PySide6",
+    ),
+    "project_save.py": (
+        "parser_", "project_package", "editor_", "qt_", "resource_", "tm_",
+        "collaborative_", "PySide6",
+    ),
 }
-_PYTHON_SOURCES_EVIDENCE = _object(_EVIDENCE["python_sources"])
-_PYTHON_SOURCE_ENTRY_COUNT = cast(int, _PYTHON_SOURCES_EVIDENCE["entry_count"])
-_PYTHON_SOURCE_PATH_DIGEST = cast(str, _PYTHON_SOURCES_EVIDENCE["path_digest"])
-_IMPORT_EVIDENCE = _object(_EVIDENCE["closed_consumer_imports"])
-_PRODUCTION_IMPORT_EVIDENCE = _object(_IMPORT_EVIDENCE["production"])
-_TEST_IMPORT_EVIDENCE = _object(_IMPORT_EVIDENCE["tests"])
-_SEMANTIC_EVIDENCE = _object(_EVIDENCE["semantic_calls"])
-_EXPECTED_CONSTRUCTOR_CALLS = _inventory_counter(
-    _SEMANTIC_EVIDENCE["constructors"]
-)
-_EXPECTED_AUTHORITY_CALLS = _inventory_counter(_SEMANTIC_EVIDENCE["authority"])
-_EXPECTED_SERIALIZATION_CALLS = _inventory_counter(
-    _SEMANTIC_EVIDENCE["serialization"]
-)
-_EXPECTED_PATCH_CALLS = _inventory_counter(_EVIDENCE["patches"])
+_CARRIER_NEUTRAL_SOURCES = ("project_workspace.py", "project_save.py")
+_DIRECT_IO_CALLS = frozenset({
+    "open", "read_bytes", "read_text", "write_bytes", "write_text",
+    "iterdir", "rglob", "glob", "scandir", "listdir", "replace", "rename", "unlink", "fsync",
+})
+_FOREIGN_SERIALIZATION_PREFIXES = ("json.", "pickle.", "csv.", "sqlite3.", "zipfile.", "xml.")
 
 
-def _tree(relative: str, *, source: str | None = None) -> ast.Module:
-    text = (_ROOT / relative).read_text(encoding="utf-8") if source is None else source
-    return ast.parse(text, filename=relative)
-
-
-def _dotted_name(node: ast.expr) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        prefix = _dotted_name(node.value)
-        return f"{prefix}.{node.attr}" if prefix else node.attr
-    return ""
-
-
-def _selected_calls(
-    relative: str,
-    names: frozenset[str],
-    *,
-    source: str | None = None,
-) -> Counter[tuple[str, str]]:
-    observed: Counter[tuple[str, str]] = Counter()
-    for node in ast.walk(_tree(relative, source=source)):
-        if not isinstance(node, ast.Call):
-            continue
-        dotted = _dotted_name(node.func)
-        if dotted.rsplit(".", 1)[-1] in names:
-            observed[(relative, dotted)] += 1
-    return observed
-
-
-def _semantic_call_inventory(
-    *,
-    override: tuple[str, str] | None = None,
-) -> tuple[
-    Counter[tuple[str, str]],
-    Counter[tuple[str, str]],
-    Counter[tuple[str, str]],
-]:
-    constructors: Counter[tuple[str, str]] = Counter()
-    authority: Counter[tuple[str, str]] = Counter()
-    serialization: Counter[tuple[str, str]] = Counter()
-    for relative in _SEMANTIC_SOURCE_FILES:
-        source = override[1] if override is not None and override[0] == relative else None
-        constructors.update(_selected_calls(relative, _KEY_CONSTRUCTORS, source=source))
-        authority.update(_selected_calls(relative, _KEY_AUTHORITY_CALLS, source=source))
-        serialization.update(
-            _selected_calls(relative, _KEY_SERIALIZATION_CALLS, source=source)
-        )
-    return constructors, authority, serialization
-
-
-def _recursive_python_sources() -> tuple[Path, ...]:
-    """Close the scan over every non-hidden Python source in this worktree."""
-
-    observed: list[Path] = []
-    for path in _ROOT.rglob("*.py"):
-        relative = path.relative_to(_ROOT)
-        if any(
-            part == "__pycache__" or part.startswith(".")
-            for part in relative.parts
-        ):
-            continue
-        observed.append(path)
-    return tuple(
-        sorted(observed, key=lambda path: path.relative_to(_ROOT).as_posix())
-    )
-
-
-def _source_path_digest(paths: tuple[Path, ...]) -> str:
-    payload = tuple(path.relative_to(_ROOT).as_posix() for path in paths)
-    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _import_consumers(
-    paths: tuple[Path, ...],
-) -> Counter[tuple[str, str, str, str | None]]:
-    observed: Counter[tuple[str, str, str, str | None]] = Counter()
-    for path in paths:
-        relative = path.relative_to(_ROOT).as_posix()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), relative)):
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module in _CLOSED_CONSUMER_MODULES
-            ):
-                for item in node.names:
-                    observed[
-                        (relative, cast(str, node.module), item.name, item.asname)
-                    ] += 1
-            elif isinstance(node, ast.Import):
-                for item in node.names:
-                    if item.name in _CLOSED_CONSUMER_MODULES:
-                        observed[(relative, item.name, "<module>", item.asname)] += 1
-    return observed
-
-
-def _import_counter_digest(
-    counter: Counter[tuple[str, str, str, str | None]],
-) -> str:
-    payload = sorted(
-        (relative, module, name, alias or "", count)
-        for (relative, module, name, alias), count in counter.items()
-    )
-    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _patch_inventory(
-    *,
-    extra_source: tuple[str, str] | None = None,
-) -> Counter[tuple[str, str]]:
-    observed: Counter[tuple[str, str]] = Counter()
-    sources = [
-        (path.relative_to(_ROOT).as_posix(), path.read_text(encoding="utf-8"))
-        for path in _recursive_python_sources()
-        if path.relative_to(_ROOT).parts[0] == "tests"
+def _workspace_boundary_violations(relative: str, source: str) -> tuple[str, ...]:
+    module_name = Path(relative).stem
+    forbidden = _WORKSPACE_FORBIDDEN_IMPORTS[relative]
+    violations = [
+        item.target
+        for item in collect_import_references(source, module_name=module_name)
+        if item.target.startswith(forbidden)
     ]
-    if extra_source is not None:
-        sources.append(extra_source)
-    for relative, source in sources:
-        for node in ast.walk(ast.parse(source, filename=relative)):
+    if relative in _CARRIER_NEUTRAL_SOURCES:
+        imported_calls = collect_imported_calls(source, module_name=module_name)
+        violations.extend(
+            target
+            for target, _line, _column in imported_calls
+            if target.startswith(_FOREIGN_SERIALIZATION_PREFIXES)
+            or target.startswith(("os.", "io.", "pathlib."))
+            and target.rsplit(".", 1)[-1] in _DIRECT_IO_CALLS
+        )
+        tree = ast.parse(source, filename=relative)
+        path_constructions = {
+            (line, column)
+            for target, line, column in imported_calls
+            if target in {"pathlib.Path", "pathlib.PosixPath", "pathlib.WindowsPath"}
+        }
+        path_variables = {
+            target.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and (node.value.lineno, node.value.col_offset) in path_constructions
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            call_name = _dotted_name(node.func).rsplit(".", 1)[-1]
-            if call_name != "patch":
-                continue
-            for argument in node.args:
-                if not (
-                    isinstance(argument, ast.Constant)
-                    and type(argument.value) is str
-                ):
-                    continue
-                target = cast(str, argument.value)
-                if any(
-                    target == module or target.startswith(f"{module}.")
-                    for module in _CLOSED_CONSUMER_MODULES
-                ):
-                    observed[(relative, target)] += 1
-    return observed
-
-
-def _counter_digest(counter: Counter[tuple[str, str]]) -> str:
-    payload = sorted(
-        (relative, symbol, count)
-        for (relative, symbol), count in counter.items()
-    )
-    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+            if isinstance(node.func, ast.Name) and node.func.id == "open":
+                violations.append("open")
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in _DIRECT_IO_CALLS - {"replace"}
+            ):
+                violations.append(node.func.attr)
+            elif isinstance(node.func, ast.Attribute) and node.func.attr == "replace":
+                receiver = node.func.value
+                if (
+                    isinstance(receiver, ast.Call)
+                    and (receiver.lineno, receiver.col_offset) in path_constructions
+                ) or isinstance(receiver, ast.Name) and receiver.id in path_variables:
+                    violations.append("pathlib.Path.replace")
+    return tuple(violations)
 
 
 def _copy_checked_in_fixture(name: str, target: Path, *, hex_encoded: bool = False) -> None:
@@ -606,200 +457,75 @@ def _search_request(query: str) -> ProjectSearchRequest:
     )
 
 
-class MultiDocumentCluster0SourceInventoryTests(unittest.TestCase):
-    def test_strict_owner_evidence_rejects_open_or_noncanonical_documents(
-        self,
-    ) -> None:
-        canonical_raw = (
-            json.dumps(
-                _EVIDENCE,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode("utf-8")
-        self.assertEqual(parse_evidence_bytes(canonical_raw), _EVIDENCE)
-
-        duplicate_key = canonical_raw.replace(
-            b'"schema":',
-            b'"schema":"duplicate","schema":',
-            1,
-        )
-        extra = json.loads(canonical_raw)
-        extra["unexpected"] = None
-        missing = json.loads(canonical_raw)
-        del missing["patches"]
-        wrong_type = json.loads(canonical_raw)
-        wrong_type["schema_version"] = True
-        noncanonical_digest = json.loads(canonical_raw)
-        noncanonical_digest["evidence_digest"] = cast(
-            str, noncanonical_digest["evidence_digest"]
-        ).upper()
-        pretty_printed = json.dumps(
-            _EVIDENCE,
-            ensure_ascii=False,
-            sort_keys=True,
-            indent=2,
-        ).encode("utf-8")
-
-        def encoded(value: object) -> bytes:
-            return (
-                json.dumps(
-                    value,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
+class MultiDocumentArchitectureTests(unittest.TestCase):
+    def test_required_owner_composition_remains_direct(self) -> None:
+        # These edges connect the public API to the approved owner. Aliases and
+        # additional benign calls are irrelevant to the dependency contract.
+        for relative, module, symbol, _alias in _CRITICAL_PRODUCTION_IMPORTS:
+            with self.subTest(source=relative, owner=module, symbol=symbol):
+                imports = collect_import_references(
+                    (_ROOT / relative).read_text(encoding="utf-8"),
+                    module_name=Path(relative).stem,
                 )
-                + "\n"
-            ).encode("utf-8")
+                self.assertIn(f"{module}.{symbol}", {item.target for item in imports})
 
-        for label, raw in (
-            ("duplicate", duplicate_key),
-            ("extra", encoded(extra)),
-            ("missing", encoded(missing)),
-            ("wrong-type", encoded(wrong_type)),
-            ("noncanonical-digest", encoded(noncanonical_digest)),
-            ("noncanonical-json", pretty_printed),
-        ):
-            with self.subTest(label=label):
-                with self.assertRaises(EvidenceValidationError):
-                    parse_evidence_bytes(raw)
+    def test_workspace_owners_do_not_acquire_parser_carrier_or_storage_authority(self) -> None:
+        for relative in _WORKSPACE_FORBIDDEN_IMPORTS:
+            with self.subTest(source=relative):
+                source = (_ROOT / relative).read_text(encoding="utf-8")
+                self.assertEqual(_workspace_boundary_violations(relative, source), ())
 
-    def test_current_runtime_roots_imports_calls_patches_and_serializers_are_closed(
-        self,
-    ) -> None:
-        self.assertEqual(_EVIDENCE["production_roots"], list(_CURRENT_SOURCE_ROOTS))
-        self.assertEqual(len(_CURRENT_SOURCE_ROOTS), 19)
-        self.assertEqual(
-            tuple(_RUNTIME_SOURCE_DIGESTS),
-            _CURRENT_SOURCE_FILES,
-        )
-        self.assertEqual(_INVENTORY_MODULES, frozenset(_CURRENT_SOURCE_ROOTS))
-        self.assertTrue(
-            _LEGACY_CONSUMER_MODULES.isdisjoint(_WORKSPACE_CONSUMER_MODULES)
-        )
-        self.assertEqual(
-            _CLOSED_CONSUMER_MODULES,
-            _LEGACY_CONSUMER_MODULES | _WORKSPACE_CONSUMER_MODULES,
-        )
-        observed_digests = {
-            relative: hashlib.sha256((_ROOT / relative).read_bytes()).hexdigest()
-            for relative in _RUNTIME_SOURCE_DIGESTS
-        }
-        self.assertEqual(observed_digests, _RUNTIME_SOURCE_DIGESTS)
+    def test_dependency_guard_rejects_aliased_and_dynamic_foreign_owners(self) -> None:
+        for relative, forbidden in _WORKSPACE_FORBIDDEN_IMPORTS.items():
+            for prefix in forbidden:
+                module = prefix + "foreign" if prefix.endswith("_") else prefix
+                for source in (
+                    f"import {module} as dependency\n",
+                    f"from {module} import foreign as dependency\n",
+                    f"from importlib import import_module as load\nload('{module}')\n",
+                ):
+                    with self.subTest(owner=relative, source=source):
+                        self.assertTrue(_workspace_boundary_violations(relative, source))
 
-        all_sources = _recursive_python_sources()
-        self.assertEqual(len(all_sources), _PYTHON_SOURCE_ENTRY_COUNT)
-        self.assertEqual(_source_path_digest(all_sources), _PYTHON_SOURCE_PATH_DIGEST)
-        production_sources = tuple(
-            path
-            for path in all_sources
-            if path.relative_to(_ROOT).parts[0] != "tests"
-        )
-        test_sources = tuple(
-            path
-            for path in all_sources
-            if path.relative_to(_ROOT).parts[0] == "tests"
-        )
-        production_imports = _import_consumers(production_sources)
-        test_imports = _import_consumers(test_sources)
-        self.assertEqual(
-            len(production_imports),
-            _PRODUCTION_IMPORT_EVIDENCE["entry_count"],
-        )
-        self.assertEqual(
-            sum(production_imports.values()),
-            _PRODUCTION_IMPORT_EVIDENCE["call_count"],
-        )
-        self.assertEqual(
-            _import_counter_digest(production_imports),
-            _PRODUCTION_IMPORT_EVIDENCE["digest"],
-        )
-        self.assertTrue(
-            _CRITICAL_PRODUCTION_IMPORTS.issubset(production_imports),
-            _CRITICAL_PRODUCTION_IMPORTS.difference(production_imports),
-        )
-        self.assertEqual(len(test_imports), _TEST_IMPORT_EVIDENCE["entry_count"])
-        self.assertEqual(
-            sum(test_imports.values()),
-            _TEST_IMPORT_EVIDENCE["call_count"],
-        )
-        self.assertEqual(
-            _import_counter_digest(test_imports),
-            _TEST_IMPORT_EVIDENCE["digest"],
-        )
-        constructors, authority, serialization = _semantic_call_inventory()
-        self.assertEqual(constructors, _EXPECTED_CONSTRUCTOR_CALLS)
-        self.assertEqual(authority, _EXPECTED_AUTHORITY_CALLS)
-        self.assertEqual(serialization, _EXPECTED_SERIALIZATION_CALLS)
-
-        patches = _patch_inventory()
-        self.assertEqual(patches, _EXPECTED_PATCH_CALLS)
-        for seam in (
-            (
-                "tests/test_parser_project_facade_characterization.py",
-                "editor_project.create_parser_application_surface",
-            ),
-            (
-                "tests/test_parser_wave4_safety.py",
-                "parser_source.tempfile.TemporaryFile",
-            ),
-            ("tests/test_workspace_state.py", "workspace_state.os.replace"),
-            ("tests/test_qt_bootstrap.py", "qt_editor.sys.platform"),
-            (
-                "tests/test_multi_document_cluster1_contracts.py",
-                "editor_project_workspace_adapter.create_parser_application_surface",
-            ),
-            (
-                "tests/test_multi_document_cluster2a_aggregation.py",
-                "project_workspace.secrets.token_hex",
-            ),
-            (
-                "tests/test_multi_document_cluster2b_save_recovery.py",
-                "project_save._resign_document",
-            ),
-            (
-                "tests/test_multi_document_cluster2c_zip_security.py",
-                "project_package._port_validate_artifact",
-            ),
-            (
-                "tests/test_multi_document_cluster2c_zip_security.py",
-                "project_package._unlink_in_bound_parent",
-            ),
-        ):
-            self.assertGreater(patches[seam], 0, seam)
-
-    def test_inventory_helpers_reject_representative_authority_and_patch_mutations(
-        self,
-    ) -> None:
-        relative = "editor_project.py"
-        source = (_ROOT / relative).read_text(encoding="utf-8")
-        mutated = source.replace("surface.open_input(", "surface.open_workspace_input(", 1)
-        self.assertNotEqual(mutated, source)
-        _constructors, authority, _serialization = _semantic_call_inventory(
-            override=(relative, mutated)
-        )
-        self.assertNotEqual(authority, _EXPECTED_AUTHORITY_CALLS)
-
-        current_patches = _patch_inventory()
-        mutated_patches = _patch_inventory(
-            extra_source=(
-                "synthetic_mutation.py",
-                'from unittest.mock import patch\npatch("editor_project.load_project")\n',
+    def test_carrier_neutral_owners_cannot_open_publish_or_serialize_files(self) -> None:
+        for relative in _CARRIER_NEUTRAL_SOURCES:
+            for source in (
+                "open('project.json', 'w')",
+                "path.write_bytes(b'project')",
+                "path.read_text()",
+                "import os\nos.replace(source, destination)",
+                "import json as wire\nwire.dumps({})",
+                "from json import dumps as encode\nencode({})",
+                "from os import fsync as flush\nflush(fd)",
+            ):
+                with self.subTest(owner=relative, source=source):
+                    self.assertTrue(_workspace_boundary_violations(relative, source))
+            self.assertEqual(
+                _workspace_boundary_violations(
+                    relative,
+                    '# open("project")\nnote = "json.dumps"\n'
+                    'note.replace("json", "wire")\n'
+                    'import dataclasses\ndataclasses.replace(value, target="new")\n',
+                ),
+                (),
             )
-        )
-        self.assertNotEqual(
-            _counter_digest(mutated_patches),
-            _counter_digest(current_patches),
-        )
 
-        current_sources = _recursive_python_sources()
-        nested_mutation = _ROOT / "synthetic" / "nested" / "consumer.py"
-        self.assertNotIn(nested_mutation, current_sources)
-        self.assertNotEqual(
-            _source_path_digest((*current_sources, nested_mutation)),
-            _source_path_digest(current_sources),
+    def test_path_replace_is_publication_but_string_and_dataclass_replace_are_not(self) -> None:
+        for source in (
+            "from pathlib import Path\nPath('old').replace('new')",
+            "from pathlib import Path\np = Path('old')\np.replace('new')",
+            "from pathlib import Path as FilePath\nFilePath('old').replace('new')",
+            "import pathlib as fs\np = fs.Path('old')\np.replace('new')",
+        ):
+            with self.subTest(source=source):
+                self.assertTrue(_workspace_boundary_violations("project_save.py", source))
+        self.assertEqual(
+            _workspace_boundary_violations(
+                "project_save.py",
+                'name = "old"\nname.replace("old", "new")\n'
+                'import dataclasses\ndataclasses.replace(value, target="new")\n',
+            ),
+            (),
         )
 
 

@@ -269,7 +269,7 @@ Cluster 0 治理/characterization
   - _Depends: 2.5a, 4.4a, 5.4, WA-01, WA-06, windows-platform-enablement 3.7_
 
 - [x] 5.5 完成治理收尾
-  - 只在 final runtime roots 冻结后机械重签 current-source inventory/evidence，不用旧结果纯重签。
+  - 保留当时 final runtime roots 的 current-source 验收；后续以直接架构及业务测试验证受影响合同，不用旧结果重签源码快照。
   - 同步已实现的 structure/tech/roadmap 事实，不声称 TMX/provider/sync/conflict 已交付。
   - 以累计 diff、faults、cold-reopen receipt 和 ownership 的可重放证据闭合 Feature 验收。
   - _Requirements: 1.1–1.6, 11.1–11.5, 12.1–12.7_
@@ -288,6 +288,16 @@ Cluster 0 治理/characterization
 - 目标业务 reader 冷重开、receipt 对账、fault recovery 与既有 TM/术语回归通过。
 - immutable port 可供 future sync 消费，但仓库中没有 provider/TMX 首轮实现。
 - 最终提交：`feat(resource): 闭合 ResourcePackage 可移植事务`。
+
+## 架构验证维护
+
+- [x] 5.6 用直接架构与行为断言替代本 owner 的静态源码快照
+  - 读取实际 owner 源码检查禁止依赖，使用静态、别名和字面量动态导入反例；保留身份、序列化、权限和发布的既有业务测试。
+  - 删除本 owner 的机械快照、专用生成器及跨 JSON 摘要消费；历史执行报告保留原字节，按原 Git 范围解释引用。
+  - 与 Multi-Document、Chunk、ResourcePackage、TMX 的对应维护项组成一次集成，逐 owner 收束消费者；Parser 架构测试只同步已删除工具和源码枚举，不放宽 owner 规则。
+  - 退出条件：本 owner 直接测试、Parser 源码枚举及已删除工具分类检查通过，活动消费者不再要求旧快照；fixture、Gate 与运行时兼容性依据保持不变。
+  - _Requirements: 12.4、12.5、12.8_
+  - _Boundary: 本 Spec 测试/合同及其静态快照、生成器；跨 owner 仅处理这四项共同的快照消费依赖_
 
 ## 明确禁止
 
