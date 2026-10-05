@@ -10,7 +10,7 @@
 
 ### TL 子集与字符串语义
 
-- **Sources Consulted**：[Ren'Py Translation](https://www.renpy.org/doc/html/translation.html)、[Language Basics](https://www.renpy.org/doc/html/language_basics.html)、[Text](https://www.renpy.org/doc/html/text.html)、[CLI](https://www.renpy.org/doc/html/cli.html)。研究对象为官方 8.5.4 文档。
+- **Sources Consulted**：[Ren'Py Translation](https://www.renpy.org/doc/html/translation.html)、[Dialogue and Narration](https://www.renpy.org/doc/html/dialogue.html)、[Language Basics](https://www.renpy.org/doc/html/language_basics.html)、[Text](https://www.renpy.org/doc/html/text.html)、[CLI](https://www.renpy.org/doc/html/cli.html)。研究对象为官方 8.5.4 文档。
 - **Findings**：TL 有 dialogue 与 old/new strings 两类翻译入口；Ren'Py 还允许复杂重排、Python 和多行文本，不能因为后缀相同就认为可安全回填。语言标识不是 BCP 47；文本含不应执行的 interpolation 与 tags。
 - **Implications**：首个 profile 限定可一一证明的翻译槽，未知执行语法拒绝；引擎不是 LocalCAT 的运行时依赖。空译文保留，空 source 因中立合同不支持而明确拒绝。
 
@@ -19,6 +19,12 @@
 - **Sources Consulted**：[parser_contracts.py](../../../parser_contracts.py)、[parser_composition.py](../../../parser_composition.py)、[project_workspace_contracts.py](../../../project_workspace_contracts.py)、[project_workspace_intake.py](../../../project_workspace_intake.py)、[project_package.py](../../../project_package.py)。
 - **Findings**：非 legacy SINGLE_FILE workspace 可以用 ProjectPackage；实际 OriginBinding/intake 仍限定多文件 profile。包内 documents JSON 已保存 source facts 与 editing overlay；raw source 和 private bytes 各自有成员。打开包不需要 codec。descriptor 尚无 round-trip factory；禁用 ProviderBinding 会抛错，不能直接混入有效 surface。
 - **Implications**：新增通用单文件 binding/profile 和注入 seam，维持现有 carrier；composition 只实例化启用的已知 provider。首次包保存必须保持 rooted source binding，不能只有内存段落。
+
+### 用户授权样本与目录入口
+
+- **Sources Consulted**：用户指定的本地 TL 样本（只读观察）；Multi 的路径、intake 与 Qt 导航合同。
+- **Findings**：样本包含同文件 dialogue 与 old/new、嵌套相对目录、say 属性、特殊 say 标识与 transition；原先“仅一个 speaker 标识符紧邻字符串”的词法范围过窄。属性不改变 speaker 取值，但必须识别并保留其跨度。既有 source_ref 可表达多级路径，UI 尚无根目录递归勾选入口。
+- **Implications**：采用有界词法识别与合成 fixture；上述观察不是生产 parser 通过证明，不复制游戏正文。用户已选择根目录递归预览勾选，由 Multi 增量负责发现与导航，codec 只处理确认输入。
 
 ## Architecture Pattern Evaluation
 
