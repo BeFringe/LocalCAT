@@ -50,7 +50,7 @@ Cluster 0 人工批准
 
 - `language-resource-portability`：现有 brief 在 Cluster 2 package 原语被验证后提升为独立 R/D/T，独立拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告、preview/receipt 和冷重开；sync 分别消费 ProjectPackage 与 ResourcePackage。
 - `tmx-context-interchange`：只拥有 TMX language-resource context/provenance/export profile；TMX 不是 ProjectDocument。
-- `rpy-project-codec`：独立拥有 RPY tokenization、sidecar、placeholder 与 writer；多文件 folder 聚合才消费 workspace，产品排期仍在 sync 后。
+- `rpy-project-codec`：独立拥有 RPY tokenization、sidecar、placeholder 与 writer；多文件 folder 聚合才消费 workspace，按 ADR-030 先完成 RPY 手工包闭环，再进入 sync。
 - PO/POT canonical writer：未来独立 format-codec 决策；本规格不因 readable origin 宣称可写。
 - `feature5-ui-integration`（Integration TM surface）：CONTEXT 精确判断与“上下文一致”标签；本规格不增加 evidence 字段或重算匹配。
 - `collaborative-job-chunks`：完整 Cluster 2 后只引用稳定 segment membership，不拥有 Document identity、项目保存或远程 provider。

@@ -82,7 +82,7 @@
 
 - `language-resource-portability`：后续独立 brief；TM JSONL 与术语 CSV/v1 ResourcePackage、报告、冷重开。
 - `tmx-context-interchange`：TMX context/provenance/export；TMX 始终是 language resource。
-- `rpy-project-codec`：RPY token/sidecar/writer；folder 聚合依赖 workspace，产品顺序在 sync 后。
+- `rpy-project-codec`：RPY token/sidecar/writer；folder 聚合依赖 workspace，按 ADR-030 先完成 RPY 手工包闭环，再进入 sync。
 - PO/POT writer：未来 format-codec 决策，不由 origin 或 ProjectPackage 推导。
 - `feature5-ui-integration`（Integration TM surface）：CONTEXT 判断与“上下文一致”投影；本规格不增加 evidence 字段。
 

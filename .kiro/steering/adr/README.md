@@ -43,5 +43,7 @@
 | ADR-027 | 已采纳 | Windows 导出输出锁的安全闲置回收 |
 | ADR-028 | 已采纳（时间准入由 ADR-029 部分取代） | Windows source 独立交付与普通 frozen 证明范围 |
 | ADR-029 | 已采纳 | Fuzzy 时间性能报告与功能准入分离 |
+| ADR-030 | 已采纳 | 显式目录选择、单文档项目包与中立格式导出 |
+| ADR-031 | 已采纳 | 可选协议适配与手动包同步状态 |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。
