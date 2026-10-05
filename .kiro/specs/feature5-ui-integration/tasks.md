@@ -354,6 +354,13 @@
   - _Boundary: Host 安全投影、Controller DTO 与 Qt TM 展示_
   - _Depends: ADR-029, tm-storage-retrieval-index 9.7_
 
+- [x] 6.9 呈现 Fuzzy 验证的等待预期
+  - 在语言资源设置的手动验证入口旁常驻显示耗时及可继续编辑保存的说明，支持换行和可访问读取。
+  - Qt 定向测试与实际打包窗口确认启动前、运行及设置重开后说明可见，验证状态、失败原因和性能警示正常更新，后台验证期间编辑保存可用。
+  - _Requirements: 6.8, 6.9, 6.11, 6.13_
+  - _Boundary: Qt 语言资源设置与 Fuzzy 状态展示_
+  - _Depends: 6.5, 6.8_
+
 - [x] 7. 完成 TextMatcher handoff 与 canonical integration 验收
 
 - [x] 7.1 向原 Qt Spec 交付唯一中立 TextMatcher handoff
