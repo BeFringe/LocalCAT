@@ -246,7 +246,7 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Requirements: 13.1, 13.2, 13.3_
   - _Boundary: Project discovery/contracts_
   - _Depends: 5.4_
-- [ ] 5.6 (P) 实现直接文件选择的单文件 profile 与包验证
+- [x] 5.6 (P) 实现直接文件选择的单文件 profile 与包验证
   - 基于既有 rooted 显式文件 intake 增加 explicit-single-file-v1 的一文档 cardinality、OriginBinding 与 package decoder/validator；使用文件选择已有的根绑定规则和规范化 source_ref，不引入 metadata 递归观察或目录预览。
   - 完成时，既有 JSON/TXT codec 可验证零文件拒绝、一个文件建立非 legacy 包、首包发布及无原路径冷重开保留 identity/overlay；多个文件的原 profile 限制与 legacy 单 JSON 行为不变，不授予源 writer。
   - 验证源/根替换、包发布失败与两个平台既有文件读写路径；Windows 的原生读写验收仍须完成，不以目录观察尚未实现为由跳过。此任务唯一提供 RPY 1.4 消费的 profile，不依赖 RPY 私有 handoff。

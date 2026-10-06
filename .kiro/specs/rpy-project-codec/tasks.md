@@ -57,7 +57,7 @@
   - _Requirements: 1.1, 1.3, 1.4_
   - _Boundary: CodecSettings / Application composition integration_
   - _Depends: 1.2, 2.3_
-- [ ] 3.2 接入单 TL 保存、冷重开与缺失 codec 行为
+- [x] 3.2 接入单 TL 保存、冷重开与缺失 codec 行为
   - 将已验证 source/overlay/private handoff 交给 Project owner，并只消费其 durable receipt。
   - 完成时，无原始路径仍能从包重开保留 target/confirmed；禁用 codec 后可编辑保存包但不可导出 TL。
   - _Requirements: 2.3, 3.1, 3.2, 3.3, 3.4_
