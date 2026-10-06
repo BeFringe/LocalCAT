@@ -37,7 +37,7 @@
   - 完成时，重复 label/old key 明确失败，显示顺序不改变身份，控制行不成为段落。
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
   - _Boundary: RpyCodec_
-- [ ] 2.3 验证并封装不透明回填映射
+- [x] 2.3 验证并封装不透明回填映射
   - 保存 source digest、字节跨度和保护 token，不镜像当前 target/confirmed。
   - 完成时，重新读取 source 能复证映射；伪造/重叠/越界 span、版本不符和摘要错误均拒绝。
   - _Requirements: 3.1, 3.3, 4.4, 7.1_

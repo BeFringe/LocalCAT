@@ -8,16 +8,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from typing import Callable
+import json
+from typing import Callable, Iterator
 
 from parser_contracts import (
-    IssueSeverity, ParseIssue, ParsedSegment, RawSpeaker,
+    CodecIdentity, IssueSeverity, ParseIssue, ParsedSegment, RawSpeaker,
     TargetPresence, TranslationState,
 )
 
 
 _MIB = 1024 * 1024
 _BOM = b'\xef\xbb\xbf'
+RPY_CODEC_IDENTITY = CodecIdentity('localcat.rpy', 'renpy-tl', '1')
 # These introduce statements in Ren'Py and cannot be treated as character names.
 _STATEMENTS = frozenset({
     'translate', 'old', 'new', 'voice', 'nvl', 'python', 'style', 'pass',
@@ -210,7 +212,9 @@ def _say(line: _Line, start: int, limits: RpyLexicalLimits,
     return _Say(literal, speaker, tuple(attributes), tuple(temporary), transition)
 
 
-def _source_text(say: _Say, line: _Line, checkpoint: Callable[[], None]) -> None:
+def _source_tokens(say: _Say, line: _Line,
+                   checkpoint: Callable[[], None]) -> Iterator[str]:
+    """One non-executing tokenizer for source recognition and private facts."""
     text = say.literal.text
     if not text:
         raise line.fail('invalid-source', 'decoded source is empty', say.literal.start - line.offset)
@@ -227,6 +231,7 @@ def _source_text(say: _Say, line: _Line, checkpoint: Callable[[], None]) -> None
             # opaque text, including conversion/format parts and nested indexing.
             stack = [']']
             quote = None
+            start = position
             position += 1
             while position < len(text) and stack:
                 if position % 4096 == 0:
@@ -248,14 +253,21 @@ def _source_text(say: _Say, line: _Line, checkpoint: Callable[[], None]) -> None
                 position += 1
             if stack or quote:
                 raise line.fail('invalid-source', 'unterminated interpolation')
+            yield text[start:position]
             continue
         if character == '{':
             end = text.find('}', position + 1)
             if end < 0 or '{' in text[position + 1:end]:
                 raise line.fail('invalid-source', 'unterminated text tag')
+            yield text[position:end + 1]
             position = end + 1
             continue
         position += 1
+
+
+def _source_text(say: _Say, line: _Line, checkpoint: Callable[[], None]) -> None:
+    for _ in _source_tokens(say, line, checkpoint):
+        pass
 
 
 def _comment_can_be_source(data: bytes, start: int) -> bool:
@@ -483,3 +495,210 @@ def parse_tl(raw: bytes, *, limits: RpyLexicalLimits = RpyLexicalLimits(),
         ))
     checkpoint()
     return _ParsedTl(lexical, tuple(records))
+
+
+def _private_error(reason: str, category: str = 'private-stale') -> RpyInputError:
+    return RpyInputError(category, 1, 0, 1, reason)
+
+
+def _private_arguments(raw: bytes, limits: RpyLexicalLimits, max_private_bytes: int,
+                       check_cancelled: Callable[[], None] | None) -> Callable[[], None]:
+    if type(raw) is not bytes or type(limits) is not RpyLexicalLimits:
+        raise TypeError('RPY private mapping requires exact source bytes and lexical limits')
+    if type(max_private_bytes) is not int:
+        raise TypeError('private byte limit must be an exact integer')
+    if not 0 < max_private_bytes <= 32 * _MIB:
+        raise ValueError('private byte limit must stay within the declared profile')
+    if check_cancelled is not None and not callable(check_cancelled):
+        raise TypeError('cancellation checkpoint must be callable')
+    checkpoint = check_cancelled if check_cancelled is not None else lambda: None
+    checkpoint()
+    if len(raw) > limits.max_input_bytes:
+        raise _private_error('input byte limit exceeded', 'limit-exceeded')
+    return checkpoint
+
+
+def _private_header(parsed: _ParsedTl) -> dict:
+    return {
+        'version': 'rpy-roundtrip-v1',
+        'codec_identity': {
+            'provider_id': RPY_CODEC_IDENTITY.provider_id,
+            'codec_id': RPY_CODEC_IDENTITY.codec_id,
+            'codec_version': RPY_CODEC_IDENTITY.codec_version,
+        },
+        'source_sha256': hashlib.sha256(parsed.lexical.raw).hexdigest(),
+        'profile': 'renpy-tl-v1',
+        'language': parsed.lexical.language,
+    }
+
+
+def _private_slot(slot: _Slot, raw: bytes, checkpoint: Callable[[], None]) -> dict:
+    source, target = slot.source.literal, slot.target.literal
+    line_start = raw.rfind(b'\n', 0, source.start) + 1
+    line = _Line(b'', source.line, line_start)
+    return {
+        # Half-open literal spans include quotes. Task 2.4 will replace only
+        # their interiors when an edited target requires fresh encoding.
+        'source_span': [source.start, source.end],
+        'target_span': [target.start, target.end],
+        'target_sha256': hashlib.sha256(target.text.encode('utf-8')).hexdigest(),
+        'source_tokens': list(_source_tokens(slot.source, line, checkpoint)),
+    }
+
+
+def build_private_payload(raw: bytes, *, limits: RpyLexicalLimits = RpyLexicalLimits(),
+                          max_private_bytes: int = 32 * _MIB,
+                          check_cancelled: Callable[[], None] | None = None) -> bytes:
+    """Encode source-derived format data, with no current edit or live authority.
+
+    Source validation is all-or-nothing. Only a single slot is serialized at a
+    time, and the accumulated byte budget is enforced before retaining it.
+    """
+    checkpoint = _private_arguments(raw, limits, max_private_bytes, check_cancelled)
+    parsed = parse_tl(raw, limits=limits, check_cancelled=checkpoint)
+    output = bytearray()
+
+    def append(chunk: bytes) -> None:
+        checkpoint()
+        if len(output) + len(chunk) > max_private_bytes:
+            raise _private_error('private payload byte limit exceeded', 'limit-exceeded')
+        output.extend(chunk)
+
+    def encode(value: dict) -> bytes:
+        return json.dumps(value, ensure_ascii=False, separators=(',', ':'),
+                          allow_nan=False).encode('utf-8')
+
+    append(encode(_private_header(parsed))[:-1] + b',"slots":{')
+    for index, (record, slot) in enumerate(zip(parsed.records, parsed.lexical.slots, strict=True)):
+        checkpoint()
+        entry = {record.local_id: _private_slot(slot, raw, checkpoint)}
+        append((b',' if index else b'') + encode(entry)[1:-1])
+    append(b'}}')
+    checkpoint()
+    return bytes(output)
+
+
+class _PrivateJsonError(ValueError):
+    pass
+
+
+def _private_json_preflight(payload: bytes, parsed: _ParsedTl,
+                            checkpoint: Callable[[], None]) -> None:
+    """Bound hostile structure and integers before JSON allocates containers.
+
+    The schema's deepest containers are the slot span/token arrays (depth 4).
+    Its separators are bounded by actual source slots and possible two-character
+    protection tokens, so a tiny TL cannot induce a huge JSON object graph.
+    Strings remain opaque here; the JSON decoder checks their exact grammar.
+    """
+    separator_limit = 16 + 12 * len(parsed.records)
+    separator_limit += sum(len(record.source) // 2 for record in parsed.records)
+    separators = 0
+    depth = 0
+    quoted = escaped = False
+    integer_digits = 0
+    for position, character in enumerate(payload):
+        if position % 4096 == 0:
+            checkpoint()
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == 92:
+                escaped = True
+            elif character == 34:
+                quoted = False
+            continue
+        if character == 34:
+            quoted = True
+        elif character in (123, 91):
+            depth += 1
+            if depth > 4:
+                raise _private_error('private JSON depth limit exceeded', 'limit-exceeded')
+        elif character in (125, 93):
+            depth -= 1
+        elif character == 44:
+            separators += 1
+            if separators > separator_limit:
+                raise _private_error('private JSON item limit exceeded', 'limit-exceeded')
+        if 48 <= character <= 57:
+            integer_digits += 1
+            # All JSON integers are byte offsets, at most 16 MiB (8 digits).
+            if integer_digits > 8:
+                raise _private_error('private JSON integer is outside the profile')
+        else:
+            integer_digits = 0
+    checkpoint()
+
+
+def _private_json_decode(payload: bytes, checkpoint: Callable[[], None]) -> object:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict:
+        checkpoint()
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise _PrivateJsonError()
+            result[key] = value
+        return result
+
+    def reject_number(value: str) -> None:
+        raise _PrivateJsonError()
+
+    try:
+        return json.loads(payload.decode('utf-8'), object_pairs_hook=unique_object,
+                          parse_float=reject_number, parse_constant=reject_number)
+    except (UnicodeDecodeError, json.JSONDecodeError, _PrivateJsonError):
+        raise _private_error('private payload is not strict profile JSON') from None
+
+
+def _private_equal(actual: object, expected: object,
+                    checkpoint: Callable[[], None]) -> bool:
+    # Python equality alone would admit bool as int and float as byte offset.
+    if type(actual) is not type(expected):
+        return False
+    if type(expected) is dict:
+        return actual.keys() == expected.keys() and all(
+            _private_equal(actual[key], value, checkpoint) for key, value in expected.items()
+        )
+    if type(expected) is list:
+        if len(actual) != len(expected):
+            return False
+        for index, (left, right) in enumerate(zip(actual, expected, strict=True)):
+            if index % 4096 == 0:
+                checkpoint()
+            if not _private_equal(left, right, checkpoint):
+                return False
+        return True
+    return actual == expected
+
+
+def validate_private_payload(raw: bytes, payload: bytes, *,
+                             limits: RpyLexicalLimits = RpyLexicalLimits(),
+                             max_private_bytes: int = 32 * _MIB,
+                             check_cancelled: Callable[[], None] | None = None) -> _ParsedTl:
+    """Reparse source and verify all opaque facts; return only immutable facts.
+
+    The caller must retain/verify its source separately. Neither successful
+    validation nor persisted JSON issues a Foundation terminal or writer token.
+    """
+    checkpoint = _private_arguments(raw, limits, max_private_bytes, check_cancelled)
+    if type(payload) is not bytes:
+        raise TypeError('RPY private payload must be exact bytes')
+    if len(payload) > max_private_bytes:
+        raise _private_error('private payload byte limit exceeded', 'limit-exceeded')
+    parsed = parse_tl(raw, limits=limits, check_cancelled=checkpoint)
+    _private_json_preflight(payload, parsed, checkpoint)
+    document = _private_json_decode(payload, checkpoint)
+    header = _private_header(parsed)
+    if type(document) is not dict or document.keys() != header.keys() | {'slots'}:
+        raise _private_error('private payload fields do not match the profile')
+    if not _private_equal({key: document[key] for key in header}, header, checkpoint):
+        raise _private_error('private identity, version or source facts do not match')
+    slots = document['slots']
+    if type(slots) is not dict or slots.keys() != {record.local_id for record in parsed.records}:
+        raise _private_error('private slot identities do not match source')
+    for record, slot in zip(parsed.records, parsed.lexical.slots, strict=True):
+        checkpoint()
+        if not _private_equal(slots[record.local_id], _private_slot(slot, raw, checkpoint), checkpoint):
+            raise _private_error('private slot spans, digest or protection tokens do not match source')
+    checkpoint()
+    return parsed
