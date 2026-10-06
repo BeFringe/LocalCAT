@@ -1672,6 +1672,67 @@ RoundTripSerializerFactory = Callable[[], RoundTripSerializer]
 
 
 @dataclass(frozen=True, slots=True)
+class SourceStateLimits:
+    """Bound private source state independently of any writer capability."""
+
+    max_opaque_payload_bytes: int
+
+    def __post_init__(self) -> None:
+        _require_positive_int(self.max_opaque_payload_bytes, field_name="max_opaque_payload_bytes")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceStateRequest:
+    codec_identity: CodecIdentity
+    format_id: FormatId
+    source: SnapshotCursorLease
+    terminal: TerminalSuccess
+    limits: SourceStateLimits
+    limit_profile: LimitProfile
+
+    def __post_init__(self) -> None:
+        _require_exact_instance(self.codec_identity, CodecIdentity, "codec_identity")
+        _require_exact_instance(self.format_id, FormatId, "format_id")
+        _require_exact_instance(self.terminal, TerminalSuccess, "terminal")
+        _require_exact_instance(self.limits, SourceStateLimits, "limits")
+        _require_exact_instance(self.limit_profile, LimitProfile, "limit_profile")
+        if not isinstance(self.source, SnapshotCursorLease):
+            raise TypeError("source must satisfy SnapshotCursorLease")
+        if (self.source.closed or self.source.tell() != 0
+                or self.source.source_identity != self.terminal.source
+                or self.terminal.codec_identity != self.codec_identity
+                or self.terminal.limit_profile != self.limit_profile):
+            raise ValueError("source state requires matching live verified source facts")
+
+
+@dataclass(frozen=True, slots=True)
+class OpaqueSourceState:
+    """Codec-owned data, never a codec instance or source writer authority."""
+
+    codec_identity: CodecIdentity
+    format_id: FormatId
+    profile_version: str
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        _require_exact_instance(self.codec_identity, CodecIdentity, "codec_identity")
+        _require_exact_instance(self.format_id, FormatId, "format_id")
+        _require_nonempty_text(self.profile_version, field_name="profile_version")
+        if type(self.payload) is not bytes:
+            raise TypeError("opaque source state must be exact bytes")
+
+
+@runtime_checkable
+class SourceStateCodec(Protocol):
+    descriptor: "CodecDescriptor"
+
+    def prepare_source_state(self, request: SourceStateRequest) -> OpaqueSourceState: ...
+
+
+SourceStateFactory = Callable[[], SourceStateCodec]
+
+
+@dataclass(frozen=True, slots=True)
 class CodecDescriptor:
     """Immutable purpose/format authority and its behavior factories."""
 
@@ -1688,6 +1749,8 @@ class CodecDescriptor:
     canonical_serializer_factory: CanonicalSerializerFactory | None
     round_trip_serializer_factory: RoundTripSerializerFactory | None = None
     round_trip_limits: RoundTripLimits | None = None
+    source_state_factory: SourceStateFactory | None = None
+    source_state_limits: SourceStateLimits | None = None
 
     def __post_init__(self) -> None:
         _require_exact_instance(self.identity, CodecIdentity, "CodecDescriptor.identity")
@@ -1769,6 +1832,15 @@ class CodecDescriptor:
                 raise ValueError("round-trip serializer requires explicit output and opaque limits")
         if self.capabilities.validatable and not self.capabilities.readable:
             raise ValueError("validatable descriptor must also be readable")
+        if self.source_state_limits is not None:
+            _require_exact_instance(self.source_state_limits, SourceStateLimits, "source_state_limits")
+        if self.source_state_factory is not None:
+            if not callable(self.source_state_factory):
+                raise TypeError("source state factory must be callable")
+            if not self.capabilities.validatable or not self.capabilities.readable:
+                raise ValueError("source state requires source verification")
+            if self.source_state_limits is None:
+                raise ValueError("source state requires an explicit opaque byte limit")
         if self.capabilities.termbase_column_preview and (
             not self.capabilities.readable
             or self.purpose is not EffectivePurpose.TERMBASE

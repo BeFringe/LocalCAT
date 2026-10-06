@@ -861,7 +861,8 @@ class ParserCompositionArchitectureTests(unittest.TestCase):
                     for target in imported
                 )
             },
-            set(PARSER_CODEC_PREFIXES),
+            # Optional providers are supplied explicitly by Application.
+            set(PARSER_CODEC_PREFIXES) - {"parser_rpy_codec"},
         )
         self.assertTrue(
             any(
