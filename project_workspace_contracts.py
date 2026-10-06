@@ -215,7 +215,7 @@ class OriginBinding:
             _fail()
         validate_project_id(self.project_id)
         profile = _exact_text(self.profile_version)
-        if profile != "explicit-selected-files-v1":
+        if profile not in {"explicit-single-file-v1", "explicit-selected-files-v1"}:
             _fail()
         root = _exact_text(self.absolute_root)
         if not os.path.isabs(root):
@@ -225,7 +225,9 @@ class OriginBinding:
         if type(self.revision) is not int or self.revision < 1:
             _fail()
         _exact_tuple(self.documents)
-        if len(self.documents) < 2 or len(self.documents) > MAX_PROJECT_DOCUMENTS:
+        minimum = 1 if profile == "explicit-single-file-v1" else 2
+        maximum = 1 if profile == "explicit-single-file-v1" else MAX_PROJECT_DOCUMENTS
+        if not minimum <= len(self.documents) <= maximum:
             _fail("PROJECT.WORKSPACE.LIMIT_EXCEEDED")
         if any(type(item) is not OriginBindingDocument for item in self.documents):
             _fail()

@@ -541,10 +541,12 @@ def stage_selected_project_documents_with_file_system(
 
     if type(selected_paths) is not tuple:
         raise TypeError("selected_paths must be an exact tuple")
-    if len(selected_paths) < 2:
+    if not selected_paths:
         _fail("PROJECT.WORKSPACE.CONTRACT_INVALID")
     if len(selected_paths) > MAX_PROJECT_DOCUMENTS:
         _fail("PROJECT.WORKSPACE.LIMIT_EXCEEDED")
+    single_file = len(selected_paths) == 1
+    profile = "explicit-single-file-v1" if single_file else _PROFILE
     if type(request) is not SelectedProjectDocumentsRequest:
         raise TypeError("request must be exact SelectedProjectDocumentsRequest")
     root_path = _absolute_root(root)
@@ -739,6 +741,37 @@ def stage_selected_project_documents_with_file_system(
                 _fail("PROJECT.INTAKE.SOURCE_STALE")
         root_authority.reprove()
 
+        # The retained anchor can remain valid after its selected root name is
+        # replaced. Reopen that name through the same neutral backend before
+        # publishing a binding that will later use the absolute root again.
+        named_root = backend.bind_root(root_path)
+        try:
+            for bound_file in bound:
+                rebound = backend.open_regular(
+                    named_root, _relative_path(bound_file.source_ref),
+                )
+                try:
+                    if rebound.snapshot() != bound_file.initial_snapshot:
+                        _fail("PROJECT.INTAKE.SOURCE_STALE")
+                finally:
+                    rebound.close()
+            named_root.reprove()
+            root_authority.reprove()
+        finally:
+            named_root.close()
+
+        if os.name != "nt":
+            # Moving the original selected subtree into a replacement root
+            # preserves file identities. Also reprove the POSIX root identity
+            # already recorded for this binding, after every file check.
+            final_root_status = os.stat(root_path, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(final_root_status.st_mode)
+                or (final_root_status.st_dev, final_root_status.st_ino)
+                != (root_device, root_inode)
+            ):
+                _fail("PROJECT.INTAKE.SOURCE_STALE")
+
         workspace = ProjectWorkspace(
             schema_version=1,
             project_id=project_id,
@@ -746,8 +779,8 @@ def stage_selected_project_documents_with_file_system(
             source_locale=request.source_locale,
             target_locale=request.target_locale,
             origin=ProjectOrigin(
-                kind=ProjectOriginKind.DIRECTORY,
-                profile_version=_PROFILE,
+                kind=(ProjectOriginKind.SINGLE_FILE if single_file else ProjectOriginKind.DIRECTORY),
+                profile_version=profile,
                 portable_root_ref="project",
             ),
             persistence_kind=ProjectPersistenceKind.PROJECT_PACKAGE,
@@ -756,7 +789,7 @@ def stage_selected_project_documents_with_file_system(
         binding = OriginBinding(
             schema_version=1,
             project_id=project_id,
-            profile_version=_PROFILE,
+            profile_version=profile,
             absolute_root=str(root_path),
             root_device=root_device,
             root_inode=root_inode,
@@ -789,7 +822,10 @@ def stage_selected_project_documents(
     if file_system is None:
         from platform_fs import compose_platform_file_backend
 
-        selected = compose_platform_file_backend(_absolute_root(root))
+        try:
+            selected = compose_platform_file_backend(_absolute_root(root))
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_UNSAFE") from error
     else:
         selected = file_system
     return stage_selected_project_documents_with_file_system(

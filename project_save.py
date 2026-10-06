@@ -665,11 +665,12 @@ class ProjectSaveService:
             ):
                 state = OriginWriteState.UNBOUND
             elif (
-                self._workspace_service.workspace.origin.kind
-                is ProjectOriginKind.DIRECTORY
-                and self._workspace_service.workspace.origin.profile_version
-                == "explicit-selected-files-v1"
-            ):
+                self._workspace_service.workspace.origin.kind,
+                self._workspace_service.workspace.origin.profile_version,
+            ) in {
+                (ProjectOriginKind.DIRECTORY, "explicit-selected-files-v1"),
+                (ProjectOriginKind.SINGLE_FILE, "explicit-single-file-v1"),
+            }:
                 state = OriginWriteState.UNSUPPORTED
             elif document.document_id in dirty:
                 state = OriginWriteState.WORKSPACE_AHEAD
