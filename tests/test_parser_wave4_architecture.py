@@ -27,6 +27,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 _EXPECTED_PARSER_MODULES = frozenset(
     {
+        "rpy_text_rules",
         "parser_rpy_codec",
         "parser_contracts",
         "parser_source",
@@ -1150,7 +1151,8 @@ class Wave4ProductionArchitectureTests(unittest.TestCase):
     def test_parser_module_inventory_is_closed_and_policy_scans_the_real_tree(self) -> None:
         self.assertEqual(set(PARSER_MODULE_PREFIXES), _EXPECTED_PARSER_MODULES)
         actual_parser_files = {
-            name for name in self.modules if name.startswith("parser_")
+            name for name in self.modules
+            if name.startswith("parser_") or name == "rpy_text_rules"
         }
         self.assertEqual(actual_parser_files, _EXPECTED_PARSER_MODULES)
         self.assertEqual(set(self.parsers), _EXPECTED_PARSER_MODULES)
