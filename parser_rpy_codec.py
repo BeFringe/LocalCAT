@@ -12,8 +12,13 @@ import json
 from typing import Callable, Iterator
 
 from parser_contracts import (
-    CodecIdentity, IssueSeverity, ParseIssue, ParsedSegment, RawSpeaker,
+    CodecIdentity, FormatId, IssueSeverity, ParseIssue, ParsedSegment, RawSpeaker,
+    PreparedFormatBytes, RoundTripLimits, RoundTripSegmentEdit,
     TargetPresence, TranslationState,
+)
+
+from rpy_text_rules import (
+    RpyTextError, check_text, encode_target, protection_tokens, validate_target,
 )
 
 
@@ -49,8 +54,10 @@ class RpyInputError(ValueError):
     """Body-safe format failure, carrying the existing neutral issue container."""
 
     def __init__(self, category: str, line: int, offset: int, column: int,
-                 reason: str) -> None:
+                 reason: str, *, local_id: str | None = None,
+                 record_number: int | None = None) -> None:
         self.category = category
+        self.local_id = local_id
         self.byte_column = column
         self.issue = ParseIssue(
             code='PARSER.RPY.' + category.replace('-', '_').upper(),
@@ -58,6 +65,7 @@ class RpyInputError(ValueError):
             safe_summary=f'RPY line {line}, byte column {column}: {reason}',
             byte_offset=offset,
             line_number=line,
+            record_number=record_number,
         )
         super().__init__(self.issue.safe_summary)
 
@@ -144,9 +152,11 @@ def _literal(line: _Line, start: int, limits: RpyLexicalLimits,
     decoded = bytearray()
     escapes = {92: 92, quote: quote, 110: 10, 114: 13, 116: 9}
     position = start + 1
+    next_checkpoint = position
     while position < len(data):
-        if (position - start) % 4096 == 0:
+        if position >= next_checkpoint:
             checkpoint()
+            next_checkpoint = position + 4096
         character = data[position]
         if character == quote:
             return (_Literal(decoded.decode('utf-8'), chr(quote),
@@ -218,51 +228,10 @@ def _source_tokens(say: _Say, line: _Line,
     text = say.literal.text
     if not text:
         raise line.fail('invalid-source', 'decoded source is empty', say.literal.start - line.offset)
-    position = 0
-    while position < len(text):
-        if position % 4096 == 0:
-            checkpoint()
-        character = text[position]
-        if text[position:position + 2] in ('[[', '{{'):
-            position += 2
-            continue
-        if character == '[':
-            # Only delimiters and quote state are recognized; expressions remain
-            # opaque text, including conversion/format parts and nested indexing.
-            stack = [']']
-            quote = None
-            start = position
-            position += 1
-            while position < len(text) and stack:
-                if position % 4096 == 0:
-                    checkpoint()
-                token = text[position]
-                if quote:
-                    if token == '\\':
-                        position += 2
-                        continue
-                    if token == quote:
-                        quote = None
-                elif token in ('"', "'"):
-                    quote = token
-                elif token in '[({':
-                    stack.append({'[': ']', '(': ')', '{': '}'}[token])
-                elif token in '])}':
-                    if token != stack.pop():
-                        raise line.fail('invalid-source', 'mismatched interpolation delimiter')
-                position += 1
-            if stack or quote:
-                raise line.fail('invalid-source', 'unterminated interpolation')
-            yield text[start:position]
-            continue
-        if character == '{':
-            end = text.find('}', position + 1)
-            if end < 0 or '{' in text[position + 1:end]:
-                raise line.fail('invalid-source', 'unterminated text tag')
-            yield text[position:end + 1]
-            position = end + 1
-            continue
-        position += 1
+    try:
+        yield from protection_tokens(text, checkpoint)
+    except RpyTextError as error:
+        raise line.fail('invalid-source', error.reason) from None
 
 
 def _source_text(say: _Say, line: _Line, checkpoint: Callable[[], None]) -> None:
@@ -702,3 +671,107 @@ def validate_private_payload(raw: bytes, payload: bytes, *,
             raise _private_error('private slot spans, digest or protection tokens do not match source')
     checkpoint()
     return parsed
+
+
+def prepare_round_trip_bytes(raw: bytes, payload: bytes,
+                             edits: tuple[RoundTripSegmentEdit, ...], *,
+                             limits: RpyLexicalLimits = RpyLexicalLimits(),
+                             round_trip_limits: RoundTripLimits = RoundTripLimits(32 * _MIB, 32 * _MIB),
+                             check_cancelled: Callable[[], None] | None = None) -> PreparedFormatBytes:
+    """Prepare bounded format bytes from source-verified slots and current edits.
+
+    This is deliberately not a live writer factory. Source/token lifetimes,
+    target selection, and publication stay with the Foundation and Application.
+    """
+    if type(round_trip_limits) is not RoundTripLimits:
+        raise TypeError('round-trip limits must be exact RoundTripLimits')
+    if type(edits) is not tuple:
+        raise TypeError('round-trip edits must be an exact tuple')
+    max_output = min(round_trip_limits.max_output_bytes, 32 * _MIB)
+    parsed = validate_private_payload(
+        raw, payload, limits=limits,
+        max_private_bytes=min(round_trip_limits.max_opaque_payload_bytes, 32 * _MIB),
+        check_cancelled=check_cancelled,
+    )
+    checkpoint = check_cancelled if check_cancelled is not None else lambda: None
+    if len(edits) != len(parsed.records):
+        raise _private_error('edit identities do not match the complete slot set', 'invalid-edits')
+    by_id: dict[str, str] = {}
+    for edit in edits:
+        checkpoint()
+        if type(edit) is not RoundTripSegmentEdit:
+            raise TypeError('edits must be exact RoundTripSegmentEdit values')
+        if type(edit.local_id) is not str or type(edit.target) is not str:
+            raise TypeError('edit identity and target must be exact strings')
+        if edit.local_id in by_id:
+            raise _private_error('duplicate edit identity', 'invalid-edits')
+        by_id[edit.local_id] = edit.target
+    if by_id.keys() != {record.local_id for record in parsed.records}:
+        raise _private_error('edit identities do not match source', 'invalid-edits')
+
+    # Account for every untouched byte up front; target replacements may grow
+    # or shrink independently. Encoded replacements never exceed the remaining
+    # final-output budget, even before assembly.
+    output_size = len(raw)
+    for slot in parsed.lexical.slots:
+        checkpoint()
+        output_size -= slot.target.literal.end - slot.target.literal.start - 2
+    if output_size > max_output:
+        raise _private_error('output byte limit exceeded', 'limit-exceeded')
+    replacements: list[bytes | None] = []
+    for number, (record, slot) in enumerate(zip(parsed.records, parsed.lexical.slots, strict=True), 1):
+        checkpoint()
+        target = by_id[record.local_id]
+        original = slot.target.literal
+        try:
+            check_text(target, limits.max_string_bytes, checkpoint)
+            validate_target(record.source, target, checkpoint)
+            if target == original.text:
+                size = original.end - original.start - 2
+                if output_size + size > max_output:
+                    raise RpyTextError('limit-exceeded', 'output byte limit exceeded')
+                replacement = None
+            else:
+                replacement = encode_target(target, original.quote, max_output - output_size, checkpoint)
+                size = len(replacement)
+        except RpyTextError as error:
+            column = original.start - raw.rfind(b'\n', 0, original.start)
+            raise RpyInputError(error.category, original.line, original.start,
+                                column, error.reason, local_id=record.local_id,
+                                record_number=number) from None
+        output_size += size
+        replacements.append(replacement)
+
+    if all(replacement is None for replacement in replacements):
+        checkpoint()
+        output = raw
+    else:
+        output_buffer = bytearray()
+        def append(chunk: bytes | memoryview) -> None:
+            # Assembly also checkpoints long untouched comments/control spans.
+            view = memoryview(chunk)
+            for start in range(0, len(view), 65536):
+                checkpoint()
+                part = view[start:start + 65536]
+                if len(output_buffer) + len(part) > max_output:
+                    raise _private_error('output byte limit exceeded', 'limit-exceeded')
+                output_buffer.extend(part)
+        cursor = 0
+        source_view = memoryview(raw)
+        for slot, replacement in zip(parsed.lexical.slots, replacements, strict=True):
+            checkpoint()
+            if replacement is None:
+                continue
+            literal = slot.target.literal
+            append(source_view[cursor:literal.start + 1])
+            append(replacement)
+            cursor = literal.end - 1
+        append(source_view[cursor:])
+        checkpoint()
+        output = bytes(output_buffer)
+    checkpoint()
+    return PreparedFormatBytes(
+        codec_identity=RPY_CODEC_IDENTITY, format_id=FormatId('renpy-tl-v1'),
+        source_fingerprint=hashlib.sha256(raw).hexdigest(),
+        output_fingerprint=hashlib.sha256(output).hexdigest(), payload=output,
+    )

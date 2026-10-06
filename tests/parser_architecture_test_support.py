@@ -738,6 +738,7 @@ def _rule_signature(rule: object) -> tuple[object, ...]:
 
 
 PARSER_MODULE_PREFIXES = (
+    "rpy_text_rules",
     "parser_rpy_codec",
     "parser_contracts",
     "parser_source",
@@ -939,11 +940,18 @@ def build_parser_architecture_policy() -> ArchitecturePolicy:
                 "LocalCAT codec uses its Design-declared neutral dependencies",
             ),
             AllowedImportRule(
+                "rpy_text_rules.allowed_dependencies",
+                ("rpy_text_rules",),
+                (),
+                (),
+                "RPY text rules are a stdlib-only leaf",
+            ),
+            AllowedImportRule(
                 "rpy_codec.allowed_dependencies",
                 ("parser_rpy_codec",),
-                ("parser_contracts",),
+                ("parser_contracts", "rpy_text_rules"),
                 (),
-                "RPY lexical codec depends only on stdlib and neutral contracts",
+                "RPY codec depends only on contracts and its pure text-rules leaf",
             ),
             AllowedImportRule(
                 "gettext_codec.allowed_dependencies",
