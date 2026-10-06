@@ -1,6 +1,8 @@
 # 实施计划
 
-按下列 owner 依赖实施，任务完成须有当前实现证据；跨规格合同与唯一任务归属见 [cross-spec-amendments.md](cross-spec-amendments.md)。任务默认顺序执行，每个子项按单一可验证结果安排，约 1–3 小时；实际超出时按同一边界拆分。
+按下列 owner 依赖实施，任务完成须有当前实现证据；跨规格合同与唯一任务归属见 [cross-spec-amendments.md](cross-spec-amendments.md)。任务按显式依赖逐项执行，每个子项按单一可验证结果安排，约 1–3 小时；实际超出时按同一边界拆分。
+
+执行顺序：2.1–2.4 的 codec 工作不依赖 1.4；完成后闭合 Multi 5.6、1.4 与 3.1，再进入单文件阶段。3.2 → 3.2a 提供桌面编辑、包保存和冷重开；3.3 → 3.4 → 3.4a → 3.4b 提供桌面预览、导出与完整单文件验证。目录物化、多章节和发行组合在此后推进；后文未另列依赖的任务沿用所在阶段顺序。
 
 - [ ] 1. 建立中立接缝与可重现输入
 - [x] 1.1 建立受支持与拒绝输入的合成夹具
@@ -20,7 +22,7 @@
   - _Boundary: Parser owner publication amendment_
   - _Depends: 1.2_
 - [ ] 1.4 接入单文件 profile 与私有数据通道
-  - 消费 Multi 增量 5.6 提供的非 legacy 单 Document profile；本任务只接入配置 surface 与 verified private handoff，保留 rooted source 至首包发布，不重复实现 profile。
+  - 消费 Multi 5.6 提供的直接文件选择与非 legacy 单 Document profile；本任务只接入配置 surface 与 verified private handoff，保留 rooted source 至首包发布，不重复实现 profile，也不要求目录预览。
   - 完成时，中立伪 codec 可创建/重开一个 Document 的包；原 legacy 与多文件 profile 拒绝规则不变。
   - _Requirements: 3.1, 3.2, 3.4, 7.2_
   - _Boundary: Multi owner amendment_
@@ -48,7 +50,7 @@
   - _Requirements: 4.2, 4.3, 4.4, 7.3_
   - _Boundary: RpyTextRules_
 
-- [ ] 3. 完成单文件项目闭环
+- [ ] 3. 完成单文件桌面闭环并准备嵌套导出
 - [ ] 3.1 接入已知 provider 配置与产品组合
   - 设备配置仅启停 allowlisted provider；建 surface 前排除禁用项，避免阻断内建格式。
   - 完成时，禁用/版本不兼容时 RPY 不可用而 JSON/TXT/PO/POT 仍工作，配置不含模块路径或私有项目内容。
@@ -61,18 +63,39 @@
   - _Requirements: 2.3, 3.1, 3.2, 3.3, 3.4_
   - _Boundary: RpyProjectAdapter / Project integration_
   - _Depends: 1.4, 3.1_
+- [ ] 3.2a 接入单 TL 打开、编辑与包保存的桌面流程
+  - 从既有统一文件选择入口消费 3.2 的中立项目能力，接通现有源文/译文/speaker、确认、浏览/搜索、包另存与冷重开，不新增目录扫描或另一份编辑状态。
+  - 导入、保存及重开结果继续受 issued session/generation、未保存保护与 Chunk mutation guard 约束；运行时界面可响应，取消或关窗后丢弃晚到候选并释放资源，已发生的保存按 owner 结果如实处理。
+  - 完成时，从正常 source 启动入口可打开混合 TL、编辑确认、保存后移走源 TL 再重开；无 codec 的包仍可中立编辑保存，失败或过期候选不替换当前项目，未接通的 TL 导出明确不可用。
+  - _Requirements: 1.1, 1.3, 2.1, 2.3, 3.1, 3.2, 3.3, 3.4, 6.1, 6.3, 7.2_
+  - _Boundary: Controller / Qt single-file open-save integration_
+  - _Depends: 3.2_
 - [ ] 3.3 接入绑定当前编辑的导出预览
   - 展示空/未确认数量、目标和诊断，绑定 session/revision、codec/source/private/目标身份；导出全部 target。
   - 完成时，修改译文、切换项目/codec 或替换目标使 preview stale；取消无发布。
   - _Requirements: 4.1, 4.4, 6.3_
   - _Boundary: RpyProjectAdapter / ProjectExportView_
-  - _Depends: 2.4, 3.2_
+  - _Depends: 2.4, 3.2a_
 - [ ] 3.4 接入受控发布和不确定结果
   - 消费 1.3 产出的 Parser prepared 发布能力，绑定项目预览与用户选定目标；不加入 codec journal，导出不替代 package 保存。
   - 完成时，发布前故障保留目标，发布后不确定不返回成功，project dirty/baseline 不被导出错误清除。
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
   - _Boundary: Parser publishing / RpyProjectAdapter integration_
   - _Depends: 1.3, 3.3_
+- [ ] 3.4a 接入单 TL 导出预览与结果的桌面流程
+  - Qt 只显示 Controller 的中立预览、目标选择、定位诊断和发布结果；沿用已有父目录内的单文件发布能力，不等待嵌套目录物化。
+  - 显示修改段数、空/未确认数量及阻断原因；修改译文、换项目/codec 或目标变化使预览失效。异步工作可取消，关窗或旧 generation 的结果不覆盖新编辑，已发出的发布返回真实结果。
+  - 完成时，正常界面可预览并导出单 TL，空 target 不补源文，错误可定位，失败与不确定结果不显示成功；导出不清除未保存的包 dirty，UI 不取得 token/private 类型或发布 authority。
+  - _Requirements: 4.1, 4.4, 4.5, 6.1, 6.3, 7.2_
+  - _Boundary: Controller / Qt single-file export integration_
+  - _Depends: 3.2a, 3.4_
+- [ ] 3.4b 验证单文件桌面闭环与故障保护
+  - 以真实 Parser、ProjectPackage 和单文件 publisher 完成打开、编辑确认、保存、离开原路径冷重开、预览与导出；使用仓库内合成 TL，不以伪 adapter 替代用户旅程。
+  - 比较合法无修改样例的完整字节与仅改单段的目标跨度；覆盖空/未确认译文、无 codec 包、stale token/private/preview、发布前后故障、取消/关窗及迟到结果，并回归既有 JSON/TXT 入口与 Chunk guards。
+  - 完成时，桌面操作和输出文件均符合 3.2–3.4a 合同；source 支持平台分别记录实际运行结果，未完成的原生验收不算通过，普通 frozen 的最终组合验收仍由 5.3、6.1 承担。
+  - _Requirements: 1.2, 2.3, 3.1, 3.2, 3.3, 3.4, 4.1, 4.2, 4.3, 4.4, 4.5, 6.1, 6.3, 7.1, 7.2, 7.3, 7.4_
+  - _Boundary: RPY / Project / Parser / Qt single-file integration validation_
+  - _Depends: 3.4a_
 - [ ] 3.5 实现平台 owner 的嵌套导出目录合同
   - 准备已有祖先身份、缺失后缀及 absent 条件；定义确认后的逐组件物化与发布目标绑定，预览零目录写入。
   - 完成时，fake 平台证明目录/目标竞争会 stale，本批创建祖先才可复用，retirement authority 不能冒充目标绑定。
@@ -102,7 +125,7 @@
   - 完成时，根目录下单选、多选、两层以上目录和同名 TL 均保留路径；未勾选内容不读取，树导航、保存和重开不改变阅读顺序。
   - _Requirements: 1.2, 5.1, 5.2, 7.1_
   - _Boundary: RpyProjectAdapter / Multi intake integration_
-  - _Depends: 3.2；multi-document-project-workspace 5.5, 5.6, 5.7, 5.8_
+  - _Depends: 3.4b；multi-document-project-workspace 5.6a, 5.7, 5.8_
 - [ ] 4.2 接入已验证源更新与完整私有映射替换
   - 复用 Project reconciliation、显式 rename 与 unresolved 处理，不按行号猜测。
   - 完成时，同 dialogue label 改源文得到 source_changed、保留 target 并清 confirmed；label 或 strings old key 改变得到 new/removed，ambiguous 可见；新 private payload 与新 source 匹配。
@@ -115,18 +138,19 @@
   - _Boundary: RpyProjectAdapter export coordination_
   - _Depends: 3.8, 4.1_
 
-- [ ] 5. 完成中立桌面入口与发行组合
-- [ ] 5.1 接入项目打开、包另存与导出对话框
-  - Qt 只消费中立 Controller view，保留现有 speaker/编辑/浏览/搜索与 Chunk mutation guard。
-  - 完成时，用户能完成单/多 TL 的打开、编辑、保存、预览和导出，UI 无 token/private 类型。
-  - _Requirements: 4.1, 5.2, 6.1_
-  - _Boundary: Controller / Qt integration_
-  - _Depends: 3.3, 4.3_
-- [ ] 5.2 接入取消和晚到结果生命周期
-  - 异步结果绑定 issued session/generation，关闭、换项目或修改后拒绝旧结果。
-  - 完成时，运行期间 UI 可响应，取消/关窗不发布新候选，不覆盖后续编辑。
-  - _Requirements: 6.3, 7.2_
-  - _Boundary: Controller lifecycle_
+- [ ] 5. 扩展多章节桌面流程与发行组合
+- [ ] 5.1 接入多 TL 的桌面流程与逐文件结果
+  - 将 3.2a、3.4a 的单文件流程扩展为多章节，消费 Multi 已有根目录勾选/导航投影和 4.3 的中立批量结果，不重复实现包保存或单文件导出对话框。
+  - 完成时，用户可按相对路径切换章节、编辑保存并预览/导出所选 TL；同名文件和逐文件失败可区分，原有单文件旅程与 Chunk mutation guard 保持有效，UI 无 token/private 类型。
+  - _Requirements: 4.1, 5.2, 5.4, 6.1_
+  - _Boundary: Controller / Qt multi-file integration_
+  - _Depends: 3.4b, 4.3_
+- [ ] 5.2 验证批量取消与晚到结果生命周期
+  - 复用单文件阶段的 issued session/generation 保护，验证多文件导入、批量预览和逐次发布在取消、关窗、换项目或修改后的结果接纳与资源释放。
+  - 完成时，UI 保持响应，取消后不启动新文件发布；已发布、失败、不确定及未执行项如实显示，旧结果不覆盖后续编辑，不虚称跨文件回滚。
+  - _Requirements: 4.5, 5.4, 6.3, 7.2_
+  - _Boundary: Controller batch lifecycle validation_
+  - _Depends: 5.1_
 - [ ] 5.3 纳入正常发行的显式模块闭包
   - 按现有 source/frozen composition 收集新 codec、adapter 和 UI 模块，不改变 Core/Host/Gate 合同。
   - 完成时，独立 checkout 与普通 frozen 可启用/禁用 RPY，不依赖开发机其他目录或 Ren'Py 安装。
@@ -134,11 +158,12 @@
   - _Boundary: Platform build composition_
 
 - [ ] 6. 验证端到端行为并闭合实际影响
-- [ ] 6.1 执行单文件保真与 owner 故障矩阵
-  - 覆盖 stale token/private、发布前后失败、无 codec 包、冷重开与无修改字节一致。
-  - 完成时，拒绝路径不产生虚假 receipt，保存/导出分别满足 owner 合同。
-  - _Requirements: 1.2, 3.2, 3.3, 3.4, 4.2, 4.3, 4.4, 4.5, 7.1, 7.2, 7.3_
-  - _Boundary: RPY / Project / Parser integration validation_
+- [ ] 6.1 复验交付版本的单文件闭环与 owner 故障矩阵
+  - 在最终 source 与普通 Windows frozen 组合中复用 3.4b 的单文件旅程及故障用例，验证多章节集成和打包后仍保持保真、无 codec 编辑、冷重开及发布失败语义。
+  - 完成时，最终交付组合上的保存/导出符合 owner 合同，拒绝路径不产生虚假 receipt；未运行的环境明确保留未验证，不沿用前期 source 结果宣称 frozen 通过。
+  - _Requirements: 1.2, 1.4, 3.2, 3.3, 3.4, 4.2, 4.3, 4.4, 4.5, 7.1, 7.2, 7.3, 7.4_
+  - _Boundary: RPY / Project / Parser release integration validation_
+  - _Depends: 3.4b, 5.2, 5.3_
 - [ ] 6.2 执行多文件编辑和手工包用户旅程
   - 验证根目录预览选择、嵌套相对路径、树导航与阅读顺序/调和、混合两类 TL、同名分目录导出、TM/术语建议与两个设备的包验证/本地资源选择。
   - 完成时，Project 与 JSONL/CSV ResourcePackage 分别完成冷重开/导入，设备资格未被搬运，未引入 TMX 前置。

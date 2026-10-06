@@ -216,7 +216,7 @@ Cluster 0 R/D/T + ADR + characterization + 人工批准
 
 ## Cluster 5：显式根目录选择与嵌套导航
 
-Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格式能力由独立规格提供。
+Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格式能力由独立规格提供。5.6 是基于既有显式文件 intake 与 ProjectPackage 的独立任务，可先于目录观察和预览的 5.3–5.5 执行；5.6a 再集成目录预览所保留的原根。其余目录任务仍按下列依赖逐项执行。
 
 - [x] 5.1 实现平台 owner 的只读观察合同
   - 定义受限 metadata、retained-root 下钻、取消/资源预算和结构化失败；只读能力不借用 live ledger 或写 authority。
@@ -246,24 +246,31 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Requirements: 13.1, 13.2, 13.3_
   - _Boundary: Project discovery/contracts_
   - _Depends: 5.4_
-- [ ] 5.6 实现单文件 profile 与原根绑定的 intake/包验证
-  - 增加 explicit-single-file-v1 的一文档 cardinality、OriginBinding 与 package decoder/validator；多个文件保留原 profile 限制。
-  - 完成时，使用既有 JSON/TXT codec 即可独立验收：零个拒绝，一个嵌套文件保留原 root/source_ref，真实包保存冷重开保留 identity/overlay；不借用 legacy writer。此任务唯一提供 RPY 1.4 消费的 profile，不依赖 RPY 私有 handoff。
-  - _Requirements: 13.2, 13.3, 13.4_
+- [ ] 5.6 (P) 实现直接文件选择的单文件 profile 与包验证
+  - 基于既有 rooted 显式文件 intake 增加 explicit-single-file-v1 的一文档 cardinality、OriginBinding 与 package decoder/validator；使用文件选择已有的根绑定规则和规范化 source_ref，不引入 metadata 递归观察或目录预览。
+  - 完成时，既有 JSON/TXT codec 可验证零文件拒绝、一个文件建立非 legacy 包、首包发布及无原路径冷重开保留 identity/overlay；多个文件的原 profile 限制与 legacy 单 JSON 行为不变，不授予源 writer。
+  - 验证源/根替换、包发布失败与两个平台既有文件读写路径；Windows 的原生读写验收仍须完成，不以目录观察尚未实现为由跳过。此任务唯一提供 RPY 1.4 消费的 profile，不依赖 RPY 私有 handoff。
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 4.1, 13.3, 13.4_
   - _Boundary: Project contracts/intake/package_
-  - _Depends: 5.5_
+  - _Depends: 2.1a, 2.4a, 2.8a_
+- [ ] 5.6a 接入目录选择的原根绑定与单/多文件 intake
+  - 消费 5.5 的 issued selection 和 retained root，按原根生成 source_ref；一个文件复用 5.6 的 profile，多个文件沿用既有 profile，不因单选或筛选重新计算根。
+  - 完成时，JSON/TXT 合成目录中零选拒绝、嵌套单选保留完整相对路径、同名多选与顺序可冷重开恢复；stale/越界/alias/取消不提交，未勾选内容零读取。
+  - _Requirements: 13.2, 13.3, 13.4_
+  - _Boundary: Project discovery / intake integration_
+  - _Depends: 5.5, 5.6_
 - [ ] 5.7 接入统一打开流程的根目录勾选 review
   - Controller/Qt 接入选根、候选树勾选、排序/语言/保存 review，复用现有单/多文件入口；异步取消与 session/generation 复证。
   - 完成时，根目录单选/多选均可保存，零选/不完整/stale 阻断，取消或迟到结果不改变当前 target/dirty，原文件多选仍可用。
   - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.6_
   - _Boundary: Controller / Qt open-flow integration_
-  - _Depends: 5.5, 5.6_
+  - _Depends: 5.6a_
 - [ ] 5.8 将既有文件夹导航投影为目录树
   - 只使用 Controller-issued identity/source_ref 构树，沿用 current/dirty、键盘跳转与 Chunk 过滤；目录仅展开。
   - 完成时，包离线冷重开仍可导航，同名文件可区分；目录交错顺序不改变 manifest、连续阅读或搜索次序。
   - _Requirements: 13.2, 13.5, 13.6_
   - _Boundary: Controller / Qt navigation projection_
-  - _Depends: 5.6_
+  - _Depends: 5.6a_
 - [ ] 5.9 纳入普通发行模块组合
   - 将新增发现/合同模块纳入 source 与普通 frozen 的显式声明，不扩张 Core/Host/Gate 合同。
   - 完成时，普通 Windows frozen 能打开目录预览及章节树，缺源目录时包导航仍可用。
