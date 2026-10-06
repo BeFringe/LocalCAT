@@ -21,7 +21,7 @@
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
   - _Boundary: Parser owner publication amendment_
   - _Depends: 1.2_
-- [ ] 1.4 接入单文件 profile 与私有数据通道
+- [x] 1.4 接入单文件 profile 与私有数据通道
   - 消费 Multi 5.6 提供的直接文件选择与非 legacy 单 Document profile；本任务只接入配置 surface 与 verified private handoff，保留 rooted source 至首包发布，不重复实现 profile，也不要求目录预览。
   - 完成时，中立伪 codec 可创建/重开一个 Document 的包；原 legacy 与多文件 profile 拒绝规则不变。
   - _Requirements: 3.1, 3.2, 3.4, 7.2_

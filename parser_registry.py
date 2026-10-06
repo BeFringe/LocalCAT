@@ -21,6 +21,9 @@ from parser_contracts import (
     PreparedFormatBytes,
     RoundTripRequest,
     RoundTripSerializer,
+    SourceStateCodec,
+    SourceStateRequest,
+    OpaqueSourceState,
     SelectionFailure,
     SelectionHintSummary,
     SelectionRequest,
@@ -120,6 +123,24 @@ class _PinnedRoundTripSerializer:
 
     def prepare(self, request: RoundTripRequest) -> PreparedFormatBytes:
         return self._prepare(request)
+
+
+class _PinnedSourceStateCodec:
+    __slots__ = ("_descriptor", "_prepare_source_state")
+
+    def __init__(self, descriptor: CodecDescriptor, prepare_source_state) -> None:
+        object.__setattr__(self, "_descriptor", descriptor)
+        object.__setattr__(self, "_prepare_source_state", prepare_source_state)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("pinned source state codec is immutable")
+
+    @property
+    def descriptor(self) -> CodecDescriptor:
+        return self._descriptor
+
+    def prepare_source_state(self, request: SourceStateRequest) -> OpaqueSourceState:
+        return self._prepare_source_state(request)
 
 
 class _PinnedSeekablePreflightReader(_PinnedRawReader):
@@ -518,6 +539,31 @@ class ParserRegistry:
                 "round-trip serializer does not match its registered descriptor contract",
             )
         return _PinnedRoundTripSerializer(descriptor, prepare)
+
+    def create_source_state_codec(self, descriptor: CodecDescriptor) -> SourceStateCodec:
+        self._require_registered_descriptor(descriptor)
+        factory = descriptor.source_state_factory
+        if factory is None:
+            raise RegistryConfigurationError(
+                "PARSER.SELECTION.UNSUPPORTED", "source state capability is unavailable",
+            )
+        try:
+            codec = factory()
+        except Exception:
+            raise RegistryConfigurationError(
+                "PARSER.SELECTION.FACTORY_FAILED", "source state factory failed",
+            ) from None
+        try:
+            published = codec.descriptor
+            prepare = codec.prepare_source_state
+            matches = isinstance(codec, SourceStateCodec)
+        except Exception:
+            published, prepare, matches = None, None, False
+        if published is not descriptor or not matches or not callable(prepare):
+            raise RegistryConfigurationError(
+                "PARSER.SELECTION.FACTORY_MISMATCH", "source state codec contract mismatch",
+            )
+        return _PinnedSourceStateCodec(descriptor, prepare)
 
     def _selection_failure(
         self,

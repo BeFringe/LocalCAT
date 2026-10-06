@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import os
 import re
 import unicodedata
@@ -243,6 +244,24 @@ class OriginBinding:
         )
         if len(file_identities) != len(set(file_identities)):
             _fail("PROJECT.WORKSPACE.IDENTITY_DUPLICATE")
+
+
+@dataclass(frozen=True, slots=True)
+class CodecPrivateMemberData:
+    """Bound opaque input bytes for an initial package, with no live authority."""
+
+    document_id: str
+    reference: CodecPrivateMemberRef
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        validate_document_id(self.document_id)
+        if type(self.reference) is not CodecPrivateMemberRef or type(self.payload) is not bytes:
+            _fail()
+        if (self.reference.member_path != f"codec-private/{self.document_id}/{self.reference.sha256}.bin"
+                or len(self.payload) != self.reference.byte_count
+                or hashlib.sha256(self.payload).hexdigest() != self.reference.sha256):
+            _fail()
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +534,7 @@ def require_workspace_segment_identity(
 
 
 __all__ = (
+    "CodecPrivateMemberData",
     "CodecPrivateMemberRef",
     "EditingOverlayEntry",
     "MAX_PROJECT_DOCUMENTS",
