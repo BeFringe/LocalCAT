@@ -2,6 +2,10 @@
 
 本规则把 Steering 与 ADR 的治理检查嵌入 cc-sdd 各阶段。它约束规格工作流，但不替代 Steering、ADR 或人工审批。
 
+## 审批信息的存放
+
+人工阶段门在会话中执行；审批状态与适用范围等元数据可留存于 `spec.json`。Requirements、Design、Tasks 正文不填写“待批准／已批准”等审批结果或授权沿革，只描述范围、合同、任务与进入下一阶段的条件。本条不改变既有人工审批门、owner 的 review clustering 或提交节奏。
+
 ## 权威与所有权
 
 - Steering 定义项目身份、长期原则与跨线边界。
@@ -27,14 +31,14 @@ ADR 不按 review、cluster、Spec 引用或会话次数产生。预期变更先
 ### Requirements
 
 - 当功能修改既有 Spec、重新纳入曾明确排除的能力，或依赖相邻 Spec 时，填写 `Scope Lineage`。
-- 明确 owning spec、被修订的既有范围声明、相邻期待和人工批准状态。
+- 明确 owning spec、被修订的既有范围声明、相邻期待和实际范围差异。
 - Requirements 只描述可观察范围；不得在此批准架构实现。
 
 ### Design
 
 - 必须填写 `Governance Impact`，即使结论是“无 ADR/Steering 影响”。
 - 列出适用 Steering、既有 ADR、候选 ADR、取代关系及 Steering 同步结论。
-- 新 ADR 或取代关系尚未获得人工批准且会改变本次实现边界时，Design 为 `NO-GO`。
+- 新 ADR 或取代关系尚未获得人工批准且会改变本次实现边界时，在会话中返回 `NO-GO` 并停止相关实现，审批状态可记录于 `spec.json`。
 - ADR 草案使用 `.kiro/settings/templates/adr.md`，并由治理分支拥有；功能分支只记录候选和引用。
 
 ### Tasks
@@ -60,7 +64,7 @@ ADR 不按 review、cluster、Spec 引用或会话次数产生。预期变更先
 - **Applicable Steering**: ...
 - **Applicable ADRs**: ADR-NNN / None
 - **ADR disposition**: Follow existing / New candidate / Supersede / None
-- **Scope amendment**: Approved reference / Not required / Pending
+- **Scope amendment**: Scope difference and affected contract references / Not required
 - **Steering sync**: Required (targets) / Not required (reason)
 - **Downstream revalidation**: ... / None
 ```

@@ -65,11 +65,11 @@ Complete this section for every design. Use `None` with a short reason when no i
 - **Applicable Steering**: Project principles and cross-line boundaries that constrain the design
 - **Applicable ADRs**: Existing adopted ADRs followed by this design, or `None`
 - **ADR disposition**: Follow existing / New candidate / Supersede / None
-- **Scope amendment**: Approved reference / Not required / Pending
+- **Scope amendment**: Scope difference and affected contract references / Not required
 - **Steering sync**: Required (name target files) / Not required (state why)
 - **Downstream revalidation**: Affected specs or integration seams / None
 
-> A draft ADR is not implementation authorization. If a new or superseding decision changes the implementation boundary, keep the design at NO-GO until human approval is recorded.
+> A draft ADR is not implementation authorization. If a new or superseding decision changes the implementation boundary, return NO-GO in the conversation and stop dependent work until human approval. Approval metadata may be stored in `spec.json`; keep approval outcomes and authorization history out of Requirements, Design, and Tasks.
 
 ## Architecture
 

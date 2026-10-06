@@ -14,7 +14,9 @@
 - **Owning spec**：{{OWNING_SPEC}}
 - **被修订的既有范围说明**：{{EXISTING_SCOPE_REFERENCE_OR_NONE}}
 - **相邻规格 / 契约**：{{ADJACENT_SPEC_REFERENCES_OR_NONE}}
-- **审批状态**：{{APPROVED_REFERENCE_OR_PENDING}}
+- **范围差异**：{{OBSERVABLE_SCOPE_CHANGE}}
+
+<!-- 人工阶段门在会话中执行；审批元数据可留存于 spec.json，R/D/T 正文不填写待批准／已批准等审批结果或授权沿革。 -->
 
 ## 需求
 
