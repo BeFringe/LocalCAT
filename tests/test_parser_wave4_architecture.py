@@ -228,6 +228,7 @@ _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
 
 _EXPECTED_PARSER_GRAMMAR_MODULES = frozenset(
     {
+        "parser_rpy_codec",
         "parser_json_support",
         "parser_localcat_codec",
         "parser_termbase_codec",
@@ -838,6 +839,13 @@ def _defined_class_names(modules: dict[str, SourceModule]) -> dict[str, set[str]
 
 
 class Wave4ArchitectureGuardSelfTests(unittest.TestCase):
+    def test_rpy_private_json_owner_does_not_allow_parallel_adapter_grammar(self) -> None:
+        grammar = "import json\njson.loads('{}')\njson.dumps({})\n"
+        owner = {"parser_rpy_codec": SourceModule("parser_rpy_codec", grammar)}
+        shadow = {"rpy_private_adapter": SourceModule("rpy_private_adapter", grammar)}
+        self.assertEqual(_unclassified_grammar_modules(owner), set())
+        self.assertEqual(_unclassified_grammar_modules(shadow), {"rpy_private_adapter"})
+
     def test_structural_guard_ignores_comments_and_strings_but_rejects_real_import(self) -> None:
         harmless = '"""import sync_provider; class BaseParser: pass"""\n# import rpy_project_codec\n'
         violating = "import sync_provider\n"
@@ -1255,12 +1263,19 @@ class Wave4ProductionArchitectureTests(unittest.TestCase):
         )
 
     def test_each_migrated_format_has_one_parser_grammar_owner(self) -> None:
+        # The new JSON grammar is only RPY's opaque private member; keep the
+        # existing canonical format assertions over their original owners.
+        migrated = {name: module for name, module in self.parsers.items()
+                    if name != "parser_rpy_codec"}
+        private = {"parser_rpy_codec": self.parsers["parser_rpy_codec"]}
+        self.assertEqual(_call_owners(private, {"json.loads", "json.dumps"}),
+                         {"parser_rpy_codec"})
         self.assertEqual(
-            _call_owners(self.parsers, {"json.load", "json.loads"}),
+            _call_owners(migrated, {"json.load", "json.loads"}),
             {"parser_json_support"},
         )
         self.assertEqual(
-            _call_owners(self.parsers, {"json.dump", "json.dumps"}),
+            _call_owners(migrated, {"json.dump", "json.dumps"}),
             {"parser_localcat_codec"},
         )
         self.assertEqual(
