@@ -309,6 +309,14 @@ class SyntaxAuthorityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.policy = build_parser_architecture_policy()
 
+    def test_rpy_private_json_preserves_neutral_only_dependency_boundary(self) -> None:
+        owner = SourceModule("parser_rpy_codec", "import json\njson.loads('{}')\n")
+        self.assertEqual(self.policy.check_module(owner), ())
+        for target in ("project_package", "editor_controller", "tm_sqlite_store", "PySide6", "parser_source"):
+            with self.subTest(target=target):
+                findings = self.policy.check_module(SourceModule("parser_rpy_codec", f"import {target}\n"))
+                self.assertIn("rpy_codec.allowed_dependencies", {item.rule_id for item in findings})
+
     def test_import_aliased_grammar_call_detects_a_second_parser(self) -> None:
         violations = self.policy.check_module(
             SourceModule(
