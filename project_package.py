@@ -351,6 +351,19 @@ class ProjectPackageManifest:
         _exact_tuple(self.documents, code="PROJECT.PACKAGE.MANIFEST_INVALID")
         if not 1 <= len(self.documents) <= MAX_PROJECT_DOCUMENTS:
             _fail("PROJECT.PACKAGE.LIMIT_EXCEEDED")
+        # Product package profiles are a closed set. ProjectOrigin itself stays
+        # descriptive so carrier-neutral workspace models remain independent.
+        if (self.origin_kind, self.origin_profile) not in {
+            ("single_file", "localcat-json-v1"),
+            ("single_file", "explicit-single-file-v1"),
+            ("directory", "explicit-selected-files-v1"),
+        }:
+            _fail("PROJECT.PACKAGE.FORMAT_UNSUPPORTED")
+        if (
+            self.origin_kind == "single_file" and len(self.documents) != 1
+            or self.origin_kind == "directory" and len(self.documents) < 2
+        ):
+            _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
         if any(type(item) is not ProjectPackageDocumentEntry for item in self.documents):
             _fail("PROJECT.PACKAGE.MANIFEST_INVALID")
         if tuple(item.order for item in self.documents) != tuple(range(len(self.documents))):

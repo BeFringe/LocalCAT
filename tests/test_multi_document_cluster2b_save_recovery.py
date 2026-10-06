@@ -2707,7 +2707,14 @@ class Cluster2BReaderOnlyAndAtomicityBoundaryTests(unittest.TestCase):
                 portable_root_ref="book.xlsx",
             ),
         )
-        workbook_service = _service(module, workbook, baseline)
+        # The descriptor model is intentionally unsupported by product intake;
+        # it must not acquire an explicit-selected-files source binding.
+        workbook_service = module.ProjectSaveService(
+            ProjectWorkspaceService(
+                workbook, None, session_id="save-session", revision=41,
+            ),
+            baseline=_baseline_contract(module, baseline),
+        )
         workbook_document = workbook.documents[0]
         workbook_ports = (
             AttrOnlyWriter(workbook_document),
