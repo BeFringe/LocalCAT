@@ -51,7 +51,7 @@
   - _Boundary: RpyTextRules_
 
 - [ ] 3. 完成单文件桌面闭环并准备嵌套导出
-- [ ] 3.1 接入已知 provider 配置与产品组合
+- [x] 3.1 接入已知 provider 配置与产品组合
   - 设备配置仅启停 allowlisted provider；建 surface 前排除禁用项，避免阻断内建格式。
   - 完成时，禁用/版本不兼容时 RPY 不可用而 JSON/TXT/PO/POT 仍工作，配置不含模块路径或私有项目内容。
   - _Requirements: 1.1, 1.3, 1.4_

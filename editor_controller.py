@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from capability_host import MatcherHandoffSnapshot
 from configured_term_adapter import ConfiguredTermAdapter
+from project_codec_settings import ProjectCodecRuntime
 from editor_contracts import (
     BatchOperationReport,
     BatchUndoState,
@@ -1240,15 +1241,19 @@ class EditorController:
         tm_adapter: EditorTMAdapter | None = None,
         workspace_package_service: ProjectPackageService | None = None,
         workspace_file_system: object | None = None,
+        project_codec_runtime: ProjectCodecRuntime | None = None,
     ) -> None:
         if tm_adapter is not None and type(tm_adapter) is not EditorTMAdapter:
             raise TypeError("TM adapter must be EditorTMAdapter")
+        if project_codec_runtime is not None and type(project_codec_runtime) is not ProjectCodecRuntime:
+            raise TypeError("project codec runtime must be ProjectCodecRuntime")
         if (
             workspace_package_service is not None
             and type(workspace_package_service) is not ProjectPackageService
         ):
             raise TypeError("workspace package service must be ProjectPackageService")
         self.repository = repository
+        self.project_codec_runtime = project_codec_runtime
         self.workspace_state = workspace_state or WorkspaceStateRepository(
             repository.config_dir
         )
@@ -6622,9 +6627,10 @@ def compose_project_enabled_editor_controller(
     *,
     tm_adapter: EditorTMAdapter | None = None,
 ) -> EditorController:
-    """Compose Project-owned Windows filesystem ports at the Application edge."""
+    """Compose Project filesystem ports and configured codecs at the Application edge."""
 
     from platform_fs import compose_platform_file_backend
+    from project_codec_settings import compose_project_codec_runtime
 
     backend = compose_platform_file_backend(repository.config_dir)
     return EditorController(
@@ -6632,6 +6638,7 @@ def compose_project_enabled_editor_controller(
         tm_adapter=tm_adapter,
         workspace_package_service=ProjectPackageService(backend=backend),
         workspace_file_system=backend,
+        project_codec_runtime=compose_project_codec_runtime(repository.config_dir),
     )
 
 if __name__ == "__main__":

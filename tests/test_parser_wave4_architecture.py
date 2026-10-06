@@ -72,6 +72,7 @@ _EXPECTED_MIGRATED_APPLICATION_FACADES = frozenset(
 )
 _EXPECTED_DIRECT_SURFACE_CONSUMERS = frozenset(
     {
+        "project_codec_settings",
         "editor_project",
         "editor_project_workspace_adapter",
         "project_workspace_intake",
@@ -137,6 +138,7 @@ _FACADE_CALL_INVENTORY = {
 # migrated grammar primitive must be classified here or rejected by Wave 4.
 _KNOWN_NON_PARSER_GRAMMAR_MODULES = frozenset(
     {
+        "project_codec_settings",  # Device settings JSON, never project input grammar.
         # Existing Windows delivery (ADR-028) and TM artifact owners use
         # their own JSON evidence/configuration grammars, not project codecs.
         "frozen_candidate",
@@ -726,6 +728,22 @@ def _unclassified_grammar_modules(
     return owners - classified
 
 
+def _product_provider_import_hits(modules: dict[str, SourceModule]) -> set[tuple[str, str]]:
+    """Only the named Application composition may import the provider symbol."""
+    hits = set()
+    for name, module in modules.items():
+        for target in _module_import_targets(module):
+            if module_matches_prefix(target, "parser_rpy_codec"):
+                if (name, target) != ("project_codec_settings", "parser_rpy_codec.RpyProvider"):
+                    hits.add((name, target))
+            elif name == "project_codec_settings" and any(
+                module_matches_prefix(target, prefix) for prefix in _EXPECTED_PARSER_MODULES
+                if prefix not in {"parser_contracts", "parser_composition"}
+            ):
+                hits.add((name, target))
+    return hits
+
+
 def _matches_reserved_engine_store_family(module_name: str) -> bool:
     """Match fixed Engine/Store namespaces plus top-level helper suffixes."""
 
@@ -840,6 +858,24 @@ def _defined_class_names(modules: dict[str, SourceModule]) -> dict[str, set[str]
 
 
 class Wave4ArchitectureGuardSelfTests(unittest.TestCase):
+    def test_product_provider_edge_rejects_grammar_imports_and_other_consumers(self) -> None:
+        allowed = "from parser_rpy_codec import RpyProvider as Provider\n"
+        self.assertEqual(_product_provider_import_hits({
+            "project_codec_settings": SourceModule("project_codec_settings", allowed),
+        }), set())
+        for name, source in (
+            ("editor_controller", allowed),
+            ("parser_composition", allowed),
+            ("project_package", allowed),
+            ("rpy_project_adapter", allowed),
+            ("project_codec_settings", "from parser_rpy_codec import parse_tl\n"),
+            ("project_codec_settings", "from parser_source import SealedSourceSnapshot\n"),
+            ("project_codec_settings", "from parser_localcat_codec import LocalcatJsonCodec\n"),
+            ("project_codec_settings", "import importlib\nimportlib.import_module('parser_rpy_codec')\n"),
+        ):
+            with self.subTest(name=name, source=source):
+                self.assertTrue(_product_provider_import_hits({name: SourceModule(name, source)}))
+
     def test_rpy_private_json_owner_does_not_allow_parallel_adapter_grammar(self) -> None:
         grammar = "import json\njson.loads('{}')\njson.dumps({})\n"
         owner = {"parser_rpy_codec": SourceModule("parser_rpy_codec", grammar)}
@@ -1257,12 +1293,11 @@ class Wave4ProductionArchitectureTests(unittest.TestCase):
         self.assertEqual(
             owners_by_codec,
             {
-                # Task 2.1 owns lexical facts only; product registration is a
-                # separate RPY task. No consumer may import this codec yet.
-                codec: set() if codec == "parser_rpy_codec" else {"parser_composition"}
+                codec: {"project_codec_settings"} if codec == "parser_rpy_codec" else {"parser_composition"}
                 for codec in PARSER_CODEC_PREFIXES
             },
         )
+        self.assertEqual(_product_provider_import_hits(self.modules), set())
 
     def test_each_migrated_format_has_one_parser_grammar_owner(self) -> None:
         # The new JSON grammar is only RPY's opaque private member; keep the

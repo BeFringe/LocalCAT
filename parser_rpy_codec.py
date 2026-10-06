@@ -12,7 +12,12 @@ import json
 from typing import Callable, Iterator
 
 from parser_contracts import (
-    CodecIdentity, FormatId, IssueSeverity, ParseIssue, ParsedSegment, RawSpeaker,
+    CodecCapabilities, CodecDescriptor, CodecIdentity, ContractViolation,
+    DocumentHeader, EffectivePurpose, FOUNDATION_GUARDED_ISSUE_CODES,
+    FormatId, InputConsumptionPolicy, IssueSeverity, LimitProfile,
+    OpaqueSourceState, ParseIssue, ParsedSegment, RawParseEvent, RawSpeaker,
+    ReadRequest, RoundTripRequest, SnapshotCursorLease, SourceStateLimits,
+    SourceStateRequest,
     PreparedFormatBytes, RoundTripLimits, RoundTripSegmentEdit,
     TargetPresence, TranslationState,
 )
@@ -775,3 +780,116 @@ def prepare_round_trip_bytes(raw: bytes, payload: bytes,
         source_fingerprint=hashlib.sha256(raw).hexdigest(),
         output_fingerprint=hashlib.sha256(output).hexdigest(), payload=output,
     )
+
+
+class RpyProvider:
+    provider_id = 'localcat.rpy'
+    provider_version = '1'
+
+    def descriptors(self) -> tuple[CodecDescriptor, ...]:
+        return (RPY_DESCRIPTOR,)
+
+
+def _lease_bytes(source: SnapshotCursorLease, limits: RpyLexicalLimits) -> bytes:
+    # A bounded complete read proves EOF to Foundation before any grammar runs.
+    raw = source.read(limits.max_input_bytes + 1)
+    if len(raw) > limits.max_input_bytes:
+        raise _private_error('input byte limit exceeded', 'limit-exceeded')
+    if source.read(1):
+        raise _private_error('input byte limit exceeded', 'limit-exceeded')
+    return raw
+
+
+def _lexical_limits(profile: LimitProfile) -> RpyLexicalLimits:
+    return RpyLexicalLimits(
+        max_input_bytes=min(profile.max_input_bytes, 16 * _MIB),
+        max_slots=min(profile.max_records, profile.max_materialized_records, 100_000),
+        max_string_bytes=min(profile.max_decoded_field_chars, _MIB),
+    )
+
+
+class RpyCodec:
+    """Consume a live lease; retain neither that lease nor caller authority."""
+
+    def __init__(self) -> None:
+        self.descriptor = RPY_DESCRIPTOR
+
+    def iter_raw(self, source: SnapshotCursorLease, request: ReadRequest) -> Iterator[RawParseEvent]:
+        try:
+            limits = _lexical_limits(self.descriptor.limit_profile)
+            raw = _lease_bytes(source, limits)
+            parsed = parse_tl(raw, limits=limits, check_cancelled=lambda: source.read(0))
+        except RpyInputError as error:
+            yield error.issue
+            return
+        yield DocumentHeader('Ren\'Py TL', None, parsed.lexical.language, ())
+        yield from parsed.records
+
+    def prepare_source_state(self, request: SourceStateRequest) -> OpaqueSourceState:
+        try:
+            limits = _lexical_limits(request.limit_profile)
+            raw = _lease_bytes(request.source, limits)
+            payload = build_private_payload(
+                raw, limits=limits,
+                max_private_bytes=min(request.limits.max_opaque_payload_bytes, 32 * _MIB),
+                check_cancelled=lambda: request.source.read(0),
+            )
+        except RpyInputError as error:
+            raise ContractViolation(error.issue.code, error.issue.safe_summary) from None
+        return OpaqueSourceState(self.descriptor.identity, self.descriptor.format_id,
+                                 'rpy-roundtrip-v1', payload)
+
+    def prepare(self, request: RoundTripRequest) -> PreparedFormatBytes:
+        limits = _lexical_limits(request.limit_profile)
+        raw = _lease_bytes(request.source, limits)
+        try:
+            return prepare_round_trip_bytes(
+                raw, request.token.opaque_payload, request.edits,
+                limits=limits, round_trip_limits=request.limits,
+                check_cancelled=lambda: request.source.read(0),
+            )
+        except RpyInputError as error:
+            # Fatal data is validated and rejected by Foundation before it can
+            # issue publication authority; preserve exact format locations.
+            return PreparedFormatBytes(
+                self.descriptor.identity, self.descriptor.format_id,
+                hashlib.sha256(raw).hexdigest(), hashlib.sha256(b'').hexdigest(),
+                b'', (error.issue,),
+            )
+
+
+RPY_DESCRIPTOR = CodecDescriptor(
+    identity=RPY_CODEC_IDENTITY,
+    purpose=EffectivePurpose.PROJECT_DOCUMENT,
+    format_id=FormatId('renpy-tl-v1'),
+    extensions=('.rpy',), mime_types=(), sniff_prefixes=(),
+    capabilities=CodecCapabilities(
+        readable=True, validatable=True, canonical_write=False,
+        source_round_trip_write=True, streaming_input=False,
+        iterator_view=True, materialized_view=True, format_profile='renpy-tl-v1',
+    ),
+    limit_profile=LimitProfile(
+        profile_id='renpy-tl-v1', profile_version=1,
+        max_input_bytes=16 * _MIB, max_decoded_field_chars=_MIB,
+        max_records=100_000, max_materialized_records=100_000,
+        max_retained_issues=256,
+        declared_issue_codes=tuple(sorted(set(FOUNDATION_GUARDED_ISSUE_CODES) | {
+            'PARSER.RPY.' + category for category in (
+                'AMBIGUOUS_SLOT', 'DUPLICATE_IDENTITY', 'INVALID_EDITS',
+                'INVALID_ENCODING', 'INVALID_ESCAPE', 'INVALID_SOURCE',
+                'LIMIT_EXCEEDED', 'MIXED_LANGUAGE', 'PLACEHOLDER_MISMATCH',
+                'PRIVATE_STALE', 'UNSUPPORTED_SYNTAX',
+            )
+        })),
+        max_metadata_entries_per_container=16,
+        max_metadata_decoded_chars_per_container=_MIB,
+        max_metadata_decoded_chars_total=16 * _MIB,
+        max_structure_depth=8,
+    ),
+    input_consumption_policy=InputConsumptionPolicy.SEALED_BYTES_EOF,
+    reader_factory=RpyCodec, canonical_serializer_factory=None,
+    round_trip_serializer_factory=RpyCodec,
+    round_trip_limits=RoundTripLimits(32 * _MIB, 32 * _MIB),
+    source_state_factory=RpyCodec,
+    source_state_limits=SourceStateLimits(32 * _MIB),
+)
