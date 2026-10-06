@@ -42,7 +42,7 @@
   - 完成时，重新读取 source 能复证映射；伪造/重叠/越界 span、版本不符和摘要错误均拒绝。
   - _Requirements: 3.1, 3.3, 4.4, 7.1_
   - _Boundary: RpyCodec private payload_
-- [ ] 2.4 实现译文转义与占位符保护
+- [x] 2.4 实现译文转义与占位符保护
   - 无修改复用原字节；修改仅编码目标跨度，检查 interpolation 多重集合和 tag 嵌套，不执行表达式。
   - 完成时，golden 覆盖引号、反斜杠、换行、Unicode、BOM/CRLF 和空目标；错误标签/新增表达式有定位诊断。
   - _Requirements: 4.2, 4.3, 4.4, 7.3_

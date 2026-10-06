@@ -317,6 +317,17 @@ class SyntaxAuthorityTests(unittest.TestCase):
                 findings = self.policy.check_module(SourceModule("parser_rpy_codec", f"import {target}\n"))
                 self.assertIn("rpy_codec.allowed_dependencies", {item.rule_id for item in findings})
 
+    def test_rpy_text_rules_are_a_stdlib_leaf_and_codec_only_consumes_leaf(self):
+        for name in ('collections', 'typing'):
+            self.assertEqual(self.policy.check_module(SourceModule('rpy_text_rules', f'import {name}\n')), ())
+        for name in ('parser_contracts', 'parser_rpy_codec', 'project_package', 'PySide6', 'tm_engine'):
+            with self.subTest(name=name):
+                findings = self.policy.check_module(SourceModule('rpy_text_rules', f'import {name}\n'))
+                self.assertIn('rpy_text_rules.allowed_dependencies', {item.rule_id for item in findings})
+        self.assertEqual(self.policy.check_module(SourceModule('parser_rpy_codec', 'import rpy_text_rules\n')), ())
+        findings = self.policy.check_module(SourceModule('parser_rpy_codec', 'import rpy_shadow_rules\n'))
+        self.assertIn('rpy_codec.allowed_dependencies', {item.rule_id for item in findings})
+
     def test_import_aliased_grammar_call_detects_a_second_parser(self) -> None:
         violations = self.policy.check_module(
             SourceModule(
