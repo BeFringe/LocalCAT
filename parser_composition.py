@@ -38,6 +38,8 @@ from parser_contracts import (
     RoundTripRequest,
     RoundTripSegmentEdit,
     RoundTripTokenEnvelope,
+    OpaqueSourceState,
+    SourceStateRequest,
     SelectionFailure,
     SelectionRequest,
     SourceReference,
@@ -61,6 +63,7 @@ from parser_source import (
     GuardedParseSession as _GuardedParseSession,
     MaterializedParseResult as _MaterializedParseResult,
     ParserSourceError as _ParserSourceError,
+    ParserSessionError as _ParserSessionError,
     SealedSourceSnapshot as _SealedSourceSnapshot,
     atomic_write_bytes as _atomic_write_bytes,
     atomic_write_bound_bytes as _atomic_write_bound_bytes,
@@ -96,6 +99,14 @@ class RoundTripPreparationError(ParserApplicationError):
     ) -> None:
         self.diagnostics = diagnostics
         super().__init__(code, safe_summary)
+
+
+class SourceHandoffError(ParserApplicationError):
+    """No source handoff was issued; diagnostics contain safe positions only."""
+
+    def __init__(self, code: str, diagnostics: tuple[ParseIssue, ...]) -> None:
+        self.diagnostics = diagnostics
+        super().__init__(code, "source verification did not complete")
 
 
 def _rooted_backend(
@@ -295,6 +306,72 @@ class ParserApplicationSurface:
         request: SelectionRequest,
     ) -> CodecDescriptor | SelectionFailure:
         return self._registry.select(request)
+
+    def materialize_handoff(self, opened: OpenedParserInput) -> VerifiedSourceHandoff:
+        """Issue complete source/records/private data once from one live sealed input."""
+        if type(opened) is not OpenedParserInput or opened not in self._opened_inputs:
+            raise ParserApplicationError("PARSER.SOURCE.UNVERIFIED", "input belongs to another surface")
+        with opened._handoff_lock:
+            _round_trip_checkpoint(opened)
+            if opened._handoff_claimed:
+                raise ParserApplicationError("PARSER.SOURCE.UNVERIFIED", "source handoff already consumed")
+            opened._handoff_claimed = True
+        descriptor = opened.descriptor
+        self._registry._require_registered_descriptor(descriptor)
+        try:
+            materialized = opened.materialize()
+        except _ParserSessionError as error:
+            raise SourceHandoffError(error.code, tuple(
+                replace(issue, safe_summary="the selected codec rejected source verification")
+                for issue in error.diagnostics
+            )) from None
+        materialized = replace(materialized, issues=tuple(
+            replace(issue, safe_summary="the selected codec reported a source diagnostic")
+            for issue in materialized.issues
+        ))
+        terminal = materialized.terminal
+        _round_trip_checkpoint(opened, terminal)
+        opened._snapshot.reprove_content(terminal.source, cancellation=opened._cancellation)
+        private = None
+        if descriptor.source_state_factory is not None:
+            codec = self._registry.create_source_state_codec(descriptor)
+            _round_trip_checkpoint(opened, terminal)
+            lease = opened._snapshot.lease(descriptor, cancellation=opened._cancellation)
+            try:
+                request = SourceStateRequest(
+                    descriptor.identity, descriptor.format_id, lease, terminal,
+                    descriptor.source_state_limits, descriptor.limit_profile,
+                )
+                try:
+                    private = codec.prepare_source_state(request)
+                except ContractViolation as error:
+                    code = error.code if error.code in descriptor.declared_issue_codes else "PARSER.PLUGIN.ISSUE_UNDECLARED"
+                    raise ParserApplicationError(code, "source state preparation rejected") from None
+                except Exception:
+                    raise ParserApplicationError("PARSER.SOURCE.READ_FAILED", "source state preparation failed") from None
+                _round_trip_checkpoint(opened, terminal)
+                if (lease.closed or not lease.consumption_proved
+                        or type(private) is not OpaqueSourceState
+                        or private.codec_identity != descriptor.identity
+                        or private.format_id != descriptor.format_id):
+                    raise ParserApplicationError("PARSER.SOURCE.UNVERIFIED", "source state binding is invalid")
+                if len(private.payload) > descriptor.source_state_limits.max_opaque_payload_bytes:
+                    raise ParserApplicationError("PARSER.LIMIT.OPAQUE_PAYLOAD", "source state exceeds its byte limit")
+            finally:
+                lease.close()
+        lease = opened._snapshot.lease(descriptor, cancellation=opened._cancellation)
+        try:
+            payload = lease.read(descriptor.limit_profile.max_input_bytes + 1)
+            _round_trip_checkpoint(opened, terminal)
+            if (lease.closed or not lease.consumption_proved
+                    or len(payload) != terminal.source.byte_count
+                    or hashlib.sha256(payload).hexdigest() != terminal.source.content_sha256):
+                raise ParserApplicationError("PARSER.SOURCE.UNVERIFIED", "source bytes do not match verified terminal")
+            with opened._handoff_lock:
+                _round_trip_checkpoint(opened, terminal)
+                return VerifiedSourceHandoff(materialized, payload, private)
+        finally:
+            lease.close()
 
     def open_input(
         self,
@@ -981,6 +1058,15 @@ class PreparedCanonicalWrite:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedSourceHandoff:
+    """Data-only copy of one fully verified source; grants no writer authority."""
+
+    materialized: _MaterializedParseResult
+    source_bytes: bytes
+    private_state: OpaqueSourceState | None
+
+
 class OpenedParserInput:
     """Own one sealed snapshot while delegating all verification to Foundation."""
 
@@ -993,6 +1079,8 @@ class OpenedParserInput:
         "_primed_reader",
         "_closed",
         "_round_trip_preparations",
+        "_handoff_claimed",
+        "_handoff_lock",
         "__weakref__",
     )
 
@@ -1019,6 +1107,8 @@ class OpenedParserInput:
         self._cancellation = cancellation
         self._primed_reader = primed_reader
         self._closed = False
+        self._handoff_claimed = False
+        self._handoff_lock = threading.RLock()
         self._round_trip_preparations: WeakSet[PreparedRoundTripWrite] = WeakSet()
 
     @property
@@ -1092,9 +1182,10 @@ class OpenedParserInput:
         )
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._handoff_lock:
+            if self._closed:
+                return
+            self._closed = True
         self._primed_reader = None
         close_error = None
         try:

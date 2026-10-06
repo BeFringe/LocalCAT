@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import stat
 import struct
 
-from parser_composition import create_parser_application_surface
+from parser_composition import ParserApplicationSurface, SourceHandoffError, create_parser_application_surface
 from parser_contracts import (
     ContractViolation,
     DocumentHeader,
@@ -29,6 +29,7 @@ from parser_contracts import (
     ParsedSegment,
     ReadRequest,
     SelectionFailure,
+    SelectionHints,
     SelectionRequest,
     SourceReference,
     SourceSnapshotIdentity,
@@ -45,6 +46,8 @@ from platform_fs_contracts import (
 )
 from project_workspace_contracts import (
     MAX_PROJECT_DOCUMENTS,
+    CodecPrivateMemberData,
+    CodecPrivateMemberRef,
     EditingOverlayEntry,
     OriginBinding,
     OriginBindingDocument,
@@ -81,6 +84,16 @@ _FORMAT_BY_SUFFIX = {
 
 def _fail(code: str) -> None:
     raise ProjectWorkspaceError(code)
+
+
+class SelectedProjectDocumentsError(ProjectWorkspaceError):
+    """Safe Parser diagnostics for the failed selected document, without body data."""
+
+    def __init__(self, parser_error: SourceHandoffError, document_order: int) -> None:
+        object.__setattr__(self, "parser_code", parser_error.code)
+        object.__setattr__(self, "diagnostics", parser_error.diagnostics)
+        object.__setattr__(self, "document_order", document_order)
+        super().__init__("PROJECT.INTAKE.INPUT_INVALID")
 
 
 def _text(value: object, *, allow_empty: bool = False) -> str:
@@ -178,10 +191,12 @@ def _modified_time_ns(snapshot: EntrySnapshot) -> int:
     _fail("PROJECT.INTAKE.SOURCE_UNSAFE")
 
 
-def _snapshot_digest(authority: BoundRegularFile, expected: EntrySnapshot) -> str:
+def _snapshot_digest(authority: BoundRegularFile, expected: EntrySnapshot, cancellation=None) -> str:
     digest = hashlib.sha256()
     offset = 0
     while offset < expected.byte_count:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         block = authority.read_at(
             offset,
             min(64 * 1024, expected.byte_count - offset),
@@ -389,6 +404,7 @@ def _document_from_materialized(
     format_id: FormatId,
     opened,
     materialized,
+    private_member: CodecPrivateMemberRef | None = None,
 ) -> ProjectDocument:
     descriptor = opened.descriptor
     source_identity = opened.source_identity
@@ -460,7 +476,7 @@ def _document_from_materialized(
         source_snapshot_digest=source_identity.content_sha256,
         source_segments=tuple(source_segments),
         editing_overlay=tuple(overlays),
-        codec_private_member=None,
+        codec_private_member=private_member,
     )
 
 
@@ -530,13 +546,166 @@ def _issue_staged(
     )
 
 
-def stage_selected_project_documents_with_file_system(
+class _RetainedSelectedSource:
+    """Application ownership of original rooted inputs until initial publication."""
+
+    def __init__(self, backend, root, files, staged, cancellation):
+        self._backend = backend
+        self._root = root
+        self._files = files
+        self._staged = staged
+        self._cancellation = cancellation
+
+    @property
+    def closed(self) -> bool:
+        return self._root is None
+
+    def reprove(self) -> None:
+        if self.closed:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        try:
+            if self._cancellation is not None:
+                self._cancellation.raise_if_cancelled()
+            self._root.reprove()
+            binding = self._staged.origin_binding
+            path = Path(binding.absolute_root)
+            named_root = self._backend.bind_root(path)
+            try:
+                for item, identity in zip(self._files, self._staged.source_identities, strict=True):
+                    if (item.authority.snapshot() != item.initial_snapshot
+                            or _snapshot_digest(item.authority, item.initial_snapshot, self._cancellation)
+                            != identity.content_sha256):
+                        _fail("PROJECT.INTAKE.SOURCE_STALE")
+                    rebound = self._backend.open_regular(named_root, _relative_path(item.source_ref))
+                    try:
+                        if rebound.snapshot() != item.initial_snapshot:
+                            _fail("PROJECT.INTAKE.SOURCE_STALE")
+                    finally:
+                        rebound.close()
+                named_root.reprove()
+                self._root.reprove()
+                if os.name != "nt":
+                    _revalidate_root(path, binding.root_device, binding.root_inode)
+                if self._cancellation is not None:
+                    self._cancellation.raise_if_cancelled()
+            finally:
+                named_root.close()
+        except Exception:
+            self.close()
+            raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_STALE") from None
+
+    def close(self) -> None:
+        root, files = self._root, self._files
+        self._root, self._files = None, ()
+        try:
+            for item in files:
+                item.close()
+        finally:
+            if root is not None:
+                root.close()
+
+
+class PreparedSelectedProjectDocuments:
+    """Closeable intake owner for editing before first package Save As.
+
+    `staged` remains immutable data. Edits live solely in the caller's Project
+    save service. A destination failure can be retried while `closed` is false;
+    source drift/cancellation invalidates this owner. Durable publication or
+    explicit abandonment releases original source handles and opaque bytes.
+    """
+
+    __slots__ = ("_staged", "_private_sources", "_source")
+
+    def __init__(self, staged, private_sources, source):
+        self._staged = staged
+        self._private_sources = private_sources
+        self._source = source
+
+    @property
+    def staged(self) -> StagedSelectedProjectDocuments:
+        return self._staged
+
+    @property
+    def closed(self) -> bool:
+        return self._source.closed
+
+    def close(self) -> None:
+        self._private_sources = ()
+        self._source.close()
+
+    def save_workspace(self, package_service, save_service, destination: Path):
+        if self.closed:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        workspace = save_service.workspace_service.workspace
+        original = self._staged.workspace
+        expected = {item.document_id: item for item in original.documents}
+        if (workspace.project_id != original.project_id or workspace.origin != original.origin
+                or workspace.persistence_kind != original.persistence_kind
+                or save_service.workspace_service.origin_binding != self._staged.origin_binding
+                or len(workspace.documents) != len(original.documents)):
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        for document in workspace.documents:
+            old = expected.get(document.document_id)
+            if old is None or replace(document, editing_overlay=old.editing_overlay,
+                                      display_name=old.display_name, order=old.order) != old:
+                _fail("PROJECT.INTAKE.SOURCE_STALE")
+        try:
+            result = package_service.save_workspace(
+                save_service, destination, codec_private_sources=self._private_sources,
+                source_reproof=self._source,
+            )
+            if result.receipt is not None and result.receipt.durable:
+                self.close()
+            return result
+        finally:
+            if self.closed:
+                self._private_sources = ()
+
+    def __enter__(self):
+        if self.closed:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def prepare_selected_project_documents(
+    root: Path, selected_paths: tuple[Path, ...], request: SelectedProjectDocumentsRequest,
+    *, parser_surface: ParserApplicationSurface | None = None,
+    file_system: RootedFileSystem | None = None, cancellation=None,
+) -> PreparedSelectedProjectDocuments:
+    """Retain a verified configured intake through editing and initial save."""
+
+    if file_system is None:
+        from platform_fs import compose_platform_file_backend
+
+        try:
+            file_system = compose_platform_file_backend(_absolute_root(root))
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_UNSAFE") from error
+    return _stage_selected_project_documents(
+        root, selected_paths, request, file_system=file_system,
+        parser_surface=parser_surface, cancellation=cancellation, retain_source=True,
+    )
+
+
+def _stage_selected_project_documents(
     root: Path,
     selected_paths: tuple[Path, ...],
     request: SelectedProjectDocumentsRequest,
     *,
     file_system: RootedFileSystem,
-) -> StagedSelectedProjectDocuments:
+    parser_surface: ParserApplicationSurface | None = None,
+    cancellation=None,
+    retain_source: bool = False,
+) -> StagedSelectedProjectDocuments | PreparedSelectedProjectDocuments:
     """Stage exactly the selected project documents without scanning the root."""
 
     if type(selected_paths) is not tuple:
@@ -553,11 +722,23 @@ def stage_selected_project_documents_with_file_system(
     selected = tuple(_selected_ref(root_path, path) for path in selected_paths)
     source_refs = tuple(item[0] for item in selected)
     validate_portable_ref_collection(source_refs, allow_exact_duplicates=False)
+    surface = parser_surface if parser_surface is not None else create_parser_application_surface()
+    if type(surface) is not ParserApplicationSurface:
+        raise TypeError("parser_surface must be exact ParserApplicationSurface")
     formats: list[FormatId] = []
     for source_ref in source_refs:
-        format_id = _FORMAT_BY_SUFFIX.get(Path(source_ref).suffix.lower())
+        suffix = Path(source_ref).suffix.lower()
+        format_id = _FORMAT_BY_SUFFIX.get(suffix)
         if format_id is None:
-            _fail("PROJECT.INTAKE.INPUT_INVALID")
+            try:
+                descriptor = surface.select(SelectionRequest(
+                    EffectivePurpose.PROJECT_DOCUMENT, hints=SelectionHints(extensions=(suffix,)),
+                ))
+            except (ContractViolation, ValueError, TypeError):
+                _fail("PROJECT.INTAKE.INPUT_INVALID")
+            if type(descriptor) is SelectionFailure:
+                _fail("PROJECT.INTAKE.INPUT_INVALID")
+            format_id = descriptor.format_id
         formats.append(format_id)
 
     backend = file_system
@@ -566,6 +747,8 @@ def stage_selected_project_documents_with_file_system(
     root_authority = None
     bound: list[_BoundSelectedFile] = []
     try:
+        if cancellation is not None:
+            cancellation.raise_if_cancelled()
         root_authority = backend.bind_root(root_path)
         root_authority.reprove()
         if os.name == "nt":
@@ -585,11 +768,17 @@ def stage_selected_project_documents_with_file_system(
         )
         observed_file_ids: set[FileObjectIdentity] = set()
         for source_ref, selected_path in selected:
+            if cancellation is not None:
+                cancellation.raise_if_cancelled()
             authority = backend.open_regular(
                 root_authority,
                 _relative_path(source_ref),
             )
-            snapshot = authority.snapshot()
+            try:
+                snapshot = authority.snapshot()
+            except BaseException:
+                authority.close()
+                raise
             file_id = snapshot.identity
             if snapshot.identity.link_count != 1 or not snapshot.reparse_free:
                 authority.close()
@@ -624,8 +813,8 @@ def stage_selected_project_documents_with_file_system(
                 ):
                     _fail("PROJECT.RECONCILE.INPUT_INVALID")
 
-        surface = create_parser_application_surface()
         documents: list[ProjectDocument] = []
+        private_sources: list[CodecPrivateMemberData] = []
         source_identities: list[SourceSnapshotIdentity] = []
         binding_documents: list[OriginBindingDocument] = []
         for order, (bound_file, format_id) in enumerate(
@@ -641,17 +830,32 @@ def stage_selected_project_documents_with_file_system(
                     ),
                     SelectionRequest(purpose=purpose, format_id=format_id),
                     ReadRequest(purpose=purpose, format_id=format_id),
+                    cancellation=cancellation,
                 )
                 if type(opened) is SelectionFailure:
                     _fail("PROJECT.INTAKE.INPUT_INVALID")
                 assert not isinstance(opened, SelectionFailure)
                 with opened:
-                    materialized = opened.materialize()
+                    private = None
+                    if retain_source:
+                        handoff = surface.materialize_handoff(opened)
+                        materialized = handoff.materialized
+                        private = handoff.private_state
+                    else:
+                        materialized = opened.materialize()
                     source_identity = opened.source_identity
                     document_id = assigned_ids.get(
                         bound_file.source_ref,
                         derive_explicit_selected_document_id(bound_file.source_ref),
                     )
+                    private_member = None
+                    if private is not None:
+                        digest = hashlib.sha256(private.payload).hexdigest()
+                        private_member = CodecPrivateMemberRef(
+                            f"codec-private/{document_id}/{digest}.bin", digest, len(private.payload),
+                            private.codec_identity, private.profile_version,
+                        )
+                        private_sources.append(CodecPrivateMemberData(document_id, private_member, private.payload))
                     document = _document_from_materialized(
                         document_id=document_id,
                         source_ref=bound_file.source_ref,
@@ -659,9 +863,12 @@ def stage_selected_project_documents_with_file_system(
                         format_id=format_id,
                         opened=opened,
                         materialized=materialized,
+                        private_member=private_member,
                     )
             except ProjectWorkspaceError:
                 raise
+            except SourceHandoffError as error:
+                raise SelectedProjectDocumentsError(error, order) from None
             except ContractViolation as error:
                 raise ProjectWorkspaceError("PROJECT.INTAKE.INPUT_INVALID") from error
             expected = bound_file.initial_snapshot
@@ -796,9 +1003,20 @@ def stage_selected_project_documents_with_file_system(
             revision=binding_revision,
             documents=tuple(binding_documents),
         )
-        return _issue_staged(workspace, binding, tuple(source_identities))
+        staged = _issue_staged(workspace, binding, tuple(source_identities))
+        if retain_source:
+            retained = _RetainedSelectedSource(backend, root_authority, tuple(bound), staged, cancellation)
+            prepared = PreparedSelectedProjectDocuments(staged, tuple(private_sources), retained)
+            retained.reprove()
+            # Transfer ownership only after all validation and construction succeeds.
+            root_authority = None
+            bound = []
+            return prepared
+        return staged
     except ProjectWorkspaceError:
         raise
+    except ContractViolation as error:
+        raise ProjectWorkspaceError("PROJECT.INTAKE.INPUT_INVALID") from error
     except PlatformFileError as error:
         raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_UNSAFE") from error
     except OSError as error:
@@ -808,6 +1026,13 @@ def stage_selected_project_documents_with_file_system(
             item.close()
         if root_authority is not None:
             root_authority.close()
+
+
+def stage_selected_project_documents_with_file_system(
+    root: Path, selected_paths: tuple[Path, ...], request: SelectedProjectDocumentsRequest,
+    *, file_system: RootedFileSystem,
+) -> StagedSelectedProjectDocuments:
+    return _stage_selected_project_documents(root, selected_paths, request, file_system=file_system)
 
 
 def stage_selected_project_documents(

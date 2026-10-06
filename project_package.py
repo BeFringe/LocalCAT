@@ -21,7 +21,7 @@ import secrets
 import stat
 import struct
 import tempfile
-from typing import BinaryIO, Iterator
+from typing import BinaryIO, Iterator, Protocol, runtime_checkable
 import unicodedata
 import zipfile
 import zlib
@@ -68,6 +68,7 @@ from project_workspace_contracts import (
     MAX_SEGMENTS_PER_PROJECT,
     PROJECT_LIMIT_PROFILE_ID,
     CodecPrivateMemberRef,
+    CodecPrivateMemberData,
     EditingOverlayEntry,
     OriginBinding,
     ProjectDocument,
@@ -1271,21 +1272,20 @@ def _open_rooted_blob_path(
 class ProjectPackageBlobSource:
     document_id: str
     member_path: str
-    path: Path
+    path: Path | None
     expected_sha256: str
     expected_byte_count: int
-    _file_facts: _FileFacts = field(init=False, repr=False)
+    _file_facts: _FileFacts | None = field(init=False, default=None, repr=False)
     _platform_backend: PlatformFileBackend | None = field(
         default=None,
         repr=False,
         compare=False,
     )
+    _payload: bytes | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         validate_document_id(self.document_id)
         _validate_physical_member_name(self.member_path)
-        if not isinstance(self.path, Path) or not self.path.is_absolute():
-            _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
         validate_sha256(self.expected_sha256)
         _exact_nonnegative_int(
             self.expected_byte_count,
@@ -1293,6 +1293,17 @@ class ProjectPackageBlobSource:
         )
         if self.expected_byte_count > MAX_CODEC_PRIVATE_MEMBER_BYTES:
             _fail("PROJECT.PACKAGE.LIMIT_EXCEEDED")
+        if self._payload is not None:
+            if type(self._payload) is not bytes:
+                raise TypeError("blob payload must be exact bytes")
+            if self.path is not None or self._platform_backend is not None:
+                _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
+            if (len(self._payload) != self.expected_byte_count
+                    or hashlib.sha256(self._payload).hexdigest() != self.expected_sha256):
+                _fail("PROJECT.PACKAGE.DIGEST_MISMATCH")
+            return
+        if not isinstance(self.path, Path) or not self.path.is_absolute():
+            _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
         object.__setattr__(self, "path", _canonical_user_path(self.path))
         if os.name == "nt":
             backend = self._platform_backend
@@ -1342,7 +1353,21 @@ class ProjectPackageBlobSource:
             _platform_backend=backend,
         )
 
+    @classmethod
+    def from_bytes(
+        cls, *, document_id: str, member_path: str, payload: bytes,
+        expected_sha256: str, expected_byte_count: int,
+    ) -> ProjectPackageBlobSource:
+        """Bound immutable data; no path, codec, or executable capability."""
+
+        if type(payload) is not bytes:
+            raise TypeError("blob payload must be exact bytes")
+        return cls(document_id, member_path, None, expected_sha256,
+                   expected_byte_count, _payload=payload)
+
     def _blob(self) -> _Blob:
+        if self._payload is not None:
+            return _bytes_blob(self.member_path, self._payload)
         if self._platform_backend is not None:
             def open_rooted_source() -> BinaryIO:
                 return _open_rooted_blob_path(
@@ -4897,6 +4922,59 @@ def _close_package_port(port: object) -> None:
             pass
 
 
+@runtime_checkable
+class ProjectPackageSourceReproof(Protocol):
+    """First-save retained source lease check; never publication authority."""
+
+    def reprove(self) -> None: ...
+
+
+class _SourceReprovedPackagePort:
+    """Keep first-source validation inside the existing save failure protocol."""
+
+    def __init__(self, port, source: ProjectPackageSourceReproof) -> None:
+        self._port = port
+        self._source = source
+        self._source_invalid = False
+
+    def __getattr__(self, name):
+        return getattr(self._port, name)
+
+    @property
+    def committed_opened(self):
+        return None if self._source_invalid else self._port.committed_opened
+
+    def _reprove(self) -> None:
+        try:
+            if self._source.reprove() is not None:
+                raise ValueError("source reproof must return None")
+        except Exception:
+            self._source_invalid = True
+            raise OSError("first-save source is no longer current") from None
+
+    def stage_candidate(self, **kwargs):
+        self._reprove()
+        return self._port.stage_candidate(**kwargs)
+
+    def arm_publication(self, handle):
+        self._reprove()
+        return self._port.arm_publication(handle)
+
+    def publish_candidate(self, handle):
+        self._reprove()
+        return self._port.publish_candidate(handle)
+
+    def readback_candidate(self, handle):
+        self._reprove()
+        result = self._port.readback_candidate(handle)
+        self._reprove()
+        return result
+
+    def commit_candidate(self, handle):
+        self._reprove()
+        return self._port.commit_candidate(handle)
+
+
 @dataclass(frozen=True, slots=True)
 class _ImportPlan:
     operation_id: str
@@ -5205,8 +5283,9 @@ class ProjectPackageService:
         save_service: ProjectSaveService,
         destination: Path,
         *,
-        codec_private_sources: tuple[ProjectPackageBlobSource, ...] = (),
+        codec_private_sources: tuple[ProjectPackageBlobSource | CodecPrivateMemberData, ...] = (),
         persistence_binding: ProjectPackagePersistenceBinding | None = None,
+        source_reproof: ProjectPackageSourceReproof | None = None,
     ) -> ProjectPackageExportResult:
         if type(save_service) is not ProjectSaveService:
             raise TypeError("save_service must be exact ProjectSaveService")
@@ -5222,13 +5301,37 @@ class ProjectPackageService:
                 _fail("PROJECT.PACKAGE.DESTINATION_STALE")
         elif persistence_binding is not None:
             raise TypeError("first package save must not supply a persistence binding")
+        if type(codec_private_sources) is not tuple:
+            raise TypeError("private sources must be an exact tuple")
+        normalized_private = []
+        documents = {item.document_id: item for item in save_service.workspace_service.workspace.documents}
+        for source in codec_private_sources:
+            if type(source) is CodecPrivateMemberData:
+                document = documents.get(source.document_id)
+                if document is None or document.codec_private_member != source.reference:
+                    _fail("PROJECT.PACKAGE.MEMBER_INVALID")
+                source = ProjectPackageBlobSource.from_bytes(
+                    document_id=source.document_id, member_path=source.reference.member_path,
+                    payload=source.payload, expected_sha256=source.reference.sha256,
+                    expected_byte_count=source.reference.byte_count,
+                )
+            if type(source) is not ProjectPackageBlobSource:
+                raise TypeError("private source must be exact blob source or neutral member data")
+            normalized_private.append(source)
+        if source_reproof is not None:
+            if (save_service.saved_workspace_snapshot is not None
+                    or not isinstance(source_reproof, ProjectPackageSourceReproof)
+                    or not callable(source_reproof.reprove)):
+                raise TypeError("source reproof requires a first-save source lease")
         port = _ProjectPackagePersistencePort(
             target,
             save_service.workspace_service.origin_binding,
-            codec_private_sources,
+            tuple(normalized_private),
             backend=self._backend_for(target),
             persistence_binding=persistence_binding,
         )
+        if source_reproof is not None:
+            port = _SourceReprovedPackagePort(port, source_reproof)
         try:
             report = save_service.save_workspace(port)
             receipt = self._export_receipt(

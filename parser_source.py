@@ -82,6 +82,10 @@ class ParserSourceError(ContractViolation):
 class ParserSessionError(ContractViolation):
     """Stable, body-safe failure that permanently denies session commit authority."""
 
+    def __init__(self, code: str, safe_summary: str, diagnostics: tuple[ParseIssue, ...] = ()) -> None:
+        self.diagnostics = diagnostics
+        super().__init__(code, safe_summary)
+
 
 class CancellationToken:
     """Thread-safe cancellation flag checked only at bounded Foundation seams."""
@@ -1561,6 +1565,9 @@ def materialize(
             issues=session.retained_issues,
             terminal=terminal,
         )
+    except ParserSessionError as error:
+        error.diagnostics = session.retained_issues
+        raise
     finally:
         close = getattr(iterator, "close", None)
         if callable(close):
