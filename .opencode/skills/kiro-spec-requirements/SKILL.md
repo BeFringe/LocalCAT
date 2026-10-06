@@ -63,12 +63,12 @@ After all research completes, synthesize findings in main context before generat
      - design = `Boundary Commitments`
      - tasks = `_Boundary:_`
    - If scope could be misread, add lightweight boundary context without introducing implementation or architecture ownership detail
-   - If this spec amends an existing spec, reintroduces previously excluded scope, or depends on an adjacent spec, populate `Scope Lineage` with the owning spec, exact prior scope reference, adjacent contracts, and approval status
+   - If this spec amends an existing spec, reintroduces previously excluded scope, or depends on an adjacent spec, populate `Scope Lineage` with the owning spec, exact prior scope reference, adjacent contracts, and observable scope differences
    - Keep this as a draft until the review gate passes; do not write `requirements.md` yet
 
 4. **Review Requirements Draft**:
    - Run the `Requirements Review Gate` from `rules/requirements-review-gate.md`
-   - Apply `.kiro/settings/rules/governance.md`; unresolved scope amendments remain explicit and cannot be treated as approved by generation
+   - Apply `.kiro/settings/rules/governance.md`; describe scope differences in the document, resolve required human decisions in the conversation, and keep approval metadata in `spec.json`; generation does not grant approval
    - Review coverage, EARS compliance, ambiguity, adjacent expectations, and scope boundaries before finalizing
    - If issues are local to the draft, repair the requirements and review again
    - Keep the review bounded to at most 2 repair passes

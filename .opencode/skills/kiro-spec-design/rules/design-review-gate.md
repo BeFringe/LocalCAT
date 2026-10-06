@@ -29,8 +29,8 @@ Before writing `design.md`, review the draft design and repair local issues unti
 ## Governance Readiness Review
 
 - `Governance Impact` must name applicable Steering and adopted ADRs, or explicitly record `None` with a reason.
-- A spec that amends or reintroduces prior out-of-scope behavior must link its approved scope amendment.
-- New or superseding ADR candidates must be explicit. If a pending decision changes the implementation boundary, the design is NO-GO until a human approves it.
+- A spec that amends or reintroduces prior out-of-scope behavior must describe the scope difference and link the affected contracts. Check human approval separately; approval metadata belongs in `spec.json`, not the design body.
+- New or superseding ADR candidates must be explicit. If a pending decision changes the implementation boundary, return NO-GO in the conversation and stop dependent work until a human approves it.
 - Required Steering sync and downstream revalidation must have named targets; vague “update docs later” statements do not pass.
 
 ## Executability Review
