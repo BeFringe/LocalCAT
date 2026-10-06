@@ -7,8 +7,11 @@ import json
 import unittest
 from unittest import mock
 
-from parser_contracts import IssueSeverity, ParseIssue
-from parser_rpy_codec import RpyInputError, RpyLexicalLimits, scan_tl
+from parser_contracts import (
+    IssueSeverity, ParseIssue, ParsedSegment, RawSpeaker,
+    TargetPresence, TranslationState,
+)
+from parser_rpy_codec import RpyInputError, RpyLexicalLimits, parse_tl, scan_tl
 from tests.test_rpy_fixture_contract import MANIFEST_PATH, materialize
 
 
@@ -196,6 +199,129 @@ class RpyLexicalTests(unittest.TestCase):
             document.language = 'changed'
         self.assertFalse(hasattr(document, 'terminal'))
         self.assertFalse(hasattr(document.slots[0], 'local_id'))
+
+
+class RpyNeutralMappingTests(unittest.TestCase):
+    def test_fixtures_map_to_neutral_unconfirmed_segments_in_order(self):
+        cases = json.loads(MANIFEST_PATH.read_text(encoding='utf-8'))['cases']
+        for case in cases:
+            expected = case['expectation']
+            if expected['classification'] != 'supported':
+                continue
+            with self.subTest(case=case['case_id']):
+                result = parse_tl(materialize(case))
+                self.assertEqual(len(result.records), len(expected['records']))
+                for actual, record in zip(result.records, expected['records'], strict=True):
+                    self.assertIs(type(actual), ParsedSegment)
+                    self.assertEqual(actual.source, record['source'])
+                    self.assertEqual(actual.target, record['target'])
+                    self.assertEqual(actual.speaker, RawSpeaker(record['speaker'] or ''))
+                    self.assertIs(actual.translation_state, TranslationState.UNCONFIRMED)
+                    self.assertIs(actual.target_presence,
+                                  TargetPresence.EXPLICIT_EMPTY if not record['target'] else TargetPresence.PRESENT)
+                    self.assertEqual(actual.format_metadata, ())
+                    self.assertTrue(actual.local_id)
+                self.assertEqual(len({record.local_id for record in result.records}), len(result.records))
+
+    def test_speaker_is_only_raw_identifier_and_strings_never_inherit_it(self):
+        raw = dialogue('guide -sad @ happy "S" with dissolve', 'guide calm "T" with fade')
+        raw += b'translate zh_Hans strings:\n    old "Menu"\n    new ""\n'
+        result = parse_tl(raw)
+        self.assertEqual([item.speaker.value for item in result.records], ['guide', ''])
+        self.assertEqual(result.lexical.slots[0].source.attributes, ('-sad',))
+        self.assertEqual(result.lexical.slots[0].target.transition, 'fade')
+        self.assertIs(result.lexical.raw, raw)
+
+    def test_special_say_and_narrator_do_not_infer_previous_character(self):
+        raw = b''
+        for index, speaker in enumerate(('guide', 'extend', 'centered', '')):
+            prefix = speaker + ' ' if speaker else ''
+            raw += dialogue(prefix+'"Source"', prefix+'""').replace(
+                b'unit:', f'unit_{index}:'.encode(),
+            )
+        records = parse_tl(raw).records
+        self.assertEqual([record.speaker.value for record in records],
+                         ['guide', 'extend', 'centered', ''])
+        self.assertEqual([record.target for record in records], ['', '', '', ''])
+        self.assertEqual(len({record.local_id for record in records}), 4)
+
+    def test_same_display_text_keeps_dialogue_and_strings_as_distinct_slots(self):
+        raw = dialogue('"Same"', '""')
+        raw += b'translate zh_Hans strings:\n    old "Same"\n    new "T"\n'
+        records = parse_tl(raw).records
+        self.assertEqual([record.source for record in records], ['Same', 'Same'])
+        self.assertEqual([record.target for record in records], ['', 'T'])
+        self.assertNotEqual(records[0].local_id, records[1].local_id)
+
+    def test_label_identity_survives_source_and_display_changes(self):
+        original = parse_tl(dialogue('guide happy "Original"', 'guide "T"')).records[0]
+        changed = parse_tl(dialogue('guide -sad @ calm "Changed" with fade', 'guide "New target"')).records[0]
+        self.assertEqual(original.local_id, changed.local_id)
+        self.assertNotEqual(original.source, changed.source)
+        other = parse_tl(dialogue().replace(b'unit:', b'other:')).records[0]
+        other_language = parse_tl(dialogue().replace(b'zh_Hans', b'fr')).records[0]
+        self.assertNotEqual(original.local_id, other.local_id)
+        self.assertNotEqual(original.local_id, other_language.local_id)
+
+    def test_identity_is_independent_of_file_order_and_blank_lines(self):
+        one = dialogue('"Same"', '"T1"').replace(b'unit:', b'first:')
+        two = dialogue('"Same"', '"T2"').replace(b'unit:', b'second:')
+        strings = b'translate zh_Hans strings:\n    old "Open"\n    new ""\n'
+        before = parse_tl(one+two+strings).records
+        after = parse_tl(b'# location change\n\n'+strings+b'\n'+two+one).records
+        self.assertEqual([r.local_id for r in before], [r.local_id for r in reversed(after)])
+        self.assertEqual(len({r.local_id for r in before}), 3)
+
+    def test_strings_identity_uses_full_decoded_old_and_language(self):
+        def read(old, language='zh_Hans', target='""'):
+            return parse_tl(f'translate {language} strings:\n    old {old}\n    new {target}\n'.encode()).records[0]
+        plain = read('"Open"')
+        escaped = read(r'"Line\nNext"')
+        alternate_quote = read("'Line\\nNext'", target='"Translation"')
+        self.assertEqual(escaped.local_id, alternate_quote.local_id)
+        self.assertNotEqual(plain.local_id, read('"Open{#verb}"').local_id)
+        self.assertNotEqual(plain.local_id, read('"Open"', 'fr').local_id)
+        self.assertNotEqual(plain.local_id, read('"Open "').local_id)
+        self.assertEqual(plain.local_id, read('"Open"', target='"Changed"').local_id)
+        self.assertEqual(len(plain.local_id.rsplit(':', 1)[-1]), 64)
+
+    def test_dialogue_language_label_encoding_is_unambiguous(self):
+        left = parse_tl(dialogue().replace(b'zh_Hans unit', b'a bc')).records[0].local_id
+        right = parse_tl(dialogue().replace(b'zh_Hans unit', b'ab c')).records[0].local_id
+        self.assertNotEqual(left, right)
+
+    def test_no_partial_neutral_result_for_duplicate_identity(self):
+        for raw in (dialogue()+dialogue(),
+                    b'translate zh_Hans strings:\n    old "a"\n    new ""\n    old \'a\'\n    new "T"\n'):
+            with self.assertRaises(RpyInputError) as raised:
+                parse_tl(raw)
+            self.assertEqual(raised.exception.category, 'duplicate-identity')
+            self.assertFalse(hasattr(raised.exception, 'records'))
+
+    def test_invalid_final_block_cannot_return_earlier_neutral_records(self):
+        raw = dialogue()+b'translate zh_Hans final:\n    # "Unfinished"\n'
+        with self.assertRaises(RpyInputError) as raised:
+            parse_tl(raw)
+        self.assertEqual(raised.exception.category, 'ambiguous-slot')
+        self.assertEqual(raised.exception.issue.line_number, 4)
+        self.assertFalse(hasattr(raised.exception, 'records'))
+
+    def test_digest_collision_is_rejected_instead_of_renumbered(self):
+        raw = b'translate zh_Hans strings:\n    old "a"\n    new ""\n    old "b"\n    new ""\n'
+        with mock.patch('parser_rpy_codec._strings_identity_digest', return_value='0'*64) as digest:
+            with self.assertRaises(RpyInputError) as raised:
+                parse_tl(raw)
+        self.assertEqual(digest.call_count, 2)
+        self.assertEqual(raised.exception.category, 'duplicate-identity')
+        self.assertEqual(raised.exception.issue.line_number, 4)
+
+    def test_mapping_cancellation_after_valid_lexing_returns_no_result(self):
+        checks = []
+        raw = dialogue()
+        scan_tl(raw, check_cancelled=lambda: checks.append(None))
+        checkpoint = mock.Mock(side_effect=[None]*len(checks)+[InterruptedError('cancelled')])
+        with self.assertRaises(InterruptedError):
+            parse_tl(raw, check_cancelled=checkpoint)
 
 
 if __name__ == '__main__':

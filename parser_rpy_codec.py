@@ -7,9 +7,13 @@ The caller supplies complete verified bytes; only a wholly valid input returns.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Callable
 
-from parser_contracts import IssueSeverity, ParseIssue
+from parser_contracts import (
+    IssueSeverity, ParseIssue, ParsedSegment, RawSpeaker,
+    TargetPresence, TranslationState,
+)
 
 
 _MIB = 1024 * 1024
@@ -426,3 +430,56 @@ def scan_tl(raw: bytes, *, limits: RpyLexicalLimits = RpyLexicalLimits(),
     if language is None:
         raise RpyInputError('unsupported-syntax', 1, 0, 1, 'no translation header found')
     return _LexicalDocument(raw, language, tuple(slots))
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedTl:
+    lexical: _LexicalDocument
+    records: tuple[ParsedSegment, ...]
+
+
+def _strings_identity_digest(language: str, source: str) -> str:
+    digest = hashlib.sha256(b'localcat:renpy-tl-v1:strings\x00')
+    for field in (language, source):
+        encoded = field.encode('utf-8')
+        digest.update(len(encoded).to_bytes(8, 'big'))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def parse_tl(raw: bytes, *, limits: RpyLexicalLimits = RpyLexicalLimits(),
+             check_cancelled: Callable[[], None] | None = None) -> _ParsedTl:
+    """Map fully checked TL slots to neutral records with stable format IDs."""
+    lexical = scan_tl(raw, limits=limits, check_cancelled=check_cancelled)
+    checkpoint = check_cancelled if check_cancelled is not None else lambda: None
+    records: list[ParsedSegment] = []
+    identities: set[str] = set()
+    for slot in lexical.slots:
+        checkpoint()
+        if slot.kind == 'dialogue':
+            # The UTF-8 byte length frames the language without delimiter
+            # ambiguity. Label/source order and current target are not inputs.
+            local_id = (f'renpy-tl-v1:d:{len(lexical.language.encode("utf-8"))}:'
+                        f'{lexical.language}:{slot.label}')
+        else:
+            local_id = 'renpy-tl-v1:s:' + _strings_identity_digest(
+                lexical.language, slot.source.literal.text,
+            )
+        if local_id in identities:
+            source = slot.source.literal
+            column = source.start - raw.rfind(b'\n', 0, source.start)
+            raise RpyInputError('duplicate-identity', source.line, source.start,
+                                column, 'translation slot identity collision')
+        identities.add(local_id)
+        target = slot.target.literal.text
+        records.append(ParsedSegment(
+            local_id=local_id,
+            source=slot.source.literal.text,
+            target=target,
+            target_presence=TargetPresence.EXPLICIT_EMPTY if target == '' else TargetPresence.PRESENT,
+            translation_state=TranslationState.UNCONFIRMED,
+            speaker=RawSpeaker(slot.source.speaker or ''),
+            format_metadata=(),
+        ))
+    checkpoint()
+    return _ParsedTl(lexical, tuple(records))

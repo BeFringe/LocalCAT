@@ -32,7 +32,7 @@
   - 完成时，正反 fixture 全部分类正确，超限/截断不会输出可提交候选。
   - _Requirements: 1.1, 1.2, 2.1, 7.1, 7.2, 7.3_
   - _Boundary: RpyCodec_
-- [ ] 2.2 映射翻译槽、speaker 与稳定局部身份
+- [x] 2.2 映射翻译槽、speaker 与稳定局部身份
   - 构造中立 source/target，speaker 只取角色标识符；属性及 transition 留在结构跨度，strings 不继承角色，extend/centered 不展开求值，首次导入 confirmed=false。
   - 完成时，重复 label/old key 明确失败，显示顺序不改变身份，控制行不成为段落。
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
