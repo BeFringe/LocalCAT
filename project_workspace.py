@@ -17,6 +17,7 @@ from project_workspace_contracts import (
     EditingOverlayEntry,
     OriginBinding,
     ProjectDocument,
+    ProjectOriginKind,
     ProjectSegment,
     ProjectSourceSegment,
     ProjectWorkspace,
@@ -1160,6 +1161,16 @@ def _require_binding_matches_workspace(
     if type(workspace) is not ProjectWorkspace or type(binding) is not OriginBinding:
         _fail("PROJECT.RECONCILE.INPUT_INVALID")
     if binding.project_id != workspace.project_id:
+        _fail("PROJECT.RECONCILE.INPUT_INVALID")
+    expected_kind = (
+        ProjectOriginKind.SINGLE_FILE
+        if binding.profile_version == "explicit-single-file-v1"
+        else ProjectOriginKind.DIRECTORY
+    )
+    if (
+        workspace.origin.profile_version != binding.profile_version
+        or workspace.origin.kind is not expected_kind
+    ):
         _fail("PROJECT.RECONCILE.INPUT_INVALID")
     attached_documents = tuple(
         document

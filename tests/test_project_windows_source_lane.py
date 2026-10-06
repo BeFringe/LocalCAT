@@ -80,6 +80,53 @@ def _workspace(root: Path):
 
 @unittest.skipUnless(sys.platform == "win32", "WA-03 requires real Windows NTFS")
 class WindowsSelectedFilesIntakeTests(unittest.TestCase):
+    def test_single_file_root_and_source_mutation_are_denied_or_rejected(self) -> None:
+        from parser_composition import OpenedParserInput
+
+        for mutation in ("root", "source"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(
+                prefix="localcat-single-intake-"
+            ) as directory:
+                base = Path(directory)
+                root = base / "root"
+                root.mkdir()
+                selected = _write_document(root, "nested/intro.json", "Single source")
+                original = selected.read_bytes()
+                materialize = OpenedParserInput.materialize
+                attempted = denied = False
+
+                def mutate_after_parse(opened):
+                    nonlocal attempted, denied
+                    result = materialize(opened)
+                    attempted = True
+                    try:
+                        if mutation == "root":
+                            root.rename(base / "moved-root")
+                            root.mkdir()
+                            _write_document(root, "nested/intro.json", "Single source")
+                        else:
+                            replacement = root / "replacement.json"
+                            replacement.write_bytes(original)
+                            os.replace(replacement, selected)
+                    except PermissionError:
+                        denied = True
+                    return result
+
+                staged = None
+                with mock.patch.object(OpenedParserInput, "materialize", mutate_after_parse):
+                    try:
+                        staged = stage_selected_project_documents(
+                            root, (selected,), SelectedProjectDocumentsRequest("single", "en", "zh-CN"),
+                        )
+                    except ProjectWorkspaceError as error:
+                        self.assertIn(error.code, {"PROJECT.INTAKE.SOURCE_UNSAFE", "PROJECT.INTAKE.SOURCE_STALE"})
+                self.assertTrue(attempted)
+                if staged is not None:
+                    self.assertTrue(denied)
+                    self.assertEqual(staged.workspace.origin.profile_version, "explicit-single-file-v1")
+                    self.assertEqual(staged.workspace.documents[0].source_ref, "nested/intro.json")
+                    self.assertEqual(selected.read_bytes(), original)
+
     def test_live_file_ids_are_not_persisted_and_hardlinks_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="localcat-wa03-intake-") as directory:
             root = Path(directory) / "root"
@@ -181,6 +228,41 @@ class WindowsSelectedFilesIntakeTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "win32", "WA-03 requires real Windows NTFS")
 class WindowsProjectPackageTests(unittest.TestCase):
+    def test_single_package_destination_share_fault_retains_lkg_dirty_and_no_receipt(self) -> None:
+        from project_save import ProjectSaveService
+
+        with tempfile.TemporaryDirectory(prefix="localcat-single-publish-") as directory:
+            root = Path(directory)
+            selected = _write_document(root, "nested/intro.json", "Single source")
+            staged = stage_selected_project_documents(
+                root, (selected,), SelectedProjectDocumentsRequest("single", "en", "zh-CN"),
+            )
+            workspace = ProjectWorkspaceService(staged.workspace, staged.origin_binding,
+                                                session_id="single", revision=0)
+            save = ProjectSaveService(workspace, baseline=None)
+            target = root / "single.localcat-project"
+            initial = ProjectPackageService().save_workspace(save, target)
+            self.assertIs(initial.save_report.journal_state, SaveJournalState.COMMITTED)
+            old_bytes, old_baseline = target.read_bytes(), save.saved_workspace_snapshot
+            workspace.update_segment_edit(workspace.workspace.documents[0].segment_identities[0],
+                                          target="Pending", confirmed=True, session_id="single", base_revision=0)
+            backend = compose_platform_file_backend(root)
+            retained_root = backend.bind_root(root)
+            retained_file = backend.open_regular(retained_root, PureWindowsPath(target.name))
+            try:
+                result = ProjectPackageService().save_workspace(
+                    save, target, persistence_binding=initial.persistence_binding,
+                )
+            finally:
+                retained_file.close()
+                retained_root.close()
+            self.assertIsNone(result.receipt)
+            self.assertNotEqual(result.save_report.journal_state, SaveJournalState.COMMITTED)
+            self.assertEqual(target.read_bytes(), old_bytes)
+            self.assertEqual(save.saved_workspace_snapshot, old_baseline)
+            self.assertTrue(save.project_dirty)
+            self.assertEqual(ProjectPackageService().open(target).workspace, old_baseline)
+
     def _initial_package(self, root: Path, name: str = "project.localcat-project"):
         _staged, workspace_service, save_service = _workspace(root)
         target = root / name
