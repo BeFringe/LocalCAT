@@ -82,14 +82,14 @@
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
   - _Boundary: Parser publishing / RpyProjectAdapter integration_
   - _Depends: 1.3, 3.3_
-- [ ] 3.4a 接入单 TL 导出预览与结果的桌面流程
+- [x] 3.4a 接入单 TL 导出预览与结果的桌面流程
   - Qt 只显示 Controller 的中立预览、目标选择、定位诊断和发布结果；沿用已有父目录内的单文件发布能力，不等待嵌套目录物化。
   - 显示修改段数、空/未确认数量及阻断原因；修改译文、换项目/codec 或目标变化使预览失效。异步工作可取消，关窗或旧 generation 的结果不覆盖新编辑，已发出的发布返回真实结果。
   - 完成时，正常界面可预览并导出单 TL，空 target 不补源文，错误可定位，失败与不确定结果不显示成功；导出不清除未保存的包 dirty，UI 不取得 token/private 类型或发布 authority。
   - _Requirements: 4.1, 4.4, 4.5, 6.1, 6.3, 7.2_
   - _Boundary: Controller / Qt single-file export integration_
   - _Depends: 3.2a, 3.4_
-- [ ] 3.4b 验证单文件桌面闭环与故障保护
+- [x] 3.4b 验证单文件桌面闭环与故障保护
   - 以真实 Parser、ProjectPackage 和单文件 publisher 完成打开、编辑确认、保存、离开原路径冷重开、预览与导出；使用仓库内合成 TL，不以伪 adapter 替代用户旅程。
   - 比较合法无修改样例的完整字节与仅改单段的目标跨度；覆盖空/未确认译文、无 codec 包、stale token/private/preview、发布前后故障、取消/关窗及迟到结果，并回归既有 JSON/TXT 入口与 Chunk guards。
   - 完成时，桌面操作和输出文件均符合 3.2–3.4a 合同；source 支持平台分别记录实际运行结果，未完成的原生验收不算通过，普通 frozen 的最终组合验收仍由 5.3、6.1 承担。

@@ -53,16 +53,36 @@ class ControllerFileOutcome:
     safe_code: str | None = None
 
 
+@dataclass
+class FileExportPreparation:
+    """Worker-owned Application candidate, consumed only by the Controller."""
+    prepared: object
+    runtime: object
+
+    def close(self):
+        self.prepared.close()
+
+
+@dataclass(frozen=True)
+class FileExportPublication:
+    result: object
+    runtime: object
+
+
 class ControllerFileJob:
     """One issued operation; contains no Controller, Qt, or SQLite callbacks."""
 
     def __init__(self, kind: str, path: Path, context: tuple,
-                 operation: Callable, *, session=None, service=None):
+                 operation: Callable, *, session=None, service=None,
+                 cancellation=None, cleanup=None, run_when_cancelled=False):
         self._identity = (kind, path, context, session, service)
-        self.cancellation = new_cancellation_token()
+        self.cancellation = cancellation if cancellation is not None else new_cancellation_token()
+        self._cleanup_callback = cleanup
+        self._run_when_cancelled = run_when_cancelled
         self._operation = operation
         self._lock = Lock()
         self._started = False
+        self._operation_invoked = False
         self._done = False
         self._disposed = False
         self._taken = False
@@ -99,6 +119,11 @@ class ControllerFileJob:
         with self._lock:
             return self._done
 
+    @property
+    def operation_invoked(self):
+        with self._lock:
+            return self._operation_invoked
+
     def cancel(self):
         self.cancellation.cancel()
 
@@ -109,7 +134,9 @@ class ControllerFileJob:
             self._started = True
         value, error = None, None
         try:
-            if not self.cancellation.cancelled:
+            if self._run_when_cancelled or not self.cancellation.cancelled:
+                with self._lock:
+                    self._operation_invoked = True
                 value = self._operation(self.cancellation)
         except Exception as caught:
             error = caught
@@ -126,8 +153,13 @@ class ControllerFileJob:
                 raise RuntimeError('PROJECT.FILE.ALREADY_STARTED')
             self._started = self._done = True
             self._error = error
+            if self._cleanup_callback is not None:
+                self._cleanup(None)
 
     def _cleanup(self, value):
+        if self._cleanup_callback is not None:
+            self._cleanup_callback(value)
+            return
         if self.kind in {'open', 'prepare_tl', 'import_tl'} and value is not None:
             value.close()
         elif self.kind in {'save', 'import_tl'} and self.session is not None:
