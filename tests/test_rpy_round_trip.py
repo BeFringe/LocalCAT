@@ -80,6 +80,31 @@ class RpyRoundTripTests(unittest.TestCase):
         self.assertEqual(result.payload, raw.replace(b"'Old'", b"'a\\'b\"c\\\\\\n    python:\\n        secret()'"))
         self.assertEqual(codec.parse_tl(result.payload).records[0].target, target)
 
+    def test_quoted_speaker_roundtrip_changes_only_second_literal_interior(self):
+        raw = ('\ufefftranslate zh_Hans unit:\r\n'
+               '    # "[character]" -sad @ happy "Source" with dissolve\r\n'
+               '    "[character]" calm \'Old\' with fade # "comment"').encode()
+        self.assertEqual(self.prepare(raw).payload, raw)
+        target = "译文 'quoted' [character]"
+        # Name interpolation is display metadata, not a source-text placeholder.
+        self.assert_bad_target(raw, target)
+        target = "译文 'quoted'"
+        expected = raw.replace(b"'Old'", "'译文 \\'quoted\\''".encode())
+        result = self.prepare(raw, target)
+        self.assertEqual(result.payload, expected)
+        record = codec.parse_tl(result.payload).records[0]
+        self.assertEqual(record.target, target)
+        self.assertEqual(record.speaker.value, '[character]')
+
+    def test_quoted_name_span_cannot_be_substituted_for_private_target_span(self):
+        raw = dialogue('"Name" "Source"', '"Name" "Target"')
+        payload = json.loads(codec.build_private_payload(raw))
+        name_start = raw.rindex(b'"Name"')
+        next(iter(payload['slots'].values()))['target_span'] = [name_start, name_start + 6]
+        with self.assertRaises(codec.RpyInputError) as caught:
+            codec.prepare_round_trip_bytes(raw, json.dumps(payload).encode(), self.edits(raw, 'Other'))
+        self.assertEqual(caught.exception.category, 'private-stale')
+
     def test_empty_targets_export_without_source_fill(self):
         raw = dialogue('"[who] {b}Source{/b}"', '""')
         self.assertEqual(self.prepare(raw).payload, raw)
