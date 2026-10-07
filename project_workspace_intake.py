@@ -59,6 +59,7 @@ from project_workspace_contracts import (
     ProjectWorkspace,
     ProjectWorkspaceError,
     StagedSelectedProjectDocuments,
+    SourcePresence,
     WriterCapabilitySnapshot,
 )
 from project_workspace_identity import (
@@ -553,7 +554,7 @@ def _issue_staged(
 
 
 class _RetainedSelectedSource:
-    """Application ownership of original rooted inputs until initial publication."""
+    """Application ownership of rooted inputs until their package publication."""
 
     def __init__(self, backend, root, files, staged, cancellation, directory_selection=None):
         self._backend = backend
@@ -567,7 +568,7 @@ class _RetainedSelectedSource:
     def closed(self) -> bool:
         return self._root is None
 
-    def reprove(self) -> None:
+    def reprove(self, *, check_digest: bool = True) -> None:
         if self.closed:
             _fail("PROJECT.INTAKE.SOURCE_STALE")
         try:
@@ -582,8 +583,9 @@ class _RetainedSelectedSource:
             try:
                 for item, identity in zip(self._files, self._staged.source_identities, strict=True):
                     if (item.authority.snapshot() != item.initial_snapshot
-                            or _snapshot_digest(item.authority, item.initial_snapshot, self._cancellation)
-                            != identity.content_sha256):
+                            or (check_digest and _snapshot_digest(
+                                item.authority, item.initial_snapshot, self._cancellation)
+                                != identity.content_sha256)):
                         _fail("PROJECT.INTAKE.SOURCE_STALE")
                     rebound = self._backend.open_regular(named_root, item.relative_path)
                     try:
@@ -626,7 +628,7 @@ class _RetainedSelectedSource:
 
 
 class PreparedSelectedProjectDocuments:
-    """Closeable intake owner for editing before first package Save As.
+    """Closeable intake owner until initial or reconciled package publication.
 
     `staged` remains immutable data. Edits live solely in the caller's Project
     save service. A destination failure can be retried while `closed` is false;
@@ -662,6 +664,87 @@ class PreparedSelectedProjectDocuments:
     def close(self) -> None:
         self._private_sources = ()
         self._source.close()
+
+    def set_display_names(self, display_names: tuple[tuple[str, str], ...]) -> None:
+        """Configure presentation metadata without changing verified source facts."""
+        if self.closed:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        if type(display_names) is not tuple or any(
+                type(item) is not tuple or len(item) != 2 for item in display_names):
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        for document_id, name in display_names:
+            validate_document_id(document_id)
+            _text(name)
+        names = dict(display_names)
+        documents = self._staged.workspace.documents
+        if len(names) != len(display_names) or set(names) - {d.document_id for d in documents}:
+            _fail("PROJECT.RECONCILE.INPUT_INVALID")
+        updated = tuple(replace(document, display_name=names.get(document.document_id, document.display_name))
+                        for document in documents)
+        self._staged = _issue_staged(replace(self._staged.workspace, documents=updated),
+                                    self._staged.origin_binding, self._staged.source_identities)
+
+    @property
+    def codec_private_sources(self) -> tuple[CodecPrivateMemberData, ...]:
+        """Opaque complete replacements; consumers must not decode payloads."""
+        if self.closed:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        return self._private_sources
+
+    def revalidate(self) -> StagedSelectedProjectDocuments:
+        """Reprove the retained exact bytes and rooted selection before apply."""
+        self._source.reprove()
+        return self._staged
+
+    def revalidate_identity(self) -> StagedSelectedProjectDocuments:
+        """Recheck live rooted identities immediately before the workspace swap.
+
+        This bounded metadata check supplements the worker's full revalidation;
+        it does not replace content hashing at intake, apply preparation or save.
+        """
+        self._source.reprove(check_digest=False)
+        return self._staged
+
+    def save_reconciled_workspace(
+        self, package_service, save_service, destination: Path, *, persistence_binding,
+    ):
+        """Save a reconciled overlay with the complete verified source/private pair.
+
+        Detached recovery rows remain workspace content, never part of the new
+        codec mapping. The package owner retains the saved baseline and receipt.
+        """
+        if self.closed:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        service = save_service.workspace_service
+        workspace, original = service.workspace, self._staged.workspace
+        if (workspace.project_id != original.project_id
+                or service.origin_binding != self._staged.origin_binding):
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        actual = {document.document_id: document for document in workspace.documents}
+        for expected in original.documents:
+            document = actual.get(expected.document_id)
+            if document is None:
+                _fail("PROJECT.INTAKE.SOURCE_STALE")
+            attached = tuple(source for source in document.source_segments
+                             if source.source_presence is SourcePresence.ATTACHED)
+            if (attached != expected.source_segments
+                    or document.codec_identity != expected.codec_identity
+                    or document.format_id != expected.format_id
+                    or document.source_ref != expected.source_ref
+                    or document.source_snapshot_digest != expected.source_snapshot_digest
+                    or document.codec_private_member != expected.codec_private_member):
+                _fail("PROJECT.INTAKE.SOURCE_STALE")
+        try:
+            result = package_service.save_workspace(
+                save_service, destination, codec_private_sources=self._private_sources,
+                persistence_binding=persistence_binding, source_reproof=self._source,
+            )
+            if result.receipt is not None and result.receipt.durable:
+                self.close()
+            return result
+        finally:
+            if self.closed:
+                self._private_sources = ()
 
     def save_workspace(self, package_service, save_service, destination: Path):
         if self.closed:
@@ -768,6 +851,8 @@ def _stage_selected_project_documents(
     cancellation=None,
     retain_source: bool = False,
     directory_selection=None,
+    rebind_workspace=None,
+    rebind_assignments=(),
 ) -> StagedSelectedProjectDocuments | PreparedSelectedProjectDocuments:
     """Stage exactly the selected project documents without scanning the root."""
 
@@ -835,6 +920,9 @@ def _stage_selected_project_documents(
             root_inode=root_inode,
             source_refs=source_refs,
         )
+        if rebind_workspace is not None:
+            project_id = rebind_workspace.project_id
+            assigned_ids = dict(rebind_assignments)
         observed_file_ids: set[FileObjectIdentity] = set()
         for selected_index, (source_ref, selected_path) in enumerate(selected):
             if cancellation is not None:
@@ -1225,6 +1313,39 @@ def _workspace_rebind_document_ids(
     return tuple(zip(selected_refs, assigned_ids, strict=True))
 
 
+def prepare_workspace_rebind(
+    root: Path, selected_paths: tuple[Path, ...], workspace: ProjectWorkspace, *,
+    rename_mappings: tuple[OriginRenameMapping, ...] = (),
+    parser_surface: ParserApplicationSurface | None = None,
+    file_system: RootedFileSystem | None = None, cancellation=None,
+) -> PreparedSelectedProjectDocuments:
+    """Retain a configured cold-package rebind, assigning IDs before handoff.
+
+    Manifest source refs or explicit rename mappings are the only identity
+    source. Opaque member paths and overlays receive the same IDs at creation.
+    """
+    assignments = _workspace_rebind_document_ids(root, selected_paths, workspace, rename_mappings)
+    if file_system is None:
+        from platform_fs import compose_platform_file_backend
+        try:
+            file_system = compose_platform_file_backend(_absolute_root(root))
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_UNSAFE") from error
+    prepared = _stage_selected_project_documents(
+        root, selected_paths,
+        SelectedProjectDocumentsRequest(workspace.name, workspace.source_locale, workspace.target_locale),
+        file_system=file_system, parser_surface=parser_surface, cancellation=cancellation,
+        retain_source=True, rebind_workspace=workspace, rebind_assignments=assignments,
+    )
+    try:
+        prepared.set_display_names(tuple((document.document_id, document.display_name)
+                                         for document in workspace.documents))
+        return prepared
+    except BaseException:
+        prepared.close()
+        raise
+
+
 def stage_workspace_rebind(
     root: Path,
     selected_paths: tuple[Path, ...],
@@ -1351,6 +1472,7 @@ __all__ = (
     "PreparedSelectedProjectDocuments",
     "prepare_directory_project_documents",
     "prepare_selected_project_documents",
+    "prepare_workspace_rebind",
     "SelectedProjectDocumentsRequest",
     "StagedSelectedProjectDocuments",
     "revalidate_staged_selected_documents",
