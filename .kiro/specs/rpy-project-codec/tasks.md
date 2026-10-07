@@ -76,7 +76,7 @@
   - _Requirements: 4.1, 4.4, 6.3_
   - _Boundary: RpyProjectAdapter / ProjectExportView_
   - _Depends: 2.4, 3.2a_
-- [ ] 3.4 接入受控发布和不确定结果
+- [x] 3.4 接入受控发布和不确定结果
   - 消费 1.3 产出的 Parser prepared 发布能力，绑定项目预览与用户选定目标；不加入 codec journal，导出不替代 package 保存。
   - 完成时，发布前故障保留目标，发布后不确定不返回成功，project dirty/baseline 不被导出错误清除。
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
