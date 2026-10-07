@@ -3188,7 +3188,7 @@ class QtEditorWindow(QMainWindow):
             result = self.controller.save_workspace_document(document)
         except (EditorControllerError, OSError) as exc:
             safe_error = self._workspace_error_text(exc)
-            current_name = self._workspace_current_document().display_name
+            current_name = self._workspace_chapter_label(self._workspace_current_document())
             self._set_workspace_save_feedback(
                 f"{safe_error} · 受影响章节：{current_name} · 当前章节未保存，"
                 "当前会话保留，可重试。"
@@ -3200,7 +3200,7 @@ class QtEditorWindow(QMainWindow):
     def _dirty_workspace_display_names(self) -> str:
         dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
         names = tuple(
-            document.display_name
+            self._workspace_chapter_label(document)
             for document in self.controller.workspace_view.documents
             if document.identity.document_id in dirty_ids
         )
@@ -3209,7 +3209,7 @@ class QtEditorWindow(QMainWindow):
     def _finish_workspace_save(self, result: object) -> bool:
         report = result.save_report
         document_names = {
-            document.identity.document_id: document.display_name
+            document.identity.document_id: self._workspace_chapter_label(document)
             for document in self.controller.workspace_view.documents
         }
         dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
@@ -3717,6 +3717,11 @@ class QtEditorWindow(QMainWindow):
         if len(self.controller.workspace_view.documents) == 1:
             return document.source_ref.rsplit('/', 1)[-1]
         return document.display_name
+
+    def _workspace_chapter_label(self, document) -> str:
+        name = document.display_name
+        parts = document.source_ref.rsplit('/', 2)
+        return f"{parts[-2]}/{name}" if len(parts) > 1 else name
 
     @staticmethod
     def _chunk_access_text(access: str, safe_code: str | None = None) -> str:
@@ -4693,13 +4698,15 @@ class QtEditorWindow(QMainWindow):
                 f"{current_view.project_global_index + 1} / {len(segments)}"
             )
             self.chapter_progress_label.setText(
-                f"{current_document.display_name} · "
+                f"{self._workspace_chapter_label(current_document)} · "
                 f"{current_document.progress.confirmed_segments} / "
                 f"{current_document.progress.total_segments} 已确认"
             )
             self.workspace_browse_chapter_title.setText(
-                f"当前文档 · {current_document.display_name}"
+                f"当前文档 · {self._workspace_chapter_label(current_document)}"
             )
+            self.chapter_progress_label.setToolTip(current_document.source_ref)
+            self.workspace_browse_chapter_title.setToolTip(current_document.source_ref)
             self._refresh_workspace_documents_menu()
         else:
             self._refresh_workspace_documents_menu()
@@ -4810,7 +4817,7 @@ class QtEditorWindow(QMainWindow):
                 if not document_segments:
                     continue
                 if len(workspace_view.documents) > 1:
-                    divider = QListWidgetItem(file_icon, document.display_name)
+                    divider = QListWidgetItem(file_icon, self._workspace_chapter_label(document))
                     divider.setFlags(
                         divider.flags() & ~Qt.ItemFlag.ItemIsSelectable
                     )
@@ -4824,7 +4831,7 @@ class QtEditorWindow(QMainWindow):
                     divider_font = divider.font()
                     divider_font.setBold(True)
                     divider.setFont(divider_font)
-                    divider.setToolTip(document.display_name)
+                    divider.setToolTip(document.source_ref)
                     divider.setSizeHint(QSize(0, 44))
                     self.segment_list.addItem(divider)
                 for item_view in document_segments:
@@ -5014,7 +5021,7 @@ class QtEditorWindow(QMainWindow):
         try:
             self.browse_table.clearSpans()
             self.browse_table.clearContents()
-            row_specs: list[tuple[str, int | None]] = []
+            row_specs: list[tuple[str, int | None, str]] = []
             if workspace_view is not None:
                 chunk_keys = (
                     None
@@ -5037,10 +5044,10 @@ class QtEditorWindow(QMainWindow):
                     )
                     if document_rows:
                         if len(workspace_view.documents) > 1:
-                            row_specs.append((document.display_name, None))
-                        row_specs.extend(("", index) for index in document_rows)
+                            row_specs.append((self._workspace_chapter_label(document), None, document.source_ref))
+                        row_specs.extend(("", index, "") for index in document_rows)
             else:
-                row_specs.extend(("", index) for index in range(len(segments)))
+                row_specs.extend(("", index, "") for index in range(len(segments)))
             maximum_position = len(segments)
             if workspace_view is not None:
                 maximum_position = max(
@@ -5053,7 +5060,7 @@ class QtEditorWindow(QMainWindow):
             self._resize_browse_position_column(maximum_position)
             self.browse_table.setRowCount(len(row_specs))
             current_row = 0
-            for row, (document_title, index) in enumerate(row_specs):
+            for row, (document_title, index, source_ref) in enumerate(row_specs):
                 if index is None:
                     for column, value in enumerate(
                         (document_title, "", "", "", "")
@@ -5063,6 +5070,7 @@ class QtEditorWindow(QMainWindow):
                             item.flags() & ~Qt.ItemFlag.ItemIsSelectable
                         )
                         item.setData(Qt.ItemDataRole.UserRole, None)
+                        item.setToolTip(source_ref)
                         item.setBackground(QColor("#26323a" if self._dark_theme else "#dcecf5"))
                         item.setForeground(QColor("#79c6df" if self._dark_theme else "#0b5e80"))
                         divider_font = item.font()
@@ -5175,7 +5183,7 @@ class QtEditorWindow(QMainWindow):
             else self._current_chunk_identity_keys()
         )
         return (
-            document.display_name,
+            self._workspace_chapter_label(document),
             tuple(
                 (
                     item.document_local_index,
