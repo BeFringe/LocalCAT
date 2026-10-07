@@ -1,5 +1,5 @@
 """Display-only directory selection and the unified local-open chooser."""
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSignalBlocker
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout)
@@ -42,7 +42,7 @@ class QtDirectoryOpenDialog(QDialog):
         self.setWindowTitle('选择目录中的项目文档')
         self.resize(800, 660)
         layout = QVBoxLayout(self)
-        self.hint = QLabel('这里只预览目录。勾选文件并确认顺序后，将验证所选内容并建立项目包。原文件保持只读。')
+        self.hint = QLabel('可逐个文件或按文件夹勾选。全选按当前支持的格式选择，正文将在确认后验证；原文件保持只读。')
         self.hint.setObjectName('directoryPreviewHint')
         self.hint.setWordWrap(True)
         self.hint.setTextFormat(Qt.TextFormat.PlainText)
@@ -67,8 +67,40 @@ class QtDirectoryOpenDialog(QDialog):
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(0, Qt.CheckState.Unchecked)
             self.entry_items[entry.entry_id] = item
+        entries = {entry.entry_id: entry for entry in review.preview.entries}
+        self._folder_entry_ids = {entry.entry_id: [] for entry in review.preview.entries
+                                  if entry.kind.value == 'directory'}
+        for entry in review.preview.entries:
+            if not entry.selectable:
+                continue
+            parent_id = entry.parent_entry_id
+            while parent_id is not None:
+                self._folder_entry_ids[parent_id].append(entry.entry_id)
+                parent_id = entries[parent_id].parent_entry_id
+        for entry_id, descendants in self._folder_entry_ids.items():
+            if descendants:
+                item = self.entry_items[entry_id]
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
         self.tree.expandToDepth(2)
         self.tree.setColumnWidth(0, 480)
+        selection_controls = QHBoxLayout()
+        self.select_all_button = QPushButton('全选支持的格式')
+        self.select_all_button.setObjectName('directorySelectAll')
+        self.clear_selection_button = QPushButton('清空选择')
+        self.clear_selection_button.setObjectName('directoryClearSelection')
+        selectable_ids = tuple(entry.entry_id for entry in review.preview.entries if entry.selectable)
+        self.select_all_button.clicked.connect(
+            lambda: self._set_entries_checked(selectable_ids, Qt.CheckState.Checked))
+        self.clear_selection_button.clicked.connect(
+            lambda: self._set_entries_checked(selectable_ids, Qt.CheckState.Unchecked))
+        selection_controls.addWidget(self.select_all_button)
+        selection_controls.addWidget(self.clear_selection_button)
+        self.selection_count = QLabel()
+        self.selection_count.setObjectName('directorySelectionCount')
+        selection_controls.addStretch()
+        selection_controls.addWidget(self.selection_count)
+        layout.addLayout(selection_controls)
         layout.addWidget(self.tree, 2)
         layout.addWidget(QLabel('所选章节顺序（完整相对路径）'))
         self.selected_files = QListWidget()
@@ -122,8 +154,22 @@ class QtDirectoryOpenDialog(QDialog):
         return self.target_locale_input.text().strip() or 'zh-CN'
 
     def _selection_changed(self, item, column):
+        if item is not None:
+            descendants = self._folder_entry_ids.get(item.data(0, Qt.ItemDataRole.UserRole))
+            if descendants:
+                self._set_entries_checked(descendants, item.checkState(0))
+                return
         checked = {entry.entry_id for entry in self.review.preview.entries if entry.selectable
             and self.entry_items[entry.entry_id].checkState(0) == Qt.CheckState.Checked}
+        with QSignalBlocker(self.tree):
+            for entry_id, descendants in self._folder_entry_ids.items():
+                if not descendants:
+                    continue
+                count = sum(child in checked for child in descendants)
+                state = (Qt.CheckState.Unchecked if not count else
+                         Qt.CheckState.Checked if count == len(descendants) else
+                         Qt.CheckState.PartiallyChecked)
+                self.entry_items[entry_id].setCheckState(0, state)
         # Keep deliberate reorder, adding newly checked entries in preview order.
         ordered = ([entry_id for entry_id in self.ordered_entry_ids if entry_id in checked]
                    if self._order_changed else [])
@@ -137,6 +183,15 @@ class QtDirectoryOpenDialog(QDialog):
             selected.setData(Qt.ItemDataRole.UserRole, entry_id)
             self.selected_files.addItem(selected)
         self._update_ready()
+
+    def _set_entries_checked(self, entry_ids, state):
+        if (not self._current() or not self.review.preview.complete
+                or state == Qt.CheckState.PartiallyChecked):
+            return
+        with QSignalBlocker(self.tree):
+            for entry_id in entry_ids:
+                self.entry_items[entry_id].setCheckState(0, state)
+        self._selection_changed(None, 0)
 
     def move_selected(self, delta):
         row = self.selected_files.currentRow()
@@ -154,6 +209,11 @@ class QtDirectoryOpenDialog(QDialog):
         ready = current and complete and self.selected_files.count() > 0 and bool(self.project_name_input.text().strip())
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(ready)
         self.tree.setEnabled(current and complete)
+        available = sum(entry.selectable for entry in self.review.preview.entries)
+        selected = self.selected_files.count()
+        self.select_all_button.setEnabled(current and complete and selected < available)
+        self.clear_selection_button.setEnabled(current and complete and selected > 0)
+        self.selection_count.setText(f'已选 {selected} / {available} 个可选文件')
         if not current:
             self.hint.setText('此预览已过期。请取消并重新选择文件夹。')
         elif not complete:

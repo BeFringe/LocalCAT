@@ -17,6 +17,7 @@ from qt_editor import _compose_editor_controller
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
 from project_workspace_identity import normalize_portable_ref_v1
+from workspace_state import WorkspaceMode
 
 
 def document_actions(menu):
@@ -107,6 +108,43 @@ class QtDirectoryNavigationTests(unittest.TestCase):
                          tuple(doc.identity.document_id for doc in original.documents))
         self.assertFalse(self.controller.workspace_save_state.project_dirty)
 
+    def test_flat_chapter_labels_show_parent_consistently_without_renaming_documents(self):
+        (self.root / 'root.txt').write_text('Root\n', encoding='utf-8')
+        refs = (*self.refs, 'root.txt')
+        self.package(refs)
+        documents = self.controller.workspace_view.documents
+        names = tuple(document.display_name for document in documents)
+        expected = (f'extra/{names[0]}', f'a/{names[1]}', f'b/{names[2]}', names[3])
+        dividers = tuple(self.window.segment_list.item(index)
+                         for index in range(self.window.segment_list.count())
+                         if self.window.segment_list.item(index).data(Qt.ItemDataRole.UserRole) is None)
+        self.assertEqual(tuple(item.text() for item in dividers), expected)
+        self.assertEqual(tuple(item.toolTip() for item in dividers), refs)
+        self.assertTrue(self.window.chapter_progress_label.text().startswith(expected[0] + ' · '))
+        self.assertEqual(self.window.chapter_progress_label.toolTip(), refs[0])
+        self.window.next_button.click()
+        self.assertTrue(self.window.chapter_progress_label.text().startswith(expected[1] + ' · '))
+        self.assertEqual(self.window.chapter_progress_label.toolTip(), refs[1])
+        self.window.set_workspace_mode(WorkspaceMode.BROWSE, persist=False)
+        self.assertEqual(self.window.workspace_browse_chapter_title.text(), f'当前文档 · {expected[1]}')
+        self.assertEqual(self.window.workspace_browse_chapter_title.toolTip(), refs[1])
+        headers = tuple(self.window.browse_table.item(row, 0)
+                        for row in range(self.window.browse_table.rowCount())
+                        if self.window.browse_table.item(row, 0).data(Qt.ItemDataRole.UserRole) is None)
+        self.assertEqual(tuple(item.text() for item in headers), expected)
+        self.assertEqual(tuple(item.toolTip() for item in headers), refs)
+        self.assertEqual(self.window._browse_document_projection()[0], expected[1])
+        self.assertEqual(tuple(doc.display_name for doc in self.controller.workspace_view.documents), names)
+        self.assertEqual(tuple(doc.source_ref for doc in self.controller.workspace_view.documents), refs)
+        self.assertFalse(self.controller.workspace_save_state.project_dirty)
+        leaves = document_actions(self.window.workspace_documents_menu)
+        self.assertTrue(all('/' not in leaf.text() for leaf in leaves))
+        self.window.set_workspace_mode(WorkspaceMode.EDIT, persist=False)
+        self.window.target_editor.setPlainText('Edited northern chapter')
+        self.assertEqual(self.window._dirty_workspace_display_names(), expected[1])
+        self.assertTrue(self.window.save_workspace_current_document(), self.errors)
+        self.assertIn(expected[1] + ':saved', self.window.workspace_save_feedback.text())
+
     def test_keyboard_leaf_current_dirty_and_chunk_pruning(self):
         self.package(self.refs)
         menu = self.window.workspace_documents_menu
@@ -165,6 +203,14 @@ class QtDirectoryNavigationTests(unittest.TestCase):
         self.assertIs(leaf.data(), self.controller.workspace_view.documents[0].identity)
         self.assertTrue(self.window.chapter_progress_label.isHidden())
         self.assertTrue(self.window.workspace_browse_chapter_title.isHidden())
+        document = self.controller.workspace_view.documents[0]
+        self.assertNotEqual(document.display_name, 'same&name.txt')
+        expected = f'deep&more/{document.display_name}'
+        self.assertEqual(self.window._browse_document_projection()[0], expected)
+        self.window.target_editor.setPlainText('Single chapter edit')
+        self.assertEqual(self.window._dirty_workspace_display_names(), expected)
+        self.assertTrue(self.window.save_workspace_current_document(), self.errors)
+        self.assertIn(expected + ':saved', self.window.workspace_save_feedback.text())
 
     def test_maximum_portable_ref_depth_builds_and_prunes_without_recursion(self):
         self.package((self.refs[0],))

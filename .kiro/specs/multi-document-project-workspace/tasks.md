@@ -260,13 +260,13 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Boundary: Project discovery / intake integration_
   - _Depends: 5.5, 5.6_
 - [x] 5.7 接入统一打开流程的根目录勾选 review
-  - Controller/Qt 接入选根、候选树勾选、排序/语言/保存 review，复用现有单/多文件入口；异步取消与 session/generation 复证。
+  - Controller/Qt 接入选根、候选树单文件/文件夹递归勾选、全选支持格式/清空、排序/语言/保存 review；目录显示部分选中态，批量选择保留手调顺序，复用现有单/多文件入口及异步取消与 session/generation 复证。
   - 完成时，根目录单选/多选均可保存，零选/不完整/stale 阻断，取消或迟到结果不改变当前 target/dirty，原文件多选仍可用。
   - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.6_
   - _Boundary: Controller / Qt open-flow integration_
   - _Depends: 5.6a_
 - [x] 5.8 将既有文件夹导航投影为目录树
-  - 只使用 Controller-issued identity/source_ref 构树，沿用 current/dirty、键盘跳转与 Chunk 过滤；目录仅展开。
+  - 只使用 Controller-issued identity/source_ref 构树，沿用 current/dirty、键盘跳转与 Chunk 过滤；目录仅展开。编辑与浏览的平面章节标题/分隔、保存反馈统一显示父目录及名称，完整相对路径作提示，不改写持久身份或显示名。
   - 完成时，包离线冷重开仍可导航，同名文件可区分；目录交错顺序不改变 manifest、连续阅读或搜索次序。
   - _Requirements: 13.2, 13.5, 13.6_
   - _Boundary: Controller / Qt navigation projection_

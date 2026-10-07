@@ -240,11 +240,11 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 
 #### 验收标准
 
-1. When 用户在统一打开流程中选择根目录, the LocalCAT shall 有界递归预览该根下候选树，显示相对目录、可选择文件和不可用原因，待用户勾选并确认后才读取/解析所选内容；不默认导入全部文件或启动后台监控。
+1. When 用户在统一打开流程中选择根目录, the LocalCAT shall 有界递归预览该根下候选树，显示相对目录、可选择文件和不可用原因，提供单文件勾选、文件夹递归勾选、全选当前配置支持的格式及清空选择；目录显示全部/部分/未选状态。默认不勾选，待用户确认后才读取/解析所选内容；格式可选不代表正文已通过验证，不启动后台监控。
 2. When 预览含两层及更深子目录或不同目录同名文件, the LocalCAT shall 保持最初选择的 portable root 与 source_ref，按确定顺序显示候选并允许 review 调整所选文档顺序，不因取消勾选或单选而重新计算根目录。
 3. If 根/所选文件身份变化、存在路径逸出/alias、枚举失败/超限或用户取消, the LocalCAT shall 阻止未验证候选提交、保留现有项目与源文件，并显示可重选/重试原因；metadata 预览不得授予 source writer 权限。
 4. When 用户确认选择, the LocalCAT shall 拒绝零文件，一个文件使用非 legacy 的 single_file/explicit-single-file-v1，多个文件使用 directory/explicit-selected-files-v1，并经完整 intake 验证保存 ProjectPackage；单选嵌套文件仍保留原根下相对路径。
-5. When 用户打开顶栏文件夹导航, the LocalCAT shall 按已保存 source_ref 的目录组件展示可键盘操作的章节树，叶项使用原 Document identity；目录分组不得改写 manifest 顺序、连续阅读、搜索、dirty 或 Chunk 权限投影，也不得读取源目录。
+5. When 用户打开顶栏文件夹导航, the LocalCAT shall 按已保存 source_ref 的目录组件展示可键盘操作的章节树，叶项使用原 Document identity；平面章节标题与分隔在存在父目录时显示父目录以区分同名文件，并提供完整相对路径提示。目录分组及显示标签不得改写 manifest 顺序、连续阅读、搜索、dirty 或 Chunk 权限投影，也不得读取源目录。
 6. When 验收此增量, the LocalCAT shall 用合成嵌套目录验证根目录预览、勾选/排序、单选/多选、包冷重开和树导航，并验证未选内容不读、取消/迟到结果/路径替换不提交；保留既有 TXT/JSON 等文件多选行为。
 
 ## 非功能约束

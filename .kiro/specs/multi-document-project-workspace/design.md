@@ -473,8 +473,8 @@ Project 的 `DirectorySelectionPreview` 含 issued preview ID、generation、roo
 
 1. 用户从既有“打开本地项目”流程选择“选择文件”或“选择文件夹”，根目录动作不占用常驻顶栏。直接文件选择/拖入仍按原有规则分流；目录拖入首版不自动处理。现有文件夹按钮只导航。
 2. 用户选定根后平台 bind，Project 有界递归只读 metadata。最多深度 32、10,000 个总条目（含目录/不可选文件）、同时至多 33 个目录 handle；沿深度优先遍历及时释放非祖先 handle。继承更小的平台路径限制。到深度/条目/资源上限或读取目录失败时，标记预览不完整并禁止确认，提示选更小的根重试，不把截断当完整结果。
-3. 普通文件根据配置能力可选；默认未勾选。链接/reparse、非 regular、非法 portable ref 均显示不可选且不跟随；所选 hardlink alias、大小写/规范化碰撞在确认时拒绝。目录本身不作为 Document。未知/不可选格式可显示但不打开正文；用户取消不发布候选。最长 source_ref 和路径组件继续沿用 owner 限额，不把“二级”写成硬性深度。
-4. 候选以规范化相对路径的 Unicode code-point 顺序稳定显示；所选列表初始采用该顺序，用户在 review 中显式调整成为 manifest order。未选内容不读取/parse、不自动加入新发现文件。刷新/换根撤销旧 preview 和确认状态，重新勾选；不后台刷新后静默改变集合。
+3. 普通文件根据配置能力可选；默认未勾选。链接/reparse、非 regular、非法 portable ref 均显示不可选且不跟随；所选 hardlink alias、大小写/规范化碰撞在确认时拒绝。目录本身不作为 Document：目录复选框只递归勾选/取消其可选后代文件，按后代显示全部/部分/未选状态，没有可选后代的目录不提供复选框。提供“全选支持的格式”和“清空选择”，只操作当前预览的可选 entry IDs；不完整或过期时禁用选择。未知/不可选格式可显示但不打开正文；用户取消不发布候选。最长 source_ref 和路径组件继续沿用 owner 限额，不把“二级”写成硬性深度。
+4. 候选以规范化相对路径的 Unicode code-point 顺序稳定显示；所选列表初始采用该顺序，用户在 review 中显式调整成为 manifest order。后续批量勾选保留仍被选择的手调顺序，新选文件按预览顺序追加；取消勾选只移除对应文件。未选内容不读取/parse、不自动加入新发现文件。刷新/换根撤销旧 preview 和确认状态，重新勾选；不后台刷新后静默改变集合。
 5. 确认携带 preview ID、generation 和有序 entry IDs。Project 复证 retained root 与所选文件身份，使用原根生成 source_ref；任一选择失效全部拒绝。确认前的 metadata 不替代 verified terminal。首包发布继续保持绑定并消费原 intake 原子候选/保存结果。取消、关窗、换项目或新请求均撤销 generation，晚到结果丢弃并释放 handle；错误不切换当前项目。
 
 ### 单文件 profile 与持久化
@@ -487,7 +487,7 @@ Project 的 `DirectorySelectionPreview` 含 issued preview ID、generation、roo
 
 Controller 从 manifest source_ref 生成目录组件，Qt 在既有文件夹菜单展示嵌套组与文件叶项。组按其中叶项在 manifest 的首次出现顺序排列，同组叶项遵守 manifest 相对顺序；树结构允许聚合跨组交错文档，但不反写 manifest 或改变连续阅读/搜索次序。目录项只展开/折叠，叶项继续持有 issued Document identity，支持键盘跳转、current/dirty 状态和现有 Chunk 可见性过滤；无可见叶项的目录不显示。
 
-导航不检查源目录存在性，包移动/离线冷重开后仍可用。同名文件通过路径分组区分；编辑左栏与浏览分隔可提供相对路径提示而不创造新身份。单文件包仍遵循当前文档导航规则。
+导航不检查源目录存在性，包移动/离线冷重开后仍可用。同名文件通过路径分组区分，树内叶项不重复父目录。编辑左栏、浏览标题与分隔、保存反馈使用同一显示规则：有父目录时显示“父目录/显示名”，无父目录时保留原显示名，章节标题与分隔的悬停提示显示完整 source_ref；标签只作投影，不修改 display_name 或身份。单文件包仍隐藏多章节进度标题。
 
 ### 增量验证与追踪
 
@@ -793,8 +793,8 @@ UI文案为“当前章节 / 搜索全部章节”。为保持既有单 JSON pub
 
 ## C4：Qt 产品表面
 
-- 原顶栏布局只增加一个无下拉箭头的文件夹按钮；点击后菜单按 manifest 顺序以文件图标+display name 列出当前 workspace Documents，当前项显示勾选，不使用 `1.` / `[1]` 等数字序号前缀。选择后跳到该 Document 首段；同名display name用安全source hint辅助区分，不暴露持久ID为主要文案。
-- 首页只保留一个“打开本地项目”控件，不显示独立单/多文档按钮或drop-zone。首页控件、项目主按钮、项目菜单唯一的“打开本地项目”和`Ctrl+O`复用同一suffix-neutral文件选择：单选直接打开，Shift多选进入显式列表review；项目菜单不得另列“新建多文档项目”。文件直接拖入首页时按同一规则分流。review显示顺序并允许重排后提交，不提供递归目录扫描或“自动导入全部文件”。
+- 原顶栏布局只增加一个无下拉箭头的文件夹按钮；点击后菜单按上述章节树投影展示目录与当前 workspace Documents，叶项使用文件图标+display name，当前项显示勾选，不使用 `1.` / `[1]` 等数字序号前缀。选择后跳到该 Document 首段；同名display name用目录分组与安全source hint辅助区分，不暴露持久ID为主要文案。
+- 首页只保留一个“打开本地项目”控件，不显示独立单/多文档按钮或drop-zone。首页控件、项目主按钮、项目菜单唯一的“打开本地项目”和`Ctrl+O`复用统一打开选择：文件入口保持单选与 Shift 多选 review，文件夹入口遵循上述根目录发现与确认流；项目菜单不得另列“新建多文档项目”。文件直接拖入首页时按原有规则分流。review显示顺序并允许重排后提交，全选仍须用户显式操作与确认，不自动导入全部文件。
 - 编辑左栏和浏览表都使用文件图标+display name的跨列header/divider，不叠加“章节 N”文案；默认连续导航跨Document边界。浏览模式的current row、Controller current Segment_Identity、当前文档标题和文件夹菜单勾选始终同步；双击再返回同段编辑。
 - 搜索scope显示“当前章节 / 搜索全部章节”；不显示chunk、sync或provider控件。
 - dirty/save反馈区分“LocalCAT项目包已保存”与“源文件已写回/只读/部分失败”，并按当前 ProjectPackage 的逐 Document report 展示状态。`explicit-selected-files-v1` 当前统一显示“源文件只读；仅保存项目包”；未来 directory/workbook write-back profile 获批后才可投影其逐文件/单文件报告，C4 不预装未启用入口。
