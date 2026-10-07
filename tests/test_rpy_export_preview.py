@@ -273,16 +273,44 @@ class RpyExportPreviewTests(unittest.TestCase):
             self.assertEqual(preview.revalidate(self.context, self.target).status, 'ready')
             preview.close()
             replacement.replace(self.package_path)
-            # The old saved binding cannot authorize the replaced package,
-            # even after the Windows guard has been released.
-            stale = self.prepare()
-            self.assertEqual(stale.view.status, 'blocked')
-            self.assertTrue(stale.closed)
-            self.assertEqual(stale.view.diagnostics[0].code, 'PROJECT.PACKAGE.SOURCE_STALE')
+            # Windows does not persist historical FileId as reopen authority.
+            # A fresh read of identical validated bytes may prepare again.
+            fresh = self.prepare()
+            self.assertEqual(fresh.view.status, 'ready')
+            self.assertNotEqual(fresh.view.preview_id, preview.view.preview_id)
+            self.assertEqual(self.package.open(self.package_path).persistence_binding,
+                             self.context.persistence_binding)
+            fresh.close()
             self.assertEqual(list(self.config.iterdir()), [])
             return
         self.assertEqual(preview.revalidate(self.context, self.target).status, 'stale')
         self.assertTrue(preview.closed)
+        self.assertEqual(list(self.config.iterdir()), [])
+
+    def test_changed_valid_package_content_rejects_old_binding(self):
+        preview = self.prepare()
+        preview.close()
+        document = self.service.workspace.documents[0]
+        changed = replace(document, editing_overlay=(
+            replace(document.editing_overlay[0], target='外部有效修改'),
+            *document.editing_overlay[1:],
+        ))
+        current = self.save_altered_document(changed)
+        self.assertNotEqual(current.persistence_binding.artifact_digest,
+                            self.context.persistence_binding.artifact_digest)
+        self.assertNotEqual(current.persistence_binding.workspace_content_digest,
+                            self.context.persistence_binding.workspace_content_digest)
+        stale = self.prepare()
+        self.assertEqual(stale.view.status, 'blocked')
+        self.assertTrue(stale.closed)
+        self.assertEqual(stale.view.diagnostics[0].code, 'PROJECT.PACKAGE.SOURCE_STALE')
+        self.assertEqual(self.save.saved_workspace_snapshot, self.baseline)
+        self.assertEqual(self.service.workspace.documents[0], document)
+        fresh = self.prepare(current)
+        self.assertEqual(fresh.view.status, 'ready')
+        self.assertEqual(fresh.view.modified_count, 1)
+        self.assertFalse(self.target.exists())
+        fresh.close()
         self.assertEqual(list(self.config.iterdir()), [])
 
     def test_persistent_bridge_cleanup_failure_is_blocked_with_residual_report(self):
