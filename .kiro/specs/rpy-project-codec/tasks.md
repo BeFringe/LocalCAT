@@ -30,12 +30,12 @@
 
 - [ ] 2. 实现独立 TL codec
 - [x] 2.1 识别有界字符串、缩进和 TL block
-  - 支持声明的编码、注释、引号/转义、混合两类 header、有限 say 属性/transition 与控制行，拒绝执行型/多行/不确定语法及空 source。
+  - 支持声明的编码、注释、引号/转义、混合两类 header、标识符/姓名字符串 say、有限属性/transition 与控制行，拒绝执行型/多行/不确定语法及空 source。
   - 完成时，正反 fixture 全部分类正确，超限/截断不会输出可提交候选。
   - _Requirements: 1.1, 1.2, 2.1, 7.1, 7.2, 7.3_
   - _Boundary: RpyCodec_
 - [x] 2.2 映射翻译槽、speaker 与稳定局部身份
-  - 构造中立 source/target，speaker 只取角色标识符；属性及 transition 留在结构跨度，strings 不继承角色，extend/centered 不展开求值，首次导入 confirmed=false。
+  - 构造中立 source/target，speaker 取角色标识符或姓名字符串，姓名 interpolation 不求值；属性及 transition 留在结构跨度，strings 不继承角色，extend/centered 不展开求值，首次导入 confirmed=false。
   - 完成时，重复 label/old key 明确失败，显示顺序不改变身份，控制行不成为段落。
   - _Requirements: 2.1, 2.2, 2.3, 2.4_
   - _Boundary: RpyCodec_

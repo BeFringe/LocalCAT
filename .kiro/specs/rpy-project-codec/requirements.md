@@ -34,7 +34,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 **目标：** 作为译者，我希望准确编辑每个翻译槽，并保留已有译文。
 
 #### 验收标准
-1. When 读取受支持的 dialogue block 或 old/new string pair, the LocalCAT shall 显示准确的源文、已有或空译文及可识别的 raw speaker；同一文件可同时包含两种形式，say 的角色标识符作为 speaker，显示属性与 transition 不并入 speaker 或可翻译文本，控制行不成为翻译段落。
+1. When 读取受支持的 dialogue block 或 old/new string pair, the LocalCAT shall 显示准确的源文、已有或空译文及可识别的 raw speaker；同一文件可同时包含两种形式，say 的角色标识符或姓名字符串作为 speaker，姓名中的 interpolation 原样保留且不求值；显示属性与 transition 不并入 speaker 或可翻译文本，控制行不成为翻译段落。
 2. When 源输入包含空译文、相同显示文本或文本内标签, the LocalCAT shall 保留各翻译槽及其顺序，不过滤空槽、不合并不同身份的段落。
 3. When 用户修改并保存 target 或 confirmed, the LocalCAT shall 在项目中保存精确编辑状态；首次导入的译文默认未确认，不依据非空文本自动确认。
 4. If 身份重复或无法唯一关联, the LocalCAT shall 阻止歧义导入/回填并指出冲突，不使用界面行号、basename 或修改时间猜测对应关系。

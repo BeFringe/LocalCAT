@@ -129,12 +129,12 @@ stateDiagram-v2
 
 支持 UTF-8（可带 BOM）、LF/CRLF、空行、注释和空格缩进。支持的 grammar 明确限定为：
 
-- `translate <language> <label>:`，其中一个源文注释 say 与一个目标 say 一一对应；支持 narrator 的单字符串，或 `speaker [attributes] <quoted-string> [with transition]`。speaker 为单个标识符，属性为零个或多个标识符/负属性（`-name`），可有一个 `@` 分隔临时属性（其后至少一个属性）；transition 限单个标识符，不求值。源/目标的 speaker 必须一致，属性及 transition 各自保留，不要求翻译前后显示效果相同。可保留 `voice <quoted-string>` 与 `nvl clear`；纯控制 block 不产生段落。
+- `translate <language> <label>:`，其中一个源文注释 say 与一个目标 say 一一对应；支持 narrator 的单字符串，或 `speaker [attributes] <quoted-string> [with transition]`。speaker 为单个标识符或单行姓名字符串；姓名字符串解码为 raw speaker，只有其后的台词字符串进入翻译槽。属性为零个或多个标识符/负属性（`-name`），可有一个 `@` 分隔临时属性（其后至少一个属性）；transition 限单个标识符，不求值。源/目标的 speaker 内容及形式必须一致，字符串姓名与同名标识符不混同；属性及 transition 各自保留，不要求翻译前后显示效果相同。可保留 `voice <quoted-string>` 与 `nvl clear`；纯控制 block 不产生段落。
 - `translate <language> strings:` 中一一对应的 `old <quoted-string>` / `new <quoted-string>`；可有多个 pair 和多个 strings block，但同一文档同一语言的重复 old key 拒绝。dialogue 与 strings 按块状态区分，可在同一文档交替出现；strings 无 speaker，不从相邻 dialogue 继承角色。
 - 字符串为单行单/双引号文本，允许声明的反斜杠转义（反斜杠、相应引号、n/r/t）；未声明转义、物理多行字符串、三引号、上述有限属性/transition 以外的 say 表达式或调用参数、`pass` 代替译文、多 say 对一 source、Python/style/条件块、原始游戏语句均整文档 unsupported。不保留无法确定边界的“未知代码”。
 - 一文档仅一个目标语言 token；language 按原 token 保存，不强制 BCP 47。`None` 只允许 strings。空目标、评论中的引号/井号按词法识别，不靠行过滤。
 
-speaker 映射示例：`guide thinking "Source"` 的中立 speaker 是 `guide`，`thinking` 只保留在 codec 的结构跨度中；`guide -thinking @ happy "Source" with dissolve` 采用同一规则。narrator 没有 speaker；`extend`、`centered` 按原始特殊 say 标识保留，不执行游戏去推断前一角色或显示别名。属性不会因未显示在 speaker 列而从导出文件删除。翻译单元 label 的摘要样式后缀是身份线索，不视为加密文本。
+speaker 映射示例：`guide thinking "Source"` 的中立 speaker 是 `guide`，`thinking` 只保留在 codec 的结构跨度中；`guide -thinking @ happy "Source" with dissolve` 采用同一规则。`"Alarm clock" "Ring"` 的 speaker 是 `Alarm clock`，`"[character]" "Hello"` 的 speaker 是 `[character]`，姓名插值不求值，姓名字节不属于可回填的译文跨度。narrator 没有 speaker；`extend`、`centered` 按原始特殊 say 标识保留，不执行游戏去推断前一角色或显示别名。属性不会因未显示在 speaker 列而从导出文件删除。翻译单元 label 的摘要样式后缀是身份线索，不视为加密文本。
 
 局部 ID：dialogue 使用 language+label 的无歧义编码；strings 使用 language+完整解码 old（含 `{#...}`）的 SHA-256 派生值，若碰撞或重复直接拒绝。ID 不使用当前序号。dialogue 的 label 不变而源文改变时 ID 保持，交给 Project 判定 source_changed、保留 target 并清除 confirmed；label 改变或 strings 的 old key 改变时产生 new/removed，交给显式调和，不靠相似文本自动合并。source 相同而显示/顺序变化不改变 ID。
 
