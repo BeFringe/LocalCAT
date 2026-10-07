@@ -63,7 +63,7 @@
   - _Requirements: 2.3, 3.1, 3.2, 3.3, 3.4_
   - _Boundary: RpyProjectAdapter / Project integration_
   - _Depends: 1.4, 3.1_
-- [ ] 3.2a 接入单 TL 打开、编辑与包保存的桌面流程
+- [x] 3.2a 接入单 TL 打开、编辑与包保存的桌面流程
   - 从既有统一文件选择入口消费 3.2 的中立项目能力，接通现有源文/译文/speaker、确认、浏览/搜索、包另存与冷重开，不新增目录扫描或另一份编辑状态。
   - 导入、保存及重开结果继续受 issued session/generation、未保存保护与 Chunk mutation guard 约束；运行时界面可响应，取消或关窗后丢弃晚到候选并释放资源，已发生的保存按 owner 结果如实处理。
   - 完成时，从正常 source 启动入口可打开混合 TL、编辑确认、保存后移走源 TL 再重开；无 codec 的包仍可中立编辑保存，失败或过期候选不替换当前项目，未接通的 TL 导出明确不可用。
