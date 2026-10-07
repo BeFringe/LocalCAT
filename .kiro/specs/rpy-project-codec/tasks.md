@@ -89,7 +89,7 @@
   - _Requirements: 4.1, 4.4, 4.5, 6.1, 6.3, 7.2_
   - _Boundary: Controller / Qt single-file export integration_
   - _Depends: 3.2a, 3.4_
-- [ ] 3.4b 验证单文件桌面闭环与故障保护
+- [x] 3.4b 验证单文件桌面闭环与故障保护
   - 以真实 Parser、ProjectPackage 和单文件 publisher 完成打开、编辑确认、保存、离开原路径冷重开、预览与导出；使用仓库内合成 TL，不以伪 adapter 替代用户旅程。
   - 比较合法无修改样例的完整字节与仅改单段的目标跨度；覆盖空/未确认译文、无 codec 包、stale token/private/preview、发布前后故障、取消/关窗及迟到结果，并回归既有 JSON/TXT 入口与 Chunk guards。
   - 完成时，桌面操作和输出文件均符合 3.2–3.4a 合同；source 支持平台分别记录实际运行结果，未完成的原生验收不算通过，普通 frozen 的最终组合验收仍由 5.3、6.1 承担。
