@@ -4,12 +4,11 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import tempfile
-import time
 from threading import Event
 import unittest
 from unittest import mock
 
-from PySide6.QtCore import QTimer, QCoreApplication, QEvent
+from PySide6.QtCore import QTimer, QCoreApplication, QEvent, QEventLoop, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QDialog
 from editor_controller import compose_project_enabled_editor_controller
@@ -53,10 +52,37 @@ class QtRpyProjectTests(unittest.TestCase):
         self.temp.cleanup()
 
     def wait_until(self, predicate, timeout=5):
-        end = time.monotonic() + timeout
-        while time.monotonic() < end and not predicate():
-            self.app.processEvents()
-            QTest.qWait(10)
+        if timeout > 0 and not predicate():
+            loop = QEventLoop()
+            poll = QTimer(loop)
+            deadline = QTimer(loop)
+            deadline.setSingleShot(True)
+            deadline.setTimerType(Qt.TimerType.PreciseTimer)
+            failure = None
+
+            def check():
+                nonlocal failure
+                try:
+                    if predicate():
+                        loop.quit()
+                except BaseException as error:
+                    # Qt callbacks must not swallow a failing test predicate.
+                    failure = error
+                    loop.quit()
+
+            poll.timeout.connect(check)
+            deadline.timeout.connect(loop.quit)
+            try:
+                poll.start(10)
+                deadline.start(int(timeout * 1000))
+                loop.exec()
+            finally:
+                poll.stop()
+                deadline.stop()
+                poll.timeout.disconnect(check)
+                deadline.timeout.disconnect(loop.quit)
+            if failure is not None:
+                raise failure
         self.assertTrue(predicate())
 
     def open(self):

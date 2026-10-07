@@ -4,6 +4,7 @@ from dataclasses import fields, is_dataclass, replace
 from contextlib import contextmanager
 import hashlib
 import io
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest import mock
 
 from parser_composition import ParserApplicationSurface
 from parser_source import CancellationToken
+from platform_fs_contracts import BoundDirectoryAuthority
 from project_codec_settings import (
     CodecProviderSetting, CodecSettings, CodecSettingsRepository,
     compose_project_codec_runtime,
@@ -164,7 +166,26 @@ class RpyExportPreviewTests(unittest.TestCase):
                 preview = self.prepare()
                 target = self.target
                 if condition == 'existing':
-                    self.target.unlink()
+                    try:
+                        self.target.unlink()
+                    except OSError as error:
+                        if os.name != 'nt' or error.winerror != 32:
+                            raise
+                        # A retained Windows SOURCE rejects replacement. A
+                        # refused mutation must not be treated as a stale file.
+                        self.assertEqual(self.target.read_bytes(), b'old target')
+                        self.assertEqual(preview.revalidate(self.context, target).status, 'ready')
+                        self.assert_unchanged()
+                        preview.close()
+                        self.assertTrue(preview.closed)
+                        self.target.unlink()
+                        self.target.write_bytes(b'replaced target')
+                        fresh = self.prepare()
+                        self.assertEqual(fresh.view.status, 'ready')
+                        self.assertNotEqual(fresh.view.preview_id, preview.view.preview_id)
+                        fresh.close()
+                        self.assertEqual(list(self.config.iterdir()), [])
+                        continue
                     self.target.write_bytes(b'replaced target')
                 elif condition == 'absent':
                     self.target.write_bytes(b'competitor')
@@ -203,9 +224,33 @@ class RpyExportPreviewTests(unittest.TestCase):
 
     def test_settings_changed_without_refreshing_runtime_stales(self):
         preview = self.prepare()
+        self.assertEqual(preview.view.status, 'ready')
+        self.assertEqual(list(self.config.iterdir()), [])
         CodecSettingsRepository(self.config).save(CodecSettings((CodecProviderSetting('localcat.rpy', False),)))
         self.assertEqual(preview.revalidate(self.context, self.target).status, 'stale')
         self.assertTrue(preview.closed)
+        self.assertFalse(self.target.exists())
+        self.assert_unchanged()
+
+    def test_source_bridge_cleanup_failure_blocks_before_preview_ready(self):
+        from rpy_project_export import _SourceBridge
+        original = _SourceBridge.close
+        failed = False
+        def close_then_fail_once(bridge):
+            nonlocal failed
+            original(bridge)
+            if not failed:
+                failed = True
+                raise OSError('private cleanup detail')
+        with mock.patch.object(_SourceBridge, 'close', close_then_fail_once):
+            preview = self.prepare()
+        self.assertTrue(failed)
+        self.assertEqual(preview.view.status, 'blocked')
+        self.assertTrue(preview.closed)
+        self.assertNotIn('private cleanup detail', repr(preview.view))
+        self.assertFalse(self.target.exists())
+        self.assertEqual(list(self.config.iterdir()), [])
+        self.assert_unchanged()
 
     def test_confirm_only_does_not_change_output(self):
         self.edit(0, self.service.flat_segments[0].segment.target, True)
@@ -218,10 +263,64 @@ class RpyExportPreviewTests(unittest.TestCase):
         preview = self.prepare()
         replacement = self.base / 'copy.localcat-project'
         replacement.write_bytes(self.package_bytes)
-        replacement.replace(self.package_path)
+        try:
+            replacement.replace(self.package_path)
+        except OSError as error:
+            if os.name != 'nt' or error.winerror != 32:
+                raise
+            self.assert_unchanged()
+            self.assertEqual(replacement.read_bytes(), self.package_bytes)
+            self.assertEqual(preview.revalidate(self.context, self.target).status, 'ready')
+            preview.close()
+            replacement.replace(self.package_path)
+            # The old saved binding cannot authorize the replaced package,
+            # even after the Windows guard has been released.
+            stale = self.prepare()
+            self.assertEqual(stale.view.status, 'blocked')
+            self.assertTrue(stale.closed)
+            self.assertEqual(stale.view.diagnostics[0].code, 'PROJECT.PACKAGE.SOURCE_STALE')
+            self.assertEqual(list(self.config.iterdir()), [])
+            return
         self.assertEqual(preview.revalidate(self.context, self.target).status, 'stale')
         self.assertTrue(preview.closed)
         self.assertEqual(list(self.config.iterdir()), [])
+
+    def test_persistent_bridge_cleanup_failure_is_blocked_with_residual_report(self):
+        for operation in ('unlink', 'rmdir'):
+            with self.subTest(operation=operation):
+                if operation == 'unlink':
+                    original = BoundDirectoryAuthority.unlink_owned
+                    def deny_source(parent, name, identity):
+                        if name == 'source.rpy':
+                            raise PermissionError('private persistent removal failure')
+                        return original(parent, name, identity)
+                    fault = mock.patch.object(BoundDirectoryAuthority, 'unlink_owned', deny_source)
+                else:
+                    original = Path.rmdir
+                    def deny_directory(path):
+                        if path.name.startswith('rpy-export-'):
+                            raise PermissionError('private persistent removal failure')
+                        return original(path)
+                    fault = mock.patch.object(Path, 'rmdir', deny_directory)
+                with fault:
+                    preview = self.prepare()
+                self.assertEqual(preview.view.status, 'blocked')
+                self.assertTrue(preview.closed)
+                self.assertIn('RPY.EXPORT.CLEANUP_FAILED', [item.code for item in preview.view.diagnostics])
+                self.assertNotIn('private persistent removal failure', repr(preview.view))
+                self.assertEqual(preview.publish(self.context, self.target).outcome, 'blocked')
+                self.assertFalse(self.target.exists())
+                self.assert_unchanged()
+                residuals = list(self.config.glob('rpy-export-*'))
+                self.assertEqual(len(residuals), 1)
+                residual = residuals[0]
+                if operation == 'unlink':
+                    self.assertEqual((residual / 'source.rpy').read_bytes(), self.raw)
+                    (residual / 'source.rpy').unlink()
+                # Failure is visible; no product retry or recursive cleanup
+                # is implied. These real removals also prove handles released.
+                residual.rmdir()
+                self.assertEqual(list(self.config.iterdir()), [])
 
     def test_project_package_internal_storage_and_hardlink_targets_are_rejected(self):
         link = self.base / 'looks-like-tl.rpy'
@@ -243,19 +342,26 @@ class RpyExportPreviewTests(unittest.TestCase):
                     if target == link:
                         target.unlink()
 
-    def test_missing_parent_is_not_created_and_symlink_target_is_rejected(self):
-        for symlink in (False, True):
-            with self.subTest(symlink=symlink):
-                if symlink:
-                    self.target = self.base / 'symlink.rpy'
-                    self.target.symlink_to(self.package_path)
-                else:
-                    self.target = self.base / 'missing' / 'nested' / 'target.rpy'
-                preview = self.prepare()
-                self.assertEqual(preview.view.status, 'blocked')
-                self.assertFalse((self.base / 'missing').exists())
-                self.assertEqual(list(self.config.iterdir()), [])
-                self.assert_unchanged()
+    def test_missing_parent_is_not_created(self):
+        self.target = self.base / 'missing' / 'nested' / 'target.rpy'
+        preview = self.prepare()
+        self.assertEqual(preview.view.status, 'blocked')
+        self.assertFalse((self.base / 'missing').exists())
+        self.assertEqual(list(self.config.iterdir()), [])
+        self.assert_unchanged()
+
+    def test_symlink_target_is_rejected(self):
+        self.target = self.base / 'symlink.rpy'
+        try:
+            self.target.symlink_to(self.package_path)
+        except OSError as error:
+            if os.name == 'nt' and error.winerror == 1314:
+                self.skipTest('Windows symlink privilege unavailable (WinError 1314)')
+            raise
+        preview = self.prepare()
+        self.assertEqual(preview.view.status, 'blocked')
+        self.assertEqual(list(self.config.iterdir()), [])
+        self.assert_unchanged()
 
     def test_member_context_exit_failure_is_not_consumed_by_parser(self):
         original = OpenedProjectPackage.open_member

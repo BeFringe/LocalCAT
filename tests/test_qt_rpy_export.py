@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
-from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QTimer, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 from qt_editor import _compose_editor_controller, _compose_chunk_controller
@@ -60,10 +60,37 @@ class QtRpyExportTests(unittest.TestCase):
         self.temp.cleanup()
 
     def wait_until(self, predicate, timeout=8):
-        end = time.monotonic() + timeout
-        while time.monotonic() < end and not predicate():
-            self.app.processEvents()
-            QTest.qWait(10)
+        if timeout > 0 and not predicate():
+            loop = QEventLoop()
+            poll = QTimer(loop)
+            deadline = QTimer(loop)
+            deadline.setSingleShot(True)
+            deadline.setTimerType(Qt.TimerType.PreciseTimer)
+            failure = None
+
+            def check():
+                nonlocal failure
+                try:
+                    if predicate():
+                        loop.quit()
+                except BaseException as error:
+                    # Qt callbacks must not swallow a failing test predicate.
+                    failure = error
+                    loop.quit()
+
+            poll.timeout.connect(check)
+            deadline.timeout.connect(loop.quit)
+            try:
+                poll.start(10)
+                deadline.start(int(timeout * 1000))
+                loop.exec()
+            finally:
+                poll.stop()
+                deadline.stop()
+                poll.timeout.disconnect(check)
+                deadline.timeout.disconnect(loop.quit)
+            if failure is not None:
+                raise failure
         self.assertTrue(predicate())
 
     def open_export(self):

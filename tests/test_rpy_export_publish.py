@@ -71,6 +71,16 @@ class RpyExportPublishTests(unittest.TestCase):
         self.assertEqual(list(self.config.iterdir()), [])
         self.assertEqual(list(self.base.glob('.parser-*.tmp')), [])
 
+    def test_ready_preview_publishes_from_sealed_source_after_bridge_removed(self):
+        preview = self.prepare()
+        self.assertEqual(preview.view.status, 'ready')
+        self.assertEqual(list(self.config.iterdir()), [])
+        result = preview.publish(self.context, self.target)
+        self.assertEqual(result.outcome, 'published')
+        self.assertEqual(self.target.read_bytes(), self.raw)
+        self.assert_released(preview)
+        self.assert_unchanged(False)
+
     def test_cold_package_noop_publishes_exact_bom_crlf_comments_once(self):
         preview = self.prepare()
         original = ParserApplicationSurface.write_prepared
@@ -239,7 +249,7 @@ class RpyExportPublishTests(unittest.TestCase):
                 self.assert_unchanged(False)
 
     def test_application_cleanup_error_does_not_report_prepublication_failure(self):
-        for authority_name in ('_opened', '_bridge'):
+        for authority_name in ('_opened',):
             with self.subTest(authority=authority_name):
                 preview = self.prepare()
                 authority = getattr(preview, authority_name)
