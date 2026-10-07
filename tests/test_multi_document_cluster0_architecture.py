@@ -271,6 +271,7 @@ _WORKSPACE_INTAKE_LOCAL_IMPORT_ALLOWLIST = frozenset(
         "platform_fs",
         "platform_fs_contracts",
         "project_workspace_contracts",
+        "project_workspace_discovery",
         "project_workspace_identity",
     }
 )
