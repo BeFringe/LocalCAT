@@ -278,7 +278,12 @@ class PreparedRpyProjectExport:
             self._view, status=status,
             diagnostics=diagnostics or (self._diagnostic(code, 'Export preparation is no longer usable.'),),
         )
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            self._view = replace(self._view, diagnostics=self._view.diagnostics + (
+                self._diagnostic('RPY.EXPORT.CLEANUP_FAILED',
+                                 'Export resource cleanup could not be proved.'),))
         return self._view
 
     def _require_context(self, context, target):
@@ -509,6 +514,11 @@ class PreparedRpyProjectExport:
         self._target_observation.reject_same_file(self._bridge.path)
         surface.bind_round_trip_target(self._prepared, TargetReference(
             str(self._target.parent), str(self._target), self._target.name))
+        # Parser retains sealed bytes, not this physical source. Keeping
+        # the bridge's rooted directory chain would lock device settings
+        # against replacement on Windows for the whole preview lifetime.
+        self._bridge.close()
+        self._bridge = None
         self._require_current(context, self._target)
         self._view = replace(
             self._view, status='ready', output_sha256=self._prepared.output_fingerprint,
