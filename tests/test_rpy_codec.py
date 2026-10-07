@@ -82,6 +82,55 @@ class RpyLexicalTests(unittest.TestCase):
         self.assertEqual(slot.target.attributes, ('-calm',))
         self.assertEqual(slot.target.transition, 'fade')
 
+    def test_quoted_speaker_maps_only_dialogue_to_translation_slot(self):
+        for name, speaker in (('"???"', '???'), ('"Alarm clock"', 'Alarm clock'),
+                              ('"[character]"', '[character]'),
+                              (r'"A \"name\" #"', 'A "name" #'),
+                              ("'向导'", '向导'), ('"with"', 'with')):
+            with self.subTest(name=name):
+                raw = dialogue(name + ' "Source"', name + ' ""')
+                with mock.patch('builtins.eval', side_effect=AssertionError('must not evaluate')):
+                    result = parse_tl(raw)
+                record = result.records[0]
+                self.assertEqual((record.source, record.target, record.speaker.value),
+                                 ('Source', '', speaker))
+                slot = result.lexical.slots[0]
+                self.assertEqual(raw[slot.source.literal.start:slot.source.literal.end], b'"Source"')
+                self.assertEqual(raw[slot.target.literal.start:slot.target.literal.end], b'""')
+
+    def test_quoted_speaker_preserves_attributes_transition_and_comment_quotes(self):
+        raw = dialogue('"[character]" calm -sad @ happy "Source" with dissolve',
+                       '"[character]" -calm "Target" with fade # "comment"')
+        slot = scan_tl(raw).slots[0]
+        self.assertEqual(slot.source.speaker, '[character]')
+        self.assertEqual(slot.source.attributes, ('calm', '-sad'))
+        self.assertEqual(slot.source.temporary_attributes, ('happy',))
+        self.assertEqual(slot.source.transition, 'dissolve')
+        self.assertEqual(slot.target.attributes, ('-calm',))
+        self.assertEqual(slot.target.transition, 'fade')
+        narrator = scan_tl(dialogue('"Source" with dissolve # "comment"',
+                                   '"Target" # "comment"')).slots[0]
+        self.assertIsNone(narrator.source.speaker)
+        self.assertIsNone(narrator.target.speaker)
+
+    def test_quoted_speaker_and_identifier_must_match_in_value_and_kind(self):
+        for source, target in (('"A" "S"', '"B" "T"'),
+                               ('"guide" "S"', 'guide "T"'),
+                               ('guide "S"', '"guide" "T"'),
+                               ('"" "S"', '"T"')):
+            with self.subTest(source=source, target=target):
+                self.assert_rejected(dialogue(source, target), 'ambiguous-slot')
+
+    def test_quoted_speaker_keeps_finite_grammar_and_string_limits(self):
+        for source in ('"Name""S"', '"Name" + "S"', '"Name" @ "S"',
+                       '"Name" "S" "extra"', '"Name"[index] "S"',
+                       '"Name" ""', '"Name" "[unclosed"'):
+            with self.subTest(source=source):
+                self.assert_rejected(dialogue(source, '"Name" ""'))
+        self.assert_rejected(dialogue('"Long name" "S"', '"Long name" ""'),
+                             'limit-exceeded', limits=RpyLexicalLimits(max_string_bytes=4))
+        self.assert_rejected(dialogue(r'"N\x20" "S"', '"Name" ""'), 'invalid-escape')
+
     def test_comments_quotes_and_hashes_preserve_raw_without_becoming_slots(self):
         raw = (b'# "a quote" # arbitrary comment\ntranslate zh_Hans unit: # header comment\n'
                b'    # line.rpy:12 "quoted note"\n    # "Source # text" # source suffix\n'

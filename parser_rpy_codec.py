@@ -91,6 +91,7 @@ class _Say:
     attributes: tuple[str, ...] = ()
     temporary_attributes: tuple[str, ...] = ()
     transition: str | None = None
+    speaker_is_literal: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,29 +203,47 @@ def _say(line: _Line, start: int, limits: RpyLexicalLimits,
     prefix = line.data[start:quote_at]
     words = _words(prefix)
     speaker = None
-    attributes: list[str] = []
-    temporary: list[str] = []
-    has_separator = False
-    if words:
+    speaker_is_literal = False
+    literal, end = _literal(line, quote_at, limits, checkpoint)
+    if not words:
+        # A second literal makes the first one a name. Quotes in a trailing
+        # comment or transition never turn narration into named dialogue.
+        remainder = line.data[end:]
+        next_quote = _quoted_start(remainder, 0)
+        comment_at = remainder.find(b'#')
+        if (next_quote >= 0 and (comment_at < 0 or next_quote < comment_at)
+                and not remainder.lstrip(b' ').startswith(b'with ')):
+            prefix = remainder[:next_quote]
+            if not prefix.startswith(b' ') or not prefix.endswith(b' '):
+                raise line.fail('unsupported-syntax', 'name and dialogue require spaces', end)
+            speaker = literal.text
+            speaker_is_literal = True
+            words = _words(prefix)
+            literal, end = _literal(line, end + next_quote, limits, checkpoint)
+    else:
         if not prefix.endswith(b' ') or not _identifier(words[0]):
             raise line.fail('unsupported-syntax', 'speaker must be a single identifier', start)
         speaker = words[0].decode('utf-8')
         if speaker in _STATEMENTS:
             raise line.fail('unsupported-syntax', 'statement is outside the TL profile', start)
-        for word in words[1:]:
-            if word == b'@':
-                if has_separator:
-                    raise line.fail('unsupported-syntax', 'multiple temporary attribute separators', start)
-                has_separator = True
-            elif _identifier(word[1:] if word.startswith(b'-') else word):
-                (temporary if has_separator else attributes).append(word.decode('utf-8'))
-            else:
-                raise line.fail('unsupported-syntax', 'unsupported say attribute', start)
-        if has_separator and not temporary:
-            raise line.fail('unsupported-syntax', 'temporary attributes are missing', start)
-    literal, end = _literal(line, quote_at, limits, checkpoint)
+        words = words[1:]
+    attributes: list[str] = []
+    temporary: list[str] = []
+    has_separator = False
+    for word in words:
+        if word == b'@':
+            if has_separator:
+                raise line.fail('unsupported-syntax', 'multiple temporary attribute separators', start)
+            has_separator = True
+        elif _identifier(word[1:] if word.startswith(b'-') else word):
+            (temporary if has_separator else attributes).append(word.decode('utf-8'))
+        else:
+            raise line.fail('unsupported-syntax', 'unsupported say attribute', start)
+    if has_separator and not temporary:
+        raise line.fail('unsupported-syntax', 'temporary attributes are missing', start)
     transition = _suffix(line, end, allow_transition=True)
-    return _Say(literal, speaker, tuple(attributes), tuple(temporary), transition)
+    return _Say(literal, speaker, tuple(attributes), tuple(temporary), transition,
+                speaker_is_literal)
 
 
 def _source_tokens(say: _Say, line: _Line,
@@ -407,7 +426,8 @@ def scan_tl(raw: bytes, *, limits: RpyLexicalLimits = RpyLexicalLimits(),
             else:
                 if block.target is not None or block.source is None:
                     raise line.fail('ambiguous-slot', 'target requires exactly one preceding source', start)
-                if say.speaker != block.source.speaker:
+                if ((say.speaker, say.speaker_is_literal) !=
+                        (block.source.speaker, block.source.speaker_is_literal)):
                     raise line.fail('ambiguous-slot', 'source and target speaker differ', start)
                 block.target = say
         offset, number = end, number + 1
