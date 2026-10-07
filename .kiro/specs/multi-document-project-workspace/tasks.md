@@ -234,13 +234,13 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Requirements: 13.1, 13.3_
   - _Boundary: Platform Windows backend_
   - _Depends: 5.1_
-- [ ] 5.4 验证平台观察到 Project 的集成合同
+- [x] 5.4 验证平台观察到 Project 的集成合同
   - 以同一中立 consumer 运行两个 backend 的正反例，验证 metadata 观察不读取正文或授予 source writer。
   - 完成时，条目/根身份事实、关闭后使用和取消行为一致，平台不泄漏额外路径权限。
   - _Requirements: 13.1, 13.3, 13.6_
   - _Boundary: Platform / Project integration validation_
   - _Depends: 5.2, 5.3_
-- [ ] 5.5 实现 Project 目录预览与显式选择服务
+- [x] 5.5 实现 Project 目录预览与显式选择服务
   - 建立 immutable 候选树、registry 中立能力筛选、确定顺序与 issued selection；默认不选，只有确认选择进入内容读取。
   - 完成时，两层及更深目录/同名文件可预览，未选内容零读取；不完整扫描/越界/alias/过期选择阻断，筛选不重算根。
   - _Requirements: 13.1, 13.2, 13.3_
@@ -253,7 +253,7 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 4.1, 13.3, 13.4_
   - _Boundary: Project contracts/intake/package_
   - _Depends: 2.1a, 2.4a, 2.8a_
-- [ ] 5.6a 接入目录选择的原根绑定与单/多文件 intake
+- [x] 5.6a 接入目录选择的原根绑定与单/多文件 intake
   - 消费 5.5 的 issued selection 和 retained root，按原根生成 source_ref；一个文件复用 5.6 的 profile，多个文件沿用既有 profile，不因单选或筛选重新计算根。
   - 完成时，JSON/TXT 合成目录中零选拒绝、嵌套单选保留完整相对路径、同名多选与顺序可冷重开恢复；stale/越界/alias/取消不提交，未勾选内容零读取。
   - _Requirements: 13.2, 13.3, 13.4_

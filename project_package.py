@@ -2865,6 +2865,7 @@ def _open_bound_source(
     binding: OriginBinding,
     document: ProjectDocument,
     backend: PlatformFileBackend | None,
+    source_reproof: ProjectPackageSourceReproof | None = None,
 ) -> BinaryIO:
     bound = next(
         (item for item in binding.documents if item.document_id == document.document_id),
@@ -2872,6 +2873,13 @@ def _open_bound_source(
     )
     if bound is None or bound.source_ref != document.source_ref:
         _fail("PROJECT.PACKAGE.SOURCE_STALE")
+    parts = tuple(document.source_ref.split("/"))
+    if isinstance(source_reproof, ProjectPackageSourcePaths):
+        parts = source_reproof.relative_source_components(document.document_id, document.source_ref)
+        if (type(parts) is not tuple or not parts
+                or any(type(part) is not str or not part or "/" in part or "\\" in part for part in parts)
+                or normalize_portable_ref_v1("/".join(parts)) != document.source_ref):
+            _fail("PROJECT.PACKAGE.SOURCE_STALE")
     root_path = Path(binding.absolute_root)
     if os.name == "nt":
         if backend is None:
@@ -2882,7 +2890,7 @@ def _open_bound_source(
             root = backend.bind_root(root_path)
             source = backend.open_regular(
                 root,
-                PureWindowsPath(*document.source_ref.split("/")),
+                PureWindowsPath(*parts),
             )
             snapshot = source.snapshot()
             expected = bound.source_identity
@@ -2892,7 +2900,7 @@ def _open_bound_source(
                 or snapshot.byte_count != expected.original_size
             ):
                 _fail("PROJECT.PACKAGE.SOURCE_STALE")
-            relative = PureWindowsPath(*document.source_ref.split("/"))
+            relative = PureWindowsPath(*parts)
             reader = _RootedBlobReader(
                 backend,
                 root,
@@ -2927,7 +2935,6 @@ def _open_bound_source(
             binding.root_inode,
         ):
             _fail("PROJECT.PACKAGE.SOURCE_STALE")
-        parts = document.source_ref.split("/")
         for component in parts[:-1]:
             child = os.open(
                 component,
@@ -2968,6 +2975,7 @@ def _source_blob(
     binding: OriginBinding,
     document: ProjectDocument,
     backend: PlatformFileBackend | None,
+    source_reproof: ProjectPackageSourceReproof | None = None,
 ) -> _Blob:
     bound = next(
         (item for item in binding.documents if item.document_id == document.document_id),
@@ -2981,7 +2989,7 @@ def _source_blob(
         path,
         identity.content_sha256,
         identity.byte_count,
-        lambda: _open_bound_source(binding, document, backend),
+        lambda: _open_bound_source(binding, document, backend, source_reproof),
     )
 
 
@@ -3061,6 +3069,7 @@ def _package_blobs(
     backend: PlatformFileBackend | None = None,
     last_known_good_package: OpenedProjectPackage | None = None,
     additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
+    source_reproof: ProjectPackageSourceReproof | None = None,
 ) -> tuple[_Blob, ...]:
     if type(workspace) is not ProjectWorkspace:
         raise TypeError("package candidate requires exact workspace")
@@ -3165,7 +3174,7 @@ def _package_blobs(
                 lkg_entry.source_member,
             )
         elif origin_binding is not None:
-            source_blob = _source_blob(origin_binding, document, backend)
+            source_blob = _source_blob(origin_binding, document, backend, source_reproof)
         else:
             _fail("PROJECT.PACKAGE.SOURCE_STALE")
         private_reference = None
@@ -3260,11 +3269,13 @@ def _build_package_snapshot(
     backend: PlatformFileBackend | None = None,
     last_known_good_package: OpenedProjectPackage | None = None,
     additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
+    source_reproof: ProjectPackageSourceReproof | None = None,
 ) -> tuple[BinaryIO, ProjectPackageValidationReport]:
     blobs = _package_blobs(
             workspace,
             origin_binding,
             private_sources,
+            source_reproof=source_reproof,
             backend=backend,
             last_known_good_package=last_known_good_package,
             additional_package_sources=additional_package_sources,
@@ -3308,11 +3319,13 @@ def _build_package_candidate(
     last_known_good_package: OpenedProjectPackage | None = None,
     additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
     destination_parent_facts: _ParentFacts | None = None,
+    source_reproof: ProjectPackageSourceReproof | None = None,
 ) -> ProjectPackageValidationReport:
     blobs = _package_blobs(
         workspace,
         origin_binding,
         private_sources,
+        source_reproof=source_reproof,
         backend=backend,
         last_known_good_package=last_known_good_package,
         additional_package_sources=additional_package_sources,
@@ -3537,6 +3550,7 @@ class _PosixProjectPackagePersistencePort:
         persistence_binding: ProjectPackagePersistenceBinding | None = None,
         additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
         allow_cross_project_lkg: bool = False,
+        source_reproof: ProjectPackageSourceReproof | None = None,
     ) -> None:
         if not isinstance(target, Path) or not target.is_absolute() or not target.name:
             _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
@@ -3561,6 +3575,7 @@ class _PosixProjectPackagePersistencePort:
         self._parent_facts = _bind_parent(self._target)
         self._binding = origin_binding
         self._private_sources = private_sources
+        self._source_reproof = source_reproof
         self._persistence_binding = persistence_binding
         self._additional_package_sources = additional_package_sources
         self._allow_cross_project_lkg = allow_cross_project_lkg
@@ -3670,6 +3685,7 @@ class _PosixProjectPackagePersistencePort:
                 candidate_workspace,
                 self._binding,
                 self._private_sources,
+                source_reproof=self._source_reproof,
                 last_known_good_package=(
                     opened_lkg
                     if opened_lkg is None
@@ -4090,6 +4106,7 @@ class _WindowsProjectPackagePersistencePort:
         persistence_binding: ProjectPackagePersistenceBinding | None = None,
         additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
         allow_cross_project_lkg: bool = False,
+        source_reproof: ProjectPackageSourceReproof | None = None,
     ) -> None:
         if not isinstance(target, Path) or not target.is_absolute() or not target.name:
             _fail("PROJECT.PACKAGE.SOURCE_UNSAFE")
@@ -4099,6 +4116,7 @@ class _WindowsProjectPackagePersistencePort:
         self._backend = backend
         self._binding = origin_binding
         self._private_sources = private_sources
+        self._source_reproof = source_reproof
         self._persistence_binding = persistence_binding
         self._additional_package_sources = additional_package_sources
         self._allow_cross_project_lkg = allow_cross_project_lkg
@@ -4563,6 +4581,7 @@ class _WindowsProjectPackagePersistencePort:
                 candidate_workspace,
                 self._binding,
                 self._private_sources,
+                source_reproof=self._source_reproof,
                 backend=self._backend,
                 last_known_good_package=(
                     opened_lkg
@@ -4890,6 +4909,7 @@ def _ProjectPackagePersistencePort(
     persistence_binding: ProjectPackagePersistenceBinding | None = None,
     additional_package_sources: tuple[OpenedProjectPackage, ...] = (),
     allow_cross_project_lkg: bool = False,
+    source_reproof: ProjectPackageSourceReproof | None = None,
 ):
     if os.name == "nt":
         if backend is None:
@@ -4902,6 +4922,7 @@ def _ProjectPackagePersistencePort(
             persistence_binding=persistence_binding,
             additional_package_sources=additional_package_sources,
             allow_cross_project_lkg=allow_cross_project_lkg,
+            source_reproof=source_reproof,
         )
     return _PosixProjectPackagePersistencePort(
         target,
@@ -4910,6 +4931,7 @@ def _ProjectPackagePersistencePort(
         persistence_binding=persistence_binding,
         additional_package_sources=additional_package_sources,
         allow_cross_project_lkg=allow_cross_project_lkg,
+        source_reproof=source_reproof,
     )
 
 
@@ -4927,6 +4949,15 @@ class ProjectPackageSourceReproof(Protocol):
     """First-save retained source lease check; never publication authority."""
 
     def reprove(self) -> None: ...
+
+
+@runtime_checkable
+class ProjectPackageSourcePaths(Protocol):
+    """Optional live spelling projection on the existing first-save source lease."""
+
+    def relative_source_components(self, document_id: str, source_ref: str) -> tuple[str, ...]:
+        """Package still proves identity, bytes and correspondence to source_ref."""
+        ...
 
 
 class _SourceReprovedPackagePort:
@@ -5329,6 +5360,7 @@ class ProjectPackageService:
             tuple(normalized_private),
             backend=self._backend_for(target),
             persistence_binding=persistence_binding,
+            source_reproof=source_reproof,
         )
         if source_reproof is not None:
             port = _SourceReprovedPackagePort(port, source_reproof)
