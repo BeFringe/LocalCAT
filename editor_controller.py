@@ -17,8 +17,12 @@ from capability_host import MatcherHandoffSnapshot
 from configured_term_adapter import ConfiguredTermAdapter
 from project_codec_settings import ProjectCodecRuntime, compose_project_codec_runtime
 from editor_file_jobs import (ControllerFileJob, ControllerFileOutcome, FileOpenCandidate,
-                              FileImportPublication, SingleTLImportReview)
+                              FileImportPublication, SingleTLImportReview,
+                              FileExportPreparation, FileExportPublication)
 from rpy_project_adapter import RpyProjectAdapter
+
+from project_export_contracts import ProjectExportDiagnostic, ProjectExportResult
+from rpy_project_export import RpyExportContext
 from editor_contracts import (
     BatchOperationReport,
     BatchUndoState,
@@ -1267,6 +1271,11 @@ class EditorController:
         self._rpy_project_session = None
         self._issued_file_jobs: dict[int, ControllerFileJob] = {}
         self._pending_tl_import = None
+        self._tl_export_generation = 0
+        self._pending_tl_export = None
+        self._issued_tl_export_jobs = {}
+        self._tl_export_publish_job = None
+        self._tl_export_display = None
         self._file_save_job: ControllerFileJob | None = None
         self._file_save_state: ControllerWorkspaceSaveState | None = None
         self._file_open_generation = 0
@@ -2001,29 +2010,198 @@ class EditorController:
         return self._workspace_recovery_target
 
     @property
-    def tl_export_unavailable_reason(self) -> str | None:
-        if not self.has_workspace or not any(
+    def is_tl_workspace(self) -> bool:
+        return self.has_workspace and any(
             d.codec_identity.provider_id == "localcat.rpy"
-            for d in self._workspace_contract.documents
-        ):
+            for d in self._workspace_contract.documents)
+
+    @property
+    def tl_export_default_path(self) -> Path | None:
+        if not self.is_tl_workspace or self._workspace_persistence_binding is None:
             return None
+        return (self._workspace_persistence_binding.path.parent
+                / Path(self._workspace_contract.documents[0].source_ref).name)
+
+    @property
+    def tl_export_publish_running(self) -> bool:
+        job = self._tl_export_publish_job
+        return job is not None and job.service is self._workspace_service
+
+    @property
+    def tl_export_unavailable_reason(self) -> str | None:
+        if not self.is_tl_workspace:
+            return None
+        if len(self._workspace_contract.documents) != 1:
+            return "TL 导出目前仅支持单文档项目。"
+        if self._workspace_persistence_binding is None:
+            return "请先保存项目包，再导出 TL。"
+        if self._workspace_recovery_target is not None:
+            return "项目包需要恢复，暂不能导出 TL。"
         runtime = self.project_codec_runtime
-        if runtime is not None:
-            document = self._workspace_contract.documents[0]
-            available = next((item for item in runtime.availability
-                              if item.codec_identity == document.codec_identity
-                              and item.format_id.value == document.format_id), None)
-            if available is None:
-                return "TL 导出不可用：此项目需要其他版本的格式支持。"
-            if not available.available:
-                reasons = {
-                    "PARSER.SELECTION.PROVIDER_DISABLED": "格式支持已禁用",
-                    "PARSER.SELECTION.PROVIDER_MISSING": "格式支持缺失",
-                    "PARSER.SELECTION.PROVIDER_INCOMPATIBLE": "格式版本不兼容",
-                    "PARSER.SELECTION.CONFIGURATION_INVALID": "格式配置无效",
-                }
-                return "TL 导出不可用：" + reasons.get(available.code, "格式支持不可用") + "。项目包仍可编辑保存。"
-        return "TL 导出暂不可用；当前可编辑并保存项目包。"
+        if runtime is None:
+            return "TL 格式支持不可用。"
+        document = self._workspace_contract.documents[0]
+        available = next((item for item in runtime.availability
+                          if item.codec_identity == document.codec_identity
+                          and item.format_id.value == document.format_id), None)
+        if available is None:
+            return "TL 导出不可用：此项目需要其他版本的格式支持。"
+        if not available.available:
+            reasons = {
+                "PARSER.SELECTION.PROVIDER_DISABLED": "格式支持已禁用",
+                "PARSER.SELECTION.PROVIDER_MISSING": "格式支持缺失",
+                "PARSER.SELECTION.PROVIDER_INCOMPATIBLE": "格式版本不兼容",
+                "PARSER.SELECTION.CONFIGURATION_INVALID": "格式配置无效",
+            }
+            return "TL 导出不可用：" + reasons.get(available.code, "格式支持不可用") + "。项目包仍可编辑保存。"
+        return None
+
+    def begin_tl_export_preview(self, target: Path) -> ControllerFileJob:
+        """Issue a worker preparation from the sole current saved workspace."""
+        self._ensure_workspace_writable()
+        if not self.is_tl_workspace or self.tl_export_unavailable_reason is not None:
+            raise EditorControllerError('RPY.EXPORT.UNAVAILABLE')
+        service = self._require_workspace_session()
+        binding = self._workspace_persistence_binding
+        target = Path(target).expanduser().absolute()
+        self.cancel_tl_export_preview()
+        generation = self._tl_export_generation
+        context = self._file_context() + (generation, binding)
+        config_dir = self.repository.config_dir
+        package_service = self._workspace_package_service
+
+        def prepare(cancellation):
+            runtime = compose_project_codec_runtime(config_dir)
+            prepared = RpyProjectAdapter(runtime, package_service=package_service).prepare_export(
+                service, binding, target, config_dir=config_dir,
+                request_generation=generation, cancellation=cancellation)
+            return FileExportPreparation(prepared, runtime)
+
+        job = ControllerFileJob('prepare_export', target, context, prepare, service=service,
+                                cleanup=lambda value: value.close() if value is not None else None)
+        self._issued_tl_export_jobs[id(job)] = (job, None)
+        return job
+
+    def tl_export_preview_current(self, view, target: Path) -> bool:
+        """GUI-safe identity/context check: no package, settings or target I/O."""
+        pending = self._pending_tl_export
+        if pending is None or view is not pending[0]:
+            return False
+        _, candidate, context, _ = pending
+        runtime = self.project_codec_runtime
+        return (view.status == 'ready'
+                and context == self._file_context() + (self._tl_export_generation,
+                                                     self._workspace_persistence_binding)
+                and str(Path(target).expanduser().absolute()) == view.target_path
+                and runtime is not None
+                and runtime.settings == candidate.runtime.settings
+                and runtime.availability == candidate.runtime.availability)
+
+    def cancel_tl_export_preview(self, view=None) -> None:
+        pending = self._pending_tl_export
+        if view is not None and (pending is None or view is not pending[0]):
+            return
+        self._tl_export_generation += 1
+        self._pending_tl_export = None
+        self._tl_export_display = None
+        if pending is not None:
+            pending[1].close()
+        for job, _ in self._issued_tl_export_jobs.values():
+            if job.kind == 'prepare_export':
+                job.cancel()
+
+    def begin_tl_export_publish(self, view, target: Path) -> ControllerFileJob:
+        """Consume the exact issued preview; freeze edits only until worker ends."""
+        self._ensure_workspace_writable()
+        if not self.tl_export_preview_current(view, target):
+            raise EditorControllerError('RPY.EXPORT.PREVIEW_STALE')
+        _, candidate, context, cancellation = self._pending_tl_export
+        self._pending_tl_export = None
+        service = self._require_workspace_session()
+        binding = self._workspace_persistence_binding
+        config_dir = self.repository.config_dir
+        generation = self._tl_export_generation
+        target = Path(target).expanduser().absolute()
+
+        def publish(_cancellation):
+            try:
+                runtime = compose_project_codec_runtime(config_dir)
+                result = candidate.prepared.publish(
+                    RpyExportContext(service, binding, runtime, generation), target)
+                return FileExportPublication(result, runtime)
+            finally:
+                candidate.close()
+
+        job = ControllerFileJob('publish_export', target, context, publish, service=service,
+                                cancellation=cancellation, run_when_cancelled=True,
+                                cleanup=lambda _value: candidate.close())
+        self._issued_tl_export_jobs[id(job)] = (job, view)
+        self._tl_export_publish_job = job
+        return job
+
+    def finish_tl_export_job(self, job: ControllerFileJob) -> ControllerFileOutcome:
+        """Accept once; publication facts survive cancellation or session changes."""
+        issued = self._issued_tl_export_jobs.get(id(job))
+        if issued is None or issued[0] is not job:
+            raise EditorControllerError('RPY.EXPORT.NOT_ISSUED')
+        value, error = job.take_result()
+        del self._issued_tl_export_jobs[id(job)]
+        current = (job.service is self._workspace_service
+                   and job.context == self._file_context() + (
+                       self._tl_export_generation, self._workspace_persistence_binding))
+        if self._tl_export_publish_job is job:
+            self._tl_export_publish_job = None
+        if current and value is not None:
+            self.project_codec_runtime = value.runtime
+        if job.kind == 'prepare_export':
+            accepted = current and not job.cancellation.cancelled and value is not None and error is None
+            view = None if value is None else value.prepared.view
+            if accepted:
+                self._pending_tl_export = (view, value, job.context, job.cancellation)
+                self._tl_export_display = (view, job.context)
+            elif value is not None:
+                value.close()
+            if error is not None and current and not job.cancellation.cancelled:
+                raise EditorControllerError(self._file_error_text(error)) from error
+            return ControllerFileOutcome(job.kind, job.path, accepted, view,
+                                         job.cancellation.cancelled)
+        result = None if value is None else value.result
+        if result is None:
+            view = issued[1]
+            outcome = 'uncertain' if job.operation_invoked else 'failed'
+            diagnostic = ProjectExportDiagnostic(
+                'RPY.EXPORT.OPERATION_FAILED', 'fatal',
+                '导出未取得发布结果，请检查目标文件。' if job.operation_invoked else '无法启动导出，目标未发布。',
+                view.document_id, view.source_ref)
+            result = ProjectExportResult(
+                view.preview_id, view.session_id, view.workspace_revision, view.request_generation,
+                view.document_id, view.source_ref, view.target_path,
+                outcome, (diagnostic,))
+        if current:
+            self._tl_export_display = (result, job.context)
+        return ControllerFileOutcome(job.kind, job.path, current, result,
+                                     job.cancellation.cancelled)
+
+    def tl_export_diagnostic_segment_number(self, projection, diagnostic) -> int | None:
+        """Project a readable row only for an exact issued diagnostic and session."""
+        issued = self._tl_export_display
+        if (issued is None or projection is not issued[0]
+                or issued[1] != self._file_context() + (self._tl_export_generation,
+                                                       self._workspace_persistence_binding)
+                or not any(diagnostic is item for item in projection.diagnostics)):
+            return None
+        for item in self.workspace_view.segments:
+            identity = item.identity.segment_identity
+            if (identity.document_id == diagnostic.document_id
+                    and identity.local_segment_id == diagnostic.local_segment_id):
+                return item.project_global_index + 1
+        return None
+
+    def locate_tl_export_diagnostic(self, projection, diagnostic) -> None:
+        number = self.tl_export_diagnostic_segment_number(projection, diagnostic)
+        if number is None:
+            raise EditorControllerError('RPY.EXPORT.DIAGNOSTIC_STALE')
+        self.go_to_workspace_segment(self.workspace_view.segments[number - 1].identity)
 
     def begin_file_open(self, path: Path, *, package: bool = False) -> ControllerFileJob:
         """Issue a background TL/package open without changing the session."""
@@ -2247,6 +2425,8 @@ class EditorController:
         return getattr(error, "code", "PROJECT.FILE.OPERATION_FAILED")
 
     def _ensure_workspace_writable(self) -> None:
+        if self.tl_export_publish_running:
+            raise EditorControllerError("PROJECT.FILE.EXPORT_IN_PROGRESS")
         if self.workspace_save_running:
             raise EditorControllerError("PROJECT.FILE.SAVE_IN_PROGRESS")
 
@@ -2259,6 +2439,9 @@ class EditorController:
                 job.cancel()
 
     def _retire_rpy_session(self) -> None:
+        self.cancel_tl_export_preview()
+        if self._tl_export_publish_job is not None:
+            self._tl_export_publish_job.cancel()
         session = self._rpy_project_session
         self._rpy_project_session = None
         if session is not None:
@@ -2272,6 +2455,11 @@ class EditorController:
         for job in self._issued_file_jobs.values():
             job.dispose()
         self._issued_file_jobs.clear()
+        self.cancel_tl_export_preview()
+        for job, _ in self._issued_tl_export_jobs.values():
+            job.dispose()
+        self._issued_tl_export_jobs.clear()
+        self._tl_export_publish_job = None
         self._file_save_job = None
         self._rpy_project_session = None
 
