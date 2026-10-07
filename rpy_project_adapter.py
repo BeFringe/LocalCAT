@@ -212,6 +212,24 @@ class RpyProjectAdapter:
         self.runtime = runtime
         self.package_service = package_service if package_service is not None else ProjectPackageService()
 
+    def prepare_export(
+        self, workspace_service: ProjectWorkspaceService,
+        persistence_binding: ProjectPackagePersistenceBinding, target: Path, *,
+        config_dir: Path, request_generation: int = 0, cancellation=None,
+    ):
+        """Prepare a display-only preview from the installed Project owner.
+
+        Ordinary package-open services use this same seam as RPY sessions.
+        The caller retains the closeable candidate and gives only its view to UI.
+        """
+        from rpy_project_export import RpyExportContext, prepare_rpy_export
+
+        return prepare_rpy_export(
+            RpyExportContext(workspace_service, persistence_binding, self.runtime, request_generation),
+            target, config_dir=config_dir, package_service=self.package_service,
+            cancellation=cancellation,
+        )
+
     def prepare_single(
         self, root: Path, source: Path, request: SelectedProjectDocumentsRequest,
         *, session_id: str, revision: int = 0, file_system=None, cancellation=None,
