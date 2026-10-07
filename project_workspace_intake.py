@@ -157,6 +157,11 @@ class _BoundSelectedFile:
     selected_path: Path
     authority: BoundRegularFile
     initial_snapshot: EntrySnapshot
+    raw_components: tuple[str, ...]
+
+    @property
+    def relative_path(self):
+        return _relative_path("/".join(self.raw_components))
 
     def close(self) -> None:
         self.authority.close()
@@ -252,7 +257,7 @@ def _absolute_root(root: Path) -> Path:
     return Path(os.path.abspath(os.fspath(root)))
 
 
-def _selected_ref(root: Path, selected: Path) -> tuple[str, Path]:
+def _selected_ref(root: Path, selected: Path, *, preserve_spelling: bool = False) -> tuple[str, Path]:
     if not isinstance(selected, Path):
         raise TypeError("selected paths must contain pathlib.Path values")
     path = selected if selected.is_absolute() else root / selected
@@ -264,7 +269,8 @@ def _selected_ref(root: Path, selected: Path) -> tuple[str, Path]:
     if not parts or any(part in {"", ".", ".."} for part in parts):
         _fail("PROJECT.WORKSPACE.PATH_INVALID")
     source_ref = normalize_portable_ref_v1("/".join(parts))
-    return source_ref, root.joinpath(*source_ref.split("/"))
+    physical_parts = parts if preserve_spelling else source_ref.split("/")
+    return source_ref, root.joinpath(*physical_parts)
 
 
 def _open_below_root(root_descriptor: int, source_ref: str) -> tuple[int, os.stat_result]:
@@ -549,12 +555,13 @@ def _issue_staged(
 class _RetainedSelectedSource:
     """Application ownership of original rooted inputs until initial publication."""
 
-    def __init__(self, backend, root, files, staged, cancellation):
+    def __init__(self, backend, root, files, staged, cancellation, directory_selection=None):
         self._backend = backend
         self._root = root
         self._files = files
         self._staged = staged
         self._cancellation = cancellation
+        self._directory_selection = directory_selection
 
     @property
     def closed(self) -> bool:
@@ -566,6 +573,8 @@ class _RetainedSelectedSource:
         try:
             if self._cancellation is not None:
                 self._cancellation.raise_if_cancelled()
+            if self._directory_selection is not None:
+                self._directory_selection.check_current()
             self._root.reprove()
             binding = self._staged.origin_binding
             path = Path(binding.absolute_root)
@@ -576,7 +585,7 @@ class _RetainedSelectedSource:
                             or _snapshot_digest(item.authority, item.initial_snapshot, self._cancellation)
                             != identity.content_sha256):
                         _fail("PROJECT.INTAKE.SOURCE_STALE")
-                    rebound = self._backend.open_regular(named_root, _relative_path(item.source_ref))
+                    rebound = self._backend.open_regular(named_root, item.relative_path)
                     try:
                         if rebound.snapshot() != item.initial_snapshot:
                             _fail("PROJECT.INTAKE.SOURCE_STALE")
@@ -586,6 +595,8 @@ class _RetainedSelectedSource:
                 self._root.reprove()
                 if os.name != "nt":
                     _revalidate_root(path, binding.root_device, binding.root_inode)
+                if self._directory_selection is not None:
+                    self._directory_selection.check_current()
                 if self._cancellation is not None:
                     self._cancellation.raise_if_cancelled()
             finally:
@@ -593,6 +604,15 @@ class _RetainedSelectedSource:
         except Exception:
             self.close()
             raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_STALE") from None
+
+    def relative_source_components(self, document_id: str, source_ref: str) -> tuple[str, ...]:
+        """Live original spelling for initial packaging, never persisted authority."""
+        if self.closed:
+            _fail("PROJECT.INTAKE.SOURCE_STALE")
+        for item, document in zip(self._files, self._staged.workspace.documents, strict=True):
+            if document.document_id == document_id and item.source_ref == source_ref:
+                return item.raw_components
+        _fail("PROJECT.INTAKE.SOURCE_STALE")
 
     def close(self) -> None:
         root, files = self._root, self._files
@@ -696,6 +716,38 @@ def prepare_selected_project_documents(
     )
 
 
+def prepare_directory_project_documents(
+    selection, request: SelectedProjectDocumentsRequest,
+    *, parser_surface: ParserApplicationSurface | None = None,
+    file_system: RootedFileSystem | None = None, cancellation=None,
+) -> PreparedSelectedProjectDocuments:
+    """Bridge one live metadata choice to verified, closeable first-save intake.
+
+    The caller keeps the discovery service alive through publication or abandonment.
+    Closing this prepared owner releases source handles but never closes that service.
+    Only its issued files are opened, using original raw spelling and original root.
+    """
+    from project_workspace_discovery import RetainedDirectorySelection
+
+    if type(selection) is not RetainedDirectorySelection:
+        raise TypeError("selection must be an issued RetainedDirectorySelection")
+    selection.reprove()
+    root, selected = selection.root_path, selection.files
+    selection.reprove()
+    if file_system is None:
+        from platform_fs import compose_platform_file_backend
+
+        try:
+            file_system = compose_platform_file_backend(_absolute_root(root))
+        except PlatformFileError as error:
+            raise ProjectWorkspaceError("PROJECT.INTAKE.SOURCE_UNSAFE") from error
+    return _stage_selected_project_documents(
+        root, tuple(root.joinpath(*item.raw_components) for item in selected), request,
+        parser_surface=parser_surface, file_system=file_system, cancellation=cancellation,
+        retain_source=True, directory_selection=selection,
+    )
+
+
 def _stage_selected_project_documents(
     root: Path,
     selected_paths: tuple[Path, ...],
@@ -705,6 +757,7 @@ def _stage_selected_project_documents(
     parser_surface: ParserApplicationSurface | None = None,
     cancellation=None,
     retain_source: bool = False,
+    directory_selection=None,
 ) -> StagedSelectedProjectDocuments | PreparedSelectedProjectDocuments:
     """Stage exactly the selected project documents without scanning the root."""
 
@@ -719,8 +772,12 @@ def _stage_selected_project_documents(
     if type(request) is not SelectedProjectDocumentsRequest:
         raise TypeError("request must be exact SelectedProjectDocumentsRequest")
     root_path = _absolute_root(root)
-    selected = tuple(_selected_ref(root_path, path) for path in selected_paths)
+    selected = tuple(_selected_ref(root_path, path, preserve_spelling=directory_selection is not None)
+                     for path in selected_paths)
     source_refs = tuple(item[0] for item in selected)
+    observed = () if directory_selection is None else directory_selection.files
+    if directory_selection is not None and source_refs != tuple(item.source_ref for item in observed):
+        _fail("PROJECT.INTAKE.SOURCE_STALE")
     validate_portable_ref_collection(source_refs, allow_exact_duplicates=False)
     surface = parser_surface if parser_surface is not None else create_parser_application_surface()
     if type(surface) is not ParserApplicationSurface:
@@ -749,6 +806,8 @@ def _stage_selected_project_documents(
     try:
         if cancellation is not None:
             cancellation.raise_if_cancelled()
+        if directory_selection is not None:
+            directory_selection.reprove()
         root_authority = backend.bind_root(root_path)
         root_authority.reprove()
         if os.name == "nt":
@@ -767,18 +826,21 @@ def _stage_selected_project_documents(
             source_refs=source_refs,
         )
         observed_file_ids: set[FileObjectIdentity] = set()
-        for source_ref, selected_path in selected:
+        for selected_index, (source_ref, selected_path) in enumerate(selected):
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
             authority = backend.open_regular(
                 root_authority,
-                _relative_path(source_ref),
+                _relative_path("/".join(selected_path.relative_to(root_path).parts)),
             )
             try:
                 snapshot = authority.snapshot()
             except BaseException:
                 authority.close()
                 raise
+            if directory_selection is not None and snapshot != observed[selected_index].snapshot:
+                authority.close()
+                _fail("PROJECT.INTAKE.SOURCE_STALE")
             file_id = snapshot.identity
             if snapshot.identity.link_count != 1 or not snapshot.reparse_free:
                 authority.close()
@@ -788,7 +850,7 @@ def _stage_selected_project_documents(
                 _fail("PROJECT.WORKSPACE.IDENTITY_DUPLICATE")
             observed_file_ids.add(file_id)
             bound.append(
-                _BoundSelectedFile(source_ref, selected_path, authority, snapshot)
+                _BoundSelectedFile(source_ref, selected_path, authority, snapshot, selected_path.relative_to(root_path).parts)
             )
 
         if request.origin_binding is not None and request.rename_mappings:
@@ -813,6 +875,8 @@ def _stage_selected_project_documents(
                 ):
                     _fail("PROJECT.RECONCILE.INPUT_INVALID")
 
+        if directory_selection is not None:
+            directory_selection.reprove()
         documents: list[ProjectDocument] = []
         private_sources: list[CodecPrivateMemberData] = []
         source_identities: list[SourceSnapshotIdentity] = []
@@ -820,6 +884,8 @@ def _stage_selected_project_documents(
         for order, (bound_file, format_id) in enumerate(
             zip(bound, formats, strict=True)
         ):
+            if directory_selection is not None:
+                directory_selection.reprove()
             purpose = EffectivePurpose.PROJECT_DOCUMENT
             try:
                 opened = surface.open_input(
@@ -875,7 +941,7 @@ def _stage_selected_project_documents(
             if (
                 source_identity.relative_reference_sha256
                 != hashlib.sha256(
-                    bound_file.source_ref.encode("utf-8", errors="strict")
+                    "/".join(bound_file.raw_components).encode("utf-8", errors="strict")
                 ).hexdigest()
                 or
                 source_identity.regular_file_identity
@@ -937,7 +1003,7 @@ def _stage_selected_project_documents(
                     _fail("PROJECT.INTAKE.SOURCE_STALE")
                 rebound = backend.open_regular(
                     root_authority,
-                    _relative_path(bound_file.source_ref),
+                    bound_file.relative_path,
                 )
                 try:
                     if rebound.snapshot() != bound_file.initial_snapshot:
@@ -955,7 +1021,7 @@ def _stage_selected_project_documents(
         try:
             for bound_file in bound:
                 rebound = backend.open_regular(
-                    named_root, _relative_path(bound_file.source_ref),
+                    named_root, bound_file.relative_path,
                 )
                 try:
                     if rebound.snapshot() != bound_file.initial_snapshot:
@@ -979,6 +1045,8 @@ def _stage_selected_project_documents(
             ):
                 _fail("PROJECT.INTAKE.SOURCE_STALE")
 
+        if directory_selection is not None:
+            directory_selection.reprove()
         workspace = ProjectWorkspace(
             schema_version=1,
             project_id=project_id,
@@ -1005,7 +1073,7 @@ def _stage_selected_project_documents(
         )
         staged = _issue_staged(workspace, binding, tuple(source_identities))
         if retain_source:
-            retained = _RetainedSelectedSource(backend, root_authority, tuple(bound), staged, cancellation)
+            retained = _RetainedSelectedSource(backend, root_authority, tuple(bound), staged, cancellation, directory_selection)
             prepared = PreparedSelectedProjectDocuments(staged, tuple(private_sources), retained)
             retained.reprove()
             # Transfer ownership only after all validation and construction succeeds.
@@ -1267,6 +1335,9 @@ def revalidate_staged_selected_documents(
 __all__ = (
     "OriginBinding",
     "OriginRenameMapping",
+    "PreparedSelectedProjectDocuments",
+    "prepare_directory_project_documents",
+    "prepare_selected_project_documents",
     "SelectedProjectDocumentsRequest",
     "StagedSelectedProjectDocuments",
     "revalidate_staged_selected_documents",
