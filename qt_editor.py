@@ -77,7 +77,7 @@ class _StartupTrace:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Launch the LocalCAT desktop editor.")
     project = parser.add_mutually_exclusive_group()
-    project.add_argument("--project", type=Path, help="Open a JSON or TXT translation project.")
+    project.add_argument("--project", type=Path, help="Open a JSON, TXT, Ren'Py TL (.rpy), or LocalCAT ProjectPackage.")
     project.add_argument("--sample", action="store_true", help="Open the bundled sample project.")
     project.add_argument(
         "--install-desktop-launcher",
@@ -1211,12 +1211,7 @@ def main(argv: list[str] | None = None, *, _ordinary: bool = False) -> int:
         # lifetime; the Controller receives only the host read boundary.
         _ = capability_composition
         startup_trace.finish("initial_project")
-        if args.project is not None:
-            if args.project.suffix.lower() == ".localcat-project":
-                controller.open_project_package(args.project)
-            else:
-                controller.open_project(args.project)
-        elif args.sample or args.smoke_test:
+        if args.project is None and (args.sample or args.smoke_test):
             controller.load_sample()
 
         # Set the Qt process identity before constructing QApplication.  On
@@ -1256,6 +1251,10 @@ def main(argv: list[str] | None = None, *, _ordinary: bool = False) -> int:
         # before the window is shown or any project menu can open.
         window.tmx_export_coordinator = tmx_export_service
         window.show()
+        from PySide6.QtCore import QEventLoop, QTimer
+        if args.project is not None:
+            # The normal CLI uses the same visible-window entry as picker/drop.
+            QTimer.singleShot(0, lambda: window.open_project_path(args.project))
         startup_trace.finish("first_events")
         validation_worker = _start_capability_validation(
             capability_composition,
@@ -1265,6 +1264,11 @@ def main(argv: list[str] | None = None, *, _ordinary: bool = False) -> int:
         # lifetime. The worker only emits; Qt invokes the window on its thread.
         _ = validation_worker
         app.processEvents()
+        if args.smoke_test and window.file_operation_running:
+            smoke_loop = QEventLoop()
+            window._file_runner.finished.connect(smoke_loop.quit)
+            QTimer.singleShot(30000, smoke_loop.quit)
+            smoke_loop.exec()
         startup_trace.finish()
         if args.bundle_smoke_marker is not None:
             _write_bundle_smoke_marker(
@@ -1290,8 +1294,10 @@ def main(argv: list[str] | None = None, *, _ordinary: bool = False) -> int:
                 or window.segment_list.count() == 0
             ):
                 print("Qt editor smoke test did not reach a usable editor state.", file=sys.stderr)
+                controller.close_project()
                 window.close()
                 return 1
+            controller.close_project()
             window.close()
             app.processEvents()
             if sys.stdout is not None:

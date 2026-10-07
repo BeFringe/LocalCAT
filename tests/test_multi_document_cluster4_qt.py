@@ -996,9 +996,9 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         before_bytes = self.package_path.read_bytes()
 
         with mock.patch.object(
-            self.controller,
-            "save_workspace_package",
-            side_effect=EditorControllerError("PROJECT.PACKAGE.APPLY_FAILED"),
+            self.controller._workspace_package_service,
+            "save_workspace",
+            side_effect=project_package_module.ProjectWorkspaceError("PROJECT.PACKAGE.APPLY_FAILED"),
         ):
             saved = self._required_method("save_workspace_project_package")()
         self.assertFalse(saved)
@@ -1040,12 +1040,8 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             retryable=True,
             safe_code="PROJECT.SAVE.COMMIT_FAILED",
         )
-        with mock.patch.object(
-            self.controller,
-            "save_workspace_package",
-            return_value=replace(committed, save_report=rolled_report),
-        ):
-            self.assertFalse(self.window.save_workspace_project_package())
+        self.assertFalse(self.window._finish_workspace_save(
+            replace(committed, save_report=rolled_report)))
         feedback = self.window.workspace_save_feedback.text()
         self.assertIn("PROJECT.SAVE.COMMIT_FAILED", feedback)
         self.assertIn("rolled_back", feedback)

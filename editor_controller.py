@@ -15,7 +15,9 @@ from uuid import uuid4
 
 from capability_host import MatcherHandoffSnapshot
 from configured_term_adapter import ConfiguredTermAdapter
-from project_codec_settings import ProjectCodecRuntime
+from project_codec_settings import ProjectCodecRuntime, compose_project_codec_runtime
+from editor_file_jobs import ControllerFileJob, ControllerFileOutcome, FileOpenCandidate
+from rpy_project_adapter import RpyProjectAdapter
 from editor_contracts import (
     BatchOperationReport,
     BatchUndoState,
@@ -190,8 +192,8 @@ class ControllerWorkspaceSaveState:
     dirty_document_ids: tuple[str, ...]
     manifest_dirty: bool
     project_dirty: bool
-    package_path: Path
-    artifact_digest: str
+    package_path: Path | None
+    artifact_digest: str | None
 
     def __post_init__(self) -> None:
         if type(self.dirty_document_ids) is not tuple:
@@ -202,6 +204,8 @@ class ControllerWorkspaceSaveState:
             raise TypeError("workspace dirty flags must be exact bool")
         if self.project_dirty != bool(self.dirty_document_ids or self.manifest_dirty):
             raise ValueError("workspace project dirty must close over document state")
+        if self.package_path is None and self.artifact_digest is None:
+            return
         if not isinstance(self.package_path, Path) or not self.package_path.is_absolute():
             raise TypeError("workspace save state requires absolute package path")
         if (
@@ -1259,6 +1263,12 @@ class EditorController:
         )
         self._tm_adapter = tm_adapter
         self._tm_query_lock = RLock()
+        self._rpy_project_session = None
+        self._issued_file_jobs: dict[int, ControllerFileJob] = {}
+        self._file_save_job: ControllerFileJob | None = None
+        self._file_save_state: ControllerWorkspaceSaveState | None = None
+        self._file_open_generation = 0
+        self._workspace_recovery_target: Path | None = None
         self._project_session_id = uuid4().hex
         self._tm_query_epoch = 0
         self._current_project_search_report: ProjectSearchReport | None = None
@@ -1499,13 +1509,19 @@ class EditorController:
 
     @property
     def workspace_save_state(self) -> ControllerWorkspaceSaveState:
-        _service, save_service, binding = self._require_workspace_save_session()
+        if self.workspace_save_running and self._file_save_state is not None:
+            return self._file_save_state
+        self._require_workspace_session()
+        save_service = self._workspace_save_service
+        binding = self._workspace_persistence_binding
+        if save_service is None:
+            raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
         return ControllerWorkspaceSaveState(
             dirty_document_ids=save_service.dirty_document_ids,
             manifest_dirty=save_service.manifest_dirty,
             project_dirty=save_service.project_dirty,
-            package_path=binding.path,
-            artifact_digest=binding.artifact_digest,
+            package_path=None if binding is None else binding.path,
+            artifact_digest=None if binding is None else binding.artifact_digest,
         )
 
     @property
@@ -1969,6 +1985,210 @@ class EditorController:
                 "PROJECT_SEARCH.ADVANCED_OPTIONS_UNAVAILABLE"
             )
 
+    def _file_context(self) -> tuple:
+        return (self._project_session_id, self._workspace_generation,
+                self._project_revision)
+
+    @property
+    def workspace_save_running(self) -> bool:
+        job = self._file_save_job
+        return job is not None and job.service is self._workspace_service
+
+    @property
+    def workspace_recovery_target(self) -> Path | None:
+        return self._workspace_recovery_target
+
+    @property
+    def tl_export_unavailable_reason(self) -> str | None:
+        if not self.has_workspace or not any(
+            d.codec_identity.provider_id == "localcat.rpy"
+            for d in self._workspace_contract.documents
+        ):
+            return None
+        runtime = self.project_codec_runtime
+        if runtime is not None:
+            document = self._workspace_contract.documents[0]
+            available = next((item for item in runtime.availability
+                              if item.codec_identity == document.codec_identity
+                              and item.format_id.value == document.format_id), None)
+            if available is None:
+                return "TL 导出不可用：此项目需要其他版本的格式支持。"
+            if not available.available:
+                reasons = {
+                    "PARSER.SELECTION.PROVIDER_DISABLED": "格式支持已禁用",
+                    "PARSER.SELECTION.PROVIDER_MISSING": "格式支持缺失",
+                    "PARSER.SELECTION.PROVIDER_INCOMPATIBLE": "格式版本不兼容",
+                    "PARSER.SELECTION.CONFIGURATION_INVALID": "格式配置无效",
+                }
+                return "TL 导出不可用：" + reasons.get(available.code, "格式支持不可用") + "。项目包仍可编辑保存。"
+        return "TL 导出暂不可用；当前可编辑并保存项目包。"
+
+    def begin_file_open(self, path: Path, *, package: bool = False) -> ControllerFileJob:
+        """Issue a background TL/package open without changing the session."""
+        path = Path(path).expanduser().absolute()
+        if not package and path.suffix.lower() not in {".rpy", ".localcat-project", ".zip"}:
+            raise EditorControllerError("PROJECT.FILE.FORMAT_UNSUPPORTED")
+        self._file_open_generation += 1
+        generation = self._file_open_generation
+        context = self._file_context() + (generation,)
+        package_service = self._workspace_package_service
+        file_system = self._workspace_file_system
+        config_dir = self.repository.config_dir
+        session_id = uuid4().hex
+
+        def prepare(cancellation):
+            runtime = compose_project_codec_runtime(config_dir)
+            if not package and path.suffix.lower() == ".rpy":
+                session = RpyProjectAdapter(runtime, package_service=package_service).prepare_single(
+                    path.parent, path,
+                    SelectedProjectDocumentsRequest(path.stem, "und", "und"),
+                    session_id=session_id, file_system=file_system,
+                    cancellation=cancellation,
+                )
+                return FileOpenCandidate(session.save_service, None, session, runtime)
+            opened = package_service.open(path)
+            return FileOpenCandidate(
+                opened.create_save_service(session_id=session_id, revision=0),
+                opened.persistence_binding, runtime=runtime,
+            )
+
+        job = ControllerFileJob("open", path, context, prepare)
+        self._issued_file_jobs[id(job)] = job
+        return job
+
+    def begin_file_save(self, destination: Path | None = None) -> ControllerFileJob:
+        """Reserve the sole live owner, then let a worker do bounded package I/O."""
+        with self._tm_query_lock:
+            self._ensure_workspace_writable()
+            if self._workspace_recovery_target is not None:
+                raise EditorControllerError("PROJECT.SAVE.RECOVERY_REQUIRED")
+            service = self._require_workspace_session()
+            save_service = self._workspace_save_service
+            binding = self._workspace_persistence_binding
+            session = self._rpy_project_session
+            if save_service is None or save_service.workspace_service is not service:
+                raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
+            if session is not None and (
+                session.closed
+                or session.save_service is not save_service
+                or session.workspace_service is not service
+            ):
+                raise EditorControllerError("PROJECT.WORKSPACE.SESSION_STALE")
+            if destination is None:
+                if binding is None:
+                    raise EditorControllerError("PROJECT.FILE.SAVE_AS_REQUIRED")
+                destination = binding.path
+            destination = Path(destination).expanduser().absolute()
+            if session is None and binding is None:
+                raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
+            package_service = self._workspace_package_service
+
+            def save(_cancellation):
+                if session is not None:
+                    return session.save(destination)
+                return package_service.save_workspace(
+                    save_service, destination, persistence_binding=binding)
+
+            job = ControllerFileJob("save", destination, self._file_context(), save,
+                                    session=session, service=service)
+            self._file_save_state = self.workspace_save_state
+            self._issued_file_jobs[id(job)] = job
+            self._file_save_job = job
+            return job
+
+    def finish_file_job(self, job: ControllerFileJob) -> ControllerFileOutcome:
+        """GUI-thread-only, once-only acceptance. A late save keeps its receipt."""
+        if self._issued_file_jobs.get(id(job)) is not job:
+            raise EditorControllerError("PROJECT.FILE.NOT_ISSUED")
+        if job.kind == "open" and job.disposed:
+            del self._issued_file_jobs[id(job)]
+            return ControllerFileOutcome(job.kind, job.path, False, cancelled=True)
+        value, error = job.take_result()
+        del self._issued_file_jobs[id(job)]
+        context_matches = job.context[:3] == self._file_context()
+        accepted = context_matches
+        if job.kind == "open":
+            accepted = (accepted and job.context[3] == self._file_open_generation
+                        and not job.cancellation.cancelled and value is not None
+                        and error is None)
+            if accepted:
+                try:
+                    self._validate_workspace_chunk_replacement(value.save_service.workspace_service)
+                    self._install_workspace_services(
+                        value.save_service, value.binding,
+                        session_id=value.save_service.workspace_service.session_id,
+                    )
+                    self._rpy_project_session = value.session
+                    self.project_codec_runtime = value.runtime
+                except BaseException:
+                    value.close()
+                    raise
+            elif value is not None:
+                value.close()
+        else:
+            accepted = context_matches and job.service is self._workspace_service
+            if self._file_save_job is job:
+                self._file_save_job = None
+                self._file_save_state = None
+            if accepted and value is not None:
+                if value.save_report.recovery_required:
+                    self._workspace_recovery_target = job.path
+                if value.persistence_binding is not None:
+                    self._workspace_persistence_binding = value.persistence_binding
+                self._reissue_workspace_session_view()
+                self._remember_current_workspace_position()
+            elif not accepted and job.session is not None:
+                job.session.close()
+        if error is not None and not (job.kind == "open" and
+                                      (job.cancellation.cancelled or not context_matches)):
+            raise EditorControllerError(self._file_error_text(error)) from error
+        return ControllerFileOutcome(job.kind, job.path, accepted,
+                                     value if job.kind == "save" else None,
+                                     job.cancellation.cancelled)
+
+    @staticmethod
+    def _file_error_text(error: Exception) -> str:
+        availability = getattr(error, "availability", None)
+        if availability is not None:
+            reasons = {
+                "PARSER.SELECTION.PROVIDER_DISABLED": "Ren’Py TL 格式支持已禁用。",
+                "PARSER.SELECTION.PROVIDER_MISSING": "Ren’Py TL 格式支持缺失。",
+                "PARSER.SELECTION.PROVIDER_INCOMPATIBLE": "Ren’Py TL 格式支持版本不兼容。",
+                "PARSER.SELECTION.CONFIGURATION_INVALID": "本机格式配置无效。",
+            }
+            return availability.code + " · " + reasons.get(availability.code, availability.safe_summary)
+        diagnostics = getattr(error, "diagnostics", ())
+        if diagnostics:
+            issue = diagnostics[0]
+            location = f" · 行 {issue.line_number}" if issue.line_number is not None else ""
+            return issue.code + location + " · " + issue.safe_summary
+        return getattr(error, "code", "PROJECT.FILE.OPERATION_FAILED")
+
+    def _ensure_workspace_writable(self) -> None:
+        if self.workspace_save_running:
+            raise EditorControllerError("PROJECT.FILE.SAVE_IN_PROGRESS")
+
+    def _discard_pending_file_opens(self) -> None:
+        for job in self._issued_file_jobs.values():
+            if job.kind == "open":
+                job.dispose()
+
+    def _retire_rpy_session(self) -> None:
+        session = self._rpy_project_session
+        self._rpy_project_session = None
+        if session is not None:
+            job = self._file_save_job
+            if job is None or job.session is not session:
+                session.close()
+
+    def abandon_file_jobs(self) -> None:
+        """Window shutdown revokes publication; workers finish their own cleanup."""
+        for job in self._issued_file_jobs.values():
+            job.dispose()
+        self._issued_file_jobs.clear()
+        self._file_save_job = None
+        self._rpy_project_session = None
+
     def open_project_package(self, path: Path) -> WorkspaceSessionView:
         """Cold-open one durable package and swap sessions only after success."""
 
@@ -2424,6 +2644,7 @@ class EditorController:
 
     def save_workspace_package(self) -> ControllerWorkspaceSaveResult:
         with self._tm_query_lock:
+            self._ensure_workspace_writable()
             _service, save_service, binding = self._require_workspace_save_session()
             try:
                 result = self._workspace_package_service.save_workspace(
@@ -2453,6 +2674,7 @@ class EditorController:
         if type(document) is not IssuedDocumentIdentity:
             raise TypeError("workspace save requires issued document identity")
         with self._tm_query_lock:
+            self._ensure_workspace_writable()
             _service, save_service, binding = self._require_workspace_save_session()
             if not any(item.identity is document for item in self.workspace_view.documents):
                 raise EditorControllerError(
@@ -2552,6 +2774,7 @@ class EditorController:
         if type(staged) is not StagedSelectedProjectDocuments:
             raise TypeError("reconciliation input must be exact")
         with self._tm_query_lock:
+            self._ensure_workspace_writable()
             service = self._require_workspace_session()
             issued = self._issued_workspace_reconciliation
             if (
@@ -2660,6 +2883,8 @@ class EditorController:
                     )
             except ProjectWorkspaceError as error:
                 raise EditorControllerError(error.code) from error
+            self._retire_rpy_session()
+            self._discard_pending_file_opens()
             self._project = None
             self._current_index = 0
             self._dirty = False
@@ -2668,6 +2893,7 @@ class EditorController:
             self._workspace_service = candidate_install.service
             self._workspace_save_service = candidate_install.save_service
             self._workspace_persistence_binding = binding
+            self._workspace_recovery_target = None
             self._workspace_flat_segments = candidate_install.projection
             self._workspace_global_index = candidate_install.current_index
             self._workspace_generation = candidate_install.generation
@@ -2769,6 +2995,7 @@ class EditorController:
         if type(preview) is not ProjectPackageImportPreview:
             raise TypeError("package import preview must be exact")
         with self._tm_query_lock:
+            self._ensure_workspace_writable()
             issued = self._issued_workspace_package_import
             if issued is None or preview is not issued[0]:
                 raise EditorControllerError("PROJECT.PACKAGE.PREVIEW_STALE")
@@ -2847,6 +3074,8 @@ class EditorController:
             except ProjectWorkspaceError as error:
                 raise EditorControllerError(error.code) from error
             binding = result.installed.persistence_binding
+            self._retire_rpy_session()
+            self._discard_pending_file_opens()
             self._project = None
             self._current_index = 0
             self._dirty = False
@@ -2855,6 +3084,7 @@ class EditorController:
             self._workspace_service = candidate_install.service
             self._workspace_save_service = candidate_install.save_service
             self._workspace_persistence_binding = binding
+            self._workspace_recovery_target = None
             self._workspace_flat_segments = candidate_install.projection
             self._workspace_global_index = candidate_install.current_index
             self._workspace_generation = candidate_install.generation
@@ -2921,12 +3151,15 @@ class EditorController:
         if not project.segments:
             raise EditorControllerError("project contains no segments")
         with self._tm_query_lock:
+            self._retire_rpy_session()
+            self._discard_pending_file_opens()
             self._remember_current_workspace_position()
             if self._workspace_service is not None:
                 self._notify_workspace_chunk_closed()
             self._workspace_service = None
             self._workspace_save_service = None
             self._workspace_persistence_binding = None
+            self._workspace_recovery_target = None
             self._workspace_flat_segments = ()
             self._workspace_global_index = 0
             self._workspace_session_view = None
@@ -3253,6 +3486,8 @@ class EditorController:
         """Leave the current project after the frontend has handled unsaved changes."""
 
         with self._tm_query_lock:
+            self._retire_rpy_session()
+            self._discard_pending_file_opens()
             if self._project is not None:
                 self._remember_current_position()
             else:
@@ -3263,6 +3498,7 @@ class EditorController:
             self._workspace_service = None
             self._workspace_save_service = None
             self._workspace_persistence_binding = None
+            self._workspace_recovery_target = None
             self._workspace_flat_segments = ()
             self._workspace_global_index = 0
             self._workspace_session_view = None
@@ -4769,6 +5005,7 @@ class EditorController:
     def _workspace_owner_for_chunk_controller(self) -> ProjectWorkspaceService:
         """Return the exact live owner to the installed composition adapter."""
 
+        self._ensure_workspace_writable()
         return self._require_workspace_session()
 
     def _install_workspace_chunk_edit_gate(self, gate: object) -> None:
@@ -4883,6 +5120,7 @@ class EditorController:
         target: str,
         confirmed: bool,
     ) -> object | None:
+        self._ensure_workspace_writable()
         gate = self._workspace_chunk_edit_gate
         if gate is None:
             return None
@@ -4904,6 +5142,7 @@ class EditorController:
         target: str,
         confirmed: bool,
     ) -> object:
+        self._ensure_workspace_writable()
         gate = self._workspace_chunk_edit_gate
         if gate is None:
             return service.update_segment_edit(
@@ -4940,6 +5179,7 @@ class EditorController:
     ) -> tuple[WriteReport, object | None]:
         """Run resource publication only after the final Chunk revalidation."""
 
+        self._ensure_workspace_writable()
         gate = self._workspace_chunk_edit_gate
         if gate is None:
             report = publish_resources()
@@ -4977,6 +5217,8 @@ class EditorController:
         ProjectSaveService,
         ProjectPackagePersistenceBinding,
     ]:
+        if self._workspace_recovery_target is not None:
+            raise EditorControllerError("PROJECT.SAVE.RECOVERY_REQUIRED")
         service = self._require_workspace_session()
         save_service = self._workspace_save_service
         binding = self._workspace_persistence_binding
@@ -5160,6 +5402,11 @@ class EditorController:
             or service.session_id != session_id
         ):
             raise ValueError("opened workspace session binding is invalid")
+        self._install_workspace_services(save_service, opened.persistence_binding,
+                                         session_id=session_id)
+
+    def _install_workspace_services(self, save_service, binding, *, session_id):
+        service = save_service.workspace_service
         projection = service.flat_segments
         if not projection:
             raise ValueError("opened workspace contains no navigable segments")
@@ -5182,7 +5429,8 @@ class EditorController:
             self._batch_undo_state = None
             self._workspace_service = service
             self._workspace_save_service = save_service
-            self._workspace_persistence_binding = opened.persistence_binding
+            self._workspace_persistence_binding = binding
+            self._workspace_recovery_target = None
             self._workspace_flat_segments = projection
             self._workspace_global_index = 0
             self._workspace_generation = next_generation
@@ -5195,10 +5443,13 @@ class EditorController:
             self._issued_workspace_package_import = None
             self._advance_tm_query_epoch()
             self._record_current_tm_baseline()
-            self._restore_workspace_position(opened.persistence_binding.path)
+            if binding is not None:
+                self._restore_workspace_position(binding.path)
             self._reissue_workspace_session_view()
             self._remember_current_workspace_position()
             self._notify_workspace_chunk_opened()
+            self._retire_rpy_session()
+            self._discard_pending_file_opens()
         except BaseException:
             self.__dict__.clear()
             self.__dict__.update(previous_state)
