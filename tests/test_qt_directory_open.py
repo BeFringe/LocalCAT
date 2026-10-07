@@ -129,6 +129,52 @@ class QtDirectoryOpenTests(unittest.TestCase):
         blocked.close()
         self.controller.cancel_directory_open(review)
 
+    def test_folder_bulk_selection_partial_state_order_and_stale_controls(self):
+        (self.root / 'b' / 'other.txt').write_text('Third\n')
+        (self.root / 'blocked').mkdir()
+        (self.root / 'blocked' / 'unknown.xyz').write_text('unsupported')
+        review = self.preview()
+        current = True
+        dialog = QtDirectoryOpenDialog(review, current=lambda: current)
+        items = {entry.source_ref: dialog.entry_items[entry.entry_id]
+                 for entry in review.preview.entries}
+        try:
+            self.assertEqual(dialog.ordered_entry_ids, ())
+            self.assertTrue(items['b'].flags() & Qt.ItemFlag.ItemIsUserCheckable)
+            self.assertFalse(items['blocked'].flags() & Qt.ItemFlag.ItemIsUserCheckable)
+            items['a/same.txt'].setCheckState(0, Qt.CheckState.Checked)
+            items['b/deep/same.txt'].setCheckState(0, Qt.CheckState.Checked)
+            self.assertEqual(items['b/deep'].checkState(0), Qt.CheckState.Checked)
+            self.assertEqual(items['b'].checkState(0), Qt.CheckState.PartiallyChecked)
+            dialog.selected_files.setCurrentRow(1)
+            dialog.move_selected(-1)
+            items['b'].setCheckState(0, Qt.CheckState.Checked)
+            self.assertEqual(dialog.ordered_entry_ids,
+                             self.ids(review, ('b/deep/same.txt', 'a/same.txt', 'b/other.txt')))
+            items['b/other.txt'].setCheckState(0, Qt.CheckState.Unchecked)
+            self.assertEqual(items['b'].checkState(0), Qt.CheckState.PartiallyChecked)
+            items['b'].setCheckState(0, Qt.CheckState.Unchecked)
+            self.assertEqual(dialog.ordered_entry_ids, self.ids(review, ('a/same.txt',)))
+            self.assertEqual(items['b/deep'].checkState(0), Qt.CheckState.Unchecked)
+            dialog.select_all_button.click()
+            selectable = tuple(entry.entry_id for entry in review.preview.entries if entry.selectable)
+            self.assertEqual(dialog.ordered_entry_ids, selectable)
+            self.assertIn(self.ids(review, ('bad.json',))[0], dialog.ordered_entry_ids)
+            self.assertEqual(items['b'].checkState(0), Qt.CheckState.Checked)
+            self.assertEqual(items['unknown.xyz'].checkState(0), Qt.CheckState.Unchecked)
+            dialog.clear_selection_button.click()
+            self.assertEqual(dialog.ordered_entry_ids, ())
+            self.assertEqual(items['b'].checkState(0), Qt.CheckState.Unchecked)
+            self.assertFalse(dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled())
+            current = False
+            dialog._update_ready()
+            self.assertFalse(dialog.select_all_button.isEnabled())
+            self.assertFalse(dialog.clear_selection_button.isEnabled())
+            self.assertFalse(dialog.tree.isEnabled())
+        finally:
+            dialog.close()
+            self.controller.cancel_directory_open(review)
+
     def test_cancel_review_save_picker_failure_and_bad_selected_keep_dirty_old_project(self):
         self.window.load_sample()
         self.window.target_editor.setPlainText('旧项目修改')
