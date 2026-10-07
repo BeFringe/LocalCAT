@@ -19,8 +19,9 @@ from project_codec_settings import ProjectCodecRuntime, compose_project_codec_ru
 from editor_file_jobs import (ControllerFileJob, ControllerFileOutcome, FileOpenCandidate,
                               FileImportPublication, SingleTLImportReview,
                               FileExportPreparation, FileExportPublication)
-from rpy_project_adapter import RpyProjectAdapter
+from rpy_project_adapter import RpyProjectAdapter, RpyProjectSession
 from editor_directory_open import DirectoryOpenCandidate
+from editor_source_update import SourceUpdateCandidate, source_update_review
 
 from project_export_contracts import ProjectExportDiagnostic, ProjectExportResult
 from rpy_project_export import RpyExportContext
@@ -152,6 +153,7 @@ from project_workspace import (
     ProjectWorkspaceService,
     ReconciliationAssociation,
     ReconciliationDecision,
+    ReconciliationDisposition,
     ReconciliationPreview,
     ReconciliationReceipt,
     WorkspaceDocumentView,
@@ -1290,6 +1292,10 @@ class EditorController:
         self._issued_file_jobs: dict[int, ControllerFileJob] = {}
         self._pending_tl_import = None
         self._pending_directory_open = None
+        self._pending_source_update = None
+        self._source_update_plan = None
+        self._source_update_generation = 0
+        self._issued_source_update_jobs = {}
         self._tl_export_generation = 0
         self._pending_tl_export = None
         self._issued_tl_export_jobs = {}
@@ -2059,6 +2065,173 @@ class EditorController:
                 self._project_revision)
 
     @property
+    def source_update_documents(self):
+        return self.workspace_view.documents if self.is_tl_workspace else ()
+
+    @property
+    def source_update_root(self):
+        binding = None if self._workspace_service is None else self._workspace_service.origin_binding
+        return None if binding is None else Path(binding.absolute_root)
+
+    def _discard_source_update_candidate(self, candidate):
+        issued = self._issued_workspace_reconciliation
+        if issued is not None and issued[1] is candidate.prepared.staged:
+            issued[2].discard_reconciliation(issued[0].operation_id)
+            self._issued_workspace_reconciliation = None
+            self._source_update_plan = None
+        candidate.close()
+
+    def source_update_preview_current(self, review) -> bool:
+        pending = self._pending_source_update
+        return (pending is not None and pending[0] is review
+                and pending[2] == self._file_context() + (self._source_update_generation,))
+
+    def cancel_source_update_preview(self, review=None) -> None:
+        pending = self._pending_source_update
+        if pending is not None and (review is None or pending[0] is review):
+            self._pending_source_update = None
+            self._discard_source_update_candidate(pending[1])
+        plan = self._source_update_plan
+        if plan is not None and (review is None or plan[0] is review):
+            self._source_update_plan = None
+            plan[1].discard_reconciliation(plan[0].preview.operation_id)
+            issued = self._issued_workspace_reconciliation
+            if issued is not None and issued[0] is plan[0].preview:
+                self._issued_workspace_reconciliation = None
+        # A closed Qt runner will never deliver disposed jobs. Their worker
+        # retains cleanup ownership until it finishes, independently of this map.
+        self._issued_source_update_jobs = {
+            key: job for key, job in self._issued_source_update_jobs.items() if not job.disposed}
+
+    def begin_source_update_preview(self, root: Path, source_refs: tuple[str, ...]) -> ControllerFileJob:
+        self._ensure_workspace_writable()
+        service = self._require_workspace_session()
+        documents = service.workspace.documents
+        root = Path(root).expanduser().absolute()
+        if self.source_update_root is not None and root != self.source_update_root:
+            raise EditorControllerError('PROJECT.RECONCILE.ROOT_REBIND_REQUIRED')
+        if (not self.is_tl_workspace or type(source_refs) is not tuple
+                or len(source_refs) != len(documents)):
+            raise EditorControllerError('PROJECT.RECONCILE.INPUT_INVALID')
+        from project_workspace_identity import validate_portable_ref_collection
+        try:
+            validate_portable_ref_collection(source_refs, allow_exact_duplicates=False)
+            renames = tuple(OriginRenameMapping(doc.source_ref, ref, doc.document_id)
+                            for doc, ref in zip(documents, source_refs, strict=True)
+                            if doc.source_ref != ref)
+        except (ValueError, TypeError) as error:
+            raise EditorControllerError('PROJECT.RECONCILE.INPUT_INVALID') from error
+        self.cancel_source_update_preview()
+        for old in self._issued_source_update_jobs.values():
+            old.dispose()
+        self._source_update_generation += 1
+        context = self._file_context() + (self._source_update_generation,)
+        sources = tuple(root.joinpath(*ref.split('/')) for ref in source_refs)
+        # Freeze the input before handing it to a worker; edits remain on the GUI owner.
+        snapshot = ProjectWorkspaceService(service.workspace, service.origin_binding,
+                    session_id=service.session_id, revision=service.revision)
+        config_dir = self.repository.config_dir
+        file_system = self._workspace_file_system
+
+        def prepare(cancellation):
+            runtime = compose_project_codec_runtime(config_dir)
+            prepared = RpyProjectAdapter(runtime).prepare_source_update(
+                snapshot, root, sources, rename_mappings=renames,
+                file_system=file_system, cancellation=cancellation)
+            return SourceUpdateCandidate(prepared, runtime)
+
+        job = ControllerFileJob('preview_source_update', root, context, prepare,
+            service=service, cleanup=lambda value: value.close() if value is not None else None)
+        self._issued_source_update_jobs[id(job)] = job
+        return job
+
+    def begin_source_update_apply(self, review, dispositions: tuple[str, ...]) -> ControllerFileJob:
+        self._ensure_workspace_writable()
+        if not self.source_update_preview_current(review):
+            raise EditorControllerError('PROJECT.RECONCILE.PREVIEW_STALE')
+        if type(dispositions) is not tuple or len(dispositions) != len(review.required_items):
+            raise EditorControllerError('PROJECT.RECONCILE.DECISION_REQUIRED')
+        preview = review.preview
+        required = []
+        for category in ('unchanged', 'source_changed', 'new', 'removed', 'ambiguous', 'unresolved'):
+            required.extend((category, identity) for identity in getattr(preview, category + '_identities')
+                            if identity in preview.required_decision_identities)
+        decisions = []
+        for (category, identity), disposition in zip(required, dispositions, strict=True):
+            allowed = ('keep_detached', 'remove') if category == 'removed' else ('keep_detached',)
+            if disposition not in allowed:
+                raise EditorControllerError('PROJECT.RECONCILE.DECISION_REQUIRED')
+            decisions.append(ReconciliationDecision(identity, ReconciliationDisposition(disposition)))
+        _, candidate, context = self._pending_source_update
+        self._pending_source_update = None
+        config_dir = self.repository.config_dir
+
+        def validate(cancellation):
+            cancellation.raise_if_cancelled()
+            runtime = compose_project_codec_runtime(config_dir)
+            if (runtime.settings != candidate.runtime.settings
+                    or runtime.availability != candidate.runtime.availability):
+                raise ProjectWorkspaceError('PROJECT.RECONCILE.PREVIEW_STALE')
+            staged = candidate.prepared.revalidate()
+            cancellation.raise_if_cancelled()
+            return (candidate, staged, tuple(decisions), review)
+
+        job = ControllerFileJob('validate_source_update', Path('.'), context, validate,
+            service=self._workspace_service, session=candidate,
+            cleanup=lambda value: candidate.close())
+        self._issued_source_update_jobs[id(job)] = job
+        return job
+
+    def finish_source_update_job(self, job: ControllerFileJob) -> ControllerFileOutcome:
+        if self._issued_source_update_jobs.get(id(job)) is not job:
+            raise EditorControllerError('PROJECT.FILE.NOT_ISSUED')
+        del self._issued_source_update_jobs[id(job)]
+        if job.disposed:
+            return ControllerFileOutcome(job.kind, job.path, False, cancelled=True)
+        value, error = job.take_result()
+        current = (job.service is self._workspace_service
+                   and job.context == self._file_context() + (self._source_update_generation,))
+        accepted = current and not job.cancellation.cancelled and error is None and value is not None
+        if not accepted:
+            candidate = value if job.kind == 'preview_source_update' else job.session
+            if candidate is not None:
+                self._discard_source_update_candidate(candidate)
+            if error is not None and current and not job.cancellation.cancelled:
+                raise EditorControllerError(self._file_error_text(error)) from error
+            return ControllerFileOutcome(job.kind, job.path, False, cancelled=job.cancellation.cancelled)
+        if job.kind == 'preview_source_update':
+            try:
+                preview = self.preview_workspace_reconciliation(value.prepared.staged)
+                review = source_update_review(preview, self._workspace_service.workspace,
+                                              value.prepared.staged.workspace)
+                self._pending_source_update = (review, value, job.context)
+                self._source_update_plan = (review, self._workspace_service)
+                return ControllerFileOutcome(job.kind, job.path, True, review)
+            except BaseException:
+                value.close()
+                raise
+        candidate, staged, decisions, review = value
+        try:
+            runtime = compose_project_codec_runtime(self.repository.config_dir)
+            if (runtime.settings != candidate.runtime.settings
+                    or runtime.availability != candidate.runtime.availability):
+                raise ProjectWorkspaceError('PROJECT.RECONCILE.PREVIEW_STALE')
+            candidate.prepared.revalidate_identity()
+            receipt = self._apply_workspace_reconciliation(
+                review.preview, candidate.prepared.staged, decisions=decisions, revalidated=staged)
+            self._rpy_project_session = RpyProjectSession(
+                self._workspace_package_service, self._workspace_save_service,
+                prepared=candidate.prepared, persistence_binding=self._workspace_persistence_binding)
+            self.project_codec_runtime = candidate.runtime
+            return ControllerFileOutcome(job.kind, job.path, True, receipt)
+        except ProjectWorkspaceError as error:
+            self._discard_source_update_candidate(candidate)
+            raise EditorControllerError(self._file_error_text(error)) from error
+        except BaseException:
+            self._discard_source_update_candidate(candidate)
+            raise
+
+    @property
     def workspace_save_running(self) -> bool:
         job = self._file_save_job
         return job is not None and job.service is self._workspace_service
@@ -2604,6 +2777,9 @@ class EditorController:
                 job.cancel()
 
     def _retire_rpy_session(self) -> None:
+        self.cancel_source_update_preview()
+        for job in self._issued_source_update_jobs.values():
+            job.dispose()
         self.cancel_tl_export_preview()
         if self._tl_export_publish_job is not None:
             self._tl_export_publish_job.cancel()
@@ -2617,6 +2793,10 @@ class EditorController:
     def abandon_file_jobs(self) -> None:
         """Window shutdown revokes publication; workers finish their own cleanup."""
         self.cancel_directory_open()
+        self.cancel_source_update_preview()
+        for job in self._issued_source_update_jobs.values():
+            job.dispose()
+        self._issued_source_update_jobs.clear()
         self.cancel_single_tl_import()
         for job in self._issued_file_jobs.values():
             job.dispose()
@@ -3087,11 +3267,14 @@ class EditorController:
             self._ensure_workspace_writable()
             _service, save_service, binding = self._require_workspace_save_session()
             try:
-                result = self._workspace_package_service.save_workspace(
-                    save_service,
-                    binding.path,
-                    persistence_binding=binding,
-                )
+                if self._rpy_project_session is not None:
+                    result = self._rpy_project_session.save(binding.path)
+                else:
+                    result = self._workspace_package_service.save_workspace(
+                        save_service,
+                        binding.path,
+                        persistence_binding=binding,
+                    )
             except ProjectWorkspaceError as error:
                 raise EditorControllerError(error.code) from error
             if result.persistence_binding is not None:
@@ -3208,6 +3391,11 @@ class EditorController:
         decisions: tuple[ReconciliationDecision, ...] = (),
     ) -> ReconciliationReceipt:
         """Consume one issued reconciliation and publish one in-memory swap."""
+        return self._apply_workspace_reconciliation(preview, staged, decisions=decisions)
+
+    def _apply_workspace_reconciliation(
+        self, preview, staged, *, decisions=(), revalidated=None,
+    ) -> ReconciliationReceipt:
 
         if type(preview) is not ReconciliationPreview:
             raise TypeError("reconciliation preview must be exact")
@@ -3238,10 +3426,11 @@ class EditorController:
                 raise EditorControllerError("PROJECT.WORKSPACE.NO_SAVE_BINDING")
             self._issued_workspace_reconciliation = None
             try:
-                revalidated = revalidate_staged_selected_documents(
-                    staged,
-                    file_system=self._workspace_file_system,
-                )
+                if revalidated is None:
+                    revalidated = revalidate_staged_selected_documents(
+                        staged,
+                        file_system=self._workspace_file_system,
+                    )
                 token = reconciliation_service.prepare_reconciliation(
                     preview.operation_id,
                     decisions=decisions,

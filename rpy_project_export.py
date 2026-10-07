@@ -29,7 +29,7 @@ from project_codec_settings import (
 from project_export_contracts import ProjectExportDiagnostic, ProjectExportResult, ProjectExportView
 from project_package import ProjectPackagePersistenceBinding, ProjectPackageService
 from project_workspace import ProjectWorkspaceService
-from project_workspace_contracts import ProjectWorkspaceError
+from project_workspace_contracts import ProjectWorkspaceError, SourcePresence
 
 
 _CHUNK = 64 * 1024
@@ -244,12 +244,15 @@ class PreparedRpyProjectExport:
         document = self._workspace.documents[0]
         self._document = document
         self._records = ()
+        attached_segments = tuple(segment for segment, source in zip(
+            document.segments, document.source_segments, strict=True)
+            if source.source_presence is SourcePresence.ATTACHED)
         self._view = ProjectExportView(
             uuid4().hex, context.workspace_service.session_id, self._revision,
             context.request_generation, document.document_id, document.source_ref,
-            str(target), len(document.segments), None,
-            sum(segment.target == '' for segment in document.segments),
-            sum(not segment.confirmed for segment in document.segments), 'preparing',
+            str(target), len(attached_segments), None,
+            sum(segment.target == '' for segment in attached_segments),
+            sum(not segment.confirmed for segment in attached_segments), 'preparing',
         )
 
     @property
@@ -489,15 +492,19 @@ class PreparedRpyProjectExport:
             _fail('PROJECT.PACKAGE.SOURCE_STALE')
         parsed = opened.materialize()
         records = parsed.records
-        if (len(records) != len(document.source_segments)
+        attached_sources = tuple(source for source in document.source_segments
+                                 if source.source_presence is SourcePresence.ATTACHED)
+        if (len(records) != len(attached_sources)
                 or any(type(record) is not ParsedSegment
                        or record.local_id != source.local_segment_id
                        or record.source != source.source
                        or record.speaker.value != source.raw_speaker
-                       for record, source in zip(records, document.source_segments))):
+                       for record, source in zip(records, attached_sources))):
             _fail('RPY.EXPORT.SOURCE_MISMATCH')
         self._records = records
-        segments = document.segments
+        segments = tuple(segment for segment, source in zip(
+            document.segments, document.source_segments, strict=True)
+            if source.source_presence is SourcePresence.ATTACHED)
         self._view = replace(self._view, modified_count=sum(
             segment.target != record.target for segment, record in zip(segments, records, strict=True)))
         self._prepared = surface.prepare_round_trip(

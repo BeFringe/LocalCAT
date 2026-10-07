@@ -5350,10 +5350,9 @@ class ProjectPackageService:
                 raise TypeError("private source must be exact blob source or neutral member data")
             normalized_private.append(source)
         if source_reproof is not None:
-            if (save_service.saved_workspace_snapshot is not None
-                    or not isinstance(source_reproof, ProjectPackageSourceReproof)
+            if (not isinstance(source_reproof, ProjectPackageSourceReproof)
                     or not callable(source_reproof.reprove)):
-                raise TypeError("source reproof requires a first-save source lease")
+                raise TypeError("source reproof requires a retained source lease")
         port = _ProjectPackagePersistencePort(
             target,
             save_service.workspace_service.origin_binding,

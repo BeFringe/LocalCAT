@@ -1914,6 +1914,12 @@ class ProjectWorkspaceService:
         self._published_transition = (receipt, prepared.transition)
         return receipt
 
+    def discard_reconciliation(self, operation_id: str) -> None:
+        """Release a staged preview on cancellation; prepared tokens stay separate."""
+        if type(operation_id) is not str or _OPERATION_ID.fullmatch(operation_id) is None:
+            _fail("PROJECT.RECONCILE.PREVIEW_STALE")
+        self._plans.pop(operation_id, None)
+
     def discard_prepared_reconciliation(
         self,
         token: PreparedReconciliationToken,
