@@ -20,6 +20,7 @@ from editor_file_jobs import (ControllerFileJob, ControllerFileOutcome, FileOpen
                               FileImportPublication, SingleTLImportReview,
                               FileExportPreparation, FileExportPublication)
 from rpy_project_adapter import RpyProjectAdapter
+from editor_directory_open import DirectoryOpenCandidate
 
 from project_export_contracts import ProjectExportDiagnostic, ProjectExportResult
 from rpy_project_export import RpyExportContext
@@ -297,6 +298,23 @@ class ControllerWorkspaceConfirmResult:
             raise TypeError("workspace confirmation index must be nonnegative")
         if type(self.write_report) is not WriteReport:
             raise TypeError("workspace confirmation requires exact write report")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceDirectoryView:
+    """Body-free navigation group; its leaves retain the issued document view."""
+
+    name: str
+    children: tuple[WorkspaceDirectoryView | WorkspaceDocumentView, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.name) is not str or not self.name:
+            raise TypeError("directory navigation requires a nonempty name")
+        if type(self.children) is not tuple or not self.children or any(
+            type(child) not in (WorkspaceDirectoryView, WorkspaceDocumentView)
+            for child in self.children
+        ):
+            raise TypeError("directory navigation requires frozen children")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1271,6 +1289,7 @@ class EditorController:
         self._rpy_project_session = None
         self._issued_file_jobs: dict[int, ControllerFileJob] = {}
         self._pending_tl_import = None
+        self._pending_directory_open = None
         self._tl_export_generation = 0
         self._pending_tl_export = None
         self._issued_tl_export_jobs = {}
@@ -1460,6 +1479,45 @@ class EditorController:
         if view is None:
             raise EditorControllerError("PROJECT.WORKSPACE.NO_SESSION")
         return view
+
+    @property
+    def workspace_document_tree(
+        self,
+    ) -> tuple[WorkspaceDirectoryView | WorkspaceDocumentView, ...]:
+        """Group saved refs in first-occurrence order without reordering manifest.
+
+        This projection is independent of the source filesystem. Directory names
+        confer no identity; document leaves are the exact current-session views.
+        """
+
+        # Integer references are private builder positions, never document IDs.
+        # Children are created after their parents, so reverse order freezes the
+        # tree without consuming Python stack depth for legal long package refs.
+        names = [""]
+        children: list[list[int | WorkspaceDocumentView]] = [[]]
+        directories: dict[tuple[int, str], int] = {}
+        for document in self.workspace_view.documents:
+            parent = 0
+            for name in document.source_ref.split('/')[:-1]:
+                key = (parent, name)
+                child = directories.get(key)
+                if child is None:
+                    child = len(children)
+                    directories[key] = child
+                    names.append(name)
+                    children.append([])
+                    children[parent].append(child)
+                parent = child
+            children[parent].append(document)
+        frozen: dict[int, WorkspaceDirectoryView] = {}
+        for index in range(len(children) - 1, 0, -1):
+            frozen[index] = WorkspaceDirectoryView(
+                names[index],
+                tuple(frozen[item] if isinstance(item, int) else item
+                      for item in children[index]),
+            )
+        return tuple(frozen[item] if isinstance(item, int) else item
+                     for item in children[0])
 
     @property
     def current_workspace_identity(self) -> IssuedSegmentIdentity:
@@ -2203,6 +2261,51 @@ class EditorController:
             raise EditorControllerError('RPY.EXPORT.DIAGNOSTIC_STALE')
         self.go_to_workspace_segment(self.workspace_view.segments[number - 1].identity)
 
+    def begin_directory_open(self, root: Path) -> ControllerFileJob:
+        """Discover metadata in a worker; the current editing session stays live."""
+        root = Path(root).expanduser().absolute()
+        self._discard_pending_file_opens()
+        self._file_open_generation += 1
+        context = self._file_context() + (self._file_open_generation,)
+        owner = DirectoryOpenCandidate(root, self.repository.config_dir,
+            self._workspace_package_service, self._workspace_file_system)
+        job = ControllerFileJob('preview_directory', root, context, owner.preview,
+            service=owner, cleanup=lambda value: owner.close(), on_cancel=owner.cancel)
+        self._issued_file_jobs[id(job)] = job
+        return job
+
+    def cancel_directory_open(self, review=None) -> None:
+        pending = self._pending_directory_open
+        if pending is not None and (review is None or review is pending[0]):
+            self._pending_directory_open = None
+            pending[1].close()
+
+    def directory_review_current(self, review) -> bool:
+        pending = self._pending_directory_open
+        return (pending is not None and review is pending[0]
+                and pending[2] == self._file_context() + (self._file_open_generation,))
+
+    def begin_directory_publish(self, review, entry_ids: tuple[str, ...], destination: Path,
+                                *, name: str, source_locale: str,
+                                target_locale: str) -> ControllerFileJob:
+        if not self.directory_review_current(review):
+            raise EditorControllerError('PROJECT.DIRECTORY.STALE')
+        available = {entry.entry_id for entry in review.preview.entries if entry.selectable}
+        if (not review.preview.complete or type(entry_ids) is not tuple or not entry_ids
+                or any(type(entry_id) is not str for entry_id in entry_ids)
+                or len(set(entry_ids)) != len(entry_ids)
+                or any(entry_id not in available for entry_id in entry_ids)):
+            raise EditorControllerError('PROJECT.DIRECTORY.INVALID_SELECTION')
+        request = SelectedProjectDocumentsRequest(name, source_locale, target_locale)
+        destination = Path(destination).expanduser().absolute()
+        _, owner, context = self._pending_directory_open
+        self._pending_directory_open = None
+        job = ControllerFileJob('import_directory', destination, context,
+            lambda cancellation: owner.publish(entry_ids, request, destination, cancellation),
+            service=owner, cleanup=lambda value: owner.close(), on_cancel=owner.cancel)
+        self._issued_file_jobs[id(job)] = job
+        return job
+
     def begin_file_open(self, path: Path, *, package: bool = False) -> ControllerFileJob:
         """Issue a background TL/package open without changing the session."""
         return self._begin_file_open(path, package=package)
@@ -2217,8 +2320,8 @@ class EditorController:
         path = Path(path).expanduser().absolute()
         if not package and path.suffix.lower() not in {".rpy", ".localcat-project", ".zip"}:
             raise EditorControllerError("PROJECT.FILE.FORMAT_UNSUPPORTED")
+        self._discard_pending_file_opens()
         self._file_open_generation += 1
-        self.cancel_single_tl_import()
         generation = self._file_open_generation
         context = self._file_context() + (generation,)
         package_service = self._workspace_package_service
@@ -2284,6 +2387,45 @@ class EditorController:
         self._issued_file_jobs[id(job)] = job
         return job
 
+    def selected_files_use_tl(self, selected_paths: tuple[Path, ...]) -> bool:
+        """Resolve configured formats without reading selected file bodies."""
+        try:
+            runtime = compose_project_codec_runtime(self.repository.config_dir)
+            return bool(RpyProjectAdapter(runtime).validate_selected_refs(
+                tuple(path.name for path in selected_paths)))
+        except Exception as error:
+            raise EditorControllerError(self._file_error_text(error)) from error
+
+    def begin_selected_tl_publish(self, root: Path, selected_paths: tuple[Path, ...],
+                                  destination: Path, *, name: str,
+                                  source_locale: str, target_locale: str) -> ControllerFileJob:
+        """Use the existing package job lifecycle for reviewed explicit TL files."""
+        request = SelectedProjectDocumentsRequest(name, source_locale, target_locale)
+        root = root.expanduser().absolute()
+        selected_paths = tuple(path.expanduser().absolute() for path in selected_paths)
+        destination = destination.expanduser().absolute()
+        self._discard_pending_file_opens()
+        self._file_open_generation += 1
+        context = self._file_context() + (self._file_open_generation,)
+        config_dir = self.repository.config_dir
+        package_service, file_system = self._workspace_package_service, self._workspace_file_system
+
+        def publish(cancellation):
+            runtime = compose_project_codec_runtime(config_dir)
+            adapter = RpyProjectAdapter(runtime, package_service=package_service)
+            with adapter.prepare_selected(
+                    root, selected_paths, request, session_id=uuid4().hex,
+                    file_system=file_system, cancellation=cancellation) as session:
+                cancellation.raise_if_cancelled()
+                result = session.save(destination)
+                candidate = FileOpenCandidate(session.save_service, result.persistence_binding,
+                                              runtime=runtime)
+                return FileImportPublication(candidate, result)
+
+        job = ControllerFileJob('import_tl', destination, context, publish)
+        self._issued_file_jobs[id(job)] = job
+        return job
+
     def begin_file_save(self, destination: Path | None = None) -> ControllerFileJob:
         """Reserve the sole live owner, then let a worker do bounded package I/O."""
         with self._tm_query_lock:
@@ -2328,7 +2470,7 @@ class EditorController:
         """GUI-thread-only, once-only acceptance. A late save keeps its receipt."""
         if self._issued_file_jobs.get(id(job)) is not job:
             raise EditorControllerError("PROJECT.FILE.NOT_ISSUED")
-        if job.kind in {"open", "prepare_tl"} and job.disposed:
+        if job.kind in {"open", "prepare_tl", "preview_directory"} and job.disposed:
             del self._issued_file_jobs[id(job)]
             return ControllerFileOutcome(job.kind, job.path, False, cancelled=True)
         value, error = job.take_result()
@@ -2336,11 +2478,16 @@ class EditorController:
         context_matches = job.context[:3] == self._file_context()
         accepted = context_matches
         safe_code = None
-        if job.kind in {"open", "prepare_tl", "import_tl"}:
+        if job.kind in {"open", "prepare_tl", "import_tl", "preview_directory", "import_directory"}:
             accepted = (accepted and job.context[3] == self._file_open_generation
                         and not job.cancellation.cancelled and value is not None
                         and error is None)
-            if job.kind == 'prepare_tl':
+            if job.kind == 'preview_directory':
+                if accepted:
+                    self._pending_directory_open = (value.review, value, job.context)
+                    return ControllerFileOutcome(job.kind, job.path, True, value.review)
+                job.service.close()
+            elif job.kind == 'prepare_tl':
                 if accepted:
                     review = SingleTLImportReview(job.path, job.path.stem,
                         len(value.save_service.workspace_service.flat_segments))
@@ -2348,7 +2495,7 @@ class EditorController:
                     return ControllerFileOutcome(job.kind, job.path, True, review)
                 if value is not None:
                     value.close()
-            elif job.kind == 'import_tl':
+            elif job.kind in {'import_tl', 'import_directory'}:
                 publication = value
                 result = None if publication is None else publication.result
                 candidate = None if publication is None else publication.candidate
@@ -2399,11 +2546,13 @@ class EditorController:
                 self._remember_current_workspace_position()
             elif not accepted and job.session is not None:
                 job.session.close()
-        if error is not None and not (job.kind in {"open", "prepare_tl"} and
+        if job.kind == "import_directory":
+            job.service.close()
+        if error is not None and not (job.kind in {"open", "prepare_tl", "import_tl", "preview_directory", "import_directory"} and
                                       (job.cancellation.cancelled or not context_matches)):
             raise EditorControllerError(self._file_error_text(error)) from error
         return ControllerFileOutcome(job.kind, job.path, accepted,
-                                     value if job.kind in {"save", "import_tl"} else None,
+                                     value if job.kind in {"save", "import_tl", "import_directory"} else None,
                                      job.cancellation.cancelled, safe_code)
 
     @staticmethod
@@ -2421,8 +2570,23 @@ class EditorController:
         if diagnostics:
             issue = diagnostics[0]
             location = f" · 行 {issue.line_number}" if issue.line_number is not None else ""
-            return issue.code + location + " · " + issue.safe_summary
-        return getattr(error, "code", "PROJECT.FILE.OPERATION_FAILED")
+            source = getattr(error, "source_ref", None)
+            return (source + " · " if source else "") + issue.code + location + " · " + issue.safe_summary
+        code = getattr(error, "code", "PROJECT.FILE.OPERATION_FAILED")
+        directory_reasons = {
+            "RPY.IMPORT.MIXED_LANGUAGE": "所选 TL 的目标语言不一致，请选择同一语言的文件。",
+            "RPY.IMPORT.DOCUMENT_LIMIT_EXCEEDED": "一次最多选择 256 个 TL 文件，请减少选择。",
+            "PROJECT.DIRECTORY.STALE": "目录或选择已变化，请重新选择文件夹。",
+            "PROJECT.INTAKE.SOURCE_STALE": "源文件已变化，请重新选择并验证。",
+            "PROJECT.DIRECTORY.INVALID_SELECTION": "请选择可用文件后重试。",
+            "PROJECT.DIRECTORY.ALIAS": "所选文件存在路径或文件身份重复，请重新选择。",
+            "PROJECT.DIRECTORY.INCOMPLETE": "目录预览不完整，请选择较小的目录重试。",
+            "PROJECT.DIRECTORY.LIMIT_EXCEEDED": "目录超过预览限制，请选择较小的目录。",
+            "PROJECT.DIRECTORY.OBSERVATION_FAILED": "无法完整读取目录，请检查访问权限并重试。",
+        }
+        source = getattr(error, "source_ref", None)
+        return ((source + " · " if source else "") + code
+                + (" · " + directory_reasons[code] if code in directory_reasons else ""))
 
     def _ensure_workspace_writable(self) -> None:
         if self.tl_export_publish_running:
@@ -2431,11 +2595,12 @@ class EditorController:
             raise EditorControllerError("PROJECT.FILE.SAVE_IN_PROGRESS")
 
     def _discard_pending_file_opens(self) -> None:
+        self.cancel_directory_open()
         self.cancel_single_tl_import()
         for job in self._issued_file_jobs.values():
-            if job.kind in {"open", "prepare_tl"}:
+            if job.kind in {"open", "prepare_tl", "preview_directory"}:
                 job.dispose()
-            elif job.kind == 'import_tl':
+            elif job.kind in {'import_tl', 'import_directory'}:
                 job.cancel()
 
     def _retire_rpy_session(self) -> None:
@@ -2451,6 +2616,7 @@ class EditorController:
 
     def abandon_file_jobs(self) -> None:
         """Window shutdown revokes publication; workers finish their own cleanup."""
+        self.cancel_directory_open()
         self.cancel_single_tl_import()
         for job in self._issued_file_jobs.values():
             job.dispose()

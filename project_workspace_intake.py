@@ -634,16 +634,26 @@ class PreparedSelectedProjectDocuments:
     explicit abandonment releases original source handles and opaque bytes.
     """
 
-    __slots__ = ("_staged", "_private_sources", "_source")
+    __slots__ = ("_staged", "_private_sources", "_source", "_verified_headers")
 
-    def __init__(self, staged, private_sources, source):
+    def __init__(self, staged, private_sources, source, verified_headers):
         self._staged = staged
         self._private_sources = private_sources
         self._source = source
+        self._verified_headers = verified_headers
 
     @property
     def staged(self) -> StagedSelectedProjectDocuments:
         return self._staged
+
+    @property
+    def verified_headers(self) -> tuple[DocumentHeader, ...]:
+        """Verified neutral headers in staged document order; never persisted.
+
+        Application format policies may consume these facts before publication
+        without reading or interpreting opaque codec-private members.
+        """
+        return self._verified_headers
 
     @property
     def closed(self) -> bool:
@@ -878,6 +888,7 @@ def _stage_selected_project_documents(
         if directory_selection is not None:
             directory_selection.reprove()
         documents: list[ProjectDocument] = []
+        verified_headers: list[DocumentHeader] = []
         private_sources: list[CodecPrivateMemberData] = []
         source_identities: list[SourceSnapshotIdentity] = []
         binding_documents: list[OriginBindingDocument] = []
@@ -973,6 +984,7 @@ def _stage_selected_project_documents(
                     ):
                         _fail("PROJECT.RECONCILE.INPUT_INVALID")
             documents.append(document)
+            verified_headers.append(materialized.header)
             binding_source_identity = _origin_binding_source_identity(
                 bound_file.source_ref,
                 source_identity,
@@ -1074,7 +1086,8 @@ def _stage_selected_project_documents(
         staged = _issue_staged(workspace, binding, tuple(source_identities))
         if retain_source:
             retained = _RetainedSelectedSource(backend, root_authority, tuple(bound), staged, cancellation, directory_selection)
-            prepared = PreparedSelectedProjectDocuments(staged, tuple(private_sources), retained)
+            prepared = PreparedSelectedProjectDocuments(
+                staged, tuple(private_sources), retained, tuple(verified_headers))
             retained.reprove()
             # Transfer ownership only after all validation and construction succeeds.
             root_authority = None

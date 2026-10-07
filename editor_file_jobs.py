@@ -12,6 +12,7 @@ from threading import Lock
 from typing import Callable
 
 from parser_composition import new_cancellation_token
+from project_directory_contracts import DirectorySelectionPreview
 
 
 @dataclass
@@ -32,6 +33,13 @@ class SingleTLImportReview:
     source_path: Path
     default_name: str
     segment_count: int
+
+
+@dataclass(frozen=True)
+class DirectoryImportReview:
+    """Issued metadata only; no path authority or parsed body."""
+    preview: DirectorySelectionPreview
+    default_name: str
 
 
 @dataclass
@@ -74,10 +82,11 @@ class ControllerFileJob:
 
     def __init__(self, kind: str, path: Path, context: tuple,
                  operation: Callable, *, session=None, service=None,
-                 cancellation=None, cleanup=None, run_when_cancelled=False):
+                 cancellation=None, cleanup=None, run_when_cancelled=False, on_cancel=None):
         self._identity = (kind, path, context, session, service)
         self.cancellation = cancellation if cancellation is not None else new_cancellation_token()
         self._cleanup_callback = cleanup
+        self._cancel_callback = on_cancel
         self._run_when_cancelled = run_when_cancelled
         self._operation = operation
         self._lock = Lock()
@@ -126,6 +135,8 @@ class ControllerFileJob:
 
     def cancel(self):
         self.cancellation.cancel()
+        if self._cancel_callback is not None:
+            self._cancel_callback()
 
     def run(self):
         with self._lock:
