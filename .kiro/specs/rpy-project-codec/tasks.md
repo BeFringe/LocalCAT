@@ -126,7 +126,7 @@
   - _Requirements: 1.2, 5.1, 5.2, 7.1_
   - _Boundary: RpyProjectAdapter / Multi intake integration_
   - _Depends: 3.4b；multi-document-project-workspace 5.6a, 5.7, 5.8_
-- [ ] 4.2 接入已验证源更新与完整私有映射替换
+- [x] 4.2 接入已验证源更新与完整私有映射替换
   - 复用 Project reconciliation、显式 rename 与 unresolved 处理，不按行号猜测。
   - 提供中立桌面入口，选择更新根和逐章节相对路径，显示六类预览并要求明确处置；异步复核、取消和终态接纳保持 session/source/codec 有效，应用后的完整源与私有映射由 Project 保存。
   - 完成时，同 dialogue label 改源文得到 source_changed、保留 target 并清 confirmed；label 或 strings old key 改变得到 new/removed，ambiguous 可见；新 private payload 与新 source 匹配。

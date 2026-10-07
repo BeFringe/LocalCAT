@@ -48,6 +48,31 @@ class RpySourceUpdateTests(unittest.TestCase):
         staged = prepared.revalidate()
         return self.service.apply_reconciliation(preview.operation_id, decisions=decisions, session_id=self.service.session_id, base_revision=self.service.revision, incoming_source_identities=staged.source_identities)
 
+    def mutate_source_or_verify_native_pin(self, prepared, mutation, expected_bytes):
+        """Exercise drift or prove Windows blocks it until the lease is closed."""
+        before_bytes = self.path.read_bytes()
+        before_workspace = self.service.workspace
+        try:
+            mutation()
+        except PermissionError:
+            if os.name != 'nt':
+                raise
+            self.assertEqual(self.path.read_bytes(), before_bytes)
+            self.assertEqual(self.service.workspace, before_workspace)
+            self.assertIs(prepared.revalidate(), prepared.staged)
+            authority_type = type(prepared._source._files[0].authority)
+            with mock.patch.object(authority_type, 'read_at', side_effect=AssertionError('body read')):
+                self.assertIs(prepared.revalidate_identity(), prepared.staged)
+            prepared.close()
+            mutation()
+            self.assertEqual(self.path.read_bytes(), expected_bytes)
+            self.assertEqual(self.service.workspace, before_workspace)
+            with self.assertRaises(ProjectWorkspaceError) as caught:
+                prepared.revalidate_identity()
+            self.assertEqual(caught.exception.code, 'PROJECT.INTAKE.SOURCE_STALE')
+            return False
+        return True
+
     def test_changed_source_keeps_target_unconfirms_and_replaces_complete_private(self):
         raw = dialogue('"Changed source"', '"upstream target"')
         self.path.write_bytes(raw)
@@ -96,6 +121,8 @@ class RpySourceUpdateTests(unittest.TestCase):
         prepared = self.prepare()
         preview = self.stage(prepared)
         self.apply(prepared, preview, tuple(ReconciliationDecision(i, ReconciliationDisposition.REMOVE) for i in preview.removed_identities))
+        # The next explicit update starts after releasing the previous source lease.
+        prepared.close()
         self.path.write_bytes(b'translate zh_Hans strings:\n    old "New"\n    new "Target"\n')
         updated = self.prepare()
         preview = self.stage(updated)
@@ -132,7 +159,10 @@ class RpySourceUpdateTests(unittest.TestCase):
                 prepared = self.prepare(cancellation=token)
                 before = self.service.workspace
                 if mode == 'drift':
-                    self.path.write_bytes(dialogue('"Drift"'))
+                    changed = dialogue('"Drift"')
+                    if not self.mutate_source_or_verify_native_pin(
+                            prepared, lambda: self.path.write_bytes(changed), changed):
+                        continue
                 elif mode == 'cancel':
                     token.cancel()
                 else:
@@ -164,7 +194,15 @@ class RpySourceUpdateTests(unittest.TestCase):
         prepared = self.prepare()
         self.apply(prepared, self.stage(prepared))
         original = self.destination.read_bytes()
-        self.path.write_bytes(dialogue('"New drift"'))
+        changed = dialogue('"New drift"')
+        if not self.mutate_source_or_verify_native_pin(
+                prepared, lambda: self.path.write_bytes(changed), changed):
+            with self.assertRaises(ProjectWorkspaceError):
+                prepared.save_reconciled_workspace(self.package, self.session.save_service,
+                    self.destination, persistence_binding=self.session.persistence_binding)
+            self.assertEqual(self.destination.read_bytes(), original)
+            self.assertTrue(self.session.save_service.project_dirty)
+            return
         result = prepared.save_reconciled_workspace(self.package, self.session.save_service,
             self.destination, persistence_binding=self.session.persistence_binding)
         self.assertIsNone(result.receipt)
@@ -232,7 +270,10 @@ class RpySourceUpdateTests(unittest.TestCase):
     def test_final_identity_check_rejects_same_size_edit_without_reading_body(self):
         prepared = self.prepare()
         prepared.revalidate()
-        self.path.write_bytes(self.raw.replace(b'Source', b'Change'))
+        changed = self.raw.replace(b'Source', b'Change')
+        if not self.mutate_source_or_verify_native_pin(
+                prepared, lambda: self.path.write_bytes(changed), changed):
+            return
         authority_type = type(prepared._source._files[0].authority)
         with mock.patch.object(authority_type, 'read_at', side_effect=AssertionError('body read')):
             with self.assertRaises(ProjectWorkspaceError) as caught:
@@ -245,7 +286,11 @@ class RpySourceUpdateTests(unittest.TestCase):
         prepared.revalidate()
         replacement = self.root / 'replacement.rpy'
         replacement.write_bytes(self.raw)
-        replacement.replace(self.path)
+        changed = self.mutate_source_or_verify_native_pin(
+            prepared, lambda: replacement.replace(self.path), self.raw)
+        self.assertFalse(replacement.exists())
+        if not changed:
+            return
         authority_type = type(prepared._source._files[0].authority)
         with mock.patch.object(authority_type, 'read_at', side_effect=AssertionError('body read')):
             with self.assertRaises(ProjectWorkspaceError) as caught:
