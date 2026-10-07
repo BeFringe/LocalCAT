@@ -4,14 +4,45 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
-import time
 import unittest
 from unittest import mock
 
-from PySide6.QtCore import Qt
-from PySide6.QtTest import QTest
+from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog
 from qt_project_source_update_dialog import QtProjectSourceUpdateDialog
+
+
+def _wait_until(predicate):
+    if not predicate():
+        # Run Qt's event loop while the Python file worker makes progress.
+        loop = QEventLoop()
+        poll, deadline = QTimer(loop), QTimer(loop)
+        deadline.setSingleShot(True)
+        failure = None
+
+        def check():
+            nonlocal failure
+            try:
+                if predicate():
+                    loop.quit()
+            except BaseException as error:
+                failure = error
+                loop.quit()
+
+        poll.timeout.connect(check)
+        deadline.timeout.connect(loop.quit)
+        try:
+            poll.start(10)
+            deadline.start(10000)
+            loop.exec()
+        finally:
+            poll.stop()
+            deadline.stop()
+            poll.timeout.disconnect(check)
+            deadline.timeout.disconnect(loop.quit)
+        if failure is not None:
+            raise failure
+    return predicate()
 
 
 class Job:
@@ -94,10 +125,7 @@ class QtRpySourceUpdateTests(unittest.TestCase):
         self.app.processEvents()
 
     def wait(self, predicate):
-        deadline = time.monotonic() + 4
-        while not predicate() and time.monotonic() < deadline:
-            QTest.qWait(10)
-        self.assertTrue(predicate())
+        self.assertTrue(_wait_until(predicate))
 
     def preview(self):
         with mock.patch.object(QFileDialog, 'getExistingDirectory', return_value='/updated/tl'):
@@ -221,10 +249,7 @@ class QtRpySourceUpdateIntegrationTests(unittest.TestCase):
         self.temp.cleanup()
 
     def wait(self, predicate):
-        deadline = time.monotonic() + 5
-        while not predicate() and time.monotonic() < deadline:
-            QTest.qWait(10)
-        self.assertTrue(predicate())
+        self.assertTrue(_wait_until(predicate))
 
     def open_preview(self, rename=False):
         self.assertTrue(self.window.source_update_action.isEnabled())
