@@ -255,6 +255,16 @@ def create_builtin_registry(
     return _compose_from_trusted_builtins(descriptors, providers=providers)
 
 
+def new_cancellation_token() -> _CancellationToken:
+    """Create an independent cancellation flag through the Application seam.
+
+    The flag can stop an operation at Foundation checkpoints. It grants no
+    source, codec, or publication authority and does not revoke proved writes.
+    """
+
+    return _CancellationToken()
+
+
 def create_parser_application_surface(
     *,
     providers: tuple[ProviderBinding, ...] = (),

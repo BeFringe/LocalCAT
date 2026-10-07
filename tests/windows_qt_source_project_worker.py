@@ -136,6 +136,7 @@ def _package_save(
     appdata: Path,
     result_path: Path,
 ) -> int:
+    from editor_file_jobs import ControllerFileJob, ControllerFileOutcome
     from project_package import ProjectPackageService
     from project_workspace_intake import SelectedProjectDocumentsRequest
 
@@ -157,20 +158,34 @@ def _package_save(
     dirty_before_save = controller.workspace_save_state.project_dirty
     identity_before_save = _identity_payload(controller)
 
-    captured: list[object] = []
-    save_workspace_package = controller.save_workspace_package
+    captured: list[ControllerFileOutcome] = []
+    finish_file_job = controller.finish_file_job
 
-    def capture_save_result():
-        result = save_workspace_package()
-        captured.append(result)
-        return result
+    def capture_save_outcome(job: ControllerFileJob) -> ControllerFileOutcome:
+        outcome = finish_file_job(job)
+        captured.append(outcome)
+        return outcome
 
-    controller.save_workspace_package = capture_save_result
-    if not window.save_workspace_project_package():
-        raise AssertionError("Qt failed to save the ProjectPackage")
+    controller.finish_file_job = capture_save_outcome
+    try:
+        if not window.save_workspace_project_package():
+            raise AssertionError("Qt failed to save the ProjectPackage")
+    finally:
+        controller.finish_file_job = finish_file_job
     if len(captured) != 1:
         raise AssertionError("Qt did not consume exactly one Controller save result")
-    result = captured[0]
+    outcome = captured[0]
+    if (
+        outcome.kind != "save"
+        or outcome.accepted is not True
+        or outcome.cancelled is not False
+        or outcome.safe_code is not None
+        or outcome.path != destination
+    ):
+        raise AssertionError("Qt did not accept the expected Controller save outcome")
+    result = outcome.result
+    if result is None:
+        raise AssertionError("Controller save outcome did not contain a result")
     receipt = result.receipt
     if receipt is None:
         raise AssertionError("committed ProjectPackage save did not issue a receipt")

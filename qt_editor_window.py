@@ -8,10 +8,13 @@ import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from qt_project_file_job import QtProjectFileJob
+
 from PySide6.QtCore import (
     QMimeData,
     QObject,
     QEvent,
+    QEventLoop,
     QItemSelectionModel,
     QPoint,
     QPointF,
@@ -982,6 +985,10 @@ class QtEditorWindow(QMainWindow):
         self.term_scroll: QScrollArea
         self.term_container: QWidget
         self.term_cards_layout: QVBoxLayout
+        self._file_runner = None
+        self._file_last_success = False
+        self._last_workspace_save_target = None
+        self._unsaved_transition_waiting = False
         self.controller = controller
         self.chunk_controller = chunk_controller
         self.tmx_export_coordinator = tmx_export_coordinator
@@ -1047,6 +1054,15 @@ class QtEditorWindow(QMainWindow):
         self.setMinimumSize(1080, 700)
         self.resize(1440, 880)
         self._build_ui()
+        self.file_cancel_button = QPushButton("取消文件操作", self)
+        self.file_cancel_button.setObjectName("cancelProjectFileOperation")
+        self.file_cancel_button.clicked.connect(self.cancel_file_operation)
+        self.statusBar().addPermanentWidget(self.file_cancel_button)
+        self.file_cancel_button.hide()
+        self.tl_export_action = self.project_menu.addAction("导出 Ren’Py TL")
+        self.tl_export_action.setObjectName("exportRenpyTlAction")
+        self.tl_export_action.setEnabled(False)
+        self.tl_export_action.setVisible(False)
         self._apply_top_bar_responsiveness(self.width())
         self.setTabOrder(self.settings_button, self.project_search_toggle)
         self.setTabOrder(self.project_search_toggle, self.project_search_input)
@@ -2639,6 +2655,8 @@ class QtEditorWindow(QMainWindow):
         return True
 
     def open_project_path(self, path: Path) -> bool:
+        if path.suffix.lower() in {".rpy", ".localcat-project", ".zip"}:
+            return self.open_project_file_async(path)
         if not self._confirm_unsaved():
             return False
         try:
@@ -2653,27 +2671,8 @@ class QtEditorWindow(QMainWindow):
         return True
 
     def open_workspace_package_path(self, path: Path) -> bool:
-        """Cold-open a real ProjectPackage through the Controller surface."""
-
-        if not self._confirm_unsaved():
-            return False
-        try:
-            self.controller.open_project_package(path)
-        except (EditorControllerError, OSError) as exc:
-            safe_error = self._workspace_error_text(exc)
-            self._show_error("无法打开项目包", safe_error)
-            self.statusBar().showMessage(
-                "ProjectPackage 打开失败；当前会话保持不变。",
-                7000,
-            )
-            return False
-        self._render_project()
-        self.refresh_recent_projects()
-        self._set_workspace_save_feedback(
-            "LocalCAT项目包已打开 · 源文件只读。"
-        )
-        self.statusBar().showMessage(f"已打开项目包：{path}", 5000)
-        return True
+        """Wait for the background package operation while Qt keeps processing."""
+        return self.open_project_file_async(path, wait=True, package=True)
 
     def open_project_package_path(self, path: Path) -> bool:
         """Stable C4 command name for opening a ProjectPackage."""
@@ -2897,25 +2896,124 @@ class QtEditorWindow(QMainWindow):
         self.statusBar().showMessage(f"已保存：{path}", 7000)
         return True
 
-    def save_workspace_package(self) -> bool:
-        """Persist the current package and project its structured outcome."""
+    @property
+    def file_operation_running(self) -> bool:
+        return self._file_runner is not None
 
-        try:
-            result = self.controller.save_workspace_package()
-        except (EditorControllerError, OSError) as exc:
-            safe_error = self._workspace_error_text(exc)
-            affected = self._dirty_workspace_display_names()
-            self._set_workspace_save_feedback(
-                f"{safe_error} · 受影响章节：{affected} · 项目包未保存，"
-                "当前会话保留，可重试。"
-            )
-            self._show_error("无法保存项目包", safe_error)
-            self.statusBar().showMessage(
-                "项目包保存失败；未证明持久化的章节仍保持未保存状态。",
-                7000,
-            )
+    def cancel_file_operation(self) -> None:
+        runner = self._file_runner
+        if runner is None:
+            return
+        runner.cancel()
+        self.statusBar().showMessage(
+            "正在取消；已经发出的保存将按实际结果报告。"
+            if runner.job.kind == "save" else "正在取消打开；候选释放后结束。")
+
+    def open_project_file_async(self, path: Path, *, wait: bool = False, package: bool = False) -> bool:
+        if self.file_operation_running:
+            self.statusBar().showMessage("请等待当前文件操作结束，或取消它。", 5000)
             return False
-        return self._finish_workspace_save(result)
+        if not self._confirm_unsaved():
+            return False
+        try:
+            job = self.controller.begin_file_open(path, package=package)
+        except (EditorControllerError, OSError, ValueError) as error:
+            self._show_error("无法打开项目", str(error))
+            return False
+        return self._run_file_operation(job, wait=wait)
+
+    def save_workspace_package(self, destination: Path | None = None, *, wait: bool = True) -> bool:
+        """Save only through the live owner; starting a job is not a receipt."""
+        if self.file_operation_running:
+            self.statusBar().showMessage("当前文件操作尚未结束。", 5000)
+            return False
+        if destination is None and self.controller.workspace_save_state.package_path is None:
+            selected, _ = QFileDialog.getSaveFileName(
+                self, "保存 LocalCAT 项目包",
+                f"{self._active_project_name()}.localcat-project",
+                "LocalCAT ProjectPackage (*.localcat-project)")
+            if not selected:
+                return False
+            destination = Path(selected)
+        try:
+            job = self.controller.begin_file_save(destination)
+        except (EditorControllerError, OSError, ValueError) as error:
+            self._show_error("无法保存项目包", str(error))
+            return False
+        return self._run_file_operation(job, wait=wait)
+
+    def _run_file_operation(self, job, *, wait: bool) -> bool:
+        self._file_last_success = False
+        runner = QtProjectFileJob(job, self._finish_file_operation, parent=self)
+        self._file_runner = runner
+        self.file_cancel_button.show()
+        self.statusBar().showMessage("正在打开并验证项目…" if job.kind == "open" else "正在保存项目包…")
+        self._apply_file_operation_access()
+        loop = QEventLoop(self) if wait else None
+        if loop is not None:
+            runner.finished.connect(loop.quit)
+        runner.start()
+        if loop is not None:
+            loop.exec()
+            loop.deleteLater()
+            return self._file_last_success
+        return True
+
+    def _finish_file_operation(self, job) -> None:
+        self._file_runner = None
+        self.file_cancel_button.hide()
+        try:
+            outcome = self.controller.finish_file_job(job)
+        except (EditorControllerError, OSError, ValueError) as error:
+            self._file_last_success = False
+            self._refresh_chunk_view()
+            self._apply_file_operation_access()
+            if (job.kind == "save" and self.controller.has_workspace
+                    and job.context[0] == self.controller.project_session_id):
+                affected = self._dirty_workspace_display_names()
+                self._set_workspace_save_feedback(
+                    f"{error} · 保存目标：{job.path} · 受影响章节：{affected} · "
+                    "项目包未保存；当前修改保留，可重试。")
+            self._show_error("无法打开项目" if job.kind == "open" else "无法保存项目包", str(error))
+            self.statusBar().showMessage("文件操作失败；当前项目与未保存修改保留。", 7000)
+            return
+        if job.kind == "open":
+            if outcome.accepted:
+                self._render_project()
+                self.refresh_recent_projects()
+                self._file_last_success = True
+                self._set_workspace_save_feedback(
+                    "尚未保存项目包 · 原始 TL 只读。"
+                    if self.controller.workspace_save_state.package_path is None
+                    else "项目包已打开 · 无需原始 TL 路径。")
+                self.statusBar().showMessage(f"已打开：{outcome.path}", 5000)
+            else:
+                self.statusBar().showMessage("打开已取消或已过期；当前项目保持不变。", 7000)
+        elif outcome.result is not None:
+            if outcome.accepted:
+                self._last_workspace_save_target = outcome.path
+                self._file_last_success = self._finish_workspace_save(outcome.result)
+            else:
+                receipt = outcome.result.receipt
+                message = (f"原项目已保存：{outcome.path}；当前项目保持不变。"
+                           if receipt is not None and receipt.durable else
+                           f"原项目保存未取得持久化确认：{outcome.path}；请检查保存结果。")
+                self.statusBar().showMessage(message, 10000)
+        else:
+            self.statusBar().showMessage("保存已在开始前取消；未发布项目包。", 7000)
+        if not outcome.accepted or (job.kind == "save" and outcome.result is None):
+            self._refresh_chunk_view()
+        self._apply_file_operation_access()
+
+    def _apply_file_operation_access(self) -> None:
+        saving = self.controller.workspace_save_running
+        recovery = self.controller.workspace_recovery_target is not None
+        self.save_button.setEnabled(self.controller.has_active_project and not saving and not recovery)
+        self.save_workspace_document_action.setEnabled(self.controller.has_workspace and not saving and not recovery)
+        self.import_workspace_package_action.setEnabled(self.controller.has_active_project and not saving)
+        self._apply_chunk_manage_access()
+        if self.controller.has_active_project:
+            self._apply_chunk_access_to_editor()
 
     def save_workspace_project_package(self) -> bool:
         """Stable C4 command for a full ProjectPackage save."""
@@ -2927,6 +3025,8 @@ class QtEditorWindow(QMainWindow):
 
         if not self.controller.has_workspace:
             return False
+        if self.controller.tl_export_unavailable_reason is not None:
+            return self.save_workspace_package(wait=False)
         document = self.controller.current_workspace_identity.document
         try:
             result = self.controller.save_workspace_document(document)
@@ -2970,9 +3070,13 @@ class QtEditorWindow(QMainWindow):
                 f"{code} · {document_summary} · 项目包未证明已保存，"
                 "请执行恢复后重试。"
             )
-            self._show_error("项目包需要恢复", code)
+            target = self._last_workspace_save_target or self.controller.workspace_save_state.package_path
+            self._set_workspace_save_feedback(
+                f"{code} · 保存目标：{target} · {document_summary} · "
+                "当前编辑保留；项目包需要恢复，不能直接重试保存。")
+            self._show_error("项目包需要恢复", f"{code}\n保存目标：{target}\n当前编辑保留；请检查并恢复此目标，不能直接重试保存。")
             self.statusBar().showMessage(
-                f"项目包发布状态需恢复：{code}。",
+                f"项目包需恢复：{target} · {code}。",
                 7000,
             )
             self._render_project()
@@ -2990,6 +3094,10 @@ class QtEditorWindow(QMainWindow):
             )
             self._show_error("部分章节未保存", code)
             self._render_project()
+            return False
+        if result.receipt is None or not result.receipt.durable:
+            self._set_workspace_save_feedback("项目包未取得持久化确认；当前修改仍需检查。")
+            self._refresh_chunk_view()
             return False
         self._render_project()
         self.refresh_recent_projects()
@@ -3089,7 +3197,7 @@ class QtEditorWindow(QMainWindow):
             self,
             "打开 LocalCAT 项目",
             "",
-            "LocalCAT projects (*.json *.txt)",
+            "LocalCAT projects (*.json *.txt *.rpy *.localcat-project *.zip)",
         )
         return bool(selected) and self.open_project_path(Path(selected))
 
@@ -3269,9 +3377,9 @@ class QtEditorWindow(QMainWindow):
             return False
         return self.apply_workspace_package_import()
 
-    def _choose_save(self) -> bool:
+    def _choose_save(self, *, wait: bool = False) -> bool:
         if self.controller.has_workspace:
-            return self.save_workspace_package()
+            return self.save_workspace_package(wait=wait)
         if not self.controller.has_project:
             return False
         current_path = self.controller.project.path
@@ -3320,6 +3428,12 @@ class QtEditorWindow(QMainWindow):
             self._refreshing = False
         self.set_workspace_mode(self.workspace_mode, persist=False)
         self._update_title()
+        reason = self.controller.tl_export_unavailable_reason
+        self.tl_export_action.setVisible(reason is not None)
+        self.tl_export_action.setText("导出 Ren’Py TL（暂不可用）")
+        self.tl_export_action.setToolTip(reason or "")
+        self.tl_export_action.setStatusTip(reason or "")
+        self._apply_file_operation_access()
 
     def _refresh_workspace_documents_menu(self) -> None:
         self.workspace_documents_menu.clear()
@@ -3438,23 +3552,10 @@ class QtEditorWindow(QMainWindow):
         view.__post_init__()
         self._chunk_view = view
         self._chunk_view_error_code = None
-        if view.mode is ChunkApplicationMode.ACTIVE:
-            self.chunk_manage_action.setEnabled(True)
-            self.segment_list.setSelectionMode(
-                QAbstractItemView.SelectionMode.SingleSelection
-            )
-        elif view.mode is ChunkApplicationMode.NO_PLAN:
-            self.chunk_manage_action.setEnabled(True)
-            self.segment_list.setSelectionMode(
-                QAbstractItemView.SelectionMode.SingleSelection
-            )
-        else:
-            self.chunk_manage_action.setEnabled(
-                view.safe_code == "CHUNK.REBASE_REQUIRED"
-            )
-            self.segment_list.setSelectionMode(
-                QAbstractItemView.SelectionMode.SingleSelection
-            )
+        self._apply_chunk_manage_access()
+        self.segment_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
         self._refresh_chunk_identity_cache(view)
         chunk_keys = self._current_chunk_identity_keys()
         self.segment_count_label.setText(
@@ -3462,6 +3563,21 @@ class QtEditorWindow(QMainWindow):
         )
         self._refresh_chunk_search_scopes(view)
         self._apply_chunk_access_to_editor()
+
+    def _apply_chunk_manage_access(self) -> None:
+        """Reuse the current captured view; a render reads the owner only once."""
+        view = self._chunk_view
+        self.chunk_manage_action.setEnabled(
+            not self.controller.workspace_save_running
+            and self.controller.has_workspace
+            and self.chunk_controller is not None
+            and self._chunk_view_error_code is None
+            and view is not None
+            and (
+                view.mode in (ChunkApplicationMode.ACTIVE, ChunkApplicationMode.NO_PLAN)
+                or view.safe_code == "CHUNK.REBASE_REQUIRED"
+            )
+        )
 
     def _populate_chunk_scope_menu(self) -> None:
         """Build the project submenu only when the user opens it."""
@@ -3596,6 +3712,9 @@ class QtEditorWindow(QMainWindow):
                     else view.safe_code
                 ),
             )
+        if self.controller.workspace_save_running:
+            editable = confirmable = False
+            reason = "正在保存项目包；完成后可继续编辑。"
         self.target_editor.setReadOnly(not editable)
         self.confirm_button.setEnabled(confirmable)
         self.target_editor.setToolTip("" if editable else reason)
@@ -5994,6 +6113,8 @@ class QtEditorWindow(QMainWindow):
         return label
 
     def _chunk_target_editable(self) -> bool:
+        if self.controller.workspace_save_running:
+            return False
         return (
             self._chunk_view is None
             and not (
@@ -6250,6 +6371,11 @@ class QtEditorWindow(QMainWindow):
             self.add_term(source_input.text(), target_input.text())
 
     def _confirm_unsaved(self) -> bool:
+        if self._unsaved_transition_waiting:
+            return False
+        if self.controller.workspace_save_running:
+            self.statusBar().showMessage("保存正在进行，请等待实际结果或取消。", 6000)
+            return False
         if not self._has_active_project() or not self._active_dirty():
             return True
         prompt = QMessageBox(
@@ -6266,8 +6392,13 @@ class QtEditorWindow(QMainWindow):
         prompt.button(QMessageBox.StandardButton.Discard).setText("放弃修改")
         prompt.button(QMessageBox.StandardButton.Cancel).setText("取消")
         decision = QMessageBox.StandardButton(prompt.exec())
+        prompt.deleteLater()
         if decision == QMessageBox.StandardButton.Save:
-            return self._choose_save()
+            self._unsaved_transition_waiting = True
+            try:
+                return self._choose_save(wait=True)
+            finally:
+                self._unsaved_transition_waiting = False
         return decision == QMessageBox.StandardButton.Discard
 
     def _update_title(self) -> None:
@@ -6306,7 +6437,24 @@ class QtEditorWindow(QMainWindow):
             self.progress_bar.setFixedWidth(180)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._confirm_unsaved():
+        if self._unsaved_transition_waiting:
+            event.ignore()
+            return
+        saving = self.controller.workspace_save_running
+        if saving:
+            decision = QMessageBox.question(
+                self, "保存正在进行", "关闭窗口后，已经发出的保存仍可能完成。是否关闭？",
+                QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            can_close = decision == QMessageBox.StandardButton.Close
+        else:
+            can_close = self._confirm_unsaved()
+        if can_close:
+            self.controller.close_project()
+            self.controller.abandon_file_jobs()
+            if self._file_runner is not None:
+                self._file_runner.close()
+                self._file_runner = None
             if self._chunk_segment_selection_session is not None:
                 self._finish_chunk_segment_selection(
                     False,

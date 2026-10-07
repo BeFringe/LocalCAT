@@ -249,7 +249,7 @@ class WindowsQtSourceProjectJourneyTests(unittest.TestCase):
             self.assertEqual(opened_facts["document_count"], 2)
             self.assertEqual(opened_facts["segment_count"], 2)
             self.assertIn("LocalCAT项目包已保存", saved_facts["feedback"])
-            self.assertIn("LocalCAT项目包已打开", opened_facts["feedback"])
+            self.assertEqual(opened_facts["feedback"], "项目包已打开 · 无需原始 TL 路径。")
             self.assertEqual(first.read_bytes(), first_source_before)
             self.assertEqual(second.read_bytes(), second_source_before)
             self.assertTrue(saved_facts["closed"])

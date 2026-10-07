@@ -72,6 +72,7 @@ _EXPECTED_MIGRATED_APPLICATION_FACADES = frozenset(
 )
 _EXPECTED_DIRECT_SURFACE_CONSUMERS = frozenset(
     {
+        "editor_file_jobs",
         "project_codec_settings",
         "editor_project",
         "editor_project_workspace_adapter",
@@ -857,7 +858,27 @@ def _defined_class_names(modules: dict[str, SourceModule]) -> dict[str, set[str]
     }
 
 
+def _file_job_parser_edges(module: SourceModule) -> set[str]:
+    return {target for target in _module_import_targets(module)
+            if target.partition(".")[0].startswith("parser")}
+
+
 class Wave4ArchitectureGuardSelfTests(unittest.TestCase):
+    def test_file_jobs_only_acquire_public_cancellation(self) -> None:
+        allowed = {"parser_composition.new_cancellation_token"}
+        cases = (
+            "from parser_composition import create_parser_surface",
+            "from parser_source import CancellationToken",
+            "from parser_rpy_codec import RpyProvider",
+            "from parser_composition import _CancellationToken",
+            "import parser_composition as internal",
+            "import importlib\nimportlib.import_module('parser_source')",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                module = SourceModule("editor_file_jobs", source)
+                self.assertNotEqual(_file_job_parser_edges(module), allowed)
+
     def test_product_provider_edge_rejects_grammar_imports_and_other_consumers(self) -> None:
         allowed = "from parser_rpy_codec import RpyProvider as Provider\n"
         self.assertEqual(_product_provider_import_hits({
@@ -1254,6 +1275,10 @@ class Wave4ProductionArchitectureTests(unittest.TestCase):
             actual_surface_consumers,
             _EXPECTED_DIRECT_SURFACE_CONSUMERS,
         )
+        # Background file jobs use only the public cancellation factory;
+        # they cannot acquire a Parser surface, grammar, or writer authority.
+        self.assertEqual(_file_job_parser_edges(self.modules["editor_file_jobs"]),
+                         {"parser_composition.new_cancellation_token"})
         self.assertEqual(set(_FACADE_CALL_INVENTORY), set(facades))
         for name, module in facades.items():
             observed = Counter(

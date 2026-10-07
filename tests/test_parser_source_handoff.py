@@ -103,6 +103,23 @@ class ParserSourceHandoffTests(unittest.TestCase):
         self.assertEqual(handoff.materialized.terminal.source.content_sha256,
                          hashlib.sha256(self.bytes).hexdigest())
 
+    def test_public_cancellation_factory_controls_only_its_surface_operation(self):
+        cancelled = composition.new_cancellation_token()
+        live = composition.new_cancellation_token()
+        fixture = NeutralFixture()
+        surface = fixture.surface()
+        opened = self.opened(surface, fixture.descriptor, cancelled)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(cancelled.cancel).result(timeout=5)
+        self.assertTrue(cancelled.cancelled)
+        self.assertFalse(live.cancelled)
+        with self.assertRaises(contracts.ContractViolation) as caught:
+            surface.materialize_handoff(opened)
+        self.assertEqual(caught.exception.code, 'PARSER.SOURCE.CANCELLED')
+        self.assertEqual(fixture.calls, [])
+        handoff = surface.materialize_handoff(self.opened(surface, fixture.descriptor, live))
+        self.assertEqual(handoff.source_bytes, self.bytes)
+
     def test_verified_same_snapshot_once_and_lease_expires(self):
         fixture = NeutralFixture()
         surface = fixture.surface()
