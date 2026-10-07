@@ -119,6 +119,8 @@ stateDiagram-v2
 
 预览绑定 session、workspace revision、选定 Document identities、codec identity、source/private digest、输出目标身份和导出策略。导出全部当前 target；空/未确认是可见警示，不自动填源文或丢段。用户编辑、重开、换 provider 或重选路径使预览失效。TL 导出不清除 package dirty，也不更新 package baseline。
 
+单文件发布成功后关闭预览窗口，并在主窗口显示成功结果与输出路径；失败、阻断、过期或结果不确定时保留诊断供检查。用户已经关闭窗口时，晚到结果不重新弹出窗口，已发生的发布仍按真实结果报告。
+
 多文件导出由用户选择一个导出根目录，按已验证的 source_ref 重建相对目录，不按 basename 展平。先准备/验证所有输出及目录/大小写/同名冲突，再确认并按顺序独立发布；root 与每个目标 ancestor 在发布前复证，拒绝符号链接/reparse、逸出和替换。缺失子目录仅由平台在用户选择的导出根内受控创建；预览不建目录，目录创建失败列为未发布，已创建空目录不宣称回滚。取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
 
 ## Components and Interfaces

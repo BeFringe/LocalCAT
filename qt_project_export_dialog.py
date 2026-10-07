@@ -134,6 +134,8 @@ class QtProjectExportDialog(QDialog):
                 self.status_label.setText(self.result_message(self.result))
                 self._show_diagnostics(self.result.diagnostics)
                 self.result_ready.emit(self.result)
+                if self.result.outcome == 'published' and self.isVisible():
+                    self.accept()
         except (EditorControllerError, OSError, ValueError) as error:
             self.status_label.setText(f'导出操作失败：{error}')
         finally:

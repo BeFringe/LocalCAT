@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
 from qt_editor import _compose_editor_controller, _compose_chunk_controller
 from qt_editor_window import QtEditorWindow
 from resource_repository import ResourceRepository
@@ -92,12 +92,44 @@ class QtRpyExportTests(unittest.TestCase):
         self.assertTrue(self.controller.active_project_dirty)
         self.assertIn('*', self.window.windowTitle())
 
+    def test_published_closes_panel_and_reopening_prepares_current_edit(self):
+        dialog = self.open_export()
+        first_view = dialog.view
+        accepted, rejected = mock.Mock(), mock.Mock()
+        dialog.accepted.connect(accepted)
+        dialog.rejected.connect(rejected)
+        with mock.patch.object(self.controller, 'cancel_tl_export_preview',
+                               wraps=self.controller.cancel_tl_export_preview) as cancel:
+            dialog.confirm_button.click()
+            job = dialog._runner.job
+            self.wait_until(lambda: dialog.result is not None)
+            self.assertEqual(dialog.result.outcome, 'published')
+            self.assertFalse(dialog.isVisible())
+            self.assertEqual(QDialog.result(dialog), QDialog.DialogCode.Accepted)
+            accepted.assert_called_once_with()
+            rejected.assert_not_called()
+            cancel.assert_not_called()
+            self.assertFalse(job.cancellation.cancelled)
+        self.assertIn('导出成功', self.window.statusBar().currentMessage())
+        self.assertIn(str(self.target), self.window.statusBar().currentMessage())
+        self.assertIn('导出不会替代项目包保存', self.window.statusBar().currentMessage())
+        self.assertEqual(self.target.read_bytes(), self.raw)
+        self.assertFalse(self.controller.tl_export_publish_running)
+        self.window.target_editor.setPlainText('再次导出时的译文')
+        reopened = self.open_export()
+        self.assertTrue(reopened.isVisible())
+        self.assertIsNone(reopened.result)
+        self.assertNotEqual(reopened.view.preview_id, first_view.preview_id)
+        self.assertEqual(reopened.view.modified_count, 1)
+        self.assertTrue(reopened.confirm_button.isEnabled())
+
     def test_edit_invalidates_preview_then_target_reselection_prepares_again(self):
         dialog = self.open_export()
         old = dialog.view
         self.window.target_editor.setPlainText('later')
         self.wait_until(lambda: not dialog.confirm_button.isEnabled())
         self.assertIn('过期', dialog.status_label.text())
+        self.assertTrue(dialog.isVisible())
         next_target = self.root / 'elsewhere.rpy'
         with mock.patch.object(QFileDialog, 'getSaveFileName', return_value=(str(next_target), '')):
             dialog.target_button.click()
@@ -113,6 +145,7 @@ class QtRpyExportTests(unittest.TestCase):
         self.window.target_editor.setPlainText('错误 [new_expression]')
         dialog = self.open_export()
         self.assertFalse(dialog.confirm_button.isEnabled())
+        self.assertTrue(dialog.isVisible())
         issue = dialog.view.diagnostics[0]
         text = dialog.diagnostics.toPlainText()
         self.assertIn('original.rpy', text)
@@ -221,6 +254,7 @@ class QtRpyExportTests(unittest.TestCase):
             dialog.confirm_button.click()
             self.wait_until(lambda: dialog.result is not None)
         self.assertEqual(dialog.result.outcome, 'failed')
+        self.assertTrue(dialog.isVisible())
         self.assertIn('导出失败', dialog.status_label.text())
         self.assertFalse(dialog.confirm_button.isEnabled())
         self.assertFalse(self.target.exists())
@@ -237,6 +271,7 @@ class QtRpyExportTests(unittest.TestCase):
             dialog.confirm_button.click()
             self.wait_until(lambda: dialog.result is not None)
         self.assertEqual(dialog.result.outcome, 'uncertain')
+        self.assertTrue(dialog.isVisible())
         self.assertIn('结果不确定', dialog.status_label.text())
         self.assertNotIn('导出成功', dialog.status_label.text())
         self.assertEqual(self.target.read_bytes(), self.raw)
@@ -383,6 +418,8 @@ class QtRpyExportTests(unittest.TestCase):
                         release.set()
                     self.wait_until(lambda: dialog.result is not None)
                 self.assertTrue(cancelled)
+                self.assertFalse(dialog.isVisible())
+                self.assertEqual(QDialog.result(dialog), QDialog.DialogCode.Rejected)
                 self.assertEqual(dialog.result.outcome, 'uncertain' if fails else 'published')
                 self.assertEqual(dialog.result.target_path, str(self.target))
                 self.assertEqual(self.target.read_bytes(), self.raw)
