@@ -1,4 +1,4 @@
-"""Immutable display-only projections for project export previews."""
+"""Immutable display-only projections for project export previews and results."""
 
 from dataclasses import dataclass
 
@@ -29,6 +29,27 @@ class ProjectExportView:
     empty_count: int
     unconfirmed_count: int
     status: str
+    diagnostics: tuple[ProjectExportDiagnostic, ...] = ()
+    output_sha256: str | None = None
+    output_byte_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectExportResult:
+    """Export facts only; this never acknowledges a ProjectPackage save.
+
+    Output facts are present only for a publication proved by the Parser owner.
+    Uncertain output may be visible on disk and requires inspection.
+    """
+
+    preview_id: str
+    session_id: str
+    workspace_revision: int
+    request_generation: int
+    document_id: str
+    source_ref: str
+    target_path: str
+    outcome: str
     diagnostics: tuple[ProjectExportDiagnostic, ...] = ()
     output_sha256: str | None = None
     output_byte_count: int | None = None

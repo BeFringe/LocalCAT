@@ -1,4 +1,4 @@
-"""Single-TL preview coordination over public Project and Parser seams.
+"""Single-TL export coordination over public Project and Parser seams.
 
 Current edits remain Project-owned. A preview owns a live Parser preparation,
 its temporary verified source and read-only target observation until discarded.
@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path, PurePath
 import tempfile
+from threading import RLock
 from uuid import uuid4
 
 from parser_composition import RoundTripPreparationError
@@ -25,7 +26,7 @@ from platform_fs_contracts import PlatformFileError, PublishMode
 from project_codec_settings import (
     CodecSettingsError, CodecSettingsRepository, ProjectCodecRuntime,
 )
-from project_export_contracts import ProjectExportDiagnostic, ProjectExportView
+from project_export_contracts import ProjectExportDiagnostic, ProjectExportResult, ProjectExportView
 from project_package import ProjectPackagePersistenceBinding, ProjectPackageService
 from project_workspace import ProjectWorkspaceService
 from project_workspace_contracts import ProjectWorkspaceError
@@ -223,8 +224,9 @@ class PreparedRpyProjectExport:
 
     Only Parser owns the prepared write. Revalidation requires current owner
     inputs; an old context alone cannot prove that a project is still installed.
-    Publication integration can consume this candidate inside this module after
-    revalidation; no public token, bytes, or raw writer getter is provided.
+    Publication consumes this candidate after revalidation; no public token,
+    bytes, or raw writer getter is provided. Operations are synchronous worker
+    operations and serialize with close; cancellation uses the supplied token.
     """
 
     def __init__(self, context, target, config_dir, package_service, cancellation):
@@ -237,6 +239,8 @@ class PreparedRpyProjectExport:
         self._target = target
         self._bridge = self._opened = self._prepared = self._target_observation = None
         self._closed = False
+        self._operation_lock = RLock()
+        self._result = None
         document = self._workspace.documents[0]
         self._document = document
         self._records = ()
@@ -316,36 +320,104 @@ class PreparedRpyProjectExport:
 
         This performs I/O and must not be polled from the GUI event thread.
         """
-        if self._closed:
+        with self._operation_lock:
+            if self._closed:
+                return self._view
+            try:
+                self._require_current(context, target)
+            except (ContractViolation, ProjectWorkspaceError, RpyExportError, PlatformFileError, CodecSettingsError, OSError) as error:
+                code = getattr(error, 'code', 'RPY.EXPORT.PREVIEW_STALE')
+                return self._stop('cancelled' if code == 'PARSER.SOURCE.CANCELLED' else 'stale', code)
             return self._view
+
+    def publish(self, context: RpyExportContext, target: Path) -> ProjectExportResult:
+        """Revalidate and consume once on a worker, using the issuing surface.
+
+        A repeated call returns the same terminal result without writing. The
+        Controller must supply its current context and selected target. Parser
+        outcomes remain authoritative after dispatch, including cancellation
+        during an issued operation; no cancellation checkpoint follows it.
+        """
+        with self._operation_lock:
+            if self._result is not None:
+                return self._result
+            if self._closed:
+                return self._finish(self._view.status, self._view.diagnostics)
+            try:
+                self._require_current(context, target)
+            except (ContractViolation, ProjectWorkspaceError, RpyExportError, PlatformFileError, CodecSettingsError, OSError) as error:
+                code = getattr(error, 'code', 'RPY.EXPORT.PREVIEW_STALE')
+                return self._finish(
+                    'cancelled' if code == 'PARSER.SOURCE.CANCELLED' else 'stale',
+                    (self._diagnostic(code, 'Export preparation is no longer usable.'),),
+                )
+            except Exception:
+                return self._finish('failed', (self._diagnostic(
+                    'RPY.EXPORT.VALIDATION_FAILED', 'Export validation failed before publication.'),))
+            except BaseException:
+                self.close()
+                raise
+            try:
+                result = self._context.runtime.surface.write_prepared(self._prepared)
+            except Exception:
+                # Once dispatched, only the Parser can prove non-publication.
+                return self._finish('uncertain', (self._diagnostic(
+                    'PARSER.SOURCE.WRITE_RECOVERY_REQUIRED',
+                    'Publication requires inspection; no success was proved.'),))
+            except BaseException:
+                self._finish('uncertain', (self._diagnostic(
+                    'PARSER.SOURCE.WRITE_RECOVERY_REQUIRED',
+                    'Publication was interrupted and requires inspection.'),))
+                raise
+            diagnostics = self._view.diagnostics
+            if result.code is not None:
+                diagnostics += (self._diagnostic(result.code, result.safe_summary),)
+            receipt = result.receipt
+            return self._finish(
+                result.outcome.value, diagnostics,
+                receipt.content_sha256 if receipt is not None else None,
+                receipt.byte_count if receipt is not None else None,
+            )
+
+    def _finish(self, outcome, diagnostics, output_sha256=None, output_byte_count=None):
+        self._view = replace(self._view, status=outcome, diagnostics=diagnostics)
         try:
-            self._require_current(context, target)
-        except (ContractViolation, ProjectWorkspaceError, RpyExportError, PlatformFileError, CodecSettingsError, OSError) as error:
-            code = getattr(error, 'code', 'RPY.EXPORT.PREVIEW_STALE')
-            return self._stop('cancelled' if code == 'PARSER.SOURCE.CANCELLED' else 'stale', code)
-        return self._view
+            self.close()
+        except Exception:
+            diagnostics += (self._diagnostic(
+                'RPY.EXPORT.CLEANUP_FAILED', 'Export resource cleanup could not be proved.'),)
+            if outcome == 'published':
+                outcome = 'uncertain'
+                output_sha256 = output_byte_count = None
+            self._view = replace(self._view, status=outcome, diagnostics=diagnostics)
+        view = self._view
+        self._result = ProjectExportResult(
+            view.preview_id, view.session_id, view.workspace_revision,
+            view.request_generation, view.document_id, view.source_ref,
+            view.target_path, outcome, diagnostics, output_sha256, output_byte_count,
+        )
+        return self._result
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        if self._view.status in ('ready', 'preparing'):
-            self._view = replace(self._view, status='cancelled')
-        try:
-            if self._prepared is not None:
-                self._prepared.close()
-        finally:
-            try:
-                if self._opened is not None:
-                    self._opened.close()
-            finally:
+        with self._operation_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._view.status in ('ready', 'preparing'):
+                self._view = replace(self._view, status='cancelled')
+            authorities = (self._prepared, self._opened, self._target_observation, self._bridge)
+            self._prepared = self._opened = self._bridge = self._target_observation = None
+            failure = None
+            for authority in authorities:
+                if authority is None:
+                    continue
                 try:
-                    if self._target_observation is not None:
-                        self._target_observation.close()
-                finally:
-                    if self._bridge is not None:
-                        self._bridge.close()
-        self._prepared = self._opened = self._bridge = self._target_observation = None
+                    authority.close()
+                except BaseException as error:
+                    if failure is None:
+                        failure = error
+            if failure is not None:
+                raise failure
 
     def __enter__(self):
         return self
