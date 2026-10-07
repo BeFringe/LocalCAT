@@ -16,7 +16,8 @@ from uuid import uuid4
 from capability_host import MatcherHandoffSnapshot
 from configured_term_adapter import ConfiguredTermAdapter
 from project_codec_settings import ProjectCodecRuntime, compose_project_codec_runtime
-from editor_file_jobs import ControllerFileJob, ControllerFileOutcome, FileOpenCandidate
+from editor_file_jobs import (ControllerFileJob, ControllerFileOutcome, FileOpenCandidate,
+                              FileImportPublication, SingleTLImportReview)
 from rpy_project_adapter import RpyProjectAdapter
 from editor_contracts import (
     BatchOperationReport,
@@ -1265,6 +1266,7 @@ class EditorController:
         self._tm_query_lock = RLock()
         self._rpy_project_session = None
         self._issued_file_jobs: dict[int, ControllerFileJob] = {}
+        self._pending_tl_import = None
         self._file_save_job: ControllerFileJob | None = None
         self._file_save_state: ControllerWorkspaceSaveState | None = None
         self._file_open_generation = 0
@@ -2025,10 +2027,20 @@ class EditorController:
 
     def begin_file_open(self, path: Path, *, package: bool = False) -> ControllerFileJob:
         """Issue a background TL/package open without changing the session."""
+        return self._begin_file_open(path, package=package)
+
+    def begin_single_tl_import(self, path: Path) -> ControllerFileJob:
+        """Validate a TL while retaining the current editable project."""
+        if Path(path).suffix.lower() != '.rpy':
+            raise EditorControllerError('PROJECT.FILE.FORMAT_UNSUPPORTED')
+        return self._begin_file_open(path, prepare_tl=True)
+
+    def _begin_file_open(self, path: Path, *, package=False, prepare_tl=False):
         path = Path(path).expanduser().absolute()
         if not package and path.suffix.lower() not in {".rpy", ".localcat-project", ".zip"}:
             raise EditorControllerError("PROJECT.FILE.FORMAT_UNSUPPORTED")
         self._file_open_generation += 1
+        self.cancel_single_tl_import()
         generation = self._file_open_generation
         context = self._file_context() + (generation,)
         package_service = self._workspace_package_service
@@ -2044,6 +2056,7 @@ class EditorController:
                     SelectedProjectDocumentsRequest(path.stem, "und", "und"),
                     session_id=session_id, file_system=file_system,
                     cancellation=cancellation,
+                    creation_pending=prepare_tl,
                 )
                 return FileOpenCandidate(session.save_service, None, session, runtime)
             opened = package_service.open(path)
@@ -2052,7 +2065,44 @@ class EditorController:
                 opened.persistence_binding, runtime=runtime,
             )
 
-        job = ControllerFileJob("open", path, context, prepare)
+        job = ControllerFileJob("prepare_tl" if prepare_tl else "open", path, context, prepare)
+        self._issued_file_jobs[id(job)] = job
+        return job
+
+    def cancel_single_tl_import(self, review: SingleTLImportReview | None = None) -> None:
+        pending = self._pending_tl_import
+        if pending is not None and (review is None or review is pending[0]):
+            self._pending_tl_import = None
+            pending[1].close()
+
+    def begin_single_tl_publish(self, review: SingleTLImportReview, destination: Path,
+                                *, name: str, source_locale: str,
+                                target_locale: str) -> ControllerFileJob:
+        pending = self._pending_tl_import
+        if pending is None or review is not pending[0]:
+            raise EditorControllerError('PROJECT.INTAKE.CANDIDATE_STALE')
+        _, candidate, context = pending
+        self._pending_tl_import = None
+        if context != self._file_context() + (self._file_open_generation,):
+            candidate.close()
+            raise EditorControllerError('PROJECT.INTAKE.CANDIDATE_STALE')
+        try:
+            request = SelectedProjectDocumentsRequest(name, source_locale, target_locale)
+            destination = Path(destination).expanduser().absolute()
+        except BaseException:
+            candidate.close()
+            raise
+
+        def publish(cancellation):
+            candidate.session.configure_creation(request)
+            candidate.save_service = candidate.session.save_service
+            cancellation.raise_if_cancelled()
+            result = candidate.session.save(destination)
+            candidate.binding = candidate.session.persistence_binding
+            return FileImportPublication(candidate, result)
+
+        job = ControllerFileJob('import_tl', destination, context, publish,
+                                session=candidate.session)
         self._issued_file_jobs[id(job)] = job
         return job
 
@@ -2100,18 +2150,50 @@ class EditorController:
         """GUI-thread-only, once-only acceptance. A late save keeps its receipt."""
         if self._issued_file_jobs.get(id(job)) is not job:
             raise EditorControllerError("PROJECT.FILE.NOT_ISSUED")
-        if job.kind == "open" and job.disposed:
+        if job.kind in {"open", "prepare_tl"} and job.disposed:
             del self._issued_file_jobs[id(job)]
             return ControllerFileOutcome(job.kind, job.path, False, cancelled=True)
         value, error = job.take_result()
         del self._issued_file_jobs[id(job)]
         context_matches = job.context[:3] == self._file_context()
         accepted = context_matches
-        if job.kind == "open":
+        safe_code = None
+        if job.kind in {"open", "prepare_tl", "import_tl"}:
             accepted = (accepted and job.context[3] == self._file_open_generation
                         and not job.cancellation.cancelled and value is not None
                         and error is None)
-            if accepted:
+            if job.kind == 'prepare_tl':
+                if accepted:
+                    review = SingleTLImportReview(job.path, job.path.stem,
+                        len(value.save_service.workspace_service.flat_segments))
+                    self._pending_tl_import = (review, value, job.context)
+                    return ControllerFileOutcome(job.kind, job.path, True, review)
+                if value is not None:
+                    value.close()
+            elif job.kind == 'import_tl':
+                publication = value
+                result = None if publication is None else publication.result
+                candidate = None if publication is None else publication.candidate
+                accepted = (accepted and result.receipt is not None
+                            and result.receipt.durable
+                            and not result.save_report.recovery_required
+                            and candidate.binding is not None)
+                if accepted:
+                    try:
+                        self._validate_workspace_chunk_replacement(candidate.save_service.workspace_service)
+                        self._install_workspace_services(
+                            candidate.save_service, candidate.binding,
+                            session_id=candidate.save_service.workspace_service.session_id)
+                        self._rpy_project_session = candidate.session
+                        self.project_codec_runtime = candidate.runtime
+                    except Exception as install_error:
+                        candidate.close()
+                        accepted = False
+                        safe_code = self._file_error_text(install_error)
+                elif job.session is not None:
+                    job.session.close()
+                value = result
+            elif accepted:
                 try:
                     self._validate_workspace_chunk_replacement(value.save_service.workspace_service)
                     self._install_workspace_services(
@@ -2139,12 +2221,12 @@ class EditorController:
                 self._remember_current_workspace_position()
             elif not accepted and job.session is not None:
                 job.session.close()
-        if error is not None and not (job.kind == "open" and
+        if error is not None and not (job.kind in {"open", "prepare_tl"} and
                                       (job.cancellation.cancelled or not context_matches)):
             raise EditorControllerError(self._file_error_text(error)) from error
         return ControllerFileOutcome(job.kind, job.path, accepted,
-                                     value if job.kind == "save" else None,
-                                     job.cancellation.cancelled)
+                                     value if job.kind in {"save", "import_tl"} else None,
+                                     job.cancellation.cancelled, safe_code)
 
     @staticmethod
     def _file_error_text(error: Exception) -> str:
@@ -2169,9 +2251,12 @@ class EditorController:
             raise EditorControllerError("PROJECT.FILE.SAVE_IN_PROGRESS")
 
     def _discard_pending_file_opens(self) -> None:
+        self.cancel_single_tl_import()
         for job in self._issued_file_jobs.values():
-            if job.kind == "open":
+            if job.kind in {"open", "prepare_tl"}:
                 job.dispose()
+            elif job.kind == 'import_tl':
+                job.cancel()
 
     def _retire_rpy_session(self) -> None:
         session = self._rpy_project_session
@@ -2183,6 +2268,7 @@ class EditorController:
 
     def abandon_file_jobs(self) -> None:
         """Window shutdown revokes publication; workers finish their own cleanup."""
+        self.cancel_single_tl_import()
         for job in self._issued_file_jobs.values():
             job.dispose()
         self._issued_file_jobs.clear()

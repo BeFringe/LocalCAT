@@ -9,6 +9,8 @@ from project_codec_settings import CodecSettingsRepository, CodecSettings, Codec
 from resource_repository import ResourceRepository
 from tests.test_rpy_provider import FIXTURES
 from tests.test_project_single_file_profile import _PACKAGE_PORT
+from project_workspace_contracts import ProjectWorkspaceError
+from project_workspace_intake import SelectedProjectDocumentsRequest
 
 
 class ControllerRpyProjectTests(unittest.TestCase):
@@ -264,3 +266,130 @@ class ControllerRpyProjectTests(unittest.TestCase):
         text.write_text('One\nTwo\n')
         self.controller.open_project(text)
         self.assertEqual(len(self.controller.project.segments), 2)
+
+    def prepare_import(self):
+        job = self.controller.begin_single_tl_import(self.source)
+        job.run()
+        outcome = self.controller.finish_file_job(job)
+        self.assertTrue(outcome.accepted)
+        return outcome.result
+
+    def publish_import(self, review, destination=None):
+        job = self.controller.begin_single_tl_publish(
+            review, destination or self.destination,
+            name='我的项目', source_locale='en', target_locale='zh-CN')
+        job.run()
+        return self.controller.finish_file_job(job)
+
+    def test_single_tl_import_installs_only_after_durable_creation(self):
+        self.controller.load_sample()
+        old = self.controller.project
+        review = self.prepare_import()
+        self.assertIs(self.controller.project, old)
+        self.assertEqual(review.source_path, self.source)
+        outcome = self.publish_import(review)
+        self.assertTrue(outcome.accepted)
+        self.assertTrue(outcome.result.receipt.durable)
+        self.assertFalse(self.controller.active_project_dirty)
+        self.assertEqual(self.controller.workspace_save_state.package_path, self.destination)
+        self.assertEqual(self.controller.workspace_view.name, '我的项目')
+        self.assertEqual(self.controller.workspace_view.documents[0].display_name, 'single.rpy')
+        self.controller.update_workspace_target('译文')
+        self.assertTrue(self.controller.active_project_dirty)
+        saved = self.controller.begin_file_save()
+        saved.run()
+        self.assertTrue(self.controller.finish_file_job(saved).result.receipt.durable)
+
+    def test_single_tl_import_cancel_failure_and_stale_keep_original(self):
+        self.controller.load_sample()
+        self.controller.update_target('原项目未保存的编辑')
+        old = self.controller.project
+        review = self.prepare_import()
+        self.controller.cancel_single_tl_import(review)
+        self.assertIs(self.controller.project, old)
+        review = self.prepare_import()
+        with mock.patch(_PACKAGE_PORT + '.stage_candidate', side_effect=OSError('failure')):
+            outcome = self.publish_import(review)
+        self.assertFalse(outcome.accepted)
+        self.assertIsNone(outcome.result.receipt)
+        self.assertFalse(self.destination.exists())
+        self.assertIs(self.controller.project, old)
+        self.assertTrue(self.controller.active_project_dirty)
+        review = self.prepare_import()
+        self.controller.update_target('又一次编辑')
+        old = self.controller.project
+        with self.assertRaisesRegex(EditorControllerError, 'STALE'):
+            self.publish_import(review)
+        self.assertIs(self.controller.project, old)
+
+    def test_single_tl_published_but_cancelled_reports_receipt_without_install(self):
+        self.controller.load_sample()
+        old = self.controller.project
+        review = self.prepare_import()
+        job = self.controller.begin_single_tl_publish(
+            review, self.destination, name='项目', source_locale='en', target_locale='zh-CN')
+        job.run()
+        job.cancel()
+        outcome = self.controller.finish_file_job(job)
+        self.assertFalse(outcome.accepted)
+        self.assertTrue(outcome.result.receipt.durable)
+        self.assertIs(self.controller.project, old)
+        self.assertTrue(job.session.closed)
+
+    def test_single_tl_import_cannot_overwrite_source(self):
+        review = self.prepare_import()
+        original = self.source.read_bytes()
+        outcome = self.publish_import(review, self.source)
+        self.assertFalse(outcome.accepted)
+        self.assertIsNone(outcome.result.receipt)
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertFalse(self.controller.has_active_project)
+
+    def test_single_tl_prepare_and_publication_reject_changed_session_context(self):
+        self.controller.load_sample()
+        job = self.controller.begin_single_tl_import(self.source)
+        job.run()
+        candidate = job._value
+        self.controller.update_target('预览期间编辑')
+        self.assertFalse(self.controller.finish_file_job(job).accepted)
+        self.assertTrue(candidate.session.closed)
+        review = self.prepare_import()
+        publish = self.controller.begin_single_tl_publish(
+            review, self.destination, name='项目', source_locale='en', target_locale='zh-CN')
+        publish.run()
+        self.controller.update_target('发布期间编辑')
+        old = self.controller.project
+        outcome = self.controller.finish_file_job(publish)
+        self.assertFalse(outcome.accepted)
+        self.assertTrue(outcome.result.receipt.durable)
+        self.assertTrue(publish.session.closed)
+        self.assertIs(self.controller.project, old)
+
+    def test_single_tl_creation_recovery_does_not_replace_or_block_current_project(self):
+        self.controller.load_sample()
+        old = self.controller.project
+        review = self.prepare_import()
+        with mock.patch(_PACKAGE_PORT + '.commit_candidate', side_effect=OSError('cleanup failure')):
+            outcome = self.publish_import(review)
+        self.assertFalse(outcome.accepted)
+        self.assertTrue(outcome.result.save_report.recovery_required)
+        self.assertIsNone(outcome.result.receipt)
+        self.assertIs(self.controller.project, old)
+        self.assertIsNone(self.controller.workspace_recovery_target)
+
+    def test_creation_metadata_rejects_reconfiguration_and_installed_session_with_domain_error(self):
+        request = SelectedProjectDocumentsRequest('项目', 'en', 'zh-CN')
+        review = self.prepare_import()
+        candidate = self.controller._pending_tl_import[1].session
+        candidate.configure_creation(request)
+        with self.assertRaisesRegex(ProjectWorkspaceError, 'PROJECT.WORKSPACE.SESSION_STALE'):
+            candidate.configure_creation(request)
+        self.controller.cancel_single_tl_import(review)
+        self.assertTrue(candidate.closed)
+        review = self.prepare_import()
+        self.assertTrue(self.publish_import(review).accepted)
+        installed = self.controller._rpy_project_session
+        with self.assertRaisesRegex(ProjectWorkspaceError, 'PROJECT.WORKSPACE.SESSION_STALE'):
+            installed.configure_creation(request)
+        self.assertFalse(installed.closed)
+        self.assertFalse(self.controller.active_project_dirty)

@@ -99,7 +99,7 @@ ProjectPackage 若需格式白名单/decoder 对新 profile 的识别，仅在 P
 
 1. 选择 TL 和可移植 origin；Parser 从 sealed source 完成读取。只有 verified terminal 才把 source bytes、中立记录和 opaque private payload 交给 Project intake。
 2. 建立 `SINGLE_FILE + explicit-single-file-v1` 的非 legacy workspace。原始 TL 保存在 `sources/{document_id}/{source_snapshot_sha256}.bin`；`documents/{document_id}.json` 使用既有 `localcat-project-package-document-v1` 保存 source facts 与 target/confirmed overlay；私有数据在 `codec-private/{document_id}/{private_sha256}.bin`。首包创建保留 rooted source binding 至发布完成，不仅构造内存 Document；不用 JSON canonical serializer 重写原始 TL。
-3. Project owner 保存并冷重开验证 ProjectPackage 后提交 baseline/receipt。未保存候选保持非 durable；源 TL 不被修改。
+3. 桌面验证成功后显示建包引导并选择包目标；Controller 保有候选及其签发会话/代次，Qt 只消费中立信息。Project owner 保存并冷重开验证 ProjectPackage 后提交 baseline/receipt，Controller 才安装新项目。此前当前项目保持可恢复；取消、失败或过期候选不替换它，已经发生的包发布如实报告。未保存候选保持非 durable，不伪造干净 baseline；源 TL 不被修改。
 4. 重开从包恢复中立状态。导出时重新从当前配置解析 exact live codec，再以包内原始字节和私有数据准备输出。设备 origin 只在用户要求覆盖原路径/调和时重绑定。
 
 ### 预览与导出
@@ -163,6 +163,8 @@ Application 消费 [平台目录合同](../windows-platform-enablement/design.md
 intake amendment 把“已验证 records + opaque payload”作为单次 handoff，在一个 retained source snapshot 下完成；codec 不能提交 workspace。单文件 profile 与多文件 profile 都保留准确 RPY CodecIdentity/FormatId，不能设置 legacy JSON codec 来规避校验。多文件选择语言必须一致，全部验证后才发布新 workspace。目录发现归 Multi 的 Requirement 13 增量，RPY 只消费其确认后的有序选择与 retained root，不自行递归或在筛选后重算共同父目录。0 文件不得提交，1 文件使用 explicit-single-file-v1，多个使用 explicit-selected-files-v1；单选嵌套文件也保留最初根下的 source_ref。章节树仅消费 Controller 的路径投影，不读取文件系统；分组不修改 manifest 顺序。
 
 Controller 继续校验 issued identity、session/revision 与 Chunk mutation permission。新增导出命令只接受 Controller-issued Document selection 和用户选择的目标；Qt 不自行构造 token。异步 result 带 session/request generation，关闭/换项目后丢弃迟到结果并释放 handle。单文件到多文件保持同一 package 权威；不改变最近项目或恢复断点语义。
+
+单 Document 的编辑和浏览页隐藏重复章节进度栏及章节分隔行；顶栏保留项目名称、总体进度和真实 dirty 状态，需要展示文档来源时使用源文件名。切换到 legacy TXT/JSON 时清空并隐藏 workspace 专属提示和操作投影，不复用上一个项目的名称、保存提示或章节进度。
 
 ## Data Models
 
