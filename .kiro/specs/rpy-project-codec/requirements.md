@@ -44,10 +44,10 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 **目标：** 作为译者，我希望一个项目包完整保存单个 TL 的翻译工作。
 
 #### 验收标准
-1. When 用户保存单 TL 项目, the LocalCAT shall 使用一个 Document 的 ProjectPackage 保存原始 TL、保真所需私有数据及中立编辑状态，不要求另存 JSON/sidecar 文件对。
+1. When 用户在桌面打开单 TL, the LocalCAT shall 先完整验证输入，再引导建立一个 Document 的 ProjectPackage；只有包持久化成功后才进入该项目编辑，包保存原始 TL、保真所需私有数据及中立编辑状态，不要求另存 JSON/sidecar 文件对。首次进入的保存基线为干净状态，实际编辑后才显示未保存修改。
 2. When 用户冷重开该包, the LocalCAT shall 恢复段落身份、target、confirmed 和顺序，并在兼容 codec 可用时允许从包内原始内容导出，无须找回原路径。
 3. If 打开包时 codec 不可用, the LocalCAT shall 允许既有合同支持的中立编辑与包保存，明确禁用 TL 导出，原样保留私有成员。
-4. If 包保存或恢复失败, the LocalCAT shall 沿用 Project 的保存报告、dirty/baseline 和恢复行为，不把未确认发布的状态显示为保存成功。
+4. If 包保存或恢复失败, the LocalCAT shall 沿用 Project 的保存报告、dirty/baseline 和恢复行为，不把未确认发布的状态显示为保存成功；导入阶段取消建包或建包失败时保留原项目，已经发生的发布按实际结果报告。
 
 ### Requirement 4：预览与保真导出
 
@@ -75,7 +75,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 **目标：** 作为译者，我希望 RPY 项目自然地使用 LocalCAT 的现有编辑和语言资源能力。
 
 #### 验收标准
-1. When 用户进入 RPY 项目, the LocalCAT shall 使用现有源文/译文/speaker、编辑/浏览、搜索和确认交互，不向用户暴露 token、私有成员或内部 codec 类型。
+1. When 用户进入 RPY 项目, the LocalCAT shall 使用现有源文/译文/speaker、编辑/浏览、搜索和确认交互，不向用户暴露 token、私有成员或内部 codec 类型。单 Document 项目不重复显示章节栏和分隔行，需要区分来源时使用实际文件名；切换项目后所有提示均来自当前项目。
 2. When 用户使用 TM 或术语建议, the LocalCAT shall 继续使用既有语言资源的显式启用、查询、应用与更新行为，不把 TMX 资源包导入设为 RPY 前置。
 3. While 导入、预览或导出正在运行, the LocalCAT shall 保持 UI 可响应、允许取消，并拒绝过期结果覆盖后来编辑或已关闭的项目。
 4. When 用户手工把项目包与选定的 JSONL/CSV 资源包交给另一设备, the LocalCAT shall 分别重新验证并按各自事务导入，不运输设备资格或恢复项目包内的执行权限。

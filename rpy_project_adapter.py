@@ -9,6 +9,7 @@ the Controller, not to this synchronous adapter.
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 
 from parser_contracts import CodecIdentity, FormatId
 from project_codec_settings import ProjectCodecAvailability, ProjectCodecRuntime
@@ -77,6 +78,7 @@ class RpyProjectSession:
         save_service: ProjectSaveService, *,
         prepared: PreparedSelectedProjectDocuments | None = None,
         persistence_binding: ProjectPackagePersistenceBinding | None = None,
+        creation_pending: bool = False,
     ) -> None:
         self._package_service = package_service
         self._save_service = save_service
@@ -84,6 +86,22 @@ class RpyProjectSession:
         self._persistence_binding = persistence_binding
         self._recovery_required = False
         self._closed = False
+        self._creation_pending = creation_pending
+
+    def configure_creation(self, request: SelectedProjectDocumentsRequest) -> None:
+        """Configure a never-installed import candidate exactly once."""
+        self._require_live()
+        service = self.workspace_service
+        if (not self._creation_pending or self._persistence_binding is not None
+                or self._prepared is None or service.revision != 0):
+            raise ProjectWorkspaceError('PROJECT.WORKSPACE.SESSION_STALE')
+        self._creation_pending = False
+        workspace = replace(service.workspace, name=request.name,
+                            source_locale=request.source_locale,
+                            target_locale=request.target_locale)
+        self._save_service = ProjectSaveService(ProjectWorkspaceService(
+            workspace, service.origin_binding, session_id=service.session_id,
+            revision=service.revision), baseline=None)
 
     @property
     def workspace_service(self) -> ProjectWorkspaceService:
@@ -197,6 +215,7 @@ class RpyProjectAdapter:
     def prepare_single(
         self, root: Path, source: Path, request: SelectedProjectDocumentsRequest,
         *, session_id: str, revision: int = 0, file_system=None, cancellation=None,
+        creation_pending: bool = False,
     ) -> RpyProjectSession:
         availability = _availability(self.runtime, _RPY_IDENTITY, _RPY_FORMAT)
         if not availability.available:
@@ -210,13 +229,17 @@ class RpyProjectAdapter:
         try:
             staged = prepared.staged
             _require_single_tl(staged.workspace)
+            document = staged.workspace.documents[0]
+            named_workspace = replace(staged.workspace, documents=(
+                replace(document, display_name=source.name),))
             workspace = ProjectWorkspaceService(
-                staged.workspace, staged.origin_binding,
+                named_workspace, staged.origin_binding,
                 session_id=session_id, revision=revision,
             )
             return RpyProjectSession(
                 self.package_service, ProjectSaveService(workspace, baseline=None),
                 prepared=prepared,
+                creation_pending=creation_pending,
             )
         except BaseException:
             prepared.close()

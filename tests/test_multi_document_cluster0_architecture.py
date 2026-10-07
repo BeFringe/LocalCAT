@@ -312,6 +312,9 @@ def _production_paths(root: Path = _ROOT) -> tuple[Path, ...]:
     paths: list[Path] = []
     for path in root.rglob("*.py"):
         relative = path.relative_to(root)
+        # Local build runtimes and review evidence are not product modules.
+        if relative.parts[0] == "artifacts":
+            continue
         if "tests" in relative.parts or "__pycache__" in relative.parts:
             continue
         if any(part.startswith(".") for part in relative.parts):
@@ -1263,6 +1266,11 @@ class MultiDocumentCluster1GuardSelfTests(unittest.TestCase):
             tests = root / "localcat" / "tests"
             tests.mkdir()
             (tests / "helper.py").write_text("value = 3\n", encoding="utf-8")
+            artifacts = root / "artifacts" / "local-review" / "runtime"
+            artifacts.mkdir(parents=True)
+            (artifacts / "generated.py").write_text(
+                "{% for module in modules %}\n", encoding="utf-8"
+            )
 
             self.assertEqual(
                 set(_production_modules(root)),

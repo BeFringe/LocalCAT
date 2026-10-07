@@ -27,12 +27,30 @@ class FileOpenCandidate:
 
 
 @dataclass(frozen=True)
+class SingleTLImportReview:
+    """Display-only facts; the Controller retains the unpublished owner."""
+    source_path: Path
+    default_name: str
+    segment_count: int
+
+
+@dataclass
+class FileImportPublication:
+    candidate: FileOpenCandidate
+    result: object
+
+    def close(self):
+        self.candidate.close()
+
+
+@dataclass(frozen=True)
 class ControllerFileOutcome:
     kind: str
     path: Path
     accepted: bool
     result: object | None = None
     cancelled: bool = False
+    safe_code: str | None = None
 
 
 class ControllerFileJob:
@@ -110,9 +128,9 @@ class ControllerFileJob:
             self._error = error
 
     def _cleanup(self, value):
-        if self.kind == 'open' and value is not None:
+        if self.kind in {'open', 'prepare_tl', 'import_tl'} and value is not None:
             value.close()
-        elif self.kind == 'save' and self.session is not None:
+        elif self.kind in {'save', 'import_tl'} and self.session is not None:
             self.session.close()
 
     def take_result(self):

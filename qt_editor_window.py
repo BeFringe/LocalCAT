@@ -486,19 +486,22 @@ class QtWorkspaceCreationDialog(QDialog):
         selected_paths: tuple[Path, ...],
         *,
         default_name: str,
+        single_document: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        if type(selected_paths) is not tuple or len(selected_paths) < 2:
-            raise ValueError("workspace creation requires at least two selected paths")
+        if type(selected_paths) is not tuple or len(selected_paths) < (1 if single_document else 2):
+            raise ValueError("workspace creation requires an explicit file selection")
         if any(not isinstance(path, Path) for path in selected_paths):
             raise TypeError("workspace creation selection must contain Paths")
         self.setObjectName("workspaceCreationDialog")
-        self.setWindowTitle("确认多文档项目")
+        self.setWindowTitle("建立单文件项目包" if single_document else "确认多文档项目")
         self.resize(680, 480)
         layout = QVBoxLayout(self)
 
         hint = QLabel(
+            "文件已验证。建立项目包后进入编辑；原始 TL 保持只读。"
+            if single_document else
             "仅导入下列显式选择的文件。列表顺序将成为初始章节顺序；"
             "不会扫描目录或自动包含相邻文件。"
         )
@@ -531,6 +534,8 @@ class QtWorkspaceCreationDialog(QDialog):
         order_row.addWidget(self.move_down_button)
         order_row.addStretch()
         layout.addLayout(order_row)
+        self.move_up_button.setVisible(not single_document)
+        self.move_down_button.setVisible(not single_document)
 
         metadata = QHBoxLayout()
         metadata.addWidget(QLabel("项目名"))
@@ -555,7 +560,7 @@ class QtWorkspaceCreationDialog(QDialog):
         )
         self.buttons.setObjectName("workspaceCreationButtons")
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
-            "开始导入"
+            "建立项目包" if single_document else "开始导入"
         )
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(
             "取消"
@@ -874,6 +879,7 @@ class QtEditorWindow(QMainWindow):
     """LocalCAT desktop shell; all domain operations go through EditorController."""
 
     _capability_validation_closed = Signal()
+    _file_operation_finished = Signal()
     _capability_display_refresh_requested = Signal()
 
     def __init__(
@@ -987,6 +993,9 @@ class QtEditorWindow(QMainWindow):
         self.term_cards_layout: QVBoxLayout
         self._file_runner = None
         self._file_last_success = False
+        self._file_import_review = None
+        self._file_operation_active = False
+        self._file_operations_closed = False
         self._last_workspace_save_target = None
         self._unsaved_transition_waiting = False
         self.controller = controller
@@ -2898,7 +2907,7 @@ class QtEditorWindow(QMainWindow):
 
     @property
     def file_operation_running(self) -> bool:
-        return self._file_runner is not None
+        return self._file_runner is not None or self._file_import_review is not None
 
     def cancel_file_operation(self) -> None:
         runner = self._file_runner
@@ -2907,7 +2916,7 @@ class QtEditorWindow(QMainWindow):
         runner.cancel()
         self.statusBar().showMessage(
             "正在取消；已经发出的保存将按实际结果报告。"
-            if runner.job.kind == "save" else "正在取消打开；候选释放后结束。")
+            if runner.job.kind in {"save", "import_tl"} else "正在取消打开；候选释放后结束。")
 
     def open_project_file_async(self, path: Path, *, wait: bool = False, package: bool = False) -> bool:
         if self.file_operation_running:
@@ -2916,7 +2925,9 @@ class QtEditorWindow(QMainWindow):
         if not self._confirm_unsaved():
             return False
         try:
-            job = self.controller.begin_file_open(path, package=package)
+            job = (self.controller.begin_single_tl_import(path)
+                   if not package and path.suffix.lower() == '.rpy'
+                   else self.controller.begin_file_open(path, package=package))
         except (EditorControllerError, OSError, ValueError) as error:
             self._show_error("无法打开项目", str(error))
             return False
@@ -2943,21 +2954,65 @@ class QtEditorWindow(QMainWindow):
         return self._run_file_operation(job, wait=wait)
 
     def _run_file_operation(self, job, *, wait: bool) -> bool:
+        self._file_operation_active = True
         self._file_last_success = False
         runner = QtProjectFileJob(job, self._finish_file_operation, parent=self)
         self._file_runner = runner
         self.file_cancel_button.show()
-        self.statusBar().showMessage("正在打开并验证项目…" if job.kind == "open" else "正在保存项目包…")
+        self.statusBar().showMessage("正在打开并验证项目…" if job.kind in {"open", "prepare_tl"} else "正在保存项目包…")
         self._apply_file_operation_access()
         loop = QEventLoop(self) if wait else None
         if loop is not None:
-            runner.finished.connect(loop.quit)
+            self._file_operation_finished.connect(loop.quit)
+        runner.finished.connect(self._file_step_finished)
         runner.start()
         if loop is not None:
             loop.exec()
+            self._file_operation_finished.disconnect(loop.quit)
             loop.deleteLater()
             return self._file_last_success
         return True
+
+    def _file_step_finished(self) -> None:
+        if self._file_operation_active and not self.file_operation_running:
+            self._file_operation_active = False
+            self._file_operation_finished.emit()
+
+    def _continue_single_tl_import(self, review) -> None:
+        self._file_import_review = review
+        try:
+            dialog = QtWorkspaceCreationDialog(
+                (review.source_path,), default_name=review.default_name,
+                single_document=True, parent=self)
+            try:
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    self.statusBar().showMessage("建包已取消；当前项目保持不变。", 7000)
+                    return
+                if self._file_operations_closed:
+                    return
+                name = dialog.project_name_input.text().strip()
+                source_locale, target_locale = dialog.source_locale, dialog.target_locale
+            finally:
+                dialog.deleteLater()
+            destination, _ = QFileDialog.getSaveFileName(
+                self, "建立 LocalCAT 项目包",
+                str(review.source_path.parent / f'{name}.localcat-project'),
+                "LocalCAT ProjectPackage (*.localcat-project)")
+            if not destination:
+                self.statusBar().showMessage("建包已取消；当前项目保持不变。", 7000)
+                return
+            if self._file_operations_closed:
+                return
+            job = self.controller.begin_single_tl_publish(
+                review, Path(destination), name=name,
+                source_locale=source_locale, target_locale=target_locale)
+            self._run_file_operation(job, wait=False)
+        except (EditorControllerError, OSError, ValueError) as error:
+            self._show_error("无法建立项目包", str(error))
+            self.statusBar().showMessage("项目包未创建；当前项目保持不变。", 7000)
+        finally:
+            self._file_import_review = None
+            self.controller.cancel_single_tl_import(review)
 
     def _finish_file_operation(self, job) -> None:
         self._file_runner = None
@@ -2974,10 +3029,38 @@ class QtEditorWindow(QMainWindow):
                 self._set_workspace_save_feedback(
                     f"{error} · 保存目标：{job.path} · 受影响章节：{affected} · "
                     "项目包未保存；当前修改保留，可重试。")
-            self._show_error("无法打开项目" if job.kind == "open" else "无法保存项目包", str(error))
+            self._show_error("无法打开项目" if job.kind in {"open", "prepare_tl"} else "无法保存项目包", str(error))
             self.statusBar().showMessage("文件操作失败；当前项目与未保存修改保留。", 7000)
             return
-        if job.kind == "open":
+        if job.kind == 'prepare_tl':
+            if outcome.accepted:
+                self._continue_single_tl_import(outcome.result)
+            else:
+                self.statusBar().showMessage("打开已取消或已过期；当前项目保持不变。", 7000)
+        elif job.kind == 'import_tl':
+            result = outcome.result
+            if outcome.accepted:
+                self._render_project()
+                self.refresh_recent_projects()
+                self._file_last_success = True
+                self._set_workspace_save_feedback("项目包已建立 · 原始 TL 只读。")
+                self.statusBar().showMessage(f"项目包已建立：{outcome.path}", 7000)
+            elif result is not None:
+                if result.receipt is not None and result.receipt.durable:
+                    reason = '无法进入编辑' if outcome.safe_code else '打开已取消或过期'
+                    message = f"项目包已建立：{outcome.path}；{reason}，当前项目保持不变。"
+                    if outcome.safe_code:
+                        self._show_error("项目包已建立，无法打开", message + '\n' + outcome.safe_code)
+                elif result.save_report.recovery_required:
+                    message = f"项目包未取得持久化确认，需要恢复：{outcome.path}；当前项目保持不变。"
+                    self._show_error("项目包需要恢复", message)
+                else:
+                    message = f"项目包创建未成功：{outcome.path}；当前项目保持不变。"
+                    self._show_error("无法建立项目包", result.save_report.safe_code or message)
+                self.statusBar().showMessage(message, 10000)
+            else:
+                self.statusBar().showMessage("建包已在开始前取消；当前项目保持不变。", 7000)
+        elif job.kind == "open":
             if outcome.accepted:
                 self._render_project()
                 self.refresh_recent_projects()
@@ -3443,6 +3526,9 @@ class QtEditorWindow(QMainWindow):
             self.workspace_browse_chapter_title.setVisible(False)
             self.workspace_save_feedback.setVisible(False)
             self.workspace_browse_save_feedback.setVisible(False)
+            self.chapter_progress_label.clear()
+            self.workspace_browse_chapter_title.clear()
+            self._set_workspace_save_feedback("")
             return
         view = self.controller.workspace_view
         current = self.controller.current_workspace_identity.document
@@ -3473,7 +3559,7 @@ class QtEditorWindow(QMainWindow):
                 else ""
             )
             is_current = document.identity is current
-            visible_name = document.display_name
+            visible_name = self._workspace_document_display_name(document)
             if display_name_counts[document.display_name] > 1:
                 visible_name = (
                     f"{document.display_name} — {document.source_ref}"
@@ -3492,10 +3578,16 @@ class QtEditorWindow(QMainWindow):
                 f"{document.progress.total_segments} 已确认"
             )
         self.workspace_documents_button.setEnabled(True)
-        self.chapter_progress_label.setVisible(True)
-        self.workspace_browse_chapter_title.setVisible(True)
+        multiple = len(view.documents) > 1
+        self.chapter_progress_label.setVisible(multiple)
+        self.workspace_browse_chapter_title.setVisible(multiple)
         self.workspace_save_feedback.setVisible(True)
         self.workspace_browse_save_feedback.setVisible(True)
+
+    def _workspace_document_display_name(self, document) -> str:
+        if len(self.controller.workspace_view.documents) == 1:
+            return document.source_ref.rsplit('/', 1)[-1]
+        return document.display_name
 
     @staticmethod
     def _chunk_access_text(access: str, safe_code: str | None = None) -> str:
@@ -4479,6 +4571,7 @@ class QtEditorWindow(QMainWindow):
             )
             self._refresh_workspace_documents_menu()
         else:
+            self._refresh_workspace_documents_menu()
             self.segment_position_label.setText(
                 f"{self.controller.current_index + 1} / {len(segments)}"
             )
@@ -4585,23 +4678,24 @@ class QtEditorWindow(QMainWindow):
                 )
                 if not document_segments:
                     continue
-                divider = QListWidgetItem(file_icon, document.display_name)
-                divider.setFlags(
-                    divider.flags() & ~Qt.ItemFlag.ItemIsSelectable
-                )
-                divider.setData(Qt.ItemDataRole.UserRole, None)
-                divider.setBackground(
-                    QColor("#26323a" if self._dark_theme else "#dcecf5")
-                )
-                divider.setForeground(
-                    QColor("#79c6df" if self._dark_theme else "#0b5e80")
-                )
-                divider_font = divider.font()
-                divider_font.setBold(True)
-                divider.setFont(divider_font)
-                divider.setToolTip(document.display_name)
-                divider.setSizeHint(QSize(0, 44))
-                self.segment_list.addItem(divider)
+                if len(workspace_view.documents) > 1:
+                    divider = QListWidgetItem(file_icon, document.display_name)
+                    divider.setFlags(
+                        divider.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                    )
+                    divider.setData(Qt.ItemDataRole.UserRole, None)
+                    divider.setBackground(
+                        QColor("#26323a" if self._dark_theme else "#dcecf5")
+                    )
+                    divider.setForeground(
+                        QColor("#79c6df" if self._dark_theme else "#0b5e80")
+                    )
+                    divider_font = divider.font()
+                    divider_font.setBold(True)
+                    divider.setFont(divider_font)
+                    divider.setToolTip(document.display_name)
+                    divider.setSizeHint(QSize(0, 44))
+                    self.segment_list.addItem(divider)
                 for item_view in document_segments:
                     index = item_view.project_global_index
                     segment = segments[index]
@@ -4811,7 +4905,8 @@ class QtEditorWindow(QMainWindow):
                         )
                     )
                     if document_rows:
-                        row_specs.append((document.display_name, None))
+                        if len(workspace_view.documents) > 1:
+                            row_specs.append((document.display_name, None))
                         row_specs.extend(("", index) for index in document_rows)
             else:
                 row_specs.extend(("", index) for index in range(len(segments)))
@@ -6440,7 +6535,18 @@ class QtEditorWindow(QMainWindow):
         if self._unsaved_transition_waiting:
             event.ignore()
             return
-        saving = self.controller.workspace_save_running
+        creating_package = (self._file_runner is not None
+                            and self._file_runner.job.kind == 'import_tl')
+        if creating_package and self.controller.active_project_dirty:
+            # This worker publishes the incoming TL, not the active project's
+            # edits. Keep the old project until its own close guard can run;
+            # starting another save here would race the outstanding operation.
+            self.statusBar().showMessage(
+                "当前项目有未保存修改。请先等待建包结束或取消导入；"
+                "文件操作结束后，保存或放弃当前修改再关闭。", 10000)
+            event.ignore()
+            return
+        saving = self.controller.workspace_save_running or creating_package
         if saving:
             decision = QMessageBox.question(
                 self, "保存正在进行", "关闭窗口后，已经发出的保存仍可能完成。是否关闭？",
@@ -6450,11 +6556,14 @@ class QtEditorWindow(QMainWindow):
         else:
             can_close = self._confirm_unsaved()
         if can_close:
+            self._file_operations_closed = True
             self.controller.close_project()
             self.controller.abandon_file_jobs()
             if self._file_runner is not None:
                 self._file_runner.close()
                 self._file_runner = None
+            self._file_import_review = None
+            self._file_step_finished()
             if self._chunk_segment_selection_session is not None:
                 self._finish_chunk_segment_selection(
                     False,
