@@ -1,4 +1,4 @@
-"""Application coordination for one TL and its Project-owned package session.
+"""Application coordination for selected TLs and a Project-owned package session.
 
 The adapter never decodes codec-private bytes or owns editing state. A session
 holds Project services and the temporary intake lease until first publication.
@@ -8,10 +8,13 @@ the Controller, not to this synchronous adapter.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from dataclasses import replace
 
-from parser_contracts import CodecIdentity, FormatId
+from parser_contracts import (
+    CodecDescriptor, CodecIdentity, EffectivePurpose, FormatId,
+    SelectionHints, SelectionRequest,
+)
 from project_codec_settings import ProjectCodecAvailability, ProjectCodecRuntime
 from project_package import (
     OpenedProjectPackage, ProjectPackageExportResult,
@@ -22,12 +25,22 @@ from project_workspace import ProjectWorkspaceService
 from project_workspace_contracts import ProjectOriginKind, ProjectWorkspaceError
 from project_workspace_intake import (
     PreparedSelectedProjectDocuments, SelectedProjectDocumentsRequest,
-    prepare_selected_project_documents,
+    SelectedProjectDocumentsError, prepare_selected_project_documents,
 )
 
 
 _RPY_IDENTITY = CodecIdentity('localcat.rpy', 'renpy-tl', '1')
 _RPY_FORMAT = FormatId('renpy-tl-v1')
+_MAX_SELECTED_TL = 256
+
+
+class RpyProjectSelectionError(ValueError):
+    """Body-safe Application policy failure at an explicitly chosen file."""
+
+    def __init__(self, code: str, source_ref: str, diagnostics=()) -> None:
+        self.code, self.source_ref = code, source_ref
+        self.diagnostics = diagnostics
+        super().__init__(code)
 
 
 class RpyProjectUnavailableError(RuntimeError):
@@ -140,7 +153,12 @@ class RpyProjectSession:
         change. A true value does not bypass later source/private validation.
         """
         self._require_live()
-        document = self.workspace_service.workspace.documents[0]
+        documents = self.workspace_service.workspace.documents
+        if len(documents) != 1:
+            return ProjectCodecAvailability(
+                _RPY_IDENTITY, _RPY_FORMAT, False, 'RPY.EXPORT.UNAVAILABLE',
+                'TL export currently supports single-document projects only.')
+        document = documents[0]
         return _availability(runtime, document.codec_identity, FormatId(document.format_id))
 
     def save(self, destination: Path | None = None) -> ProjectPackageExportResult:
@@ -211,6 +229,82 @@ class RpyProjectAdapter:
             raise TypeError('runtime must be exact ProjectCodecRuntime')
         self.runtime = runtime
         self.package_service = package_service if package_service is not None else ProjectPackageService()
+
+    def validate_selected_refs(self, source_refs: tuple[str, ...]) -> int:
+        """Bound confirmed TL choices from configured descriptors before body I/O.
+
+        This consumes supplied names only; neither the adapter nor codec scans
+        a directory. Other configured formats keep their own intake policy.
+        """
+        count = 0
+        for source_ref in source_refs:
+            suffix = PurePosixPath(source_ref).suffix.lower()
+            if not suffix:
+                continue
+            selected = self.runtime.surface.select(SelectionRequest(
+                EffectivePurpose.PROJECT_DOCUMENT,
+                hints=SelectionHints(extensions=(suffix,))))
+            if (type(selected) is CodecDescriptor
+                    and selected.identity == _RPY_IDENTITY
+                    and selected.format_id == _RPY_FORMAT):
+                count += 1
+                if count > _MAX_SELECTED_TL:
+                    raise RpyProjectSelectionError(
+                        'RPY.IMPORT.DOCUMENT_LIMIT_EXCEEDED', source_ref)
+            elif suffix == '.rpy':
+                # Explain the unavailable known format; never guess a reader.
+                availability = _availability(self.runtime, _RPY_IDENTITY, _RPY_FORMAT)
+                if not availability.available:
+                    raise RpyProjectUnavailableError(availability)
+        return count
+
+    def workspace_from_prepared(self, prepared: PreparedSelectedProjectDocuments):
+        """Apply TL policy to complete Project-issued neutral intake facts."""
+        if type(prepared) is not PreparedSelectedProjectDocuments or prepared.closed:
+            raise ProjectWorkspaceError('PROJECT.INTAKE.SOURCE_STALE')
+        workspace = prepared.staged.workspace
+        documents = []
+        language = None
+        count = 0
+        for document, header in zip(workspace.documents, prepared.verified_headers, strict=True):
+            if (document.codec_identity == _RPY_IDENTITY
+                    and document.format_id == _RPY_FORMAT.value):
+                count += 1
+                if count > _MAX_SELECTED_TL:
+                    raise RpyProjectSelectionError(
+                        'RPY.IMPORT.DOCUMENT_LIMIT_EXCEEDED', document.source_ref)
+                if header.target_locale is None or document.codec_private_member is None:
+                    raise ProjectWorkspaceError('PROJECT.INTAKE.INPUT_INVALID')
+                if language is not None and header.target_locale != language:
+                    raise RpyProjectSelectionError('RPY.IMPORT.MIXED_LANGUAGE', document.source_ref)
+                language = header.target_locale
+                document = replace(document, display_name=PurePosixPath(document.source_ref).name)
+            documents.append(document)
+        return replace(workspace, documents=tuple(documents))
+
+    def prepare_selected(
+        self, root: Path, sources: tuple[Path, ...], request: SelectedProjectDocumentsRequest,
+        *, session_id: str, file_system=None, cancellation=None,
+    ) -> RpyProjectSession:
+        """Retain exactly the caller's ordered explicit files through first save."""
+        refs = tuple(source.relative_to(root).as_posix() for source in sources)
+        self.validate_selected_refs(refs)
+        try:
+            prepared = prepare_selected_project_documents(
+                root, sources, request, parser_surface=self.runtime.surface,
+                file_system=file_system, cancellation=cancellation)
+        except SelectedProjectDocumentsError as error:
+            raise RpyProjectSelectionError(
+                error.code, refs[error.document_order], error.diagnostics) from error
+        try:
+            workspace = ProjectWorkspaceService(
+                self.workspace_from_prepared(prepared), prepared.staged.origin_binding,
+                session_id=session_id, revision=0)
+            return RpyProjectSession(
+                self.package_service, ProjectSaveService(workspace, baseline=None), prepared=prepared)
+        except BaseException:
+            prepared.close()
+            raise
 
     def prepare_export(
         self, workspace_service: ProjectWorkspaceService,

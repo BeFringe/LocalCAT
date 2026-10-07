@@ -7,6 +7,8 @@ intake/exporter; no manifest, member, or in-memory package double is used.
 
 from __future__ import annotations
 
+from qt_directory_open_dialog import QtLocalProjectOpenDialog
+
 import ast
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -271,11 +273,14 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         self._events()
 
     def _document_actions(self) -> tuple[QAction, ...]:
-        return tuple(
-            action
-            for action in self.window.workspace_documents_menu.actions()
-            if action.data() is not None
-        )
+        def leaves(menu):
+            for action in menu.actions():
+                if action.menu() is not None:
+                    yield from leaves(action.menu())
+                elif action.data() is not None:
+                    yield action
+
+        return tuple(leaves(self.window.workspace_documents_menu))
 
     def _select_document(self, index: int) -> None:
         self._document_actions()[index].trigger()
@@ -618,6 +623,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         self.assertIsNone(getattr(self.window, "empty_workspace_button", None))
 
         with (
+            mock.patch.object(QtLocalProjectOpenDialog, "exec", return_value=QDialog.DialogCode.Accepted),
             mock.patch.object(
                 QFileDialog,
                 "getOpenFileNames",
@@ -634,6 +640,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         open_single.assert_called_once_with(first)
 
         with (
+            mock.patch.object(QtLocalProjectOpenDialog, "exec", return_value=QDialog.DialogCode.Accepted),
             mock.patch.object(
                 QFileDialog,
                 "getOpenFileNames",
@@ -1697,7 +1704,6 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             "ProjectPackageManifest",
             "manifest.json",
             "ZipFile",
-            "getExistingDirectory",
             "Project documents (*.json",
         ):
             self.assertNotIn(forbidden_marker, source)
