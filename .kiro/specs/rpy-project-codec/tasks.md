@@ -82,7 +82,7 @@
   - _Requirements: 4.2, 4.3, 4.4, 4.5, 7.2_
   - _Boundary: Parser publishing / RpyProjectAdapter integration_
   - _Depends: 1.3, 3.3_
-- [ ] 3.4a 接入单 TL 导出预览与结果的桌面流程
+- [x] 3.4a 接入单 TL 导出预览与结果的桌面流程
   - Qt 只显示 Controller 的中立预览、目标选择、定位诊断和发布结果；沿用已有父目录内的单文件发布能力，不等待嵌套目录物化。
   - 显示修改段数、空/未确认数量及阻断原因；修改译文、换项目/codec 或目标变化使预览失效。异步工作可取消，关窗或旧 generation 的结果不覆盖新编辑，已发出的发布返回真实结果。
   - 完成时，正常界面可预览并导出单 TL，空 target 不补源文，错误可定位，失败与不确定结果不显示成功；导出不清除未保存的包 dirty，UI 不取得 token/private 类型或发布 authority。

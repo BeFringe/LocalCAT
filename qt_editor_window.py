@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from qt_project_file_job import QtProjectFileJob
+from qt_project_export_dialog import QtProjectExportDialog
 
 from PySide6.QtCore import (
     QMimeData,
@@ -1072,6 +1073,9 @@ class QtEditorWindow(QMainWindow):
         self.tl_export_action.setObjectName("exportRenpyTlAction")
         self.tl_export_action.setEnabled(False)
         self.tl_export_action.setVisible(False)
+        self._tl_export_dialog = None
+        self.tl_export_action.triggered.connect(self._open_tl_export_dialog)
+        self.project_menu.aboutToShow.connect(self._refresh_tl_export_action)
         self._apply_top_bar_responsiveness(self.width())
         self.setTabOrder(self.settings_button, self.project_search_toggle)
         self.setTabOrder(self.project_search_toggle, self.project_search_input)
@@ -3089,12 +3093,13 @@ class QtEditorWindow(QMainWindow):
         self._apply_file_operation_access()
 
     def _apply_file_operation_access(self) -> None:
-        saving = self.controller.workspace_save_running
+        saving = self.controller.workspace_save_running or self.controller.tl_export_publish_running
         recovery = self.controller.workspace_recovery_target is not None
         self.save_button.setEnabled(self.controller.has_active_project and not saving and not recovery)
         self.save_workspace_document_action.setEnabled(self.controller.has_workspace and not saving and not recovery)
         self.import_workspace_package_action.setEnabled(self.controller.has_active_project and not saving)
         self._apply_chunk_manage_access()
+        self._refresh_tl_export_action()
         if self.controller.has_active_project:
             self._apply_chunk_access_to_editor()
 
@@ -3108,7 +3113,7 @@ class QtEditorWindow(QMainWindow):
 
         if not self.controller.has_workspace:
             return False
-        if self.controller.tl_export_unavailable_reason is not None:
+        if self.controller.is_tl_workspace:
             return self.save_workspace_package(wait=False)
         document = self.controller.current_workspace_identity.document
         try:
@@ -3511,12 +3516,42 @@ class QtEditorWindow(QMainWindow):
             self._refreshing = False
         self.set_workspace_mode(self.workspace_mode, persist=False)
         self._update_title()
-        reason = self.controller.tl_export_unavailable_reason
-        self.tl_export_action.setVisible(reason is not None)
-        self.tl_export_action.setText("导出 Ren’Py TL（暂不可用）")
-        self.tl_export_action.setToolTip(reason or "")
-        self.tl_export_action.setStatusTip(reason or "")
+        self._refresh_tl_export_action()
         self._apply_file_operation_access()
+
+    def _refresh_tl_export_action(self) -> None:
+        reason = self.controller.tl_export_unavailable_reason
+        self.tl_export_action.setVisible(self.controller.is_tl_workspace)
+        self.tl_export_action.setEnabled(
+            self.controller.is_tl_workspace and reason is None
+            and not self.controller.workspace_save_running
+            and not self.controller.tl_export_publish_running)
+        self.tl_export_action.setText('导出 Ren’Py TL' if reason is None else '导出 Ren’Py TL（不可用）')
+        self.tl_export_action.setToolTip(reason or '预览全部当前译文，然后导出到所选文件。项目包另行保存。')
+        self.tl_export_action.setStatusTip(self.tl_export_action.toolTip())
+
+    def _open_tl_export_dialog(self) -> None:
+        if self._tl_export_dialog is None:
+            dialog = QtProjectExportDialog(self.controller, self)
+            self._tl_export_dialog = dialog
+            dialog.activity_changed.connect(self._apply_file_operation_access)
+            dialog.segment_located.connect(self._tl_export_segment_located)
+            dialog.result_ready.connect(lambda result: self.statusBar().showMessage(
+                QtProjectExportDialog.result_message(result), 15000))
+        dialog = self._tl_export_dialog
+        dialog.show()
+        dialog.raise_()
+        if not dialog.operation_running:
+            dialog.select_target(initial=self.controller.tl_export_default_path)
+
+    def _tl_export_segment_located(self) -> None:
+        self._refreshing = True
+        try:
+            self._select_project_index(self._active_index())
+            self._render_current_segment()
+            self._refresh_browse_table()
+        finally:
+            self._refreshing = False
 
     def _refresh_workspace_documents_menu(self) -> None:
         self.workspace_documents_menu.clear()
@@ -3661,6 +3696,7 @@ class QtEditorWindow(QMainWindow):
         view = self._chunk_view
         self.chunk_manage_action.setEnabled(
             not self.controller.workspace_save_running
+            and not self.controller.tl_export_publish_running
             and self.controller.has_workspace
             and self.chunk_controller is not None
             and self._chunk_view_error_code is None
@@ -3804,9 +3840,9 @@ class QtEditorWindow(QMainWindow):
                     else view.safe_code
                 ),
             )
-        if self.controller.workspace_save_running:
+        if self.controller.workspace_save_running or self.controller.tl_export_publish_running:
             editable = confirmable = False
-            reason = "正在保存项目包；完成后可继续编辑。"
+            reason = "正在保存项目包或导出 TL；完成后可继续编辑。"
         self.target_editor.setReadOnly(not editable)
         self.confirm_button.setEnabled(confirmable)
         self.target_editor.setToolTip("" if editable else reason)
@@ -6208,7 +6244,7 @@ class QtEditorWindow(QMainWindow):
         return label
 
     def _chunk_target_editable(self) -> bool:
-        if self.controller.workspace_save_running:
+        if self.controller.workspace_save_running or self.controller.tl_export_publish_running:
             return False
         return (
             self._chunk_view is None
@@ -6466,6 +6502,9 @@ class QtEditorWindow(QMainWindow):
             self.add_term(source_input.text(), target_input.text())
 
     def _confirm_unsaved(self) -> bool:
+        if self.controller.tl_export_publish_running:
+            self.statusBar().showMessage('正在导出 TL，请取消或等待实际结果后再保存、放弃修改或关闭。', 7000)
+            return False
         if self._unsaved_transition_waiting:
             return False
         if self.controller.workspace_save_running:
@@ -6535,6 +6574,13 @@ class QtEditorWindow(QMainWindow):
         if self._unsaved_transition_waiting:
             event.ignore()
             return
+        if self.controller.tl_export_publish_running and self.controller.active_project_dirty:
+            if self._tl_export_dialog is not None:
+                self._tl_export_dialog.cancel_operation()
+            self.statusBar().showMessage(
+                'TL 导出不能代替项目包保存。正在取消导出；结束后请保存或放弃未保存修改再关闭。', 10000)
+            event.ignore()
+            return
         creating_package = (self._file_runner is not None
                             and self._file_runner.job.kind == 'import_tl')
         if creating_package and self.controller.active_project_dirty:
@@ -6554,9 +6600,12 @@ class QtEditorWindow(QMainWindow):
                 QMessageBox.StandardButton.Cancel)
             can_close = decision == QMessageBox.StandardButton.Close
         else:
-            can_close = self._confirm_unsaved()
+            can_close = (not self.controller.active_project_dirty
+                         if self.controller.tl_export_publish_running else self._confirm_unsaved())
         if can_close:
             self._file_operations_closed = True
+            if self._tl_export_dialog is not None:
+                self._tl_export_dialog.shutdown()
             self.controller.close_project()
             self.controller.abandon_file_jobs()
             if self._file_runner is not None:

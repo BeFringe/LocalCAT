@@ -259,8 +259,8 @@ class QtRpyProjectTests(unittest.TestCase):
     def test_normal_open_edit_save_cold_reopen_browse(self):
         self.open()
         self.assertIn('guide', self.window.speaker_display.text())
-        self.assertFalse(self.window.tl_export_action.isEnabled())
-        self.assertIn('暂不可用', self.window.tl_export_action.toolTip())
+        self.assertTrue(self.window.tl_export_action.isEnabled())
+        self.assertIn('项目包另行保存', self.window.tl_export_action.toolTip())
         now = datetime.now(timezone.utc).replace(microsecond=0)
         self.capabilities.matcher_validation_owner.validate_basic(
             generated_at_utc=now, valid_until_utc=now + timedelta(days=1),
