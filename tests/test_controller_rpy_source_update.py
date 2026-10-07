@@ -1,6 +1,7 @@
 """Source-template review keeps the Project owner and exact candidate together."""
 from dataclasses import replace
 from pathlib import Path
+import os
 import tempfile
 import unittest
 
@@ -50,6 +51,30 @@ class ControllerRpySourceUpdateTests(unittest.TestCase):
         job = self.controller.begin_source_update_apply(view, decisions)
         job.run()
         return self.controller.finish_source_update_job(job)
+
+    def mutate_source_or_verify_native_pin(self, view, text, job=None):
+        before = self.source.read_bytes()
+        workspace = self.controller.workspace_view
+        try:
+            self.source.write_text(text, encoding='utf-8')
+        except PermissionError:
+            if os.name != 'nt':
+                raise
+            self.assertEqual(self.source.read_bytes(), before)
+            self.assertEqual(self.controller.workspace_view, workspace)
+            if job is not None:
+                job.dispose()
+            self.controller.cancel_source_update_preview(view)
+            if job is not None:
+                self.assertTrue(job.disposed)
+                with self.assertRaisesRegex(EditorControllerError, 'PROJECT.FILE.NOT_ISSUED'):
+                    self.controller.finish_source_update_job(job)
+            self.assertFalse(self.controller.source_update_preview_current(view))
+            self.source.write_text(text, encoding='utf-8')
+            self.assertEqual(self.source.read_text(encoding='utf-8'), text)
+            self.assertEqual(self.controller.workspace_view, workspace)
+            return False
+        return True
 
     def test_changed_source_save_cold_reopen_and_export(self):
         self.source.write_text(template('New source'), encoding='utf-8')
@@ -101,9 +126,9 @@ class ControllerRpySourceUpdateTests(unittest.TestCase):
         self.controller.update_workspace_target('之后编辑')
         self.assertFalse(self.controller.source_update_preview_current(view))
         view = self.preview()
-        self.source.write_text(template('Changed again'), encoding='utf-8')
-        with self.assertRaises(EditorControllerError):
-            self.apply(view)
+        if self.mutate_source_or_verify_native_pin(view, template('Changed again')):
+            with self.assertRaises(EditorControllerError):
+                self.apply(view)
         self.assertEqual(self.controller.workspace_view.segments[0].source, 'Old source')
         self.assertEqual(self.controller.workspace_view.segments[0].target, '之后编辑')
 
@@ -131,7 +156,9 @@ class ControllerRpySourceUpdateTests(unittest.TestCase):
                 job = self.controller.begin_source_update_apply(view, ())
                 job.run()
                 if change == 'source':
-                    self.source.write_text(template('Late changed source'), encoding='utf-8')
+                    if not self.mutate_source_or_verify_native_pin(
+                            view, template('Late changed source'), job):
+                        continue
                 else:
                     CodecSettingsRepository(self.root / 'data').save(
                         CodecSettings((CodecProviderSetting('localcat.rpy', False),)))
