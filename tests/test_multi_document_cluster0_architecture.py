@@ -165,6 +165,13 @@ _APPLICATION_PARSER_FACADES = frozenset(
     {"parser_composition", "parser_contracts"}
 )
 _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST = {
+    "editor_directory_open": frozenset({
+        "project_save.ProjectSaveService",
+        "project_workspace.ProjectWorkspaceService",
+        "project_workspace_discovery.ProjectDirectoryDiscoveryService",
+        "project_workspace_identity.ProjectWorkspaceError",
+        "project_workspace_intake.prepare_directory_project_documents",
+    }),
     "editor_contracts": frozenset(
         {
             "project_workspace_identity.validate_document_id",

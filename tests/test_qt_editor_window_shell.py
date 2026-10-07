@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from editor_contracts import ResourceKind, SegmentDensity, WorkspaceMode
 from editor_controller import EditorController
 from qt_editor_window import QtEditorWindow
+from qt_directory_open_dialog import QtLocalProjectOpenDialog
 from qt_control_styles import LOCALCAT_COMBO_POPUP_STYLE, LOCALCAT_MENU_STYLE
 from resource_repository import ResourceRepository
 
@@ -368,7 +369,7 @@ class QtEditorWindowShellTest(unittest.TestCase):
                 QFileDialog,
                 "getOpenFileNames",
                 return_value=([], ""),
-            ) as choose:
+            ) as choose, patch.object(QtLocalProjectOpenDialog, "exec", return_value=1):
                 QTest.mouseClick(
                     button,
                     Qt.MouseButton.LeftButton,

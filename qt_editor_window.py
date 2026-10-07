@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from qt_project_file_job import QtProjectFileJob
+from qt_directory_open_dialog import QtDirectoryOpenDialog, QtLocalProjectOpenDialog
 from qt_project_export_dialog import QtProjectExportDialog
 
 from PySide6.QtCore import (
@@ -116,7 +117,7 @@ from editor_contracts import (
     WorkspaceSearchRequest,
     WorkspaceMode,
 )
-from editor_controller import EditorController, EditorControllerError
+from editor_controller import EditorController, EditorControllerError, WorkspaceDirectoryView
 from chunk_controller_contracts import (
     ChunkApplicationMode,
     ChunkApplicationProjectView,
@@ -1446,8 +1447,8 @@ class QtEditorWindow(QMainWindow):
         title.setObjectName("emptyTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint = QLabel(
-            "打开或拖入本地文件；按住 Shift 可多选创建项目。\n"
-            "只导入所选文件，不扫描文件夹或相邻文件。"
+            "打开或拖入本地文件；按住 Shift 可多选。\n"
+            "也可选择文件夹，递归预览后勾选文档建立项目。"
         )
         hint.setObjectName("emptyHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2647,7 +2648,7 @@ class QtEditorWindow(QMainWindow):
         self.chunk_scope_menu.setEnabled(False)
         self.chunk_manage_action.setEnabled(False)
         self.workspace_documents_button.setEnabled(False)
-        self.workspace_documents_menu.clear()
+        self._clear_workspace_documents_menu()
         self._refresh_browse_group_button()
         self.import_workspace_package_action.setEnabled(False)
         self.save_workspace_document_action.setEnabled(False)
@@ -2705,6 +2706,20 @@ class QtEditorWindow(QMainWindow):
         """Create one package from an explicit ordered selection, never a folder scan."""
 
         if not self._confirm_unsaved():
+            return False
+        try:
+            if self.controller.selected_files_use_tl(selected_paths):
+                if self.file_operation_running:
+                    self.statusBar().showMessage("请等待当前文件操作结束，或取消它。", 5000)
+                    return False
+                job = self.controller.begin_selected_tl_publish(
+                    root, selected_paths, destination, name=name,
+                    source_locale=source_locale, target_locale=target_locale)
+                return self._run_file_operation(job, wait=True)
+        except EditorControllerError as error:
+            # This branch receives the same body-safe Application diagnostics
+            # as background TL jobs, including unavailable configured codecs.
+            self._show_error("无法新建多文档项目", str(error))
             return False
         try:
             result = self.controller.create_workspace_package(
@@ -2920,7 +2935,7 @@ class QtEditorWindow(QMainWindow):
         runner.cancel()
         self.statusBar().showMessage(
             "正在取消；已经发出的保存将按实际结果报告。"
-            if runner.job.kind in {"save", "import_tl"} else "正在取消打开；候选释放后结束。")
+            if runner.job.kind in {"save", "import_tl", "import_directory"} else "正在取消打开；候选释放后结束。")
 
     def open_project_file_async(self, path: Path, *, wait: bool = False, package: bool = False) -> bool:
         if self.file_operation_running:
@@ -2934,6 +2949,19 @@ class QtEditorWindow(QMainWindow):
                    else self.controller.begin_file_open(path, package=package))
         except (EditorControllerError, OSError, ValueError) as error:
             self._show_error("无法打开项目", str(error))
+            return False
+        return self._run_file_operation(job, wait=wait)
+
+    def open_directory_async(self, root: Path, *, wait: bool = False) -> bool:
+        if self.file_operation_running:
+            self.statusBar().showMessage("请等待当前文件操作结束，或取消它。", 5000)
+            return False
+        if not self._confirm_unsaved():
+            return False
+        try:
+            job = self.controller.begin_directory_open(root)
+        except (EditorControllerError, OSError, ValueError) as error:
+            self._show_error("无法预览目录", str(error))
             return False
         return self._run_file_operation(job, wait=wait)
 
@@ -2963,7 +2991,10 @@ class QtEditorWindow(QMainWindow):
         runner = QtProjectFileJob(job, self._finish_file_operation, parent=self)
         self._file_runner = runner
         self.file_cancel_button.show()
-        self.statusBar().showMessage("正在打开并验证项目…" if job.kind in {"open", "prepare_tl"} else "正在保存项目包…")
+        self.statusBar().showMessage(
+            "正在预览目录（尚未读取文件内容）…" if job.kind == 'preview_directory' else
+            "正在验证所选文件并建立项目包…" if job.kind in {'import_tl', 'import_directory'} else
+            "正在打开并验证项目…" if job.kind in {"open", "prepare_tl"} else "正在保存项目包…")
         self._apply_file_operation_access()
         loop = QEventLoop(self) if wait else None
         if loop is not None:
@@ -3018,6 +3049,38 @@ class QtEditorWindow(QMainWindow):
             self._file_import_review = None
             self.controller.cancel_single_tl_import(review)
 
+    def _continue_directory_import(self, review) -> None:
+        self._file_import_review = review
+        try:
+            dialog = QtDirectoryOpenDialog(review,
+                current=lambda: self.controller.directory_review_current(review), parent=self)
+            try:
+                if dialog.exec() != QDialog.DialogCode.Accepted or self._file_operations_closed:
+                    self.statusBar().showMessage("建包已取消；当前项目保持不变。", 7000)
+                    return
+                entry_ids = dialog.ordered_entry_ids
+                name = dialog.project_name_input.text().strip()
+                source_locale, target_locale = dialog.source_locale, dialog.target_locale
+            finally:
+                dialog.deleteLater()
+            if not self.controller.directory_review_current(review):
+                raise EditorControllerError('PROJECT.DIRECTORY.STALE')
+            destination, _ = QFileDialog.getSaveFileName(
+                self, "建立 LocalCAT 项目包", f'{name}.localcat-project',
+                "LocalCAT ProjectPackage (*.localcat-project)")
+            if not destination or self._file_operations_closed:
+                self.statusBar().showMessage("建包已取消；当前项目保持不变。", 7000)
+                return
+            job = self.controller.begin_directory_publish(review, entry_ids, Path(destination),
+                name=name, source_locale=source_locale, target_locale=target_locale)
+            self._run_file_operation(job, wait=False)
+        except (EditorControllerError, OSError, ValueError) as error:
+            self._show_error("无法建立项目包", str(error))
+            self.statusBar().showMessage("项目包未创建；当前项目保持不变。", 7000)
+        finally:
+            self._file_import_review = None
+            self.controller.cancel_directory_open(review)
+
     def _finish_file_operation(self, job) -> None:
         self._file_runner = None
         self.file_cancel_button.hide()
@@ -3033,21 +3096,26 @@ class QtEditorWindow(QMainWindow):
                 self._set_workspace_save_feedback(
                     f"{error} · 保存目标：{job.path} · 受影响章节：{affected} · "
                     "项目包未保存；当前修改保留，可重试。")
-            self._show_error("无法打开项目" if job.kind in {"open", "prepare_tl"} else "无法保存项目包", str(error))
+            self._show_error("无法打开项目" if job.kind in {"open", "prepare_tl", "preview_directory"} else "无法保存项目包", str(error))
             self.statusBar().showMessage("文件操作失败；当前项目与未保存修改保留。", 7000)
             return
-        if job.kind == 'prepare_tl':
+        if job.kind == 'preview_directory':
+            if outcome.accepted:
+                self._continue_directory_import(outcome.result)
+            else:
+                self.statusBar().showMessage('目录预览已取消或过期；当前项目保持不变。', 7000)
+        elif job.kind == 'prepare_tl':
             if outcome.accepted:
                 self._continue_single_tl_import(outcome.result)
             else:
                 self.statusBar().showMessage("打开已取消或已过期；当前项目保持不变。", 7000)
-        elif job.kind == 'import_tl':
+        elif job.kind in {'import_tl', 'import_directory'}:
             result = outcome.result
             if outcome.accepted:
                 self._render_project()
                 self.refresh_recent_projects()
                 self._file_last_success = True
-                self._set_workspace_save_feedback("项目包已建立 · 原始 TL 只读。")
+                self._set_workspace_save_feedback("项目包已建立 · 原文件只读。")
                 self.statusBar().showMessage(f"项目包已建立：{outcome.path}", 7000)
             elif result is not None:
                 if result.receipt is not None and result.receipt.durable:
@@ -3290,6 +3358,16 @@ class QtEditorWindow(QMainWindow):
         return bool(selected) and self.open_project_path(Path(selected))
 
     def _choose_open_home(self) -> bool:
+        chooser = QtLocalProjectOpenDialog(self)
+        try:
+            if chooser.exec() != QDialog.DialogCode.Accepted:
+                return False
+            kind = chooser.selection_kind
+        finally:
+            chooser.deleteLater()
+        if kind == 'folder':
+            selected = QFileDialog.getExistingDirectory(self, "选择项目文档根目录")
+            return bool(selected) and self.open_directory_async(Path(selected))
         selected, _ = QFileDialog.getOpenFileNames(
             self,
             "打开本地项目（Shift 可多选）",
@@ -3553,8 +3631,17 @@ class QtEditorWindow(QMainWindow):
         finally:
             self._refreshing = False
 
-    def _refresh_workspace_documents_menu(self) -> None:
+    def _clear_workspace_documents_menu(self) -> None:
+        # QMenu.clear removes the submenu actions, but their QMenus are owned
+        # separately. Defer deletion until an active triggered handler returns.
+        submenus = tuple(action.menu() for action in self.workspace_documents_menu.actions()
+                         if action.menu() is not None)
         self.workspace_documents_menu.clear()
+        for submenu in submenus:
+            submenu.deleteLater()
+
+    def _refresh_workspace_documents_menu(self) -> None:
+        self._clear_workspace_documents_menu()
         if not self.controller.has_workspace:
             self.workspace_documents_button.setEnabled(False)
             self.chapter_progress_label.setVisible(False)
@@ -3575,43 +3662,50 @@ class QtEditorWindow(QMainWindow):
             else {document_id for document_id, _segment_id in chunk_keys}
         )
         file_icon = _localcat_document_icon()
-        display_name_counts = {
-            document.display_name: sum(
-                candidate.display_name == document.display_name
-                for candidate in view.documents
-            )
-            for document in view.documents
-        }
-        for document in view.documents:
-            if (
-                chunk_document_ids is not None
-                and document.identity.document_id not in chunk_document_ids
-            ):
-                continue
-            dirty = (
-                " · 未保存"
-                if document.identity.document_id in dirty_ids
-                else ""
-            )
-            is_current = document.identity is current
-            visible_name = self._workspace_document_display_name(document)
-            if display_name_counts[document.display_name] > 1:
-                visible_name = (
-                    f"{document.display_name} — {document.source_ref}"
+
+        pending = [(self.workspace_documents_menu, self.controller.workspace_document_tree)]
+        submenus = []
+        while pending:
+            menu, nodes = pending.pop()
+            documents = tuple(node for node in nodes
+                              if not isinstance(node, WorkspaceDirectoryView))
+            for node in nodes:
+                if isinstance(node, WorkspaceDirectoryView):
+                    submenu = QMenu(node.name.replace('&', '&&'), menu)
+                    configure_menu(submenu)
+                    menu.addMenu(submenu)
+                    submenus.append((menu, submenu))
+                    pending.append((submenu, node.children))
+                    continue
+                document = node
+                if (chunk_document_ids is not None
+                        and document.identity.document_id not in chunk_document_ids):
+                    continue
+                dirty = " · 未保存" if document.identity.document_id in dirty_ids else ""
+                is_current = document.identity is current
+                visible_name = self._workspace_document_display_name(document)
+                if sum(item.display_name == document.display_name for item in documents) > 1:
+                    visible_name = f"{visible_name} — {document.source_ref.rsplit('/', 1)[-1]}"
+                action = menu.addAction(
+                    file_icon,
+                    f"{visible_name.replace('&', '&&')}{dirty}"
+                    f"{'    ✓' if is_current else ''}",
                 )
-            action = self.workspace_documents_menu.addAction(
-                file_icon,
-                f"{visible_name}{dirty}"
-                f"{'    ✓' if is_current else ''}",
-            )
-            action.setData(document.identity)
-            action.setCheckable(True)
-            action.setChecked(is_current)
-            action.setToolTip(
-                f"{document.source_ref} · "
-                f"{document.progress.confirmed_segments} / "
-                f"{document.progress.total_segments} 已确认"
-            )
+                action.setData(document.identity)
+                action.setCheckable(True)
+                action.setChecked(is_current)
+                action.setToolTip(
+                    f"{document.source_ref} · "
+                    f"{document.progress.confirmed_segments} / "
+                    f"{document.progress.total_segments} 已确认"
+                )
+
+        # Children are pruned before ancestors, without recursion even for
+        # pre-existing packages deeper than the directory discovery scan limit.
+        for parent_menu, submenu in reversed(submenus):
+            if not submenu.actions():
+                parent_menu.removeAction(submenu.menuAction())
+                submenu.deleteLater()
         self.workspace_documents_button.setEnabled(True)
         multiple = len(view.documents) > 1
         self.chapter_progress_label.setVisible(multiple)
@@ -4552,6 +4646,7 @@ class QtEditorWindow(QMainWindow):
             self._refreshing
             or not self.controller.has_workspace
             or self._chunk_segment_selection_session is not None
+            or action.menu() is not None
         ):
             return
         identity = action.data()
@@ -6582,9 +6677,9 @@ class QtEditorWindow(QMainWindow):
             event.ignore()
             return
         creating_package = (self._file_runner is not None
-                            and self._file_runner.job.kind == 'import_tl')
+                            and self._file_runner.job.kind in {'import_tl', 'import_directory'})
         if creating_package and self.controller.active_project_dirty:
-            # This worker publishes the incoming TL, not the active project's
+            # This worker publishes the incoming documents, not the active project's
             # edits. Keep the old project until its own close guard can run;
             # starting another save here would race the outstanding operation.
             self.statusBar().showMessage(
