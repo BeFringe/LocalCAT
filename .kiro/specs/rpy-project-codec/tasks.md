@@ -70,7 +70,7 @@
   - _Requirements: 1.1, 1.3, 2.1, 2.3, 3.1, 3.2, 3.3, 3.4, 6.1, 6.3, 7.2_
   - _Boundary: Controller / Qt single-file open-save integration_
   - _Depends: 3.2_
-- [ ] 3.3 接入绑定当前编辑的导出预览
+- [x] 3.3 接入绑定当前编辑的导出预览
   - 展示空/未确认数量、目标和诊断，绑定 session/revision、codec/source/private/目标身份；导出全部 target。
   - 完成时，修改译文、切换项目/codec 或替换目标使 preview stale；取消无发布。
   - _Requirements: 4.1, 4.4, 6.3_
