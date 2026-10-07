@@ -29,6 +29,11 @@ from platform_fs_contracts import (
     CandidateContentFacts,
     DEVICE_SECRET_SIZE_BYTES,
     DeviceSecretAuthority,
+    DirectoryEntryKind,
+    DirectoryEntryMetadata,
+    DirectoryEntryUnavailableReason,
+    DirectoryHandleBudget,
+    DirectoryObservationCancellation,
     EntrySnapshot,
     ExactEmptyChildDirectoryRetirement,
     ExistingProcessFileLock,
@@ -62,6 +67,8 @@ from platform_fs_contracts import (
     ProcessFileLock,
     RootedDirectoryAuthority,
     RootedFileSystem,
+    ReadOnlyDirectoryObservation,
+    RetainedObservationDirectory,
     RetainedRetirement,
     RetirementDirectoryAuthority,
     VerifiedPrivateProof,
@@ -7369,7 +7376,282 @@ def _verify_private_proof_material(
         raise _private_unproven() from None
 
 
+_FILE_ID_EXTD_DIR_RESTART_INFO_CLASS = 20
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsObservedName:
+    name: str
+    file_id: bytes
+    byte_count: int
+    modified_token: bytes
+    attributes: int
+    reparse_tag: int
+
+
+def _decode_observation_buffer(payload: bytes):
+    offset = 0
+    while True:
+        if offset + _FILE_ID_EXTD_DIR_HEADER.size > len(payload):
+            raise _identity_stale()
+        values = _FILE_ID_EXTD_DIR_HEADER.unpack_from(payload, offset)
+        (next_offset, _, _, _, modified, changed, size, _, attributes,
+         name_length, _, tag, file_id) = values
+        _validate_directory_record_bounds(
+            offset=offset, name_length=name_length,
+            next_offset=next_offset, buffer_size=len(payload),
+        )
+        start = offset + _FILE_ID_EXTD_DIR_HEADER.size
+        name = payload[start:start + name_length].decode("utf-16-le", errors="surrogatepass")
+        if name not in {".", ".."}:
+            if size < 0 or not any(file_id):
+                raise _identity_stale()
+            yield _WindowsObservedName(
+                name, file_id, size, struct.pack("<qqI", modified, changed, attributes), attributes, tag,
+            )
+        if next_offset == 0:
+            return
+        offset += next_offset
+
+
+class _WindowsObservationHandle:
+    """One metadata handle; directory capacity is reserved before acquisition."""
+
+    def __init__(
+        self, api, path, resources, cancellation, *, kind, listing=False,
+        expected_path=None, volume_id=None, stale=True,
+    ):
+        self.handle = None
+        self.closed = False
+        self.reservation = resources.reserve() if kind == "directory" else None
+        try:
+            cancellation.check()
+            self.handle = api.open_handle(
+                path,
+                desired_access=FILE_READ_ATTRIBUTES | SYNCHRONIZE | (FILE_LIST_DIRECTORY if listing else 0),
+                share_mode=FILE_SHARE_READ if listing else FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                creation_disposition=OPEN_EXISTING,
+                # Without BACKUP_SEMANTICS a regular-entry race cannot acquire
+                # an unbudgeted directory handle.
+                flags=FILE_FLAG_OPEN_REPARSE_POINT | (FILE_FLAG_BACKUP_SEMANTICS if kind == "directory" else 0),
+            )
+            cancellation.check()
+            with self.handle.borrow() as raw:
+                self.proof = _capture_handle_proof(
+                    api, raw, expected_final_path=expected_path,
+                    expected_kind=kind, stale=stale,
+                )
+            if volume_id is not None:
+                _require_volume(self.proof.identity, volume_id, stale=stale)
+            self.record = _WindowsDirectoryRecord(
+                self.handle, self.proof.final_path, self.proof.identity,
+            )
+            cancellation.check()
+        except BaseException as error:
+            self.close()
+            if isinstance(error, Win32CallError):
+                raise _proof_failure(stale=stale) from None
+            raise
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.handle is not None:
+            try:
+                self.handle.close()
+            except Exception:
+                # A failed CloseHandle is terminal but does not prove release.
+                raise _capability_unavailable() from None
+        if self.reservation is not None and not self.reservation._claimed:
+            self.reservation.close()
+
+
+def _close_observation_handles(handles):
+    failure = None
+    for item in reversed(handles):
+        try:
+            item.close()
+        except BaseException as error:
+            failure = failure or error
+    if failure is not None:
+        raise failure
+
+
+class _WindowsObservationDirectory(RetainedObservationDirectory):
+    def __init__(self, api, handles, maximum_component_units):
+        super().__init__(handles[-1].reservation)
+        self._api = api
+        self._handles = tuple(handles)
+        self._records = tuple(item.record for item in handles)
+        self._maximum_component_units = maximum_component_units
+
+    @property
+    def _leaf_path(self):
+        return self._records[-1].expected_final_path
+
+    def _reprove_identity(self):
+        self._require_open()
+        _reprove_directory_chain(self._api, self._records)
+        return self._records[-1].identity
+
+    def _snapshot(self):
+        with self._records[-1].handle.borrow() as raw:
+            return _capture_handle_proof(
+                self._api, raw, expected_final_path=self._leaf_path,
+                expected_kind="directory", stale=True,
+            ).snapshot
+
+    def _close_authority(self):
+        _close_observation_handles(self._handles)
+
+
+class _WindowsReadOnlyDirectoryObservation(ReadOnlyDirectoryObservation):
+    def _bind_observation_root(self, root, resources, cancellation):
+        _validate_probe_root(root)
+        components = _validated_components(tuple(root.parts[1:]))
+        handles = []
+        try:
+            api = self._native_api()
+            drive = _WindowsObservationHandle(
+                api, f"{root.drive}\\", resources, cancellation,
+                kind="directory", listing=True, stale=False,
+            )
+            handles.append(drive)
+            guid_root = _guid_root_from_final_path(drive.proof.final_path)
+            if guid_root != drive.proof.final_path:
+                raise _outside_root()
+            process_machine, native_machine = _machine_facts(api)
+            version = sys.getwindowsversion()
+            _validate_runtime_facts(
+                windows_major=int(version.major), windows_build=int(version.build),
+                product_type=int(version.product_type), python_implementation=sys.implementation.name,
+                python_version=(sys.version_info.major, sys.version_info.minor),
+                python_bits=struct.calcsize("P") * 8,
+                process_machine=process_machine, native_machine=native_machine,
+            )
+            with drive.handle.borrow() as raw:
+                _, file_system, flags, maximum_units = _volume_facts_by_handle(api, raw)
+            if (_fixed_drive_type(api, guid_root) != DRIVE_FIXED or file_system != "NTFS"
+                    or not flags & FILE_PERSISTENT_ACLS or not flags & FILE_SUPPORTS_REPARSE_POINTS):
+                raise _capability_unavailable()
+            current = guid_root
+            for component in components:
+                cancellation.check()
+                current = _append_component(current, component, maximum_units=maximum_units)
+                handles.append(_WindowsObservationHandle(
+                    api, current, resources, cancellation, kind="directory", listing=True,
+                    expected_path=current, volume_id=drive.proof.identity.volume_id, stale=False,
+                ))
+            _hit_fault(self._fault_injector, "observation_after_root_open")
+            cancellation.check()
+            result = _WindowsObservationDirectory(api, handles, maximum_units)
+            handles = []
+            return result
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _capability_unavailable() from None
+        finally:
+            _close_observation_handles(handles)
+
+    def _iter_observed_children(self, directory, resources, cancellation):
+        if not isinstance(directory, _WindowsObservationDirectory):
+            raise _capability_unavailable()
+        try:
+            generation = directory._snapshot()
+            first = True
+            # A private retained handle and root-scope lock own the query cursor.
+            # Restart explicitly after every complete, cancelled or failed scan.
+            while True:
+                cancellation.check()
+                buffer = ctypes.create_string_buffer(_DIRECTORY_QUERY_BUFFER_BYTES)
+                with directory._records[-1].handle.borrow() as raw:
+                    ok = directory._api.GetFileInformationByHandleEx(
+                        raw, _FILE_ID_EXTD_DIR_RESTART_INFO_CLASS if first else FILE_ID_EXTD_DIR_INFO_CLASS,
+                        buffer, len(buffer),
+                    )
+                    error = 0 if ok else directory._api.last_error()
+                first = False
+                if not ok:
+                    if error == ERROR_NO_MORE_FILES:
+                        break
+                    raise _entry_unavailable()
+                for entry in _decode_observation_buffer(buffer.raw):
+                    cancellation.check()
+                    try:
+                        _validate_windows_component(entry.name, maximum_units=directory._maximum_component_units)
+                    except PlatformFileError:
+                        yield DirectoryEntryMetadata(
+                            entry.name, DirectoryEntryKind.OTHER, None, DirectoryEntryUnavailableReason.UNSAFE_NAME,
+                        )
+                        continue
+                    if entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT or entry.reparse_tag:
+                        yield DirectoryEntryMetadata(
+                            entry.name, DirectoryEntryKind.REPARSE, None, DirectoryEntryUnavailableReason.REPARSE,
+                        )
+                        continue
+                    kind = "directory" if entry.attributes & FILE_ATTRIBUTE_DIRECTORY else "regular"
+                    path = _append_component(directory._leaf_path, entry.name,
+                                             maximum_units=directory._maximum_component_units)
+                    _hit_fault(self._fault_injector, "observation_before_entry_proof")
+                    opened = _WindowsObservationHandle(
+                        directory._api, path, resources, cancellation, kind=kind,
+                        expected_path=path, volume_id=generation.identity.volume_id,
+                    )
+                    try:
+                        snapshot = opened.proof.snapshot
+                        # NTFS can leave directory times stale in enumeration
+                        # records until a metadata handle closes. FileId still
+                        # binds that entry; use its validated handle snapshot.
+                        if (snapshot.identity.file_id != entry.file_id
+                                or (kind == "regular" and (
+                                    snapshot.modified_token != entry.modified_token
+                                    or snapshot.byte_count != entry.byte_count))):
+                            raise _identity_stale()
+                    finally:
+                        opened.close()
+                    _hit_fault(self._fault_injector, "observation_after_entry_proof")
+                    cancellation.check()
+                    yield DirectoryEntryMetadata(entry.name, DirectoryEntryKind(kind), snapshot)
+            _hit_fault(self._fault_injector, "observation_after_enumeration")
+            cancellation.check()
+            if directory._snapshot() != generation:
+                raise _identity_stale()
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _entry_unavailable() from None
+
+    def _retain_observed_directory(self, parent, entry, resources, cancellation):
+        if not isinstance(parent, _WindowsObservationDirectory):
+            raise _capability_unavailable()
+        opened = None
+        try:
+            path = _append_component(parent._leaf_path, entry.name,
+                                     maximum_units=parent._maximum_component_units)
+            opened = _WindowsObservationHandle(
+                parent._api, path, resources, cancellation, kind="directory", listing=True,
+                expected_path=path, volume_id=parent.identity().volume_id,
+            )
+            if opened.proof.identity != entry.snapshot.identity:
+                raise _identity_stale()
+            _hit_fault(self._fault_injector, "observation_after_child_open")
+            cancellation.check()
+            result = _WindowsObservationDirectory(parent._api, (opened,), parent._maximum_component_units)
+            opened = None
+            return result
+        except PlatformFileError:
+            raise
+        except Exception:
+            raise _identity_stale() from None
+        finally:
+            if opened is not None:
+                opened.close()
+
+
 class WindowsPlatformAdapter(
+    _WindowsReadOnlyDirectoryObservation,
     WindowsRootedFileSystem,
     WindowsProcessFileLock,
     WindowsOutputArtifactLockRetirement,

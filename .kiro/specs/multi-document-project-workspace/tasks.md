@@ -228,7 +228,7 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - 完成时，POSIX 合成目录的替换、深度/条目/handle 限额及取消返回明确结果。
   - _Requirements: 13.1, 13.3_
   - _Boundary: Platform POSIX backend_
-- [ ] 5.3 实现 Windows 只读目录观察
+- [x] 5.3 实现 Windows 只读目录观察
   - 使用同一合同处理 retained root、reparse/ancestor drift 与资源释放，不以字符串前缀冒充根约束。
   - 完成时，Windows 合成 junction/reparse、替换、限额及取消矩阵符合相同失败语义。
   - _Requirements: 13.1, 13.3_
