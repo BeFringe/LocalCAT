@@ -11,6 +11,7 @@ from pathlib import Path
 from qt_project_file_job import QtProjectFileJob
 from qt_directory_open_dialog import QtDirectoryOpenDialog, QtLocalProjectOpenDialog
 from qt_project_export_dialog import QtProjectExportDialog
+from qt_project_source_update_dialog import QtProjectSourceUpdateDialog
 
 from PySide6.QtCore import (
     QMimeData,
@@ -1075,6 +1076,12 @@ class QtEditorWindow(QMainWindow):
         self.tl_export_action.setEnabled(False)
         self.tl_export_action.setVisible(False)
         self._tl_export_dialog = None
+        self._source_update_dialog = None
+        self.source_update_action = self.project_menu.addAction("更新 TL 源模板…")
+        self.source_update_action.setObjectName("updateTlSourceAction")
+        self.source_update_action.setVisible(False)
+        self.source_update_action.setEnabled(False)
+        self.source_update_action.triggered.connect(self._open_source_update_dialog)
         self.tl_export_action.triggered.connect(self._open_tl_export_dialog)
         self.project_menu.aboutToShow.connect(self._refresh_tl_export_action)
         self._apply_top_bar_responsiveness(self.width())
@@ -3607,6 +3614,30 @@ class QtEditorWindow(QMainWindow):
         self.tl_export_action.setText('导出 Ren’Py TL' if reason is None else '导出 Ren’Py TL（不可用）')
         self.tl_export_action.setToolTip(reason or '预览全部当前译文，然后导出到所选文件。项目包另行保存。')
         self.tl_export_action.setStatusTip(self.tl_export_action.toolTip())
+        self.source_update_action.setVisible(self.controller.is_tl_workspace)
+        self.source_update_action.setEnabled(
+            self.controller.is_tl_workspace and not self.controller.workspace_save_running
+            and not self.controller.tl_export_publish_running
+            and not (self._source_update_dialog is not None
+                     and self._source_update_dialog.operation_running))
+
+    def _open_source_update_dialog(self) -> None:
+        if not self.source_update_action.isEnabled():
+            return
+        if self._source_update_dialog is not None:
+            self._source_update_dialog.shutdown()
+            self._source_update_dialog.deleteLater()
+        dialog = QtProjectSourceUpdateDialog(self.controller, self)
+        self._source_update_dialog = dialog
+        dialog.activity_changed.connect(self._refresh_tl_export_action)
+        dialog.result_ready.connect(self._source_update_applied)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _source_update_applied(self, _receipt) -> None:
+        self._render_project()
+        self.statusBar().showMessage('源更新已应用到当前项目。请保存项目包以保留结果。', 15000)
 
     def _open_tl_export_dialog(self) -> None:
         if self._tl_export_dialog is None:
@@ -6709,6 +6740,8 @@ class QtEditorWindow(QMainWindow):
             self._file_operations_closed = True
             if self._tl_export_dialog is not None:
                 self._tl_export_dialog.shutdown()
+            if self._source_update_dialog is not None:
+                self._source_update_dialog.shutdown()
             self.controller.close_project()
             self.controller.abandon_file_jobs()
             if self._file_runner is not None:

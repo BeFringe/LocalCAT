@@ -26,6 +26,7 @@ from project_workspace_contracts import ProjectOriginKind, ProjectWorkspaceError
 from project_workspace_intake import (
     PreparedSelectedProjectDocuments, SelectedProjectDocumentsRequest,
     SelectedProjectDocumentsError, prepare_selected_project_documents,
+    OriginRenameMapping, prepare_workspace_rebind,
 )
 
 
@@ -174,6 +175,11 @@ class RpyProjectSession:
             result = self._prepared.save_workspace(
                 self._package_service, self._save_service, destination,
             )
+        elif self._prepared is not None:
+            result = self._prepared.save_reconciled_workspace(
+                self._package_service, self._save_service, destination,
+                persistence_binding=binding,
+            )
         else:
             result = self._package_service.save_workspace(
                 self._save_service, destination, persistence_binding=binding,
@@ -302,6 +308,60 @@ class RpyProjectAdapter:
                 session_id=session_id, revision=0)
             return RpyProjectSession(
                 self.package_service, ProjectSaveService(workspace, baseline=None), prepared=prepared)
+        except BaseException:
+            prepared.close()
+            raise
+
+    def prepare_source_update(
+        self, workspace_service: ProjectWorkspaceService, root: Path,
+        sources: tuple[Path, ...], *, rename_mappings: tuple[OriginRenameMapping, ...] = (),
+        file_system=None, cancellation=None,
+    ) -> PreparedSelectedProjectDocuments:
+        """Prepare verified source updates without mutating the editing authority."""
+        workspace = workspace_service.workspace
+        for document in workspace.documents:
+            if document.codec_identity.provider_id == _RPY_IDENTITY.provider_id:
+                availability = _availability(self.runtime, document.codec_identity, FormatId(document.format_id))
+                if not availability.available:
+                    raise RpyProjectUnavailableError(availability)
+        refs = tuple(source.relative_to(root).as_posix() for source in sources)
+        self.validate_selected_refs(refs)
+        binding = workspace_service.origin_binding
+        try:
+            if binding is None:
+                prepared = prepare_workspace_rebind(
+                    root, sources, workspace, rename_mappings=rename_mappings,
+                    parser_surface=self.runtime.surface, file_system=file_system,
+                    cancellation=cancellation,
+                )
+            else:
+                prepared = prepare_selected_project_documents(
+                    root, sources, SelectedProjectDocumentsRequest(
+                        workspace.name, workspace.source_locale, workspace.target_locale,
+                        binding, binding.revision, rename_mappings),
+                    parser_surface=self.runtime.surface, file_system=file_system,
+                    cancellation=cancellation,
+                )
+        except SelectedProjectDocumentsError as error:
+            raise RpyProjectSelectionError(
+                error.code, refs[error.document_order], error.diagnostics) from error
+        try:
+            projected = self.workspace_from_prepared(prepared)
+            existing = {document.document_id: document for document in workspace.documents}
+            names = []
+            for document in projected.documents:
+                old = existing.get(document.document_id)
+                name = document.display_name
+                if old is not None:
+                    if (old.codec_identity != document.codec_identity
+                            or old.format_id != document.format_id):
+                        raise ProjectWorkspaceError('PROJECT.RECONCILE.INPUT_INVALID')
+                    name = (PurePosixPath(document.source_ref).name
+                            if old.display_name == PurePosixPath(old.source_ref).name
+                            else old.display_name)
+                names.append((document.document_id, name))
+            prepared.set_display_names(tuple(names))
+            return prepared
         except BaseException:
             prepared.close()
             raise
