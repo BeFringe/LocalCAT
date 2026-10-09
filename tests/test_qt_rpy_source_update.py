@@ -1,4 +1,4 @@
-"""Body-safe source update UI over Controller projections and cancellable jobs."""
+"""Read-only diff navigation over Controller projections and cancellable jobs."""
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from pathlib import Path
@@ -10,6 +10,7 @@ from unittest import mock
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog
 from qt_project_source_update_dialog import QtProjectSourceUpdateDialog
+from editor_source_update import SourceUpdateBlock, SourceUpdateItem, SourceUpdateReview, SourceUpdateText
 
 
 def _wait_until(predicate):
@@ -74,11 +75,17 @@ class Controller:
             for ref in ('a/intro.rpy', 'b/intro.rpy'))
         self.current = True
         self.source_update_root = None
-        self.items = tuple(SimpleNamespace(category=category, source_ref='a/intro.rpy',
-            segment_number=number, required=category in ('removed', 'ambiguous', 'unresolved'))
+        self.items = tuple(SourceUpdateItem(category=category, source_ref='a/intro.rpy',
+            segment_number=number, required=category in ('removed', 'ambiguous', 'unresolved'),
+            old=None if category == 'new' else SourceUpdateText('a/intro.rpy', number, 'Old sentence.', '旧译文'),
+            new=None if category in ('removed', 'ambiguous', 'unresolved') else
+                SourceUpdateText('a/intro.rpy', number, 'New sentence.', '模板译文'))
             for number, category in enumerate(('unchanged', 'source_changed', 'new', 'removed',
                                                'ambiguous', 'unresolved'), 1))
-        self.review = SimpleNamespace(items=self.items, required_items=self.items[3:])
+        self.review = SourceUpdateReview(None, self.items, tuple(
+            SourceUpdateBlock(indices, tuple(self.items[i].old for i in indices if self.items[i].old),
+                              tuple(self.items[i].new for i in indices if self.items[i].new))
+            for indices in ((1,), (2, 3), (4,), (5,))))
         self.gate = None
         self.applied = None
         self.error = None
@@ -139,19 +146,29 @@ class QtRpySourceUpdateTests(unittest.TestCase):
         self.assertEqual(self.controller.selection,
                          (Path('/updated/tl'), ('a/intro.rpy', 'renamed/intro.rpy')))
         self.assertTrue(self.dialog.cancel_button.isDefault())
-        self.assertEqual(self.dialog.results.rowCount(), 6)
+        self.assertEqual(self.dialog.results.rowCount(), 1)
         self.assertIn('源文变更：1', self.dialog.summary_label.text())
-        self.assertIn('第 2 段', self.dialog.results.item(1, 2).text())
+        self.assertIn('第 2 段', self.dialog.results.item(0, 2).text())
+        self.assertIn('Old sentence.', self.dialog.diff_view.toPlainText())
+        self.assertIn('New sentence.', self.dialog.diff_view.toPlainText())
+        self.assertFalse(self.dialog.previous_button.isEnabled())
+        self.assertEqual(self.dialog.position_label.text(), '1 / 4')
         self.assertFalse(self.dialog.apply_button.isEnabled())
-        for row in (3, 4, 5):
+        for index, row in ((1, 1), (2, 0), (3, 0)):
+            self.dialog.next_button.click()
             choice = self.dialog.results.cellWidget(row, 3)
             self.assertIsNone(choice.currentData())
-            self.assertEqual(choice.findData('remove') >= 0, row == 3)
-            choice.setCurrentIndex(choice.findData('keep_detached'))
+            self.assertEqual(choice.findData('remove') >= 0, index == 1)
+            choice.setCurrentIndex(choice.findData('remove' if index == 1 else 'keep_detached'))
+        self.assertEqual(self.dialog.position_label.text(), '4 / 4')
+        self.assertFalse(self.dialog.next_button.isEnabled())
+        self.dialog.previous_button.click()
+        self.dialog.previous_button.click()
+        self.assertEqual(self.dialog.results.cellWidget(1, 3).currentData(), 'remove')
         self.assertTrue(self.dialog.apply_button.isEnabled())
         self.dialog.apply_button.click()
         self.wait(lambda: not self.dialog.operation_running)
-        self.assertEqual(self.controller.applied, ('keep_detached',) * 3)
+        self.assertEqual(self.controller.applied, ('remove', 'keep_detached', 'keep_detached'))
         self.assertIn('保存项目包', self.dialog.status_label.text())
         self.assertFalse(self.dialog.apply_button.isEnabled())
 
@@ -160,6 +177,8 @@ class QtRpySourceUpdateTests(unittest.TestCase):
         self.dialog.paths.item(0, 1).setText('new.rpy')
         self.assertIsNone(self.dialog.view)
         self.assertFalse(self.dialog.apply_button.isEnabled())
+        self.assertEqual(self.dialog.diff_view.toPlainText(), '')
+        self.assertFalse(self.dialog.next_button.isVisible())
         self.preview()
         self.controller.current = False
         self.wait(lambda: self.dialog.view is None)
@@ -167,7 +186,8 @@ class QtRpySourceUpdateTests(unittest.TestCase):
 
     def test_cancel_and_close_do_not_deliver_late_application(self):
         self.preview()
-        for row in (3, 4, 5):
+        for row in (1, 0, 0):
+            self.dialog.next_button.click()
             self.dialog.results.cellWidget(row, 3).setCurrentIndex(1)
         self.controller.gate = Event()
         self.dialog.apply_button.click()
@@ -198,6 +218,48 @@ class QtRpySourceUpdateTests(unittest.TestCase):
         self.assertIsNone(self.dialog.view)
         self.assertIn('失败', self.dialog.status_label.text())
         self.assertEqual(self.dialog.paths.item(1, 1).text(), 'b/intro.rpy')
+
+    def test_no_diff_hides_navigation_and_distinguishes_template_bytes(self):
+        for identical in (True, False):
+            self.controller.review = SourceUpdateReview(None, (), (), identical)
+            self.preview()
+            self.assertFalse(self.dialog.next_button.isVisible())
+            self.assertFalse(self.dialog.previous_button.isVisible())
+            self.assertIn('模板一致' if identical else '模板其他内容有变化', self.dialog.diff_view.toPlainText())
+
+    def test_visual_block_order_does_not_reorder_required_dispositions(self):
+        original = self.controller.review
+        self.controller.review = SourceUpdateReview(None, original.items, tuple(reversed(original.blocks)))
+        self.preview()
+        while True:
+            for row in range(self.dialog.results.rowCount()):
+                choice = self.dialog.results.cellWidget(row, 3)
+                if choice is not None:
+                    choice.setCurrentIndex(choice.findData('remove') if choice.findData('remove') >= 0 else 1)
+            if not self.dialog.next_button.isEnabled():
+                break
+            self.dialog.next_button.click()
+        self.assertTrue(self.dialog.apply_button.isEnabled())
+        self.dialog.apply_button.click()
+        self.wait(lambda: not self.dialog.operation_running)
+        self.assertEqual(self.controller.applied, ('remove', 'keep_detached', 'keep_detached'))
+
+    def test_body_is_escaped_read_only_and_long_text_is_complete(self):
+        old = SourceUpdateText('a/<intro>.rpy', 1, '<img src="file:///secret"> & old', '')
+        new = SourceUpdateText('a/<intro>.rpy', 1, '<script>new</script> & "text"', '')
+        self.controller.review = SourceUpdateReview(None, (), (SourceUpdateBlock((), (old,), (new,)),))
+        self.preview()
+        body = self.dialog.diff_view.toPlainText()
+        self.assertIn(old.source, body)
+        self.assertIn(new.source, body)
+        self.assertIn('a/<intro>.rpy', body)
+        self.assertTrue(self.dialog.diff_view.isReadOnly())
+        self.assertNotIn('<img ', self.dialog.diff_view.toHtml())
+        long = SourceUpdateText('intro.rpy', 1, 'word ' * 3000, '')
+        self.controller.review = SourceUpdateReview(None, (), (SourceUpdateBlock((), (long,), (new,)),))
+        self.preview()
+        self.assertIn(long.source, self.dialog.diff_view.toPlainText())
+        self.assertIn('未做词级高亮', self.dialog.diff_view.toPlainText())
 
 
 class QtRpySourceUpdateIntegrationTests(unittest.TestCase):
@@ -276,10 +338,14 @@ class QtRpySourceUpdateIntegrationTests(unittest.TestCase):
         dialog = self.open_preview(rename=True)
         categories = [item.category for item in dialog.view.items]
         self.assertCountEqual(categories, ['source_changed', 'new', 'removed'])
-        for row, item in enumerate(dialog.view.items):
-            if item.required:
+        while True:
+            for row in range(dialog.results.rowCount()):
                 choice = dialog.results.cellWidget(row, 3)
-                choice.setCurrentIndex(choice.findData('remove'))
+                if choice is not None:
+                    choice.setCurrentIndex(choice.findData('remove'))
+            if not dialog.next_button.isEnabled():
+                break
+            dialog.next_button.click()
         dialog.apply_button.click()
         self.wait(lambda: not dialog.operation_running)
         self.assertIsNotNone(dialog.result_receipt, dialog.status_label.text())
