@@ -67,7 +67,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 #### 验收标准
 1. When 用户通过 Project 的 TL 根目录递归预览勾选文件，或使用既有显式文件选择入口, the LocalCAT shall 仅解析确认选择的受支持 TL，按 review 确认顺序建立 Document，保留相对于原选择根目录的路径，并区分嵌套目录下的同名文件；未勾选内容不得读取或纳入项目。
 2. When 用户切换章节、搜索、保存或重开, the LocalCAT shall 沿用既有复合段落身份、文档顺序、当前章节/全部章节范围与项目持久化行为；文件夹导航按相对目录分组且不改变阅读顺序或身份。
-3. When 用户明确重新绑定并调和源更新, the LocalCAT shall 报告 unchanged/source_changed/new/removed/ambiguous，保留 changed 段的已有 target 并撤销 confirmed，rename 只消费显式映射。
+3. When 用户明确重新绑定并调和源更新, the LocalCAT shall 报告未变化（unchanged）、源文变更（source_changed）、新增（new）、已移除（removed）、关联冲突（ambiguous）及无法关联（unresolved），保留源文变更段的已有 target 并撤销 confirmed，rename 只消费显式映射。预览直接显示旧文／新文，以 `−`／`+` 和词级高亮标出变化，默认隐藏未变化正文；统计栏显示当前章节各分类的段落数量，右侧提供上一差异／下一差异及当前位置。展示分组不改变身份分类或明确处置，无法唯一关联时不猜测。无差异时隐藏导航，区分源文一致与完整模板字节一致。多章节预览提供按相对路径列出的章节选择和各章对照块数量，可查看无差异章节；对照块数量与分类段落数量分别表达阅读位置和源变更，不相互替代。当前差异可按需展开相邻未变化段落，阅读选择不改变更新范围或处置。
 4. When 用户批量导出多个 TL, the LocalCAT shall 在用户选择的导出根目录下按各 source_ref 保留嵌套路径，先验证全部候选及路径冲突，再报告逐文件结果；失败或取消时明确已发布与未发布文件，不宣称跨文件原子性。
 
 ### Requirement 6：编辑器与资源消费
@@ -75,7 +75,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 **目标：** 作为译者，我希望 RPY 项目自然地使用 LocalCAT 的现有编辑和语言资源能力。
 
 #### 验收标准
-1. When 用户进入 RPY 项目, the LocalCAT shall 使用现有源文/译文/speaker、编辑/浏览、搜索和确认交互，不向用户暴露 token、私有成员或内部 codec 类型。单 Document 项目不重复显示章节栏和分隔行，需要区分来源时使用实际文件名；切换项目后所有提示均来自当前项目。
+1. When 用户进入 RPY 项目, the LocalCAT shall 使用现有源文/译文/speaker、编辑/浏览、搜索和确认交互，不向用户暴露 token、私有成员或内部 codec 类型。单 Document 项目不重复显示章节栏和分隔行，需要区分来源时使用实际文件名；切换项目后所有提示均来自当前项目。源更新预览的快捷键提示使用当前平台的按键名称，并与实际绑定一致。
 2. When 用户使用 TM 或术语建议, the LocalCAT shall 继续使用既有语言资源的显式启用、查询、应用与更新行为，不把 TMX 资源包导入设为 RPY 前置。
 3. While 导入、预览或导出正在运行, the LocalCAT shall 保持 UI 可响应、允许取消，并拒绝过期结果覆盖后来编辑或已关闭的项目。
 4. When 用户手工把项目包与选定的 JSONL/CSV 资源包交给另一设备, the LocalCAT shall 分别重新验证并按各自事务导入，不运输设备资格或恢复项目包内的执行权限。

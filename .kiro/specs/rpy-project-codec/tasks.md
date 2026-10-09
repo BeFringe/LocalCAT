@@ -128,10 +128,24 @@
   - _Depends: 3.4b；multi-document-project-workspace 5.6a, 5.7, 5.8_
 - [x] 4.2 接入已验证源更新与完整私有映射替换
   - 复用 Project reconciliation、显式 rename 与 unresolved 处理，不按行号猜测。
-  - 提供中立桌面入口，选择更新根和逐章节相对路径，显示六类预览并要求明确处置；异步复核、取消和终态接纳保持 session/source/codec 有效，应用后的完整源与私有映射由 Project 保存。
+  - 提供中立桌面入口，选择更新根和逐章节相对路径，分别显示未变化、源文变更、新增、已移除、关联冲突与无法关联的预览，并要求完成必要的明确处置；异步复核、取消和终态接纳保持 session/source/codec 有效，应用后的完整源与私有映射由 Project 保存。
   - 完成时，同 dialogue label 改源文得到 source_changed、保留 target 并清 confirmed；label 或 strings old key 改变得到 new/removed，ambiguous 可见；新 private payload 与新 source 匹配。
   - _Requirements: 2.4, 5.2, 5.3_
   - _Boundary: RpyProjectAdapter / Project reconciliation / Controller-Qt source-update integration_
+- [x] 4.2a 补齐源更新的正文对照与差异导航
+  - 直接显示旧文／新文、`−`／`+` 和词级高亮，默认隐藏未变化正文；在变化统计栏右侧提供上一差异／下一差异和当前位置。
+  - 按同文档的稳定身份边界组织只读对照块，保持新增／移除分类和明确处置；不按行号或相似文本猜测身份，不自动迁移译文。无差异时隐藏导航并准确区分源文与模板字节一致。
+  - 完成时，单处及多处分离变更可逐块查看，跨导航处置不丢失且提交顺序不变；长文本计算有界、正文安全显示，取消／过期不恢复旧预览。
+  - _Requirements: 2.4, 5.3, 6.1, 6.3, 7.1_
+  - _Boundary: Controller neutral source-update projection / Qt review UI_
+  - _Depends: 4.2_
+- [ ] 4.2b 接入分章节差异审阅与相邻上下文
+  - 多章节使用相对路径章节下拉，显示各章差异块计数，包含零差异章节；统计与差异导航按当前章节显示，保留全局处置及各章阅读位置。章节选择只筛选预览，不改变源更新范围。
+  - 在旧文／新文之后统一展开相邻的未变化正文，同一连续阅读区仅使用整体滚动；预览后可折叠根目录和路径设置。只消费旧／新顺序中均相邻的 unchanged 稳定身份，不跨章、不猜测，切换或过期时清除旧上下文。
+  - 完成时，同名异目录、显式 rename、零差异章、跨章处置与恢复阅读位置均可验证，当前章节分类段落数与对照块数可区分，全局处置进度明确；支持平台上的快捷键名称与实际按键一致。
+  - _Requirements: 2.4, 5.2, 5.3, 6.1, 6.3, 7.1_
+  - _Boundary: Controller neutral source-update projection / Qt chapter review UI_
+  - _Depends: 4.2a_
 - [ ] 4.3 协调批量准备与逐文件导出结果
   - 按 source_ref 保留嵌套目录，先准备所有候选并检查目录/路径冲突再发布；受控创建子目录及逐次复证，取消停止未发布项。
   - 完成时，第二个文件发布失败不会被报告为全批成功或全批回滚，重试要求新预览。

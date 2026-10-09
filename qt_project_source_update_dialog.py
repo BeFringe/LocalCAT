@@ -1,13 +1,17 @@
 """Source update review UI; all identity and apply authority stays in Controller."""
+from __future__ import annotations
+
+from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-    QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QTextBrowser, QVBoxLayout,
 )
 
 from editor_controller import EditorControllerError
+from editor_source_update import source_update_word_diff
 from qt_project_file_job import QtProjectFileJob
 
 
@@ -30,8 +34,10 @@ class QtProjectSourceUpdateDialog(QDialog):
         self._runner = None
         self._shut_down = False
         self._documents = self._document_context()
+        self._block_index = 0
+        self._choices = {}
         self.setWindowTitle('更新 TL 源模板')
-        self.resize(840, 620)
+        self.resize(980, 740)
         layout = QVBoxLayout(self)
         self.root_label = self._label(f'更新根目录：{self._root}' if self._root else '请选择更新后的 TL 根目录。')
         layout.addWidget(self.root_label)
@@ -46,14 +52,45 @@ class QtProjectSourceUpdateDialog(QDialog):
             self.paths.setItem(row, 0, self._readonly_item(ref))
             self.paths.setItem(row, 1, QTableWidgetItem(ref))
         self.paths.itemChanged.connect(self._input_changed)
+        self.paths.setMaximumHeight(self.paths.horizontalHeader().height()
+                                    + min(len(self._documents), 3) * self.paths.verticalHeader().defaultSectionSize() + 8)
         layout.addWidget(self.paths)
-        self.summary_label = self._label('预览只显示变化类型、文件路径及段落位置。')
-        layout.addWidget(self.summary_label)
+        statistics = QHBoxLayout()
+        self.summary_label = self._label('预览将显示变化段落的旧文与新文。')
+        statistics.addWidget(self.summary_label, 1)
+        self.previous_button = QPushButton('上一差异')
+        self.next_button = QPushButton('下一差异')
+        self.position_label = self._label('')
+        self.position_label.setWordWrap(False)
+        for name, widget in (('previousSourceDifference', self.previous_button),
+                             ('sourceDifferencePosition', self.position_label),
+                             ('nextSourceDifference', self.next_button)):
+            widget.setObjectName(name)
+            statistics.addWidget(widget)
+        self.previous_button.clicked.connect(lambda: self._navigate(-1))
+        self.next_button.clicked.connect(lambda: self._navigate(1))
+        self.previous_button.setShortcut('Alt+Up')
+        self.next_button.setShortcut('Alt+Down')
+        self.previous_button.setToolTip('上一差异（Alt+↑）')
+        self.next_button.setToolTip('下一差异（Alt+↓）')
+        self.previous_button.setAutoDefault(False)
+        self.next_button.setAutoDefault(False)
+        layout.addLayout(statistics)
+        self.diff_view = QTextBrowser()
+        self.diff_view.setObjectName('sourceUpdateDiff')
+        self.diff_view.setAccessibleName('源更新旧文与新文对照')
+        self.diff_view.setOpenLinks(False)
+        self.diff_view.setOpenExternalLinks(False)
+        self.diff_view.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
+                                               | Qt.TextInteractionFlag.TextSelectableByKeyboard)
+        layout.addWidget(self.diff_view, 1)
         self.results = QTableWidget(0, 4)
-        self.results.setHorizontalHeaderLabels(('类型', '相对路径', '段落', '明确处置'))
+        self.results.setHorizontalHeaderLabels(('当前差异类型', '相对路径', '段落', '明确处置'))
+        self.results.setObjectName('sourceUpdateDispositions')
         self.results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.results.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.results.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.results.setMaximumHeight(150)
         layout.addWidget(self.results)
         self.status_label = self._label('更新只改变当前内存中的项目；应用后请保存项目包。')
         layout.addWidget(self.status_label)
@@ -74,6 +111,7 @@ class QtProjectSourceUpdateDialog(QDialog):
         self._watch.setInterval(100)
         self._watch.timeout.connect(self._watch_context)
         self._watch.start()
+        self._clear_diff()
         self._update_access()
 
     @staticmethod
@@ -117,7 +155,6 @@ class QtProjectSourceUpdateDialog(QDialog):
     def _input_changed(self):
         self._discard_preview()
         self.result_receipt = None
-        self.results.setRowCount(0)
         self.summary_label.setText('输入已更新，请重新预览。')
         self._update_access()
 
@@ -125,6 +162,17 @@ class QtProjectSourceUpdateDialog(QDialog):
         if self.view is not None:
             self.controller.cancel_source_update_preview(self.view)
             self.view = None
+        self._clear_diff()
+
+    def _clear_diff(self):
+        self._choices.clear()
+        self._block_index = 0
+        self.results.setRowCount(0)
+        self.results.hide()
+        self.diff_view.clear()
+        self.position_label.clear()
+        for widget in (self.previous_button, self.position_label, self.next_button):
+            widget.hide()
 
     def prepare_preview(self):
         if self.operation_running or self._shut_down or self._root is None or not self._context_current():
@@ -142,8 +190,8 @@ class QtProjectSourceUpdateDialog(QDialog):
     def apply_update(self):
         if not self.apply_button.isEnabled() or self.view is None:
             return
-        dispositions = tuple(self.results.cellWidget(row, 3).currentData()
-                             for row, item in enumerate(self.view.items) if item.required)
+        dispositions = tuple(self._choices[index]
+                             for index, item in enumerate(self.view.items) if item.required)
         try:
             job = self.controller.begin_source_update_apply(self.view, dispositions)
         except (EditorControllerError, OSError, ValueError) as error:
@@ -174,6 +222,7 @@ class QtProjectSourceUpdateDialog(QDialog):
             else:
                 self.result_receipt = outcome.result
                 self.view = None
+                self._clear_diff()
                 self.status_label.setText('源更新已应用到当前项目。请保存项目包以保留结果。')
                 self.result_ready.emit(self.result_receipt)
         except (EditorControllerError, OSError, ValueError) as error:
@@ -192,11 +241,52 @@ class QtProjectSourceUpdateDialog(QDialog):
 
     def _show_preview(self):
         counts = {category: 0 for category in _CATEGORY_LABELS}
-        self.results.setRowCount(len(self.view.items))
-        for row, item in enumerate(self.view.items):
+        for item in self.view.items:
             counts[item.category] += 1
+        self.summary_label.setText('；'.join(f'{_CATEGORY_LABELS[key]}：{count}' for key, count in counts.items()))
+        self._choices = {index: None for index, item in enumerate(self.view.items) if item.required}
+        self._block_index = 0
+        self._show_block()
+        self.status_label.setText('请核对变化并逐项处置；源文变更保留已有译文并撤销确认。应用后仍需保存项目包。')
+
+    def _navigate(self, offset):
+        if self.view is None or self.operation_running or self._shut_down:
+            return
+        if not self._context_current() or not self.controller.source_update_preview_current(self.view):
+            self._watch_context()
+            return
+        position = self._block_index + offset
+        if 0 <= position < len(self.view.blocks):
+            self._block_index = position
+            self._show_block()
+            self._update_access()
+
+    def _show_block(self):
+        self.results.setRowCount(0)
+        if not self.view.blocks:
+            self.diff_view.setPlainText('模板一致，没有源文差异。' if self.view.templates_identical else
+                '源文与段落标识一致；模板其他内容有变化，请核对路径后应用。')
+            self.results.hide()
+            for widget in (self.previous_button, self.position_label, self.next_button):
+                widget.hide()
+            return
+        self.results.show()
+        for widget in (self.previous_button, self.position_label, self.next_button):
+            widget.show()
+        block = self.view.blocks[self._block_index]
+        self.position_label.setText(f'{self._block_index + 1} / {len(self.view.blocks)}')
+        self.results.setRowCount(len(block.item_indices))
+        self.results.setMaximumHeight(self.results.horizontalHeader().height()
+                                      + min(len(block.item_indices), 3) * self.results.verticalHeader().defaultSectionSize() + 8)
+        for row, index in enumerate(block.item_indices):
+            item = self.view.items[index]
+            positions = []
+            if item.old:
+                positions.append(f'旧：第 {item.old.segment_number} 段')
+            if item.new:
+                positions.append(f'新：第 {item.new.segment_number} 段')
             for column, text in enumerate((_CATEGORY_LABELS[item.category], item.source_ref,
-                    f'第 {item.segment_number} 段' if item.segment_number is not None else '—')):
+                                          ' / '.join(positions) or '—')):
                 self.results.setItem(row, column, self._readonly_item(text))
             if item.required:
                 choice = QComboBox()
@@ -204,12 +294,46 @@ class QtProjectSourceUpdateDialog(QDialog):
                 choice.addItem('保留为脱离源的段落', 'keep_detached')
                 if item.category == 'removed':
                     choice.addItem('移除段落', 'remove')
-                choice.currentIndexChanged.connect(self._update_access)
+                choice.setCurrentIndex(choice.findData(self._choices[index]))
+                choice.currentIndexChanged.connect(
+                    lambda _, item_index=index, widget=choice: self._choose(item_index, widget.currentData()))
                 self.results.setCellWidget(row, 3, choice)
             else:
                 self.results.setItem(row, 3, self._readonly_item('无需处置'))
-        self.summary_label.setText('；'.join(f'{_CATEGORY_LABELS[key]}：{count}' for key, count in counts.items()))
-        self.status_label.setText('请核对变化并逐项处置；源文变更保留已有译文并撤销确认。应用后仍需保存项目包。')
+        self.diff_view.setHtml(self._block_html(block))
+        self.diff_view.verticalScrollBar().setValue(0)
+
+    def _choose(self, index, value):
+        self._choices[index] = value
+        self._update_access()
+
+    def _block_html(self, block):
+        categories = {self.view.items[index].category for index in block.item_indices}
+        chunks = []
+        if 'removed' in categories and 'new' in categories:
+            chunks.append('<p>同一区间的旧文／新文仅作对照，仍计为新增／已移除；译文不会自动迁移。</p>')
+        elif categories & {'ambiguous', 'unresolved'}:
+            chunks.append('<p>这些段落无法唯一关联，请明确处置；不会根据位置或相似文本猜测。</p>')
+        word_diff = None
+        if len(block.old) == len(block.new) == 1:
+            word_diff = source_update_word_diff(block.old[0].source, block.new[0].source)
+            if not word_diff.highlighted:
+                chunks.append('<p>段落较长，未做词级高亮；以下保留完整旧文与新文。</p>')
+        for side, texts, sign, label, background, highlight in (
+                ('old', block.old, '−', '旧文', '#fff0f0', '#f4a8ad'),
+                ('new', block.new, '+', '新文', '#edf8ee', '#a5d9b0')):
+            if not texts:
+                chunks.append(f'<p>{sign} {label}：无</p>')
+            for text in texts:
+                parts = getattr(word_diff, side) if word_diff else ((text.source, False),)
+                body = ''.join(f'<span style="background-color:{highlight};">{escape(value)}</span>'
+                               if changed else escape(value) for value, changed in parts)
+                chunks.append(f'<p><b>{sign} {label}</b> · {escape(text.source_ref)} · 第 {text.segment_number} 段</p>'
+                    f'<table width="100%" cellpadding="10" cellspacing="0" bgcolor="{background}"><tr><td>'
+                    f'<p style="white-space:pre-wrap; color:#202020;">{body}</p></td></tr></table>')
+                if side == 'old' and text.target:
+                    chunks.append(f'<p style="white-space:pre-wrap;">旧译文（供核对）：{escape(text.target)}</p>')
+        return ''.join(chunks)
 
     def _watch_context(self):
         if self.operation_running or self._shut_down or self.result_receipt is not None:
@@ -227,11 +351,16 @@ class QtProjectSourceUpdateDialog(QDialog):
         self.paths.setEnabled(idle and current)
         self.preview_button.setEnabled(idle and current and self._root is not None)
         self.results.setEnabled(idle)
+        self.diff_view.setEnabled(idle)
+        has_blocks = self.view is not None and bool(self.view.blocks)
+        self.previous_button.setEnabled(idle and current and has_blocks and self._block_index > 0)
+        self.next_button.setEnabled(idle and current and has_blocks
+                                    and self._block_index + 1 < len(self.view.blocks))
         ready = idle and current and self.view is not None
         if ready:
             ready = self.controller.source_update_preview_current(self.view) and all(
-                self.results.cellWidget(row, 3).currentData() is not None
-                for row, item in enumerate(self.view.items) if item.required)
+                self._choices.get(index) is not None
+                for index, item in enumerate(self.view.items) if item.required)
         self.apply_button.setEnabled(bool(ready))
 
     def cancel_operation(self):

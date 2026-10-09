@@ -1077,7 +1077,7 @@ class QtEditorWindow(QMainWindow):
         self.tl_export_action.setVisible(False)
         self._tl_export_dialog = None
         self._source_update_dialog = None
-        self.source_update_action = self.project_menu.addAction("更新 TL 源模板…")
+        self.source_update_action = self.project_menu.addAction("更新 TL 源模板")
         self.source_update_action.setObjectName("updateTlSourceAction")
         self.source_update_action.setVisible(False)
         self.source_update_action.setEnabled(False)
