@@ -36,7 +36,7 @@ TL profile/token 版本变化重验 RPY golden fixtures 与旧包缺失/不兼�
 
 ## Governance Impact
 
-- **Decision basis**：[ADR-030](../../steering/adr/adr-030.md) 定义目录选择、格式导出与 RPY→Sync 顺序；ADR-015/018/019 保持 Parser、codec、项目包分权，ADR-020/025/026 保持 rooted 发布与无状态 Parser。
+- **Decision basis**：[ADR-030](../../steering/adr/adr-030.md) 定义目录选择、格式导出与 RPY→Sync 顺序；[ADR-032](../../steering/adr/adr-032.md) 定义缺失目录准备与文件发布的分阶段授权；ADR-015/018/019 保持 Parser、codec、项目包分权，ADR-020/025/026 保持 rooted 发布与无状态 Parser。
 - **Contract changes**：各 owner 的当前条款与唯一执行任务见 [跨规格合同](cross-spec-amendments.md)，本设计只定义 RPY 语法、private payload 与 Application 消费方式。
 - **Steering sync**：Multi border/review-clustering 的顺序、spec-ownership，以及交付后 product/tech/structure/roadmap 的实际能力。
 - **Downstream revalidation**：Parser canonical 路径、Project 单/多文档与包恢复、Qt/Chunk mutation guards、ResourcePackage 手工消费、Sync 的 RPY 包冷重开。
@@ -123,7 +123,7 @@ stateDiagram-v2
 
 单文件发布成功后关闭预览窗口，并在主窗口显示成功结果与输出路径；失败、阻断、过期或结果不确定时保留诊断供检查。用户已经关闭窗口时，晚到结果不重新弹出窗口，已发生的发布仍按真实结果报告。
 
-多文件导出由用户选择一个导出根目录，按已验证的 source_ref 重建相对目录，不按 basename 展平。先准备/验证所有输出及目录/大小写/同名冲突，再确认并按顺序独立发布；root 与每个目标 ancestor 在发布前复证，拒绝符号链接/reparse、逸出和替换。缺失子目录仅由平台在用户选择的导出根内受控创建；预览不建目录，目录创建失败列为未发布，已创建空目录不宣称回滚。取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
+多文件导出由用户选择一个导出根目录，按已验证的 source_ref 重建相对目录，不按 basename 展平。先准备/验证所有输出及目录/大小写/同名冲突，再确认并按顺序独立发布；root 与每个目标 ancestor 在发布前复证，拒绝符号链接/reparse、逸出和替换。预览按完整相对路径显示新建／覆盖，覆盖项须在确认操作中明确提示；允许覆盖原目录中的 TL。全部父目录存在时只确认一次。缺失子目录时，用户先确认仅准备目录；平台完成后丢弃旧计划，重新只读预览，再经明确确认才发布文件。预览不建目录，准备目录不写 TL，已创建空目录不宣称回滚。取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
 
 ## Components and Interfaces
 
@@ -160,7 +160,7 @@ codec 实现 [Parser 中立 round-trip 准备与发布合同](../parser-subsyste
 
 Application 消费 [平台目录合同](../windows-platform-enablement/design.md#只读目录观察与受控目标物化) 的 `prepare_descendant_target`/`materialize_target`，codec 不接触目录。导出 preview 绑定目录 plan、session/revision、source/private/输出摘要；确认前排除重复、大小写与文件/祖先冲突。RPY 批次至多 256 文件，同时遵守平台深度与更小的 owner 限制。
 
-确认后按顺序物化并调用 Parser `write_prepared`，只编排发布结果，不绕过 issuing surface、一次性消费和 rooted binding 验证。目录失败不发布该文件；已创建空目录如实报告，不伪称回滚。canonical serializer 不重新编码 round-trip bytes，Application 不取得 codec journal/LKG 或 Project receipt 权威。
+存在缺失目录时先执行独立的目录准备阶段，关闭旧候选、重新签发预览并等待新的明确确认；取消或过期不自动进入下一阶段。文件发布只接受本次预览已绑定的现存父目录，确认后按顺序物化目标绑定并调用 Parser `write_prepared`，只编排发布结果，不绕过 issuing surface、一次性消费和 rooted binding 验证。目录失败不发布该文件；已创建空目录如实报告，不伪称回滚。canonical serializer 不重新编码 round-trip bytes，Application 不取得 codec journal/LKG 或 Project receipt 权威。
 
 ### RpyProjectAdapter 与 UI
 
