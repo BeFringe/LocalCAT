@@ -113,7 +113,7 @@
   - _Requirements: 4.4, 4.5, 5.4, 7.2_
   - _Boundary: Platform POSIX export-directory backend_
   - _Depends: 3.5a_
-- [ ] 3.7 实现 Windows 导出子目录物化
+- [x] 3.7 实现 Windows 导出子目录物化
   - 实现相同的目录准备／重新预览／目标绑定合同，处理 reparse、已观察祖先替换及 Windows 创建竞争，保持同一取消与失败语义。
   - 完成时，Windows 合成嵌套目录成功发布，竞争/reparse/失败不写错误目标，不宣称回滚已创建目录。
   - _Requirements: 4.4, 4.5, 5.4, 7.2_
