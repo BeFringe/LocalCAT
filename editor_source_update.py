@@ -30,10 +30,32 @@ class SourceUpdateItem:
 
 
 @dataclass(frozen=True)
+class SourceUpdateContext:
+    old: SourceUpdateText
+    new: SourceUpdateText
+
+
+@dataclass(frozen=True)
+class SourceUpdateChapter:
+    document_id: str
+    old_source_ref: str | None
+    new_source_ref: str | None
+    block_indices: tuple[int, ...]
+    counts: tuple[tuple[str, int], ...]
+    templates_identical: bool
+
+    @property
+    def source_ref(self):
+        return self.new_source_ref if self.new_source_ref is not None else self.old_source_ref
+
+
+@dataclass(frozen=True)
 class SourceUpdateBlock:
     item_indices: tuple[int, ...]
     old: tuple[SourceUpdateText, ...]
     new: tuple[SourceUpdateText, ...]
+    before: SourceUpdateContext | None = None
+    after: SourceUpdateContext | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +64,7 @@ class SourceUpdateReview:
     items: tuple[SourceUpdateItem, ...]
     blocks: tuple[SourceUpdateBlock, ...] = ()
     templates_identical: bool = False
+    chapters: tuple[SourceUpdateChapter, ...] = ()
 
     @property
     def required_items(self):
@@ -89,40 +112,55 @@ def _text_index(doc):
 
 
 def _document_blocks(old, new, indices, items):
-    """Linear anchor walk; reordered anchors conservatively use one file block.
-
-    Anchors are owner-classified shared identities, never text or row similarity.
-    A block is a display interval only, including multiple old/new paragraphs.
-    """
+    """Linear stable-identity walk; context requires adjacency in both full orders."""
     blocks = []
+    old_keys, new_keys = tuple(old), tuple(new)
+    old_positions = {key: position for position, key in enumerate(old_keys)}
+    new_positions = {key: position for position, key in enumerate(new_keys)}
 
-    def append(keys):
-        selected = tuple(sorted({indices[key] for key in keys
-                                 if key in indices and items[indices[key]].category != 'unchanged'}))
+    def context(old_position, new_position):
+        if not (0 <= old_position < len(old_keys) and 0 <= new_position < len(new_keys)):
+            return None
+        key = old_keys[old_position]
+        if key != new_keys[new_position] or key not in indices:
+            return None
+        item = items[indices[key]]
+        if item.category != 'unchanged' or item.old is None or item.new is None:
+            return None
+        return SourceUpdateContext(item.old, item.new)
+
+    def append(old_start, old_end, new_start, new_end, *, allow_context=True):
+        old_interval, new_interval = old_keys[old_start:old_end], new_keys[new_start:new_end]
+        # Conflicting identities have no authorized incoming display text. A moved
+        # conflict must appear only at its old position, and cannot justify context.
+        allow_context = allow_context and all(key in indices and getattr(items[indices[key]], side) is not None
+            for side, keys in (('old', old_interval), ('new', new_interval)) for key in keys)
+        selected = tuple(sorted({indices[key]
+            for side, keys in (('old', old_interval), ('new', new_interval)) for key in keys
+            if key in indices and items[indices[key]].category != 'unchanged'
+            and getattr(items[indices[key]], side) is not None}))
         if selected:
             blocks.append(SourceUpdateBlock(selected,
                 tuple(sorted((items[i].old for i in selected if items[i].old is not None),
                              key=lambda text: text.segment_number)),
                 tuple(sorted((items[i].new for i in selected if items[i].new is not None),
-                             key=lambda text: text.segment_number))))
+                             key=lambda text: text.segment_number)),
+                context(old_start - 1, new_start - 1) if allow_context else None,
+                context(old_end, new_end) if allow_context else None))
 
-    old_keys = tuple(key for key in old if key in indices and items[indices[key]].old is not None)
-    new_keys = tuple(key for key in new if key in indices and items[indices[key]].new is not None)
-    new_positions = {key: position for position, key in enumerate(new_keys)}
     anchors = [key for key in old_keys if key in new_positions and key in indices
                and items[indices[key]].category in ('unchanged', 'source_changed')]
     if any(new_positions[a] >= new_positions[b] for a, b in zip(anchors, anchors[1:])):
-        append(indices)
+        append(0, len(old_keys), 0, len(new_keys), allow_context=False)
         return blocks
-    old_positions = {key: position for position, key in enumerate(old_keys)}
     old_start = new_start = 0
     for key in anchors:
         old_end, new_end = old_positions[key], new_positions[key]
-        append((*old_keys[old_start:old_end], *new_keys[new_start:new_end]))
+        append(old_start, old_end, new_start, new_end)
         if items[indices[key]].category == 'source_changed':
-            append((key,))
+            append(old_end, old_end + 1, new_end, new_end + 1)
         old_start, new_start = old_end + 1, new_end + 1
-    append((*old_keys[old_start:], *new_keys[new_start:]))
+    append(old_start, len(old_keys), new_start, len(new_keys))
     return blocks
 
 
@@ -144,13 +182,26 @@ def source_update_review(preview, current, incoming):
             indices[doc_id][key] = len(items)
             items.append(SourceUpdateItem(category, chosen.source_ref,
                 chosen.segment_number, identity in required, old, new))
-    blocks = []
+    blocks, chapters = [], []
     # Source update retains Document identity, including explicit path renames.
     for doc_id in dict.fromkeys((*old_docs, *new_docs)):
+        first_block = len(blocks)
         blocks.extend(_document_blocks(old_text.get(doc_id, {}), new_text.get(doc_id, {}),
                                        indices[doc_id], items))
+        old_doc, new_doc = old_docs.get(doc_id), new_docs.get(doc_id)
+        counts = dict.fromkeys(_CATEGORIES, 0)
+        for index in indices[doc_id].values():
+            counts[items[index].category] += 1
+        chapters.append(SourceUpdateChapter(doc_id,
+            old_doc.source_ref if old_doc is not None else None,
+            new_doc.source_ref if new_doc is not None else None,
+            tuple(range(first_block, len(blocks))), tuple(counts.items()),
+            old_doc is not None and new_doc is not None
+            and old_doc.source_ref == new_doc.source_ref
+            and old_doc.source_snapshot_digest == new_doc.source_snapshot_digest))
     identical = tuple((doc.document_id, doc.source_ref, doc.source_snapshot_digest)
                       for doc in current.documents) == tuple(
                           (doc.document_id, doc.source_ref, doc.source_snapshot_digest)
                           for doc in incoming.documents)
-    return SourceUpdateReview(preview, tuple(items), tuple(blocks), identical)
+    return SourceUpdateReview(preview, tuple(items), tuple(blocks), identical,
+                              tuple(chapters))
