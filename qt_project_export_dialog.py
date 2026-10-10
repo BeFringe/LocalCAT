@@ -45,6 +45,8 @@ class QtProjectExportDialog(QDialog):
         self.files_table.setRootIsDecorated(False)
         self.files_table.setAlternatingRowColors(True)
         self.files_table.setAccessibleName('TL 章节选择与逐文件导出结果')
+        self.files_table.header().setStretchLastSection(False)
+        self.files_table.header().setMinimumSectionSize(90)
         self.files_table.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column in range(1, 5):
             self.files_table.header().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
