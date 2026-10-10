@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Callable, Iterator
 
+from platform_export_directory import ExportDirectoryCreationError
 from platform_fs_contracts import (
     BoundContentCapture,
     BoundContentFacts,
@@ -6643,6 +6644,74 @@ class WindowsRootedFileSystem(
                 _close_handles_reverse(tuple(record.handle for record in records))
             if restore_error is not None and sys.exception() is None:
                 raise _recovery_required() from None
+
+    def duplicate_export_directory(self, parent):
+        if type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}:
+            raise _capability_unavailable()
+        parent.reprove()
+        records = _duplicate_directory_chain(parent._api, parent._records)
+        return _WindowsBoundDirectory(
+            parent._api, parent._issuer, parent._root_anchor, records,
+            parent._maximum_component_units, self._fault_injector,
+        )
+
+    def open_export_directory(self, parent, name, *, create=False):
+        if type(parent) not in {_WindowsRootedDirectory, _WindowsBoundDirectory}:
+            raise _capability_unavailable()
+        if type(create) is not bool:
+            raise TypeError('create must be exact bool')
+        component = _validate_windows_component(
+            name, maximum_units=parent._maximum_component_units,
+        )
+        records = ()
+        leaf = None
+        created = False
+        try:
+            parent.reprove()
+            records = _duplicate_directory_chain(parent._api, parent._records)
+            path = _append_component(parent._leaf_path, component,
+                                     maximum_units=parent._maximum_component_units)
+            if create:
+                try:
+                    parent._api.checked_bool('CreateDirectoryW', parent._api.CreateDirectoryW,
+                                             path, None)
+                except Win32CallError as error:
+                    if error.winerror == ERROR_ALREADY_EXISTS:
+                        raise _identity_stale() from None
+                    raise
+                created = True
+            observed = _open_entry_proof(
+                parent._api, path, path, expected_kind='directory',
+                expected_volume_id=records[0].identity.volume_id, stale=True,
+            )
+            if create:
+                _hit_fault(self._fault_injector, 'export_directory_after_create')
+            leaf = _open_directory_record(
+                parent._api, path, path, stale=True,
+                expected_volume_id=records[0].identity.volume_id,
+            )
+            if observed is None or leaf.identity != observed.identity:
+                raise _identity_stale()
+            _hit_fault(self._fault_injector, 'export_directory_after_open')
+            parent.reprove()
+            transferred = records + (leaf,)
+            records, leaf = (), None
+            return _WindowsBoundDirectory(
+                parent._api, parent._issuer, parent._root_anchor, transferred,
+                parent._maximum_component_units, self._fault_injector,
+            )
+        except Exception as error:
+            if created:
+                raise ExportDirectoryCreationError() from None
+            if isinstance(error, PlatformFileError):
+                raise
+            raise _capability_unavailable() from None
+        finally:
+            handles = tuple(record.handle for record in records)
+            if leaf is not None:
+                handles += (leaf.handle,)
+            if _close_handles_reverse(handles) is not None:
+                raise (ExportDirectoryCreationError() if created else _capability_unavailable())
 
     def _bind_parent(
         self,
