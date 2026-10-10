@@ -119,7 +119,7 @@ stateDiagram-v2
 
 预览绑定 session、workspace revision、选定 Document identities、codec identity、source/private digest、输出目标身份和导出策略。导出全部当前 target；空/未确认是可见警示，不自动填源文或丢段。用户编辑、重开、换 provider 或重选路径使预览失效。TL 导出不清除 package dirty，也不更新 package baseline。
 
-应用源更新后，须先将新模板及私有映射保存到项目包，再从包内准备 TL 导出；保存前的导出入口应明确说明此前置条件。模板已经入包时，当前译文的未保存修改仍可导出。
+应用源更新后，若模板或源段落信息与项目包内保存的内容不同，须先保存项目包，再从包内准备 TL 导出；保存前的导出入口应明确说明此前置条件。模板与包内内容一致时，不要求重复保存；当前译文的未保存修改仍可导出。
 
 包内源文的临时物理副本只用于建立 Parser sealed snapshot；预览就绪前完成同文件目标检查并清理副本及其目录句柄，清理失败阻断预览。issuing `OpenedParserInput` 与 prepared 结果继续存活到消费或丢弃，设备配置变化仍使旧预览失效。
 

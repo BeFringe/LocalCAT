@@ -120,6 +120,47 @@ class ControllerRpySourceUpdateTests(unittest.TestCase):
         self.assertIsNone(self.controller.tl_export_unavailable_reason)
         self.assertTrue(self.controller.active_project_dirty)
 
+    def test_identical_source_update_does_not_require_another_save(self):
+        for target in (None, '尚未保存的译文'):
+            with self.subTest(target=target):
+                if target is not None:
+                    self.controller.update_workspace_target(target)
+                view = self.preview()
+                self.assertTrue(view.templates_identical)
+                self.assertTrue(self.apply(view).accepted)
+                self.assertIsNone(self.controller.tl_export_unavailable_reason)
+                destination = self.root / 'identical-export.rpy'
+                job = self.controller.begin_tl_export_preview(destination)
+                job.run()
+                exported = self.controller.finish_tl_export_job(job).result
+                self.assertEqual(exported.status, 'ready')
+                self.controller.cancel_tl_export_preview()
+
+    def test_identical_template_can_be_overwritten_before_package_save(self):
+        self.controller.update_workspace_target('覆盖原模板后的译文')
+        self.assertTrue(self.apply(self.preview()).accepted)
+        job = self.controller.begin_tl_export_preview(self.source)
+        job.run()
+        view = self.controller.finish_tl_export_job(job).result
+        self.assertEqual(view.status, 'ready')
+        job = self.controller.begin_tl_export_publish(view, self.source)
+        job.run()
+        self.assertEqual(self.controller.finish_tl_export_job(job).result.outcome, 'published')
+        self.assertIn('覆盖原模板后的译文', self.source.read_text(encoding='utf-8'))
+        self.assertTrue(self.controller.save_workspace_package().receipt.durable)
+        self.controller.close_project()
+        self.controller.open_project_package(self.package)
+        self.assertEqual(self.controller.workspace_view.segments[0].target, '覆盖原模板后的译文')
+
+    def test_template_only_source_update_still_requires_save(self):
+        self.source.write_text('# 新模板注释\n' + template(), encoding='utf-8')
+        view = self.preview()
+        self.assertEqual(view.preview.source_changed_count, 0)
+        self.assertFalse(view.templates_identical)
+        self.assertTrue(self.apply(view).accepted)
+        self.assertEqual(self.controller.tl_export_unavailable_reason,
+                         '源更新尚未保存。请先保存项目包，再导出 TL。')
+
     def test_rename_new_removed_require_explicit_decisions(self):
         renamed = self.root / 'renamed.rpy'
         self.source.rename(renamed)

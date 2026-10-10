@@ -91,6 +91,26 @@ class ControllerRpyBatchExportTests(unittest.TestCase):
         self.assertEqual((self.target / self.refs[1]).read_bytes(), fixtures.tl(1))
         self.assertFalse((self.target / 'notes.txt').exists())
 
+    def test_identical_multitl_releases_templates_before_in_place_export(self):
+        self.controller.update_workspace_target('覆盖后仍能保存')
+        job = self.controller.begin_source_update_preview(self.input, self.refs)
+        job.run()
+        view = self.controller.finish_source_update_job(job).result
+        self.assertTrue(view.templates_identical)
+        job = self.controller.begin_source_update_apply(view, ())
+        job.run()
+        self.assertTrue(self.controller.finish_source_update_job(job).accepted)
+        self.assertIsNone(self.controller.tl_export_unavailable_reason)
+        job = self.controller.begin_tl_export_preview(self.input)
+        view = self.finish(job).result
+        self.assertEqual(view.status, 'ready')
+        result = self.finish(self.controller.begin_tl_export_publish(view, self.input)).result
+        self.assertEqual([item.outcome for item in result.files], ['published'] * 3)
+        self.assertTrue(self.controller.save_workspace_package().receipt.durable)
+        self.controller.close_project()
+        self.controller.open_project_package(self.package_path)
+        self.assertEqual(self.controller.workspace_view.segments[0].target, '覆盖后仍能保存')
+
     def test_runtime_failure_before_owner_call_has_no_uncertain_file(self):
         for directories in (True, False):
             with self.subTest(directories=directories):
