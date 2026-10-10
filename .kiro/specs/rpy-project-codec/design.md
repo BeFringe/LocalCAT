@@ -119,9 +119,13 @@ stateDiagram-v2
 
 预览绑定 session、workspace revision、选定 Document identities、codec identity、source/private digest、输出目标身份和导出策略。导出全部当前 target；空/未确认是可见警示，不自动填源文或丢段。用户编辑、重开、换 provider 或重选路径使预览失效。TL 导出不清除 package dirty，也不更新 package baseline。
 
+应用源更新后，若模板或源段落信息与项目包内保存的内容不同，须先保存项目包，再从包内准备 TL 导出；保存前的导出入口应明确说明此前置条件。模板与包内内容一致时，不要求重复保存；当前译文的未保存修改仍可导出。
+
 包内源文的临时物理副本只用于建立 Parser sealed snapshot；预览就绪前完成同文件目标检查并清理副本及其目录句柄，清理失败阻断预览。issuing `OpenedParserInput` 与 prepared 结果继续存活到消费或丢弃，设备配置变化仍使旧预览失效。
 
 单文件发布成功后关闭预览窗口，并在主窗口显示成功结果与输出路径；失败、阻断、过期或结果不确定时保留诊断供检查。用户已经关闭窗口时，晚到结果不重新弹出窗口，已发生的发布仍按真实结果报告。
+
+导出界面随阶段显示必要内容：预览呈现目标、警示与当前可用的确认操作；执行期间提供取消；发布结束后突出逐文件结果，收起确认操作和已完成的准备提示，全部成功时提供“完成”。仅在存在诊断时显示诊断正文，仅在诊断可定位到段落时提供问题译文跳转；文件级失败仍保留诊断。再次导出须恢复新的预览与确认，不能复用已结束的发布候选。
 
 多文件导出由用户选择一个导出根目录，按已验证的 source_ref 重建相对目录，不按 basename 展平。先准备/验证所有输出及目录/大小写/同名冲突，再确认并按顺序独立发布；root 与每个目标 ancestor 在发布前复证，拒绝符号链接/reparse、逸出和替换。预览按完整相对路径显示新建／覆盖，覆盖项须在确认操作中明确提示；允许覆盖原目录中的 TL。全部父目录存在时只确认一次。缺失子目录时，用户先确认仅准备目录；平台完成后丢弃旧计划，重新只读预览，再经明确确认才发布文件。预览不建目录，准备目录不写 TL，已创建空目录不宣称回滚。取消只停止尚未发布项。报告 `published/unchanged/failed/uncertain/not_attempted`，已发布项不虚构回滚。再次执行重新预览。
 
@@ -165,6 +169,8 @@ Application 消费 [平台目录合同](../windows-platform-enablement/design.md
 ### RpyProjectAdapter 与 UI
 
 intake amendment 把“已验证 records + opaque payload”作为单次 handoff，在一个 retained source snapshot 下完成；codec 不能提交 workspace。单文件 profile 与多文件 profile 都保留准确 RPY CodecIdentity/FormatId，不能设置 legacy JSON codec 来规避校验。多文件选择语言必须一致，全部验证后才发布新 workspace。目录发现归 Multi 的 Requirement 13 增量，RPY 只消费其确认后的有序选择与 retained root，不自行递归或在筛选后重算共同父目录。0 文件不得提交，1 文件使用 explicit-single-file-v1，多个使用 explicit-selected-files-v1；单选嵌套文件也保留最初根下的 source_ref。章节树仅消费 Controller 的路径投影，不读取文件系统；分组不修改 manifest 顺序。
+
+多文档导出在同一对话框按完整相对路径勾选章节，逐文件显示新建／覆盖、修改段数、空译文和未确认数量；更改选择必须重新预览。目录准备完成后显示创建及失败事实，只有当前会话有效、未取消且窗口未关闭时重新预览，文件发布仍等待新的明确确认。批量终态保留逐文件结果供检查；修改数为零也不代表目标文件已经存在或无需发布。
 
 Controller 继续校验 issued identity、session/revision 与 Chunk mutation permission。新增导出命令只接受 Controller-issued Document selection 和用户选择的目标；Qt 不自行构造 token。异步 result 带 session/request generation，关闭/换项目后丢弃迟到结果并释放 handle。单文件到多文件保持同一 package 权威；不改变最近项目或恢复断点语义。
 

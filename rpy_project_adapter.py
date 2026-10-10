@@ -101,6 +101,12 @@ class RpyProjectSession:
         self._recovery_required = False
         self._closed = False
         self._creation_pending = creation_pending
+        if (prepared is not None
+                and persistence_binding is not None and not self.source_update_requires_save):
+            # Identical templates already belong to the package. Retaining the
+            # external lease would make in-place TL export invalidate later saves.
+            prepared.close()
+            self._prepared = None
 
     def configure_creation(self, request: SelectedProjectDocumentsRequest) -> None:
         """Configure a never-installed import candidate exactly once."""
@@ -136,6 +142,23 @@ class RpyProjectSession:
     @property
     def source_retained(self) -> bool:
         return self._prepared is not None and not self._prepared.closed
+
+    @property
+    def source_update_requires_save(self) -> bool:
+        """Whether retained template facts differ from the durable baseline."""
+        if not self.source_retained:
+            return False
+        saved = self._save_service.saved_workspace_snapshot
+        current = self.workspace_service.workspace
+        if (saved is None or current.project_id != saved.project_id
+                or current.origin != saved.origin
+                or len(current.documents) != len(saved.documents)):
+            return True
+        source_fields = ('document_id', 'source_ref', 'codec_identity', 'format_id',
+                         'source_snapshot_digest', 'codec_private_member', 'source_segments')
+        return any(getattr(document, field) != getattr(baseline, field)
+                   for document, baseline in zip(current.documents, saved.documents)
+                   for field in source_fields)
 
     @property
     def recovery_required(self) -> bool:

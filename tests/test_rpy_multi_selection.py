@@ -105,7 +105,7 @@ class RpyMultiSelectionTests(unittest.TestCase):
              mock.patch.object(QFileDialog, 'getSaveFileName', return_value=(str(self.destination), '')):
             return self.window.open_directory_async(self.root, wait=True)
 
-    def test_nested_order_same_names_edit_save_offline_and_multi_export_guard(self):
+    def test_nested_order_same_names_edit_save_offline_and_multi_export_available(self):
         self.assertTrue(self.open_directory(self.refs), self.errors)
         docs = self.controller._workspace_service.workspace.documents
         self.assertEqual(tuple(d.source_ref for d in docs), self.refs)
@@ -114,9 +114,8 @@ class RpyMultiSelectionTests(unittest.TestCase):
         self.assertEqual(len({s.identity for s in self.controller.workspace_view.segments}), 6)
         self.assertTrue(all(not s.confirmed for s in self.controller.workspace_view.segments))
         self.assertFalse(self.controller.active_project_dirty)
-        self.assertFalse(self.window.tl_export_action.isEnabled())
-        with self.assertRaises(EditorControllerError):
-            self.controller.begin_tl_export_preview(self.base / 'must-not-export.rpy')
+        self.assertTrue(self.window.tl_export_action.isEnabled())
+        self.assertTrue(self.controller.tl_export_uses_directory)
         self.assertEqual(tuple(group.name for group in self.controller.workspace_document_tree), ('b', 'a'))
         self.window.target_editor.setPlainText('保存新译文')
         self.window.confirm_current()
