@@ -229,7 +229,7 @@ class PreparedRpyProjectExport:
     operations and serialize with close; cancellation uses the supplied token.
     """
 
-    def __init__(self, context, target, config_dir, package_service, cancellation):
+    def __init__(self, context, target, config_dir, package_service, cancellation, *, document_index=None):
         self._context = context
         self._workspace = context.workspace_service.workspace
         self._revision = context.workspace_service.revision
@@ -241,7 +241,9 @@ class PreparedRpyProjectExport:
         self._closed = False
         self._operation_lock = RLock()
         self._result = None
-        document = self._workspace.documents[0]
+        self._document_index = document_index
+        self._directory_binding = None
+        document = self._workspace.documents[0 if document_index is None else document_index]
         self._document = document
         self._records = ()
         attached_segments = tuple(segment for segment, source in zip(
@@ -389,21 +391,26 @@ class PreparedRpyProjectExport:
 
     def _finish(self, outcome, diagnostics, output_sha256=None, output_byte_count=None):
         self._view = replace(self._view, status=outcome, diagnostics=diagnostics)
+        view = self._view
+        # Cache the known outcome before any cleanup that can be interrupted.
+        self._result = ProjectExportResult(
+            view.preview_id, view.session_id, view.workspace_revision,
+            view.request_generation, view.document_id, view.source_ref,
+            view.target_path, outcome, diagnostics, output_sha256, output_byte_count,
+        )
         try:
             self.close()
-        except Exception:
+        except BaseException as error:
             diagnostics += (self._diagnostic(
                 'RPY.EXPORT.CLEANUP_FAILED', 'Export resource cleanup could not be proved.'),)
             if outcome == 'published':
                 outcome = 'uncertain'
                 output_sha256 = output_byte_count = None
             self._view = replace(self._view, status=outcome, diagnostics=diagnostics)
-        view = self._view
-        self._result = ProjectExportResult(
-            view.preview_id, view.session_id, view.workspace_revision,
-            view.request_generation, view.document_id, view.source_ref,
-            view.target_path, outcome, diagnostics, output_sha256, output_byte_count,
-        )
+            self._result = replace(self._result, outcome=outcome, diagnostics=diagnostics,
+                output_sha256=output_sha256, output_byte_count=output_byte_count)
+            if not isinstance(error, Exception):
+                raise
         return self._result
 
     def close(self):
@@ -440,14 +447,16 @@ class PreparedRpyProjectExport:
         context = self._context
         document = self._document
         _checkpoint(self._cancellation)
-        _require_single_tl(self._workspace)
+        if self._document_index is None:
+            _require_single_tl(self._workspace)
         format_id = FormatId(document.format_id)
         available = _availability(context.runtime, document.codec_identity, format_id)
         if not available.available:
             return self._stop('blocked', available.code, (
                 self._diagnostic(available.code, available.safe_summary),))
         package = self._require_current(context, self._target)
-        saved = package.workspace.documents[0]
+        index = 0 if self._document_index is None else self._document_index
+        saved = package.workspace.documents[index]
         if (package.workspace.project_id != self._workspace.project_id
                 or package.workspace.origin != self._workspace.origin
                 or saved.document_id != document.document_id
@@ -458,7 +467,7 @@ class PreparedRpyProjectExport:
                 or saved.codec_private_member != document.codec_private_member
                 or saved.source_segments != document.source_segments):
             _fail('PROJECT.PACKAGE.SOURCE_STALE')
-        entry = package.manifest.documents[0]
+        entry = package.manifest.documents[index]
         private_ref = document.codec_private_member
         if (entry.source_member.sha256 != document.source_snapshot_digest
                 or entry.codec_private_member is None
@@ -516,11 +525,15 @@ class PreparedRpyProjectExport:
         )
         # Observe before Parser binding and reprove afterwards, so a target
         # race between these two readers cannot silently become a new preview.
-        self._target_observation = _TargetObservation(self._target)
+        if self._directory_binding is None:
+            self._target_observation = _TargetObservation(self._target)
         self._target_observation.reject_same_file(context.persistence_binding.path)
         self._target_observation.reject_same_file(self._bridge.path)
-        surface.bind_round_trip_target(self._prepared, TargetReference(
-            str(self._target.parent), str(self._target), self._target.name))
+        if self._directory_binding is None:
+            surface.bind_round_trip_target(self._prepared, TargetReference(
+                str(self._target.parent), str(self._target), self._target.name))
+        self._view = replace(self._view, target_action=(
+            'overwrite' if self._target_observation.expected is not None else 'new'))
         # Parser retains sealed bytes, not this physical source. Keeping
         # the bridge's rooted directory chain would lock device settings
         # against replacement on Windows for the whole preview lifetime.
@@ -562,3 +575,9 @@ def prepare_rpy_export(
         candidate.close()
         raise
     return candidate
+
+
+
+def prepare_rpy_batch_export(*args, **kwargs):
+    from rpy_project_batch_export import prepare_batch
+    return prepare_batch(*args, **kwargs)

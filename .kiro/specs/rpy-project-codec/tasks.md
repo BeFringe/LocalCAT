@@ -153,7 +153,7 @@
   - _Requirements: 2.4, 5.2, 5.3, 6.1, 6.3, 7.1_
   - _Boundary: Controller neutral source-update projection / Qt chapter review UI_
   - _Depends: 4.2a_
-- [ ] 4.3 协调批量准备与逐文件导出结果
+- [x] 4.3 协调批量准备与逐文件导出结果
   - 按 source_ref 保留嵌套目录，先准备所有候选并检查目录/路径冲突再发布；缺失目录先经明确确认准备，关闭旧候选并重新预览，再经确认逐次发布；取消停止未发布项。
   - 完成时，第二个文件发布失败不会被报告为全批成功或全批回滚，重试要求新预览。
   - _Requirements: 4.5, 5.4, 6.3_
