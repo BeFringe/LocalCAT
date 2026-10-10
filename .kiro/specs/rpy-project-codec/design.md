@@ -166,6 +166,8 @@ Application 消费 [平台目录合同](../windows-platform-enablement/design.md
 
 intake amendment 把“已验证 records + opaque payload”作为单次 handoff，在一个 retained source snapshot 下完成；codec 不能提交 workspace。单文件 profile 与多文件 profile 都保留准确 RPY CodecIdentity/FormatId，不能设置 legacy JSON codec 来规避校验。多文件选择语言必须一致，全部验证后才发布新 workspace。目录发现归 Multi 的 Requirement 13 增量，RPY 只消费其确认后的有序选择与 retained root，不自行递归或在筛选后重算共同父目录。0 文件不得提交，1 文件使用 explicit-single-file-v1，多个使用 explicit-selected-files-v1；单选嵌套文件也保留最初根下的 source_ref。章节树仅消费 Controller 的路径投影，不读取文件系统；分组不修改 manifest 顺序。
 
+多文档导出在同一对话框按完整相对路径勾选章节，逐文件显示新建／覆盖、修改段数、空译文和未确认数量；更改选择必须重新预览。目录准备完成后显示创建及失败事实，只有当前会话有效、未取消且窗口未关闭时重新预览，文件发布仍等待新的明确确认。批量终态保留逐文件结果供检查；修改数为零也不代表目标文件已经存在或无需发布。
+
 Controller 继续校验 issued identity、session/revision 与 Chunk mutation permission。新增导出命令只接受 Controller-issued Document selection 和用户选择的目标；Qt 不自行构造 token。异步 result 带 session/request generation，关闭/换项目后丢弃迟到结果并释放 handle。单文件到多文件保持同一 package 权威；不改变最近项目或恢复断点语义。
 
 单 Document 的编辑和浏览页隐藏重复章节进度栏及章节分隔行；顶栏保留项目名称、总体进度和真实 dirty 状态，需要展示文档来源时使用源文件名。切换到 legacy TXT/JSON 时清空并隐藏 workspace 专属提示和操作投影，不复用上一个项目的名称、保存提示或章节进度。
