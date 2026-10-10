@@ -98,6 +98,72 @@ class SourceUpdateReviewTests(unittest.TestCase):
         self.assertCountEqual(indices, [i for i, item in enumerate(view.items) if item.category != 'unchanged'])
         self.assertEqual(len(indices), len(set(indices)))
 
+    def test_chapters_include_zero_changes_paths_and_original_document_order(self):
+        old = (document([('a', 'A')], doc_id='zero', ref='zero/intro.rpy'),
+               document([('a', 'A'), ('x', 'Old'), ('z', 'Z')], doc_id='changed', ref='one/intro.rpy'),
+               document([('a', 'A')], doc_id='renamed', ref='two/intro.rpy'))
+        new = (document([('a', 'A')], doc_id='zero', ref='zero/intro.rpy'),
+               document([('a', 'A'), ('y', 'New'), ('z', 'Z')], doc_id='changed', ref='one/intro.rpy', digest='new'),
+               document([('a', 'A')], doc_id='renamed', ref='three/intro.rpy'))
+        view = review(old, new)
+        self.assertTrue(hasattr(view, 'chapters'), '预览须保留零差异章及逐章计数')
+        self.assertEqual([c.document_id for c in view.chapters], ['zero', 'changed', 'renamed'])
+        self.assertEqual([c.block_indices for c in view.chapters], [(), (0,), ()])
+        self.assertEqual(dict(view.chapters[1].counts), dict(unchanged=2, source_changed=0,
+                          new=1, removed=1, ambiguous=0, unresolved=0))
+        self.assertEqual((view.chapters[2].old_source_ref, view.chapters[2].new_source_ref),
+                         ('two/intro.rpy', 'three/intro.rpy'))
+        self.assertEqual([c.templates_identical for c in view.chapters], [True, False, False])
+
+    def test_context_is_same_unchanged_identity_adjacent_in_both_sequences(self):
+        old = document([('a', '<before> & body'), ('x', 'Old'), ('z', 'After')])
+        new = document([('a', '<before> & body'), ('y', 'New'), ('z', 'After')])
+        view = review((old,), (new,))
+        block = view.blocks[0]
+        self.assertTrue(hasattr(block, 'before'), '差异应投影前后稳定上下文')
+        self.assertEqual((block.before.old.source, block.before.new.source), ('<before> & body',) * 2)
+        self.assertEqual((block.after.old.segment_number, block.after.new.segment_number), (3, 3))
+        self.assertTrue(all(view.items[i].category != 'unchanged' for i in block.item_indices))
+
+    def test_insert_delete_and_edge_context_positions(self):
+        variants = (
+            ([('a', 'A'), ('z', 'Z')], [('a', 'A'), ('x', 'X'), ('z', 'Z')], (1, 1), (2, 3)),
+            ([('a', 'A'), ('x', 'X'), ('z', 'Z')], [('a', 'A'), ('z', 'Z')], (1, 1), (3, 2)),
+            ([('x', 'Old'), ('z', 'Z')], [('x', 'New'), ('z', 'Z')], None, (2, 2)),
+            ([('a', 'A'), ('x', 'Old')], [('a', 'A'), ('x', 'New')], (1, 1), None),
+        )
+        for old_rows, new_rows, before, after in variants:
+            with self.subTest(old=old_rows, new=new_rows):
+                block = review((document(old_rows),), (document(new_rows),)).blocks[0]
+                self.assertTrue(hasattr(block, 'before'), '插入／删除区间也须准确展示上下文')
+                for context, positions in ((block.before, before), (block.after, after)):
+                    self.assertEqual(None if context is None else
+                        (context.old.segment_number, context.new.segment_number), positions)
+
+    def test_context_does_not_cross_another_change_conflict_or_reorder(self):
+        old = document([('a', 'A'), ('x', 'Old'), ('removed', 'Removed'), ('z', 'Z')])
+        new = document([('a', 'A'), ('x', 'Changed'), ('new', 'New'), ('z', 'Z')])
+        blocks = review((old,), (new,)).blocks
+        self.assertEqual(len(blocks), 2)
+        self.assertTrue(hasattr(blocks[0], 'before'), '上下文必须由可靠邻接投影')
+        self.assertIsNone(blocks[0].after)
+        self.assertIsNone(blocks[1].before)
+        reordered = document([('z', 'Z'), ('x', 'Changed'), ('new', 'New'), ('a', 'A')])
+        block = review((old,), (reordered,)).blocks[0]
+        self.assertIsNone(block.before)
+        self.assertIsNone(block.after)
+        conflicted = review((old,), (new,), conflicts=(('chapter', 'a'),))
+        self.assertIsNone(conflicted.blocks[1].before)
+
+    def test_moved_conflict_is_displayed_once_without_context_guessing(self):
+        old = document([('a', 'A'), ('conflict', 'Conflict'), ('b', 'B'), ('x', 'Old'), ('z', 'Z')])
+        new = document([('a', 'A'), ('b', 'B'), ('conflict', 'Conflict'), ('y', 'New'), ('z', 'Z')])
+        view = review((old,), (new,), conflicts=(('chapter', 'conflict'),))
+        covered = [i for block in view.blocks for i in block.item_indices]
+        self.assertEqual(len(covered), len(set(covered)))
+        self.assertCountEqual(covered, [i for i, item in enumerate(view.items) if item.category != 'unchanged'])
+        self.assertIsNone(view.blocks[1].before)
+
     def test_word_changes_preserve_all_text_and_bound_long_or_repetitive_input(self):
         result = display.source_update_word_diff('The ship had had sailed.', 'The ship had sailed.')
         self.assertTrue(result.highlighted)
