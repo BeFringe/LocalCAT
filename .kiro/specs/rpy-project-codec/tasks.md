@@ -173,7 +173,7 @@
   - _Requirements: 4.5, 5.4, 6.3, 7.2_
   - _Boundary: Controller batch lifecycle validation_
   - _Depends: 5.1_
-- [ ] 5.3 纳入正常发行的显式模块闭包
+- [x] 5.3 纳入正常发行的显式模块闭包
   - 按现有 source/frozen composition 收集新 codec、adapter 和 UI 模块，不改变 Core/Host/Gate 合同。
   - 完成时，独立 checkout 与普通 frozen 可启用/禁用 RPY，不依赖开发机其他目录或 Ren'Py 安装。
   - _Requirements: 1.4, 7.4_

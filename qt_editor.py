@@ -1284,10 +1284,6 @@ def main(argv: list[str] | None = None, *, _ordinary: bool = False) -> int:
             )
 
         if args.smoke_test:
-            if _ordinary and args.bundle_smoke_marker is not None:
-                from frozen_product_entry import finish_ordinary_smoke
-                finish_ordinary_smoke(app, capability_composition, validation_worker,
-                                      args.bundle_smoke_marker.expanduser().resolve(), window=window)
             if (
                 not controller.has_active_project
                 or window.pages.currentWidget().objectName() != "editorPage"
@@ -1297,6 +1293,10 @@ def main(argv: list[str] | None = None, *, _ordinary: bool = False) -> int:
                 controller.close_project()
                 window.close()
                 return 1
+            if _ordinary and args.bundle_smoke_marker is not None:
+                from frozen_product_entry import finish_ordinary_smoke
+                finish_ordinary_smoke(app, capability_composition, validation_worker,
+                                      args.bundle_smoke_marker.expanduser().resolve(), window=window)
             controller.close_project()
             window.close()
             app.processEvents()

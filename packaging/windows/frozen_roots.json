@@ -108,6 +108,18 @@
         "policy": "not-bundled",
         "reason": "speaker_avatars 是被忽略的用户资源；本声明不收集任意本机目录，保留无匹配头像 fallback。"
       }
+    },
+    {
+      "dispatch_id": "WA-09",
+      "revision": "R1",
+      "owning_spec": "rpy-project-codec",
+      "reason": "内建 Ren'Py TL codec、设备本地开关、项目适配和单/多文件桌面流程随正常发行收集，不依赖 Ren'Py 安装。",
+      "module_roots": [
+        "parser_rpy_codec", "rpy_text_rules", "project_codec_settings",
+        "rpy_project_adapter", "rpy_project_export", "rpy_project_batch_export",
+        "project_export_contracts", "editor_source_update",
+        "qt_project_export_dialog", "qt_project_source_update_dialog"
+      ]
     }
   ],
   "platform": {
