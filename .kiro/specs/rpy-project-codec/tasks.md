@@ -96,7 +96,7 @@
   - _Requirements: 1.2, 2.3, 3.1, 3.2, 3.3, 3.4, 4.1, 4.2, 4.3, 4.4, 4.5, 6.1, 6.3, 7.1, 7.2, 7.3, 7.4_
   - _Boundary: RPY / Project / Parser / Qt single-file integration validation_
   - _Depends: 3.4a_
-- [ ] 3.5 实现平台 owner 的嵌套导出目录合同
+- [x] 3.5 实现平台 owner 的嵌套导出目录合同
   - 准备已有祖先身份、缺失后缀及 absent 条件；定义确认后的逐组件物化与发布目标绑定，预览零目录写入。
   - 完成时，fake 平台证明目录/目标竞争会 stale，本批创建祖先才可复用，retirement authority 不能冒充目标绑定。
   - _Requirements: 4.4, 5.4, 7.2_
