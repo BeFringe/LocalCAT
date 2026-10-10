@@ -103,6 +103,23 @@ class ControllerRpySourceUpdateTests(unittest.TestCase):
         self.assertIn('# guide "New source"', target.read_text(encoding='utf-8'))
         self.assertIn('guide "保留的译文"', target.read_text(encoding='utf-8'))
 
+    def test_unsaved_source_update_explains_required_package_save(self):
+        before = self.package.read_bytes()
+        self.source.write_text(template('New source'), encoding='utf-8')
+        self.assertTrue(self.apply(self.preview()).accepted)
+        self.assertEqual(self.controller.tl_export_unavailable_reason,
+                         '源更新尚未保存。请先保存项目包，再导出 TL。')
+        with self.assertRaisesRegex(EditorControllerError, 'RPY.EXPORT.UNAVAILABLE'):
+            self.controller.begin_tl_export_preview(self.root / 'output.rpy')
+        self.assertEqual(self.package.read_bytes(), before)
+        self.assertTrue(self.controller.active_project_dirty)
+        self.controller.save_workspace_package()
+        self.assertIsNone(self.controller.tl_export_unavailable_reason)
+        # 新模板已入包后，仅修改译文仍可在不保存项目的情况下导出。
+        self.controller.update_workspace_target('未保存的后续译文')
+        self.assertIsNone(self.controller.tl_export_unavailable_reason)
+        self.assertTrue(self.controller.active_project_dirty)
+
     def test_rename_new_removed_require_explicit_decisions(self):
         renamed = self.root / 'renamed.rpy'
         self.source.rename(renamed)

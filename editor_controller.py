@@ -2284,6 +2284,9 @@ class EditorController:
             return "请先保存项目包，再导出 TL。"
         if self._workspace_recovery_target is not None:
             return "项目包需要恢复，暂不能导出 TL。"
+        if (self._rpy_project_session is not None
+                and self._rpy_project_session.source_retained):
+            return "源更新尚未保存。请先保存项目包，再导出 TL。"
         runtime = self.project_codec_runtime
         if runtime is None:
             return "TL 格式支持不可用。"
