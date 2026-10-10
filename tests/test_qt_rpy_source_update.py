@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from PySide6.QtCore import QEventLoop, QTimer
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtCore import QEventLoop, QTimer, Qt, QUrl
+from PySide6.QtWidgets import QApplication, QFileDialog, QTextBrowser
+from PySide6.QtTest import QTest
 from qt_project_source_update_dialog import QtProjectSourceUpdateDialog
 from editor_source_update import SourceUpdateBlock, SourceUpdateItem, SourceUpdateReview, SourceUpdateText
 
@@ -171,6 +172,169 @@ class QtRpySourceUpdateTests(unittest.TestCase):
         self.assertEqual(self.controller.applied, ('remove', 'keep_detached', 'keep_detached'))
         self.assertIn('保存项目包', self.dialog.status_label.text())
         self.assertFalse(self.dialog.apply_button.isEnabled())
+
+    def test_zero_diff_chapter_reports_its_own_template_changes(self):
+        from tests.test_source_update_review import document, review
+        old = (document([('a', 'A')], doc_id='a', ref='a/intro.rpy'),
+               document([('b', 'B')], doc_id='b', ref='b/intro.rpy'))
+        new = (document([('a', 'A')], doc_id='a', ref='a/intro.rpy'),
+               document([('b', 'B')], doc_id='b', ref='renamed/intro.rpy', digest='new'))
+        self.controller.review = review(old, new)
+        self.preview()
+        self.assertTrue(self.dialog.chapter_selector.isVisible())
+        self.assertIn('模板一致', self.dialog.diff_view.toPlainText())
+        self.dialog.chapter_selector.setCurrentIndex(1)
+        self.assertIn('模板其他内容有变化', self.dialog.diff_view.toPlainText())
+        self.assertFalse(self.dialog.next_button.isVisible())
+        self.assertNotIn('查看相邻未变化段落', self.dialog.diff_view.toPlainText())
+        self.assertIn('整个项目无需处置', self.dialog.decision_progress_label.text())
+
+    def test_chapter_navigation_retains_positions_and_global_choices(self):
+        from tests.test_source_update_review import document, review
+        old = (document([('a', 'A')], doc_id='zero', ref='zero/intro.rpy'),
+               document([('a', 'A'), ('x', 'Old one'), ('b', 'B'), ('y', 'Old two'), ('z', 'Z')],
+                        doc_id='one', ref='one/intro.rpy'),
+               document([('a', 'A'), ('x', 'Old three'), ('z', 'Z')], doc_id='two', ref='two/intro.rpy'))
+        new = (document([('a', 'A')], doc_id='zero', ref='zero/intro.rpy'),
+               document([('a', 'A'), ('p', 'New one'), ('b', 'B'), ('q', 'New two'), ('z', 'Z')],
+                        doc_id='one', ref='one/intro.rpy'),
+               document([('a', 'A'), ('p', 'New three'), ('z', 'Z')], doc_id='two', ref='renamed/intro.rpy'))
+        self.controller.review = review(old, new)
+        self.preview()
+        self.assertEqual(self.dialog.chapter_selector.currentIndex(), 1)
+        self.assertEqual([self.dialog.chapter_selector.itemText(i) for i in range(3)],
+                         ['zero/intro.rpy · 0 处差异', 'one/intro.rpy · 2 处差异',
+                          'two/intro.rpy → renamed/intro.rpy · 1 处差异'])
+        self.assertIn('已完成 0 / 3', self.dialog.decision_progress_label.text())
+        self.dialog.results.cellWidget(1, 3).setCurrentIndex(1)
+        self.dialog.next_button.click()
+        self.dialog.results.cellWidget(1, 3).setCurrentIndex(2)
+        self.dialog.chapter_selector.setCurrentIndex(2)
+        self.assertEqual(self.dialog.position_label.text(), '1 / 1')
+        self.assertIn('已完成 2 / 3', self.dialog.decision_progress_label.text())
+        self.assertFalse(self.dialog.apply_button.isEnabled())
+        self.dialog.chapter_selector.setCurrentIndex(0)
+        self.assertFalse(self.dialog.next_button.isVisible())
+        self.assertIn('模板一致', self.dialog.diff_view.toPlainText())
+        self.dialog.chapter_selector.setCurrentIndex(1)
+        self.assertEqual(self.dialog.position_label.text(), '2 / 2')
+        self.assertEqual(self.dialog.results.cellWidget(1, 3).currentData(), 'remove')
+        self.dialog.previous_button.click()
+        self.assertEqual(self.dialog.results.cellWidget(1, 3).currentData(), 'keep_detached')
+        self.dialog.chapter_selector.setCurrentIndex(2)
+        self.dialog.results.cellWidget(1, 3).setCurrentIndex(2)
+        self.assertTrue(self.dialog.apply_button.isEnabled())
+        self.dialog.apply_button.click()
+        self.wait(lambda: not self.dialog.operation_running)
+        self.assertEqual(self.controller.applied, ('keep_detached', 'remove', 'remove'))
+
+    def test_context_follows_diff_in_one_safe_continuous_reading_area(self):
+        from tests.test_source_update_review import document, review
+        before = '<img src="file:///secret"> & before'
+        old = document([('a', before), ('x', 'Old body'), ('b', 'Middle context'), ('y', 'Old end')])
+        new = document([('a', before), ('p', 'New body'), ('b', 'Middle context'), ('q', 'New end')])
+        self.controller.review = review((old,), (new,))
+        self.preview()
+        self.assertEqual(self.dialog.findChildren(QTextBrowser), [self.dialog.diff_view])
+        self.assertFalse(self.dialog.context_expanded)
+        self.assertNotIn(before, self.dialog.diff_view.toPlainText())
+        self.assertIn('查看相邻未变化段落', self.dialog.diff_view.toPlainText())
+        self.dialog.toggle_context()
+        body = self.dialog.diff_view.toPlainText()
+        self.assertLess(body.index('Old body'), body.index('New body'))
+        self.assertLess(body.index('New body'), body.index('前一段'))
+        self.assertLess(body.index('前一段'), body.index('后一段'))
+        self.assertIn('旧第 1 段／新第 1 段', body)
+        self.assertIn(before, body)
+        self.assertNotIn('<img ', self.dialog.diff_view.toHtml())
+        self.assertTrue(self.dialog.diff_view.isReadOnly())
+        self.dialog.next_button.click()
+        self.assertFalse(self.dialog.context_expanded)
+        self.assertNotIn('Middle context', self.dialog.diff_view.toPlainText())
+        self.dialog.toggle_context()
+        self.assertIn('Middle context', self.dialog.diff_view.toPlainText())
+        self.assertNotIn('后一段', self.dialog.diff_view.toPlainText())
+        self.controller.current = False
+        self.wait(lambda: self.dialog.view is None)
+        self.assertFalse(self.dialog.context_expanded)
+        self.assertEqual(self.dialog.diff_view.toPlainText(), '')
+        self.assertEqual(self.dialog.chapter_selector.count(), 0)
+        self.assertEqual(self.dialog.decision_progress_label.text(), '')
+
+    def test_source_settings_fold_after_preview_and_reopen_for_explicit_changes(self):
+        self.assertTrue(self.dialog.source_settings.isVisible())
+        self.preview()
+        self.assertFalse(self.dialog.source_settings.isVisible())
+        self.assertIn('源文件：2 章', self.dialog.settings_toggle.text())
+        self.assertIn('查看路径', self.dialog.settings_toggle.text())
+        before = self.dialog.view
+        self.dialog.settings_toggle.click()
+        self.assertTrue(self.dialog.source_settings.isVisible())
+        self.assertIs(self.dialog.view, before)
+        self.dialog.paths.item(0, 1).setText('renamed/intro.rpy')
+        self.assertIsNone(self.dialog.view)
+        self.assertFalse(self.dialog.apply_button.isEnabled())
+        self.assertTrue(self.dialog.source_settings.isVisible())
+        self.assertEqual(self.dialog.diff_view.toPlainText(), '')
+
+    def test_one_scroll_area_uses_available_height_and_keeps_scroll_on_toggle(self):
+        from tests.test_source_update_review import document, review
+        old = document([('a', 'Short before.'), ('x', 'Old body.'), ('z', 'Short after.')])
+        new = document([('a', 'Short before.'), ('y', 'New body.'), ('z', 'Short after.')])
+        self.controller.review = review((old,), (new,))
+        self.preview()
+        self.dialog.toggle_context()
+        self.app.processEvents()
+        self.assertEqual(self.dialog.findChildren(QTextBrowser), [self.dialog.diff_view])
+        self.assertEqual(self.dialog.diff_view.verticalScrollBar().maximum(), 0)
+        self.assertIn('Short before.', self.dialog.diff_view.toPlainText())
+        self.assertIn('Short after.', self.dialog.diff_view.toPlainText())
+        long_source = 'A long paragraph with wrapping and complete preserved text. ' * 120
+        old = document([('a', 'Before long.'), ('x', long_source), ('z', 'After long.')])
+        new = document([('a', 'Before long.'), ('y', long_source + 'Changed.'), ('z', 'After long.')])
+        self.controller.review = review((old,), (new,))
+        self.preview()
+        self.app.processEvents()
+        scrollbar = self.dialog.diff_view.verticalScrollBar()
+        self.assertGreater(scrollbar.maximum(), 100)
+        scrollbar.setValue(100)
+        self.dialog.toggle_context()
+        self.app.processEvents()
+        self.assertEqual(scrollbar.value(), 100)
+        self.assertIn(long_source, self.dialog.diff_view.toPlainText())
+        self.assertIn('Before long.', self.dialog.diff_view.toPlainText())
+        self.assertIn('After long.', self.dialog.diff_view.toPlainText())
+        self.dialog.toggle_context()
+        self.app.processEvents()
+        self.assertEqual(scrollbar.value(), 100)
+
+    def test_context_toggle_accepts_only_internal_link_and_keyboard_shortcut(self):
+        from tests.test_source_update_review import document, review
+        old = document([('a', 'Before'), ('x', 'Old'), ('z', 'After')])
+        new = document([('a', 'Before'), ('y', 'New'), ('z', 'After')])
+        self.controller.review = review((old,), (new,))
+        self.preview()
+        from PySide6.QtGui import QKeySequence
+        self.assertIn(self.dialog.context_shortcut.key().toString(QKeySequence.SequenceFormat.NativeText),
+                      self.dialog.diff_view.toPlainText())
+        for button in (self.dialog.previous_button, self.dialog.next_button):
+            self.assertIn(button.shortcut().toString(QKeySequence.SequenceFormat.NativeText), button.toolTip())
+        for link in ('https://example.invalid/', 'file:///secret', '#source-update-context?spoof',
+                     'https://example.invalid/#source-update-context'):
+            self.dialog.diff_view.anchorClicked.emit(QUrl(link))
+            self.assertFalse(self.dialog.context_expanded)
+        self.dialog.diff_view.anchorClicked.emit(QUrl('#source-update-context'))
+        self.assertTrue(self.dialog.context_expanded)
+        self.dialog.activateWindow()
+        self.dialog.diff_view.setFocus()
+        self.app.processEvents()
+        QTest.keyClick(self.dialog.diff_view, Qt.Key.Key_C, Qt.KeyboardModifier.AltModifier)
+        self.app.processEvents()
+        self.assertFalse(self.dialog.context_expanded)
+        self.controller.current = False
+        self.dialog.toggle_context()
+        self.assertIsNone(self.dialog.view)
+        self.assertEqual(self.dialog.diff_view.toPlainText(), '')
 
     def test_editing_input_or_context_invalidates_preview(self):
         self.preview()
