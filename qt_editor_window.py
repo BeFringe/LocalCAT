@@ -3612,7 +3612,7 @@ class QtEditorWindow(QMainWindow):
             and not self.controller.workspace_save_running
             and not self.controller.tl_export_publish_running)
         self.tl_export_action.setText('导出 Ren’Py TL' if reason is None else '导出 Ren’Py TL（不可用）')
-        self.tl_export_action.setToolTip(reason or '预览全部当前译文，然后导出到所选文件。项目包另行保存。')
+        self.tl_export_action.setToolTip(reason or '选择章节并预览新建／覆盖，再导出当前译文。项目包另行保存。')
         self.tl_export_action.setStatusTip(self.tl_export_action.toolTip())
         self.source_update_action.setVisible(self.controller.is_tl_workspace)
         self.source_update_action.setEnabled(

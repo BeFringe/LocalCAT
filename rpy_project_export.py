@@ -265,6 +265,10 @@ class PreparedRpyProjectExport:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def terminal_result(self):
+        return self._result
+
     def _diagnostic(self, code, summary, issue=None):
         local_id = None
         if issue is not None and issue.record_number is not None:
