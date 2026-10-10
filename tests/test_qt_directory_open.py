@@ -333,12 +333,12 @@ class QtDirectoryOpenTests(unittest.TestCase):
             try:
                 self.wait_until(published.is_set)
                 self.assertTrue(self.destination.exists())
-                with mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Cancel) as question:
+                with mock.patch('qt_editor_window.ask_localized_question', return_value=QMessageBox.StandardButton.Cancel) as question:
                     self.assertFalse(self.window.close())
                     question.assert_called_once()
                 self.assertTrue(self.window.isVisible())
                 self.assertFalse(job.disposed)
-                with mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Close) as question:
+                with mock.patch('qt_editor_window.ask_localized_question', return_value=QMessageBox.StandardButton.Close) as question:
                     self.assertTrue(self.window.close())
                     question.assert_called_once()
                 self.assertTrue(job.disposed)
@@ -366,7 +366,7 @@ class QtDirectoryOpenTests(unittest.TestCase):
             self.window._run_file_operation(job, wait=False)
             try:
                 self.wait_until(published.is_set)
-                with mock.patch.object(QMessageBox, 'question') as question, \
+                with mock.patch('qt_editor_window.ask_localized_question') as question, \
                      mock.patch.object(self.window, '_confirm_unsaved') as confirm:
                     self.assertFalse(self.window.close())
                     question.assert_not_called()
