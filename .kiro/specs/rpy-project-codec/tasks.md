@@ -119,7 +119,7 @@
   - _Requirements: 4.4, 4.5, 5.4, 7.2_
   - _Boundary: Platform Windows export-directory backend_
   - _Depends: 3.5a_
-- [ ] 3.8 验证目录准备到 Parser 发布的集成
+- [x] 3.8 验证目录准备到 Parser 发布的集成
   - 验证 absent 条件、已有目标身份、目录准备后的旧计划失效、新预览目标绑定与文件／目录交叉冲突，发布仍使用已签发 prepared 内容。
   - 完成时，两个 backend 均拒绝 preview 后替换/并发创建；部分失败保留准确逐文件结果，handle 全部按生命周期释放。
   - _Requirements: 4.4, 4.5, 5.4, 6.3, 7.2_
