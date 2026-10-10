@@ -203,6 +203,56 @@ class QtBootstrapTest(unittest.TestCase):
         self.assertIn("Qt editor smoke test passed", completed.stdout)
         self.assertNotIn("Traceback", completed.stderr)
 
+    def test_ordinary_smoke_checks_editor_before_close_and_preserves_failures(self) -> None:
+        from platform_fs import compose_platform_file_backend
+        from platform_source_authority import compose_rooted_source_authority
+        from qt_source_resources import resolve_source_qt_resources
+        from PySide6.QtWidgets import QApplication
+
+        # Exercise the real bootstrap/window/Controller lifecycle. The ordinary
+        # authority and expensive Core checks are isolated; this is not frozen evidence.
+        app = QApplication.instance() or QApplication([])
+        authority = compose_rooted_source_authority(
+            ROOT, backend=compose_platform_file_backend(ROOT))
+        self.addCleanup(authority.close)
+        resources = resolve_source_qt_resources(
+            authority, logo_filename=qt_editor.APPLICATION_ICON_FILENAME)
+        compose = qt_editor._compose_editor_controller
+        for scenario in ('close', 'unusable', 'core_failure'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp_dir:
+                observed = {}
+                def source_composition(repository, **kwargs):
+                    controller, composition = compose(repository, source_authority=authority)
+                    observed['controller'] = controller
+                    return controller, composition
+                def start_validation(composition, window):
+                    observed['window'] = window
+                    if scenario == 'unusable':
+                        window.controller.close_project()
+                def ordinary_finish(app, composition, worker, marker, *, window):
+                    self.assertTrue(window.controller.has_active_project)
+                    if scenario == 'core_failure':
+                        raise RuntimeError('ordinary smoke failure')
+                    self.assertTrue(window.close())
+                    self.assertFalse(window.controller.has_active_project)
+                candidate = SimpleNamespace(read_data=lambda name: (ROOT / name).read_bytes())
+                with (patch('frozen_candidate.running_candidate', return_value=candidate),
+                      patch('frozen_product_entry.ordinary_resources', return_value=resources),
+                      patch('frozen_product_entry.finish_ordinary_smoke', side_effect=ordinary_finish) as finish,
+                      patch.object(qt_editor, '_compose_editor_controller', side_effect=source_composition),
+                      patch.object(qt_editor, '_start_capability_validation', side_effect=start_validation),
+                      contextlib.redirect_stderr(io.StringIO()),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    code = qt_editor.main(['--smoke-test', '--data-dir', temp_dir,
+                                           '--bundle-smoke-marker', str(Path(temp_dir) / 'marker.json')],
+                                          _ordinary=True)
+                self.assertEqual(code, 0 if scenario == 'close' else 1)
+                self.assertEqual(finish.call_count, 0 if scenario == 'unusable' else 1)
+                observed['window'].close()
+                self.assertFalse(observed['controller'].has_active_project)
+                observed['window'].deleteLater()
+                app.processEvents()
+
     def test_source_qt_does_not_require_xlwings(self) -> None:
         requirements = tuple(
             line.strip().lower()
@@ -469,6 +519,7 @@ class QtBootstrapTest(unittest.TestCase):
             ) -> None:
                 super().__init__()
                 self.chunk_controller = chunk_controller
+                self.file_operation_running = False
                 self.speaker_avatar_catalog = speaker_avatar_catalog
                 captured_catalog.append(speaker_avatar_catalog)
                 self.pages = SimpleNamespace(
