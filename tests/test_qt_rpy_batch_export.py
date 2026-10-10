@@ -54,6 +54,9 @@ class QtRpyBatchExportTests(unittest.TestCase):
         self.assertIn('准备目录', dialog.confirm_button.text())
         self.assertEqual(dialog.files_table.topLevelItemCount(), 3)
         self.assertEqual(tuple(dialog.files_table.topLevelItem(i).text(0) for i in range(3)), self.refs)
+        self.assertFalse(dialog.locate_button.isVisible())
+        self.assertFalse(dialog.diagnostics.isVisible())
+        self.assertFalse(dialog.cancel_button.isVisible())
         dialog.confirm_button.click()
         self.wait_until(lambda: not dialog.operation_running and dialog.view is not None and dialog.view is not old)
         self.assertEqual(dialog.view.status, 'ready')
@@ -70,6 +73,18 @@ class QtRpyBatchExportTests(unittest.TestCase):
         self.assertIn('已创建', dialog.directory_label.text())
         self.assertNotIn('未发布 TL', dialog.directory_label.text())
         self.assertNotIn('仍需确认', dialog.directory_label.text())
+        self.assertFalse(dialog.confirm_button.isVisible())
+        self.assertFalse(dialog.cancel_button.isVisible())
+        self.assertFalse(dialog.summary_label.isVisible())
+        self.assertFalse(dialog.directory_label.isVisible())
+        self.assertEqual(dialog.close_button.text(), '完成')
+        self.assertIn('导出完成', dialog.status_label.text())
+        dialog.prepare_target(self.target)
+        self.wait_until(lambda: not dialog.operation_running)
+        self.assertTrue(dialog.confirm_button.isVisible())
+        self.assertTrue(dialog.summary_label.isVisible())
+        self.assertIn('覆盖 3', dialog.confirm_button.text())
+        self.assertEqual(dialog.close_button.text(), '关闭')
 
     def test_existing_original_directory_overwrite_visible_and_once(self):
         self.target = self.input
@@ -80,6 +95,29 @@ class QtRpyBatchExportTests(unittest.TestCase):
         dialog.confirm_button.click()
         self.wait_until(lambda: dialog.result is not None)
         self.assertEqual(dialog.result.outcome, 'published')
+
+    def test_partial_result_keeps_diagnostics_without_another_publish_action(self):
+        from parser_composition import ParserApplicationSurface
+        for ref in self.refs:
+            (self.target / ref).parent.mkdir(parents=True, exist_ok=True)
+        dialog = self.open_export()
+        original = ParserApplicationSurface.write_prepared
+        calls = []
+        def write(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError('synthetic interrupted publication')
+            return original(*args, **kwargs)
+        with mock.patch.object(ParserApplicationSurface, 'write_prepared', write):
+            dialog.confirm_button.click()
+            self.wait_until(lambda: not dialog.operation_running)
+        self.assertEqual(dialog.result.outcome, 'partial')
+        self.assertEqual([dialog.files_table.topLevelItem(i).text(1) for i in range(3)],
+                         ['已导出', '不确定／需检查', '未执行'])
+        self.assertTrue(dialog.diagnostics.isVisible())
+        self.assertFalse(dialog.locate_button.isVisible())
+        self.assertFalse(dialog.confirm_button.isVisible())
+        self.assertEqual(dialog.close_button.text(), '关闭')
 
     def test_selection_change_invalidates_preview_and_exports_only_checked(self):
         for ref in self.refs:

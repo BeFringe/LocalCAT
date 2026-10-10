@@ -59,7 +59,8 @@ class QtProjectExportDialog(QDialog):
         self.diagnostics = QPlainTextEdit()
         self.diagnostics.setReadOnly(True)
         layout.addWidget(self.diagnostics)
-        self.locate_button = QPushButton('定位首个诊断段落')
+        self.locate_button = QPushButton('跳到首个问题译文')
+        self.locate_button.setToolTip('跳到导出校验指出的首个问题段落，以便修正译文。')
         self.locate_button.clicked.connect(self._locate_diagnostic)
         layout.addWidget(self.locate_button)
         buttons = QHBoxLayout()
@@ -315,6 +316,9 @@ class QtProjectExportDialog(QDialog):
         if type(result) is ProjectExportBatchResult:
             counts = {name: sum(item.outcome == name for item in result.files)
                       for name in ('published', 'failed', 'uncertain', 'not_attempted')}
+            if result.outcome == 'published':
+                return (f'导出完成：已导出 {counts["published"]} 个文件。输出目录：{result.target_path}。'
+                        '导出不会替代项目包保存。')
             return (f'已导出 {counts["published"]}，失败 {counts["failed"]}，不确定 {counts["uncertain"]}，'
                     f'未执行 {counts["not_attempted"]}：{result.target_path}。导出不会替代项目包保存。')
         messages = {
@@ -366,6 +370,16 @@ class QtProjectExportDialog(QDialog):
             not running and projection is not None and any(
                 self.controller.tl_export_diagnostic_segment_number(projection, item) is not None
                 for item in projection.diagnostics))
+        finished = self.result is not None and type(self.result) is not ProjectExportDirectoryResult
+        self.target_label.setVisible(not finished)
+        self.summary_label.setVisible(not finished)
+        self.directory_label.setVisible(bool(self.directory_label.text()) and not finished)
+        self.confirm_button.setVisible(self.confirm_button.isEnabled())
+        self.cancel_button.setVisible(running)
+        self.diagnostics.setVisible(bool(projection is not None and projection.diagnostics))
+        self.locate_button.setVisible(self.locate_button.isEnabled())
+        self.close_button.setText('完成' if finished and self.result.outcome == 'published' else '关闭')
+        self.target_button.setText('再次导出…' if finished else '选择目标并重新预览…')
 
     def cancel_operation(self):
         if self._runner is not None:

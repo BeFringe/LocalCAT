@@ -189,6 +189,8 @@ class QtRpyExportTests(unittest.TestCase):
         self.assertIn('第 1 段', text)
         self.controller.move_workspace(1)
         self.assertTrue(dialog.locate_button.isEnabled())
+        self.assertTrue(dialog.locate_button.isVisible())
+        self.assertTrue(dialog.diagnostics.isVisible())
         dialog.locate_button.click()
         self.assertEqual(self.controller.current_workspace_identity, self.controller.workspace_view.segments[0].identity)
         self.assertEqual(self.window.target_editor.toPlainText(), '错误 [new_expression]')
