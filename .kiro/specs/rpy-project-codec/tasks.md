@@ -101,19 +101,26 @@
   - 完成时，fake 平台证明目录/目标竞争会 stale，本批创建祖先才可复用，retirement authority 不能冒充目标绑定。
   - _Requirements: 4.4, 5.4, 7.2_
   - _Boundary: Platform export-directory contracts_
-- [ ] 3.6 实现 POSIX 导出子目录物化
-  - 在用户选择的导出根内按组件 no-follow 创建并复证，返回 Parser 可消费的目标绑定；取消/失败释放 handle，不收养竞争创建对象。
+- [x] 3.5a 分离目录准备与目标绑定合同
+  - 缺失目录准备只返回创建事实，不签发文件目标绑定；准备结束关闭全部旧计划，文件绑定仅接受新的只读预览中已存在的祖先。
+  - 完成时，目录准备不写 TL，旧计划不可继续使用；新预览前的当前目录可重新绑定，新预览后的竞争与替换拒绝，取消不自动进入文件发布。
+  - _Requirements: 4.4, 5.4, 7.2_
+  - _Boundary: Platform export-directory contracts_
+  - _Depends: 3.5_
+- [x] 3.6 实现 POSIX 导出子目录物化
+  - 在用户选择的导出根内按组件 no-follow 准备目录并复证当前身份，只返回目录修改事实；经新预览和新确认后才可取得 Parser 目标绑定，取消／失败释放 handle。
   - 完成时，缺失目录导出可用，symlink/祖先替换/创建失败不发布目标，已建空目录如实报告。
   - _Requirements: 4.4, 4.5, 5.4, 7.2_
   - _Boundary: Platform POSIX export-directory backend_
+  - _Depends: 3.5a_
 - [ ] 3.7 实现 Windows 导出子目录物化
-  - 实现相同的创建/绑定合同，处理 reparse/祖先替换及 Windows 创建竞争，保持同一取消与失败语义。
+  - 实现相同的目录准备／重新预览／目标绑定合同，处理 reparse、已观察祖先替换及 Windows 创建竞争，保持同一取消与失败语义。
   - 完成时，Windows 合成嵌套目录成功发布，竞争/reparse/失败不写错误目标，不宣称回滚已创建目录。
   - _Requirements: 4.4, 4.5, 5.4, 7.2_
   - _Boundary: Platform Windows export-directory backend_
-  - _Depends: 3.5_
+  - _Depends: 3.5a_
 - [ ] 3.8 验证目录准备到 Parser 发布的集成
-  - 验证 absent 条件、已有目标身份、本批共享祖先与文件/目录交叉冲突，发布仍使用已签发 prepared 内容。
+  - 验证 absent 条件、已有目标身份、目录准备后的旧计划失效、新预览目标绑定与文件／目录交叉冲突，发布仍使用已签发 prepared 内容。
   - 完成时，两个 backend 均拒绝 preview 后替换/并发创建；部分失败保留准确逐文件结果，handle 全部按生命周期释放。
   - _Requirements: 4.4, 4.5, 5.4, 6.3, 7.2_
   - _Boundary: Platform / Parser / Project export integration validation_
@@ -147,7 +154,7 @@
   - _Boundary: Controller neutral source-update projection / Qt chapter review UI_
   - _Depends: 4.2a_
 - [ ] 4.3 协调批量准备与逐文件导出结果
-  - 按 source_ref 保留嵌套目录，先准备所有候选并检查目录/路径冲突再发布；受控创建子目录及逐次复证，取消停止未发布项。
+  - 按 source_ref 保留嵌套目录，先准备所有候选并检查目录/路径冲突再发布；缺失目录先经明确确认准备，关闭旧候选并重新预览，再经确认逐次发布；取消停止未发布项。
   - 完成时，第二个文件发布失败不会被报告为全批成功或全批回滚，重试要求新预览。
   - _Requirements: 4.5, 5.4, 6.3_
   - _Boundary: RpyProjectAdapter export coordination_
@@ -156,7 +163,7 @@
 - [ ] 5. 扩展多章节桌面流程与发行组合
 - [ ] 5.1 接入多 TL 的桌面流程与逐文件结果
   - 将 3.2a、3.4a 的单文件流程扩展为多章节，消费 Multi 已有根目录勾选/导航投影和 4.3 的中立批量结果，不重复实现包保存或单文件导出对话框。
-  - 完成时，用户可按相对路径切换章节、编辑保存并预览/导出所选 TL；同名文件和逐文件失败可区分，原有单文件旅程与 Chunk mutation guard 保持有效，UI 无 token/private 类型。
+  - 完成时，用户可按相对路径切换章节、编辑保存并预览/导出所选 TL；预览明确新建／覆盖且确认操作包含覆盖提示；缺失目录有准备与重新确认两阶段，同名文件和逐文件失败可区分，原有单文件旅程与 Chunk mutation guard 保持有效，UI 无 token/private 类型。
   - _Requirements: 4.1, 5.2, 5.4, 6.1_
   - _Boundary: Controller / Qt multi-file integration_
   - _Depends: 3.4b, 4.3_

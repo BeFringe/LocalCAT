@@ -17,6 +17,7 @@ import sys
 import time
 from typing import Any, Callable, Generator, Iterator, cast
 
+from platform_export_directory import ExportDirectoryCreationError
 from platform_fs_contracts import (
     BoundContentFacts,
     BoundDirectoryAuthority,
@@ -2376,6 +2377,77 @@ class PosixPlatformAdapter(
             PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
             retryable=False,
         )
+
+    def duplicate_export_directory(
+        self, parent: BoundDirectoryAuthority,
+    ) -> BoundDirectoryAuthority:
+        if type(parent) not in {_PosixRootedDirectory, _PosixBoundDirectory}:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        parent.reprove()
+        return _PosixBoundDirectory(
+            _duplicate_directory_chain(parent._directory_fds),
+            parent._directory_names, self._fault_injector,
+        )
+
+    def open_export_directory(
+        self, parent: BoundDirectoryAuthority, name: str, *, create: bool = False,
+    ) -> BoundDirectoryAuthority:
+        """Retain an ordinary child; exclusive creation never adopts EEXIST."""
+        if type(parent) not in {_PosixRootedDirectory, _PosixBoundDirectory}:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        name = validate_relative_name(name)
+        if type(create) is not bool:
+            raise TypeError('create must be exact bool')
+        retained = None
+        child = None
+        created = False
+        try:
+            parent.reprove()
+            retained = _duplicate_directory_chain(parent._directory_fds)
+            if create:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=retained[-1])
+                except FileExistsError:
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True) from None
+                created = True
+            # Capture the named identity before any subsequent open/reproof;
+            # a replacement between this observation and retention is rejected.
+            observed = os.stat(name, dir_fd=retained[-1], follow_symlinks=False)
+            if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+                raise _platform_error(PlatformFileErrorCode.REPARSE_REJECTED, retryable=False)
+            expected = _identity_from_stat(observed)
+            if create:
+                _hit_fault(self._fault_injector, 'export_directory_after_create')
+            child = os.open(name, _DIRECTORY_FLAGS, dir_fd=retained[-1])
+            actual = _identity_from_stat(os.fstat(child))
+            _hit_fault(self._fault_injector, 'export_directory_after_open')
+            named = os.stat(name, dir_fd=retained[-1], follow_symlinks=False)
+            if (not _same_identity(expected, actual)
+                    or not _same_identity(actual, _identity_from_stat(named))):
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            parent.reprove()
+            if created:
+                os.fsync(retained[-1])
+            descriptors = retained + (child,)
+            retained = child = None
+            return _PosixBoundDirectory(
+                descriptors, parent._directory_names + (name,), self._fault_injector,
+            )
+        except Exception as error:
+            if created:
+                raise ExportDirectoryCreationError() from None
+            if isinstance(error, PlatformFileError):
+                raise
+            if isinstance(error, OSError):
+                raise _map_os_error(error, fallback=PlatformFileErrorCode.ENTRY_UNAVAILABLE,
+                                    retryable=False) from None
+            raise
+        finally:
+            if child is not None:
+                _close_fd(child)
+            if retained is not None:
+                for descriptor in reversed(retained):
+                    _close_fd(descriptor)
 
     def _bind_parent(
         self,
