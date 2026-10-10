@@ -144,7 +144,7 @@ from qt_control_styles import (
     configure_combo_popup,
     configure_menu,
 )
-from qt_localized_message_box import show_localized_critical
+from qt_localized_message_box import ask_localized_question, show_localized_critical
 from qt_theme import ThemeSelection, projected_widget_uses_dark, system_uses_dark_theme
 from qt_tm_threshold import (
     TMThresholdButton,
@@ -3612,7 +3612,7 @@ class QtEditorWindow(QMainWindow):
             and not self.controller.workspace_save_running
             and not self.controller.tl_export_publish_running)
         self.tl_export_action.setText('导出 Ren’Py TL' if reason is None else '导出 Ren’Py TL（不可用）')
-        self.tl_export_action.setToolTip(reason or '预览全部当前译文，然后导出到所选文件。项目包另行保存。')
+        self.tl_export_action.setToolTip(reason or '选择章节并预览新建／覆盖，再导出当前译文。项目包另行保存。')
         self.tl_export_action.setStatusTip(self.tl_export_action.toolTip())
         self.source_update_action.setVisible(self.controller.is_tl_workspace)
         self.source_update_action.setEnabled(
@@ -6728,10 +6728,17 @@ class QtEditorWindow(QMainWindow):
             return
         saving = self.controller.workspace_save_running or creating_package
         if saving:
-            decision = QMessageBox.question(
-                self, "保存正在进行", "关闭窗口后，已经发出的保存仍可能完成。是否关闭？",
-                QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel)
+            decision = ask_localized_question(
+                self,
+                title="保存正在进行",
+                text="关闭窗口后，已经发出的保存仍可能完成。是否关闭？",
+                buttons=QMessageBox.StandardButton.Close | QMessageBox.StandardButton.Cancel,
+                default_button=QMessageBox.StandardButton.Cancel,
+                button_labels={
+                    QMessageBox.StandardButton.Close: "关闭",
+                    QMessageBox.StandardButton.Cancel: "取消",
+                },
+            )
             can_close = decision == QMessageBox.StandardButton.Close
         else:
             can_close = (not self.controller.active_project_dirty

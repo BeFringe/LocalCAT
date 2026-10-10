@@ -73,6 +73,7 @@ _EXPECTED_MIGRATED_APPLICATION_FACADES = frozenset(
 _EXPECTED_DIRECT_SURFACE_CONSUMERS = frozenset(
     {
         "rpy_project_export",
+        "rpy_project_batch_export",
         "editor_file_jobs",
         "project_codec_settings",
         "editor_project",

@@ -103,6 +103,14 @@ class QtRpyExportTests(unittest.TestCase):
         self.wait_until(lambda: not dialog.operation_running)
         return dialog
 
+    def test_existing_single_target_warns_in_preview_and_confirmation(self):
+        self.target.write_bytes(b'previous output')
+        dialog = self.open_export()
+        self.assertEqual(dialog.view.target_action, 'overwrite')
+        self.assertIn('覆盖 1', dialog.summary_label.text())
+        self.assertIn('覆盖', dialog.confirm_button.text())
+        self.assertEqual(self.target.read_bytes(), b'previous output')
+
     def test_menu_preview_confirm_empty_target_and_dirty_preserved(self):
         self.window.target_editor.setPlainText('')
         dialog = self.open_export()
@@ -181,6 +189,8 @@ class QtRpyExportTests(unittest.TestCase):
         self.assertIn('第 1 段', text)
         self.controller.move_workspace(1)
         self.assertTrue(dialog.locate_button.isEnabled())
+        self.assertTrue(dialog.locate_button.isVisible())
+        self.assertTrue(dialog.diagnostics.isVisible())
         dialog.locate_button.click()
         self.assertEqual(self.controller.current_workspace_identity, self.controller.workspace_view.segments[0].identity)
         self.assertEqual(self.window.target_editor.toPlainText(), '错误 [new_expression]')
@@ -457,7 +467,7 @@ class QtRpyExportTests(unittest.TestCase):
     def test_chooser_return_restores_preview_panel_after_native_window_handoff(self):
         for selected in (str(self.target), ''):
             with self.subTest(selected=selected):
-                def choose(dialog, *_args):
+                def choose(dialog, *_args, **_kwargs):
                     # A native chooser can return after moving its parent out
                     # of view. Simulate that GUI handoff, not publication.
                     dialog.hide()
@@ -470,7 +480,7 @@ class QtRpyExportTests(unittest.TestCase):
                 dialog.close()
 
     def test_chooser_return_does_not_reopen_panel_after_window_shutdown(self):
-        def choose(dialog, *_args):
+        def choose(dialog, *_args, **_kwargs):
             dialog.shutdown()
             return str(self.target), ''
         with mock.patch.object(QFileDialog, 'getSaveFileName', side_effect=choose):

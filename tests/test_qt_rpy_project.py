@@ -207,7 +207,7 @@ class QtRpyProjectTests(unittest.TestCase):
              mock.patch.object(RpyProjectSession, 'save', delayed):
             self.assertTrue(self.window.open_project_file_async(self.source))
             self.wait_until(entered.is_set)
-            with mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Close):
+            with mock.patch('qt_editor_window.ask_localized_question', return_value=QMessageBox.StandardButton.Close):
                 self.window.close()
             self.assertFalse(sessions[0].closed)
             release.set()
@@ -240,7 +240,7 @@ class QtRpyProjectTests(unittest.TestCase):
                             self.window.target_editor.setPlainText('建包期间编辑的原项目')
                         old = self.controller.project
                         self.assertTrue(self.controller.active_project_dirty)
-                        with mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Close):
+                        with mock.patch('qt_editor_window.ask_localized_question', return_value=QMessageBox.StandardButton.Close):
                             self.assertFalse(self.window.close())
                         self.assertIs(self.controller.project, old)
                         self.assertTrue(self.controller.active_project_dirty)
@@ -402,7 +402,7 @@ class QtRpyProjectTests(unittest.TestCase):
         with mock.patch.object(RpyProjectSession, 'save', delayed):
             self.window.save_workspace_package(self.destination, wait=False)
             self.wait_until(entered.is_set)
-            with mock.patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Close):
+            with mock.patch('qt_editor_window.ask_localized_question', return_value=QMessageBox.StandardButton.Close):
                 self.window.close()
             self.assertFalse(sessions[0].closed)
             release.set()
