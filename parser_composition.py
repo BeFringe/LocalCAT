@@ -17,6 +17,8 @@ from weakref import WeakKeyDictionary, WeakSet
 
 from platform_fs import compose_platform_file_backend as _compose_platform_file_backend
 from platform_fs_contracts import PlatformFileBackend, PlatformFileError
+from platform_export_directory import MaterializedExportTarget as _MaterializedExportTarget
+
 
 from parser_contracts import (
     BUILTIN_FORMAT_IDS,
@@ -681,6 +683,36 @@ class ParserApplicationSurface:
             except BaseException:
                 prepared.close()
                 raise
+
+    def bind_materialized_round_trip_target(self, prepared, target):
+        """Consume a platform target without resampling its preview condition."""
+        if type(target) is not _MaterializedExportTarget:
+            raise TypeError('target must be a platform-issued materialized target')
+        with self._preparation_lock:
+            transferred = None
+            try:
+                binding = self._require_round_trip_preparation(prepared)
+                if binding.target is not None:
+                    raise ParserApplicationError(
+                        'PARSER.CAPABILITY.INVALID_PREPARATION',
+                        'a preparation cannot be rebound to another target condition',
+                    )
+                transferred = _BoundWriteTarget(*target.take_binding())
+                if not isinstance(transferred.backend, PlatformFileBackend):
+                    raise TypeError('materialized target backend must implement PlatformFileBackend')
+                transferred.reprove()
+                binding.target, transferred = transferred, None
+                self._require_round_trip_preparation(prepared)
+            except BaseException:
+                if type(prepared) is PreparedRoundTripWrite and prepared in self._prepared_round_trips:
+                    prepared.close()
+                raise
+            finally:
+                try:
+                    if transferred is not None:
+                        transferred.close()
+                finally:
+                    target.close()
 
     def write_prepared(self, prepared: PreparedRoundTripWrite) -> PreparedWriteResult:
         """Consume once, publish exact prepared bytes, and report physical proof.
