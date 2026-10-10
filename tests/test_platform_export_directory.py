@@ -85,16 +85,23 @@ class ExportDirectoryContractTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             plan.relative_path = 'other.rpy'
 
-    def test_materialization_preserves_absence_and_reuses_only_batch_ancestors(self):
+    def test_directory_preparation_consumes_batch_without_target_authority(self):
         first = self.batch.prepare_descendant_target('a/one.rpy')
-        second = self.batch.prepare_descendant_target('a/b/two.rpy')
-        with self.batch.materialize_target(first) as target:
-            target.reprove()
-            self.assertIsNone(target.expected)
-        with self.batch.materialize_target(second) as target:
-            target.reprove()
-        self.assertEqual(self.backend.created, ['/a', '/a/b'])
-        self.assertEqual(self.batch.created_directories, ('a', 'a/b'))
+        self.batch.prepare_descendant_target('a/b/two.rpy')
+        with self.assertRaises(PlatformFileError):
+            self.batch.materialize_target(first)
+        self.assertEqual(self.backend.created, [])
+        created = self.batch.prepare_directories()
+        self.assertEqual(created, ('a', 'a/b'))
+        self.assertTrue(self.batch.closed)
+        with self.assertRaises(PlatformFileError):
+            self.batch.materialize_target(first)
+        with export.ExportDirectoryBatch(self.backend, self.backend.root) as fresh:
+            plan = fresh.prepare_descendant_target('a/b/two.rpy')
+            self.assertEqual(plan.missing_directories, ())
+            with fresh.materialize_target(plan) as target:
+                target.reprove()
+        self.assertNotIn('/a/b/two.rpy', self.backend.tree)
 
     def test_external_directory_or_target_creation_is_stale(self):
         for changed, kind in (('/a', 'directory'), ('/target.rpy', 'regular')):
@@ -107,6 +114,23 @@ class ExportDirectoryContractTests(unittest.TestCase):
                         batch.materialize_target(plan)
                     self.assertEqual(batch.created_directories, ())
                 backend.root.close()
+
+    def test_preparation_rechecks_all_plans_before_creating_any_directory(self):
+        self.batch.prepare_descendant_target('a/new.rpy')
+        self.batch.prepare_descendant_target('b/new.rpy')
+        self.backend.tree['/b'] = snapshot('external')
+        with self.assertRaises(PlatformFileError):
+            self.batch.prepare_directories()
+        self.assertEqual(self.backend.created, [])
+        self.assertTrue(self.batch.closed)
+
+    def test_missing_directory_blocks_binding_even_for_existing_parent_plan(self):
+        existing = self.batch.prepare_descendant_target('existing.rpy')
+        self.batch.prepare_descendant_target('a/new.rpy')
+        with self.assertRaises(PlatformFileError):
+            self.batch.materialize_target(existing)
+        self.assertFalse(self.batch.closed)
+        self.assertEqual(self.batch.prepare_directories(), ('a',))
 
     def test_existing_target_and_ancestor_replacement_rejected(self):
         self.backend.tree['/a'] = snapshot('a')
@@ -140,7 +164,7 @@ class ExportDirectoryContractTests(unittest.TestCase):
                 raise RuntimeError('cancelled')
 
         with self.assertRaisesRegex(RuntimeError, 'cancelled'):
-            self.batch.materialize_target(plan, Cancelled())
+            self.batch.prepare_directories(Cancelled())
         self.assertEqual(self.backend.created, [])
         self.batch.close()
         self.assertTrue(all(item.closed for item in self.backend.opened if item is not self.backend.root))
@@ -162,7 +186,7 @@ class ExportDirectoryContractTests(unittest.TestCase):
 
         self.backend.open_export_directory = fail
         with self.assertRaises(export.ExportDirectoryCreationError):
-            self.batch.materialize_target(plan)
+            self.batch.prepare_directories()
         self.assertEqual(self.batch.created_directories, ('a',))
         self.assertNotIn('/a/x.rpy', self.backend.tree)
         self.batch.close()
@@ -190,7 +214,7 @@ class ExportDirectoryContractTests(unittest.TestCase):
                             if operation == 'prepare':
                                 batch.prepare_descendant_target('a/x.rpy')
                             else:
-                                batch.materialize_target(plan)
+                                batch.prepare_directories()
                 self.assertTrue(all(item.closed for item in backend.opened if item is not backend.root))
                 backend.root.close()
 

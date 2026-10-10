@@ -1,7 +1,7 @@
 """Platform-owned preparation and materialization of nested export targets.
 
-Plans preserve the preview's existing/absent conditions. A batch may reuse only
-its own created directory authorities; it never adopts a concurrent creator.
+Plans preserve the preview's existing/absent conditions. Directory preparation
+consumes its batch; only a fresh preview can authorize later file publication.
 The primitives belong to the platform adapters, not to retirement or Parser.
 """
 
@@ -92,6 +92,13 @@ class _PlanState:
     consumed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ExportDirectoryFailure:
+    relative_path: str
+    outcome: str
+    code: str
+
+
 class MaterializedExportTarget(OpaqueAuthority):
     """One-use transfer of ordinary rooted publication authority to its owner."""
 
@@ -160,13 +167,18 @@ class ExportDirectoryBatch(OpaqueAuthority):
         super().__init__()
         self._backend, self._root = backend, root
         self._states: dict[ExportDirectoryPlan, _PlanState] = {}
-        self._created: dict[tuple[str, ...], BoundDirectoryAuthority] = {}
+        self._prepared_directories: dict[tuple[str, ...], BoundDirectoryAuthority] = {}
         self._created_paths: list[str] = []
+        self._directory_failures: list[ExportDirectoryFailure] = []
         self._started = False
 
     @property
     def created_directories(self) -> tuple[str, ...]:
         return tuple(self._created_paths)
+
+    @property
+    def directory_failures(self) -> tuple[ExportDirectoryFailure, ...]:
+        return tuple(self._directory_failures)
 
     def prepare_descendant_target(self, portable_ref: str) -> ExportDirectoryPlan:
         self._require_open()
@@ -231,7 +243,7 @@ class ExportDirectoryBatch(OpaqueAuthority):
                 raise _stale()
         elif state.parent.inspect_entry(plan.missing_directories[0]) is not None:
             prefix = state.prefix + (plan.missing_directories[0],)
-            created = self._created.get(prefix)
+            created = self._prepared_directories.get(prefix)
             if created is None:
                 raise _stale()
             created.reprove()
@@ -247,19 +259,38 @@ class ExportDirectoryBatch(OpaqueAuthority):
             raise _stale()
         return state
 
-    def materialize_target(self, plan: ExportDirectoryPlan, cancellation=None) -> MaterializedExportTarget:
-        state = self._require_plan(plan)
+    def prepare_directories(self, cancellation=None) -> tuple[str, ...]:
+        """Prepare directories only, then invalidate every plan in this batch.
+
+        Successful mkdir calls are mutation facts, not creator-identity proofs.
+        The caller must obtain and confirm a fresh preview before publishing.
+        """
+        self._require_open()
+        if self._started:
+            raise _stale()
         self._started = True
-        parent = existing = None
         try:
-            _checkpoint(cancellation)
-            self.reprove(plan)
+            for plan in self._states:
+                _checkpoint(cancellation)
+                self.reprove(plan)
+            for state in self._states.values():
+                self._prepare_plan_directories(state, cancellation)
+            return self.created_directories
+        finally:
+            self.close()
+
+    def _prepare_plan_directories(self, state, cancellation) -> None:
+        parent = None
+        attempted = None
+        try:
+            self.reprove(state.plan)
             parent = self._backend.duplicate_export_directory(state.parent)
             prefix = state.prefix
-            for part in plan.missing_directories:
+            for part in state.plan.missing_directories:
                 _checkpoint(cancellation)
                 prefix += (part,)
-                shared = self._created.get(prefix)
+                attempted = '/'.join(prefix)
+                shared = self._prepared_directories.get(prefix)
                 if shared is not None:
                     shared.reprove()
                     child = self._backend.duplicate_export_directory(shared)
@@ -271,11 +302,34 @@ class ExportDirectoryBatch(OpaqueAuthority):
                     except ExportDirectoryCreationError:
                         self._created_paths.append('/'.join(prefix))
                         raise
-                    self._created[prefix] = shared
+                    self._prepared_directories[prefix] = shared
                     self._created_paths.append('/'.join(prefix))
                     child = self._backend.duplicate_export_directory(shared)
                 previous, parent = parent, child
                 previous.close()
+                attempted = None
+            _checkpoint(cancellation)
+        except Exception as error:
+            if attempted is not None:
+                self._directory_failures.append(ExportDirectoryFailure(
+                    attempted,
+                    'uncertain' if attempted in self._created_paths else 'failed',
+                    getattr(error, 'code', PlatformFileErrorCode.ENTRY_UNAVAILABLE.value),
+                ))
+            raise
+        finally:
+            _close_all((parent,))
+
+    def materialize_target(self, plan: ExportDirectoryPlan, cancellation=None) -> MaterializedExportTarget:
+        state = self._require_plan(plan)
+        if any(item.plan.missing_directories for item in self._states.values()):
+            raise _stale()
+        self._started = True
+        parent = existing = None
+        try:
+            _checkpoint(cancellation)
+            self.reprove(plan)
+            parent = self._backend.duplicate_export_directory(state.parent)
             _checkpoint(cancellation)
             if parent.inspect_entry(plan.relative_path.rsplit('/', 1)[-1]) != plan.expected:
                 raise _stale()
@@ -300,7 +354,7 @@ class ExportDirectoryBatch(OpaqueAuthority):
 
     def _close_authority(self) -> None:
         authorities = [a for state in self._states.values() for a in (state.existing, state.parent)]
-        authorities.extend(reversed(tuple(self._created.values())))
+        authorities.extend(reversed(tuple(self._prepared_directories.values())))
         self._states.clear()
-        self._created.clear()
+        self._prepared_directories.clear()
         _close_all(authorities)

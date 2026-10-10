@@ -327,9 +327,11 @@ class PersistentPrivateProof(Protocol):
 
 `prepare_descendant_target(retained_export_root, portable_ref)` 只读验证相对引用、根/已有祖先身份、既有目标身份或缺失事实，将已有 lineage、缺失目录后缀与目标 absent 条件封装为不可变 plan；不存在的父目录不产生虚构 handle。Application 在确认前排除重复、大小写冲突和文件/祖先冲突，并把 plan 与其 session、revision 和输出事实绑定。
 
-`materialize_target(directory_plan, cancellation)` 仅在用户确认后复证祖先，逐组件 no-follow 创建缺失目录并保留新 handle/身份。预览中 absent 的目录或目标被其他执行者创建时返回 stale，不收养该对象；仅同批成功创建且复证的共享祖先可复用。已有目标必须匹配预览身份。完成后签发 Parser 可消费的 rooted target binding，再按原条件执行 prepared write。
+`prepare_export_directories(directory_plan, cancellation)` 只在用户明确确认准备目录后执行。逐组件 no-follow 创建缺失目录，并复证输出根和当前目录；遇已观察身份漂移、符号链接或逸出即停止。创建调用成功与随后取得的当前目录身份是不同事实，不承诺创建者连续性，不将创建结果签发为文件发布目标绑定。该阶段可复用本阶段已复证的当前目录，但不能将其称为创建者权威。
 
-替换、取消或失败时关闭本次 handle；取消后不启动新目录或文件写入，已发出系统调用的结果仍须复证。目录创建失败不发布该目标文件，如实返回本批已创建目录，不承诺删除空目录或将其计为已导出文件。逐目标物化及时释放非必要 handle，保留本批新目录身份事实至批次结束。POSIX/Windows 原语分别归本 owner adapter，观察与创建都不得复用 retirement/ledger authority。
+目录准备结束后，关闭并丢弃全部旧 plan 与 handle，如实报告创建调用成功、失败或无法确定的路径，不承诺空目录回滚。Application 必须重新只读预览并获得用户对新预览的明确确认，不能沿旧确认自动发布文件。新预览把当前存在的目录作为已有祖先绑定；之后目录或目标出现身份／存在条件变化仍 stale。
+
+`materialize_target(directory_plan, cancellation)` 仅接受全部父目录在本次只读预览中已存在的计划；不创建目录，不接受上次准备阶段的计划或 handle。复证祖先、既有目标身份或 absent 条件后，签发 Parser 可消费的一次性 rooted target binding。目录准备与文件发布都在组件／文件边界检查取消，已发出的操作如实报告；逐项及终态释放 handle。POSIX/Windows 原语分别归本 owner adapter，不复用 retirement/ledger authority。该分阶段合同遵循 [ADR-032](../../steering/adr/adr-032.md)。
 
 ## Windows Native Adapter
 
