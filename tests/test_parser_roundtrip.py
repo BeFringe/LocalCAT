@@ -170,6 +170,64 @@ class ParserRoundTripTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b"leave target untouched")
         return caught.exception
 
+    def test_materialized_nested_target_preserves_prepared_bytes_and_old_plan_is_closed(self):
+        from platform_export_directory import ExportDirectoryBatch
+        backend = _PlatformAdapter()
+        with backend.bind_root(self.root) as root:
+            with ExportDirectoryBatch(backend, root) as batch:
+                old = batch.prepare_descendant_target('a/b/output.rpy')
+                batch.prepare_directories()
+                with self.assertRaises(PlatformFileError):
+                    batch.materialize_target(old)
+            with ExportDirectoryBatch(backend, root) as fresh:
+                plan = fresh.prepare_descendant_target('a/b/output.rpy')
+                prepared = self.prepare()
+                target = fresh.materialize_target(plan)
+                self.surface.bind_materialized_round_trip_target(prepared, target)
+                self.assertTrue(target.closed)
+                result = self.surface.write_prepared(prepared)
+                self.assertEqual(result.outcome, contracts.PreparedWriteOutcome.PUBLISHED)
+        self.assertEqual((self.root / 'a/b/output.rpy').read_bytes(), self.output)
+
+    def test_materialized_existing_target_overwrites_and_is_single_use(self):
+        from platform_export_directory import ExportDirectoryBatch
+        backend = _PlatformAdapter()
+        with backend.bind_root(self.root) as root, ExportDirectoryBatch(backend, root) as batch:
+            plan = batch.prepare_descendant_target(self.target.name)
+            target = batch.materialize_target(plan)
+            prepared = self.prepare()
+            self.surface.bind_materialized_round_trip_target(prepared, target)
+            other = self.prepare()
+            with self.assertRaises(PlatformFileError):
+                self.surface.bind_materialized_round_trip_target(other, target)
+            self.assertTrue(other.closed)
+            self.assertEqual(self.surface.write_prepared(prepared).outcome,
+                             contracts.PreparedWriteOutcome.PUBLISHED)
+        self.assertEqual(self.target.read_bytes(), self.output)
+
+    def test_materialized_absent_race_is_not_rebound_and_foreign_preparation_releases_target(self):
+        from platform_export_directory import ExportDirectoryBatch
+        backend = _PlatformAdapter()
+        path = self.root / 'race.rpy'
+        with backend.bind_root(self.root) as root, ExportDirectoryBatch(backend, root) as batch:
+            plan = batch.prepare_descendant_target(path.name)
+            target = batch.materialize_target(plan)
+            prepared = self.prepare()
+            path.write_bytes(b'external')
+            with self.assertRaises(PlatformFileError):
+                self.surface.bind_materialized_round_trip_target(prepared, target)
+            self.assertTrue(target.closed)
+            self.assertTrue(prepared.closed)
+            self.assertEqual(path.read_bytes(), b'external')
+        with backend.bind_root(self.root) as root, ExportDirectoryBatch(backend, root) as batch:
+            target = batch.materialize_target(batch.prepare_descendant_target('foreign.rpy'))
+            prepared = self.prepare()
+            with self.assertRaises(composition.ParserApplicationError):
+                self.make_surface().bind_materialized_round_trip_target(prepared, target)
+            self.assertTrue(target.closed)
+            self.assertFalse(prepared.closed)
+        self.assertFalse((self.root / 'foreign.rpy').exists())
+
     def test_round_trip_prepare_verifies_source_before_factory_without_target_open(self):
         opened = self.opened()
         with mock.patch.object(composition, "_rooted_backend", side_effect=AssertionError("target open")) as target_open, \

@@ -430,6 +430,8 @@ Foundation 同时验证 metadata 的 JSON-compatible scalar/tuple 结构。每�
 
 `write_prepared` 验证 issuing surface、一次性消费状态、源/输出摘要与 rooted target binding，沿用平台原子发布；普通 bytes DTO 不是写权限。发布前故障无发布，发布后证明不足返回 uncertain。round-trip 输出不交给 canonical serializer 重编码；canonical writer、无 journal/LKG 的恢复边界和已有格式语义保持独立。
 
+平台签发的一次性目标绑定可直接移交给 prepared 发布；Parser 保留其已观察的目标身份或 absent 条件，不以路径重新绑定最新状态。失效、重复或非本 surface 的准备不能接受该绑定，消费与失败均释放转入权威。缺失目录的准备与重新确认由 Application 协调，Parser 不创建目录。
+
 ## 迭代器与提交授权
 
 codec 的行为合同是结构化 protocol，不是必须继承的 ABC。raw codec 只有一个语法入口，不能自行发布提交终态：

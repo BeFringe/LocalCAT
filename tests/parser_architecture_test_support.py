@@ -990,6 +990,7 @@ def build_parser_architecture_policy() -> ArchitecturePolicy:
                     "parser_source",
                     "platform_fs",
                     "platform_fs_contracts",
+                    "platform_export_directory",
                     *PARSER_CODEC_PREFIXES,
                 ),
                 (),
