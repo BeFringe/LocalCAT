@@ -67,6 +67,9 @@ class QtRpyBatchExportTests(unittest.TestCase):
         self.assertEqual(dialog.result.outcome, 'published')
         self.assertTrue(dialog.isVisible())
         self.assertEqual([dialog.files_table.topLevelItem(i).text(1) for i in range(3)], ['已导出'] * 3)
+        self.assertIn('已创建', dialog.directory_label.text())
+        self.assertNotIn('未发布 TL', dialog.directory_label.text())
+        self.assertNotIn('仍需确认', dialog.directory_label.text())
 
     def test_existing_original_directory_overwrite_visible_and_once(self):
         self.target = self.input

@@ -311,7 +311,7 @@ class QtProjectExportDialog(QDialog):
             failures = len(result.directory_failures)
             state = {'prepared': '目录准备完成', 'cancelled': '目录准备已取消',
                      'failed': '目录准备失败', 'uncertain': '目录准备结果需检查'}.get(result.outcome, '目录准备未完成')
-            return f'{state}：已创建 {created} 个目录，失败／需检查 {failures} 个。未发布 TL；新预览仍需确认。'
+            return f'{state}：已创建 {created} 个目录，失败／需检查 {failures} 个。'
         if type(result) is ProjectExportBatchResult:
             counts = {name: sum(item.outcome == name for item in result.files)
                       for name in ('published', 'failed', 'uncertain', 'not_attempted')}
