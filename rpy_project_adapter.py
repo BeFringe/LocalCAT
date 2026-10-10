@@ -155,12 +155,17 @@ class RpyProjectSession:
         """
         self._require_live()
         documents = self.workspace_service.workspace.documents
-        if len(documents) != 1:
+        documents = tuple(document for document in documents
+                          if document.codec_identity.provider_id == _RPY_IDENTITY.provider_id)
+        if not documents:
             return ProjectCodecAvailability(
                 _RPY_IDENTITY, _RPY_FORMAT, False, 'RPY.EXPORT.UNAVAILABLE',
-                'TL export currently supports single-document projects only.')
-        document = documents[0]
-        return _availability(runtime, document.codec_identity, FormatId(document.format_id))
+                'This project contains no Ren’Py TL documents.')
+        for document in documents:
+            availability = _availability(runtime, document.codec_identity, FormatId(document.format_id))
+            if not availability.available:
+                return availability
+        return availability
 
     def save(self, destination: Path | None = None) -> ProjectPackageExportResult:
         self._require_live()
@@ -370,14 +375,23 @@ class RpyProjectAdapter:
         self, workspace_service: ProjectWorkspaceService,
         persistence_binding: ProjectPackagePersistenceBinding, target: Path, *,
         config_dir: Path, request_generation: int = 0, cancellation=None,
+        document_ids: tuple[str, ...] | None = None,
     ):
         """Prepare a display-only preview from the installed Project owner.
 
         Ordinary package-open services use this same seam as RPY sessions.
         The caller retains the closeable candidate and gives only its view to UI.
         """
-        from rpy_project_export import RpyExportContext, prepare_rpy_export
+        from rpy_project_export import RpyExportContext, prepare_rpy_export, prepare_rpy_batch_export
 
+        if document_ids is not None or len(workspace_service.workspace.documents) != 1:
+            if document_ids is None:
+                document_ids = tuple(document.document_id for document in workspace_service.workspace.documents
+                                     if document.codec_identity.provider_id == _RPY_IDENTITY.provider_id)
+            return prepare_rpy_batch_export(
+                RpyExportContext(workspace_service, persistence_binding, self.runtime, request_generation),
+                target, document_ids=document_ids, config_dir=config_dir,
+                package_service=self.package_service, cancellation=cancellation)
         return prepare_rpy_export(
             RpyExportContext(workspace_service, persistence_binding, self.runtime, request_generation),
             target, config_dir=config_dir, package_service=self.package_service,
