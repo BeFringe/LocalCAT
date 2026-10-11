@@ -1,0 +1,94 @@
+{
+  "kind": "observation_only_not_product_pass",
+  "runtime": {
+    "python": "3.14.7",
+    "sqlite": "3.53.1",
+    "platform": "darwin",
+    "kernel": "25.2.0",
+    "architecture": "arm64"
+  },
+  "experiments": [
+    {
+      "case": "control",
+      "replacement_created": false,
+      "journal_mode": "delete",
+      "commit_returned_success": true,
+      "retained_inode_still_original": true,
+      "retained_database_changed": true,
+      "configured_database_changed": true,
+      "retained_journal_after_close": false,
+      "configured_journal_after_close": false,
+      "retained_readonly_reopen": {
+        "rows": [
+          [
+            "seed"
+          ],
+          [
+            "transaction"
+          ]
+        ]
+      },
+      "configured_readonly_reopen": {
+        "rows": [
+          [
+            "seed"
+          ],
+          [
+            "transaction"
+          ]
+        ]
+      }
+    },
+    {
+      "case": "before_connect",
+      "replacement_created": true,
+      "replacement_journal_before_commit": false,
+      "journal_mode": "delete",
+      "commit_returned_success": true,
+      "retained_inode_still_original": true,
+      "retained_database_changed": false,
+      "configured_database_changed": true,
+      "retained_journal_after_close": false,
+      "configured_journal_after_close": false,
+      "retained_readonly_reopen": {
+        "rows": [
+          [
+            "seed"
+          ]
+        ]
+      },
+      "configured_readonly_reopen": {
+        "rows": [
+          [
+            "seed"
+          ],
+          [
+            "transaction"
+          ]
+        ]
+      }
+    },
+    {
+      "case": "after_insert",
+      "replacement_created": true,
+      "journal_mode": "delete",
+      "replacement_journal_before_commit": true,
+      "commit_returned_success": true,
+      "retained_inode_still_original": true,
+      "retained_database_changed": true,
+      "configured_database_changed": false,
+      "retained_journal_after_close": true,
+      "configured_journal_after_close": false,
+      "retained_readonly_reopen": {
+        "sqlite_errorname": "SQLITE_READONLY_ROLLBACK"
+      },
+      "configured_readonly_reopen": {
+        "rows": [
+          [
+            "seed"
+          ]
+        ]
+      }
+    }
+  ]
+}

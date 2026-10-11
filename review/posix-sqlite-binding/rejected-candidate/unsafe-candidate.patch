@@ -1,0 +1,270 @@
+diff --git a/tests/test_resource_portability_exports.py b/tests/test_resource_portability_exports.py
+index cbe8387..0df3bc8 100644
+--- a/tests/test_resource_portability_exports.py
++++ b/tests/test_resource_portability_exports.py
+@@ -244,9 +244,25 @@ class ResourcePortabilityExportTests(unittest.TestCase):
+         callback_observations: list[str] = []
+ 
+         def assert_pending_path_locked(path: Path) -> None:
+-            """The Core pending publication must retain exclusive handles."""
++            """Prove native publication protection while the callback runs."""
+ 
+             self.assertTrue(path.exists())
++            if os.name == "posix":
++                # POSIX uses a cooperative resource W1, not Windows share
++                # denial against arbitrary writes/unlinks by other code.
++                import fcntl
++                from tm_contracts import CanonicalResourceIdentity
++
++                identity = CanonicalResourceIdentity.from_configured_jsonl(
++                    "lock-probe", path,
++                )
++                lock_path = path.with_name(
++                    f".{identity.canonical_sidecar_path.name}.localcat-initial-activation.lock"
++                )
++                with lock_path.open("rb") as contender:
++                    with self.assertRaises(BlockingIOError):
++                        fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++                return
+             with self.assertRaises(PermissionError):
+                 path.write_bytes(path.read_bytes())
+             with self.assertRaises(PermissionError):
+diff --git a/tm_migration.py b/tm_migration.py
+index 0576643..ac30c4d 100644
+--- a/tm_migration.py
++++ b/tm_migration.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Callable, Iterator
++from contextlib import nullcontext
+ import ctypes
+ import errno
+ import hashlib
+@@ -936,6 +937,15 @@ def _copy_bound_export_prior(
+     source = backend.open_regular(root, PurePath(source_name))
+     pending: PendingPublication | None = None
+     published_identity: FileObjectIdentity | None = None
++    # POSIX CREATE_IF_ABSENT links the candidate to a distinct destination.
++    # Windows keeps its existing handle-bound naming protocol.
++    candidate_name = (
++        recovery_name
++        if sys.platform == "win32"
++        else f"{recovery_name}.{uuid.uuid4().hex}.tmp"
++    )
++    candidate: CandidateFile | None = None
++    candidate_identity: FileObjectIdentity | None = None
+     try:
+         facts = source.content_facts()
+         if (
+@@ -946,7 +956,7 @@ def _copy_bound_export_prior(
+             raise ExportPreflightError("EXPORT.DESTINATION_STALE")
+         candidate, copied, candidate_identity = _bound_candidate_from_opened(
+             parent,
+-            recovery_name,
++            candidate_name,
+             source,
+             prior.snapshot,
+         )
+@@ -957,7 +967,7 @@ def _copy_bound_export_prior(
+             mismatch = ExportPreflightError("EXPORT.RECOVERY_COPY_FAILED")
+             cleanup_error = _cleanup_failed_bound_candidate(
+                 parent,
+-                recovery_name,
++                candidate_name,
+                 candidate,
+                 candidate_identity,
+             )
+@@ -980,8 +990,21 @@ def _copy_bound_export_prior(
+         ):
+             raise ExportPreflightError("EXPORT.RECOVERY_COPY_FAILED")
+         published_identity = published.destination_identity
+-    except BaseException:
++    except BaseException as error:
+         _close_bound_export_authorities(pending, source)
++        if sys.platform != "win32":
++            cleanup_error = _cleanup_failed_bound_candidate(
++                parent, candidate_name, candidate, candidate_identity,
++            )
++            if cleanup_error is not None:
++                raise cleanup_error from error
++            # begin_publish can fail after naming the copy.  Retire only the
++            # exact candidate identity, never an unproven conflicting entry.
++            observed = parent.inspect_entry(recovery_name)
++            if observed is not None and observed.identity == candidate_identity:
++                _cleanup_bound_export_artifacts(
++                    parent, ((recovery_name, candidate_identity),),
++                )
+         raise
+     close_error = _close_bound_export_authorities(source)
+     return published_identity, pending, close_error
+@@ -3388,7 +3411,7 @@ class TMMigrationService:
+         failure and never falls through to JSONL activation/query behavior.
+         """
+ 
+-        if reservation._backend is not None:
++        if sys.platform == "win32" and reservation._backend is not None:
+             return self._recover_existing_portable_initial_activation(
+                 coordinator=coordinator,
+                 source=source,
+@@ -6999,7 +7022,9 @@ class TMMigrationService:
+         payload_authority: BoundRegularFile | None = None
+         owner_started = False
+         try:
+-            with reservation:
++            # POSIX compensation below borrows the same root/W1 as publication;
++            # its explicit release is after exception cleanup in the finalizer.
++            with (reservation if sys.platform == "win32" else nullcontext(reservation)):
+                 self._active_owner_reservation = reservation
+                 backend, source_root, lease, _lock_name, _lock_payload = (
+                     reservation.bound_family_inputs()
+@@ -7062,6 +7087,15 @@ class TMMigrationService:
+                     if prior.snapshot is None
+                     else PublishMode.REPLACE_UNDER_LOCK
+                 )
++                if sys.platform != "win32":
++                    source_publication = _BoundExportPublication(
++                        name=destination_name,
++                        candidate_name=candidate_name,
++                        content=content,
++                        candidate_identity=candidate_identity,
++                        candidate=None,
++                        pending=None,
++                    )
+                 try:
+                     pending = source_parent.begin_publish(
+                         candidate,
+@@ -7084,21 +7118,30 @@ class TMMigrationService:
+                 reservation.reprove()
+ 
+                 owner_started = True
+-                outcome = (
+-                    self._activate_initial_with_resource_reservation(
++                if initial:
++                    outcome = self._activate_initial_with_resource_reservation(
+                         coordinator=coordinator,
+                         source=self._resource_identity.configured_jsonl_path,
+                         source_before=expected_digest,
+                         reservation=reservation,
+                     )
+-                    if initial
+-                    else self._portable_explicit_disambiguation_reserved(
++                elif sys.platform == "win32":
++                    outcome = self._portable_explicit_disambiguation_reserved(
+                         source=self._resource_identity.configured_jsonl_path,
+                         resource_id=resource_id,
+                         coordinator=coordinator,
+                         reservation=reservation,
+                     )
+-                )
++                else:
++                    # Keep the configured-source PendingPublication, root and
++                    # W1 live while the existing POSIX replacement owner seals,
++                    # publishes and reconciles its activation journal.
++                    outcome = self._explicit_disambiguation(
++                        self._resource_identity.configured_jsonl_path,
++                        resource_id,
++                    )
++                if sys.platform != "win32":
++                    reservation.reprove()
+                 if type(outcome) is MigrationReport:
+                     if (
+                         outcome.source_digest != expected_digest
+@@ -7150,6 +7193,17 @@ class TMMigrationService:
+                     return outcome
+ 
+                 if type(outcome) is MigrationFailure:
++                    if (
++                        sys.platform != "win32"
++                        and not initial
++                        and outcome.active_store_preservation.state
++                        is not AssetPreservationState.VERIFIED_UNCHANGED
++                    ):
++                        # POSIX replacement failures describe prior authority
++                        # through preservation evidence, not the first-
++                        # activation flags.  An unproven rollback must leave
++                        # configured-source facts to the activation journal.
++                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+                     if (
+                         outcome.canonical_authority_published
+                         or outcome.canonical_authority_ambiguous
+@@ -7265,7 +7319,10 @@ class TMMigrationService:
+             if (
+                 not owner_started
+                 and source_publication is not None
+-                and source_publication.pending is not None
++                and (
++                    source_publication.pending is not None
++                    or sys.platform != "win32"
++                )
+                 and source_root is not None
+                 and source_parent is not None
+             ):
+@@ -7285,6 +7342,15 @@ class TMMigrationService:
+                         "IMPORT.RECOVERY_REQUIRED"
+                     ) from (close_error or recovery_close_error)
+                 try:
++                    if sys.platform != "win32":
++                        cleanup_error = _cleanup_failed_bound_candidate(
++                            source_parent,
++                            source_publication.candidate_name,
++                            None,
++                            source_publication.candidate_identity,
++                        )
++                        if cleanup_error is not None:
++                            raise cleanup_error
+                     rollback = _restore_bound_export_member(
+                         backend,
+                         source_root,
+@@ -7307,12 +7373,27 @@ class TMMigrationService:
+             raise
+         finally:
+             self._active_owner_reservation = None
+-            _close_bound_export_authorities(
+-                source_publication.pending if source_publication is not None else None,
+-                source_recovery_pending,
+-                payload_authority,
+-                payload_root,
+-            )
++            try:
++                close_error = _close_bound_export_authorities(
++                    source_publication.pending if source_publication is not None else None,
++                    source_recovery_pending,
++                    payload_authority,
++                    payload_root,
++                )
++                if sys.platform != "win32":
++                    if close_error is not None:
++                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED") from close_error
++                    if owner_started and source_parent is not None:
++                        # The canonical journal owns post-entry recovery; this
++                        # anonymous source copy cannot serve as a recovery fact.
++                        _cleanup_bound_export_artifacts(
++                            source_parent,
++                            ((source_recovery_name, source_recovery_identity),),
++                        )
++                    reservation.reprove()
++            finally:
++                if sys.platform != "win32":
++                    reservation.release()
+ 
+     def rebuild_from_snapshot(
+         self,
+@@ -10682,7 +10763,7 @@ class _InitialActivationResourceReservation:
+     ) -> dict[str, object]:
+         """Mint one non-closing portable seal borrow from the held reservation."""
+ 
+-        if self._backend is None:
++        if sys.platform != "win32" or self._backend is None:
+             return {"platform": None, "caller_borrow": None}
+         if (
+             self._released
+@@ -11557,7 +11638,7 @@ def _freeze_initial_stage_attempt(
+             )
+         backend = resource_reservation._backend
+         root = resource_reservation._root
+-        if backend is not None:
++        if sys.platform == "win32" and backend is not None:
+             if root is None:
+                 raise MigrationPreflightError(
+                     "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"

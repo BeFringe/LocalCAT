@@ -1,0 +1,62 @@
+{
+  "status": "historical_rejected_candidate_not_current_product",
+  "observations": [
+    {
+      "phase": "parent_replaced"
+    },
+    {
+      "phase": "reservation_reprove_passed"
+    },
+    {
+      "phase": "second_owner_acquired_w1_at_configured_path"
+    },
+    {
+      "phase": "stage_created",
+      "under_replacement_parent": true,
+      "exists": true
+    },
+    {
+      "phase": "reservation_reprove_passed"
+    },
+    {
+      "phase": "reservation_reprove_passed"
+    },
+    {
+      "phase": "reservation_reprove_passed"
+    },
+    {
+      "phase": "reservation_reprove_passed"
+    },
+    {
+      "phase": "reservation_reprove_passed"
+    },
+    {
+      "phase": "outcome",
+      "type": "success"
+    },
+    {
+      "phase": "replacement_residue",
+      "names": [
+        ".old-c5c66994.jsonl.localcat-import-recovery-0937f91a762b40c1af2c1fe2bbc6e920.jsonl",
+        ".old-c5c66994.jsonl.localcat-snapshot.json.localcat-recovery.4e13b924f2694ddf8444eefc72657d1d.manifest.bak",
+        ".old-c5c66994.jsonl.sqlite3.localcat-activated-lineage.json",
+        ".old-c5c66994.jsonl.sqlite3.localcat-activation-journal.json",
+        ".old-c5c66994.jsonl.sqlite3.localcat-initial-activation.lock",
+        ".old-c5c66994.jsonl.sqlite3.localcat-recovery.4e13b924f2694ddf8444eefc72657d1d.database.bak",
+        "old-c5c66994.jsonl",
+        "old-c5c66994.jsonl.localcat-snapshot.json",
+        "old-c5c66994.jsonl.sqlite3"
+      ]
+    },
+    {
+      "phase": "canonical_comparison",
+      "held_canonical_unchanged": true,
+      "named_canonical_changed": true,
+      "named_generation": 1
+    }
+  ],
+  "terminal_assertion": "父目录置换后不得签发成功结果：AssertionError",
+  "historical_observation_head": "07a12b7ed551fb495259dd9f6feec6414c467a6c",
+  "reproduction_base": "2e1cbce96a27b13b42f89f73c0eabe47dbd3cdc5",
+  "provenance_note": "原观察提取自07a12b7工作树上的未提交候选；2e1cbce仅作后续隔离复核基线，不是原运行锚。"
+}
