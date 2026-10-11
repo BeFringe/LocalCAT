@@ -5358,6 +5358,19 @@ class EditorController:
         with self._tm_query_lock:
             try:
                 configs = self.repository.list_resources()
+                target_config = next(
+                    (
+                        config
+                        for config in configs
+                        if config.id == resource_id
+                        and config.kind is ResourceKind.TRANSLATION_MEMORY
+                    ),
+                    None,
+                )
+                if target_config is None:
+                    raise ValueError(
+                        "activation completion resource is unavailable"
+                    )
                 tm_engines: dict[str, TMEngine] | None = None
 
                 def validate_candidate(snapshot: object) -> None:
@@ -5384,10 +5397,15 @@ class EditorController:
                         if status.resource_id == resource_id
                     )
                     target_engine = tm_engines.get(resource_id)
-                    if target_status.mode is TMResourceDisplayMode.UNAVAILABLE:
+                    # Runtime proof above also covers inactive resources; only
+                    # Active resources belong to the compatibility engine set.
+                    if (
+                        not target_config.active
+                        or target_status.mode is TMResourceDisplayMode.UNAVAILABLE
+                    ):
                         if target_engine is not None:
                             raise ValueError(
-                                "unavailable activation retained compatibility authority"
+                                "inactive or unavailable activation retained compatibility authority"
                             )
                     else:
                         if target_engine is None:
@@ -5403,21 +5421,8 @@ class EditorController:
                         )
 
                 if adapter is None:
-                    target_config = next(
-                        (
-                            config
-                            for config in configs
-                            if config.id == resource_id
-                            and config.kind
-                            is ResourceKind.TRANSLATION_MEMORY
-                            and config.active
-                        ),
-                        None,
-                    )
-                    if target_config is None:
-                        raise ValueError(
-                            "activation completion resource is unavailable"
-                        )
+                    from tm_application_composition import TMResourceResolver
+
                     target_engine = self._load_tm_engine(
                         target_config.path,
                         target_config.id,
@@ -5428,6 +5433,14 @@ class EditorController:
                         service_canonical_store_id=(
                             service_canonical_store_id
                         ),
+                    )
+                    # A cold-open engine may retain LKG after source divergence.
+                    # Re-prove the complete lifecycle state before completion.
+                    _validate_activation_runtime_candidate(
+                        TMResourceResolver().resolve((target_config,)),
+                        resource_id=resource_id,
+                        outcome=outcome,
+                        service_canonical_store_id=service_canonical_store_id,
                     )
                     tm_engines = {
                         config.id: (
