@@ -69,6 +69,13 @@
 - **Steering sync**：Required。实现闭合时同步 `product.md`、`structure.md`、`tech.md` 的 exact-only/JSONL 当前态与新增文件边界；已同步的 integration boundary、roadmap 和 ownership 不重复改写。
 - **Downstream revalidation**：`qt-editor-json-mvp-increment` Requirement 3/7 matcher handoff、既有 Qt/Excel/legacy tests、macOS bootstrap；Parser/multi-document 仅登记未来触发器。
 
+### POSIX 资源家族会话与局部停止
+
+- **Applicable Steering / ADRs**：遵循 `delivery-boundaries.md`、`tech.md`、`structure.md` 与 ADR-033；ADR-016 device-only 维护及 Core Fuzzy Gate 保持各自独立条件。
+- **Scope amendment**：5.6、5.9 与 6.14 收束 legacy/LKG 保留的前提，并消费 Core 7.15–7.18、ResourcePortability 7.7、8.6–8.7 的资源级停止与恢复要求。Application 负责共享 Core owner 及安全投影，不取得 root、W1、SQL、恢复 phase 或 capability authority。
+- **Steering sync**：继承共享治理 owner 的 ADR-033 与 POSIX 支持边界；本 Spec 只核对实际 composition、adapter、Controller 的消费关系。
+- **Downstream revalidation**：Task 10 复用原 7.4 失败矩阵，覆盖资源停止、晚到结果、健康 peer 与独立项目保存；平台 Task 11.5 按实际共享修改验证 Windows source/普通 frozen。`rpy-project-codec` 6.2/6.3 继续拥有资源包交付出口。
+
 ### Windows Compatibility Amendment WA-07
 
 - **ADR mapping与ownership**：遵循ADR-009/011/013/020/021及其已采纳修订、ADR-028。Feature5/UI继续拥有Controller、CapabilityHost、resource/runtime projection与safe diagnostic；Windows Spec拥有构建、入口、候选关联与transport，TM Core拥有输入/session、资格及activation/private proof；使用既有public capability schema。
@@ -170,7 +177,10 @@ graph LR
 ### Modified Files
 
 - `editor_contracts.py` — 移除 ambiguous 单 `source` suggestion，增加双 source、Core match type、safe status 和 query identity。
-- `editor_controller.py` — 将 legacy loops 替换为 adapter use case；保持唯一 session、dirty/confirmed 和 term flow。
+- `editor_controller.py` — 将 legacy loops 替换为 adapter use case；保持唯一 session、dirty/confirmed 和 term flow；消费资源失效，撤销其旧结果，分别呈现 TM 写回与项目保存结果。
+- `tm_application_composition.py` — 使 runtime/resolver 与 ResourcePort 借用同一 Core 家族会话，刷新不重新铸造失效资源 owner。
+- `editor_tm_adapter.py` — 将 Core 资源局部停止投影到原 frozen status/report，过滤失效资源晚到结果并保留健康 peer 结果。
+- `tests/test_tm_resource_lifecycle.py`、`tests/test_editor_controller_inactive_tm_activation.py`、`tests/test_editor_controller_tm_activation_completion.py`、`tests/test_qt_resource_portability.py` — 复用真实 owner/Controller 入口验证局部停止、late completion、peer 可用及独立项目保存。
 - `workspace_state.py` — 在现有原子 workspace payload 中增加应用级 TM preference，旧/非法值回退 0.60。
 - `resource_importer.py` — 通过精确 Feature 5 merge 继承 canonical variant-preserving import；integration 只验证 hot reload/status。
 - `qt_editor_window.py` / `qt_settings_dialog.py` — 只渲染 Controller contracts，不构造 Core query 或 capability。
@@ -272,14 +282,14 @@ stateDiagram-v2
     Preflight --> LegacyExactOnly: cancel before formal start
     Preflight --> Activating: explicit confirm
     Activating --> CanonicalActive: MigrationReport + runtime reopen succeeds
-    Activating --> LegacyExactOnly: proven first cancel or rollback
+    Activating --> LegacyExactOnly: proven first cancel or rollback and legacy remains usable
     Activating --> Unavailable: ambiguous first activation or recovery
     CanonicalActive --> SourceDiverged: external source divergence
     SourceDiverged --> Activating: explicit rebuild/import
-    Activating --> SourceDiverged: update failure keeps last-known-good
+    Activating --> SourceDiverged: update failure with proven last-known-good
     CanonicalActive --> Unavailable: canonical authority cannot be re-proven
     SourceDiverged --> Unavailable: canonical authority cannot be re-proven
-    Unavailable --> CanonicalActive: explicit ADR-016 same-generation re-attestation succeeds
+    Unavailable --> CanonicalActive: Core-classified device-only ADR-016 re-attestation succeeds
 ```
 
 - 打开应用、项目、设置、刷新或查询绝不调用 migration。
@@ -288,9 +298,13 @@ stateDiagram-v2
 - `activate_initial()` 必须在 Core 内部独占 `build → StageSealer → coordinator durable activation → verify/recovery` 链，公开方法只接收 configured JSONL 与 resource identity，不暴露 registry、mutable/sealed stage、capability 或 prepared activation。该合同未通过 Feature 5 既有 frozen/tamper/seal/publication/recovery tests 前，不得进入 Controller 或当前段 TM suggestion UI 实施。
 - 正式开始后禁用重复激活与取消；既有 legacy query 或 last-known-good canonical 在 Core 允许的范围内继续服务。
 - 成功后先重新 resolve 并 re-prove canonical runtime，再原子替换 resource snapshot、递增 epoch、刷新当前建议。
-- 已证明未发布 canonical authority 的首次取消或完整回滚保持 JSONL bytes/config 和 legacy exact-only；已有 canonical 更新失败保持 last-known-good，不查询 JSONL。
+- Core 证明未发布 canonical authority 的首次取消或完整回滚，且原 JSONL 的身份与可用状态仍可证明时，保持 JSONL bytes/config 和 legacy exact-only；已有 canonical 更新失败仅在 last-known-good 仍可验证时保留该版本，不查询 JSONL。
 - 上述 legacy 保留只适用于 Core 明确证明“从未发布 canonical”或“首次 activation 已完整取消/回滚”的 outcome；存在 ambiguous durable facts、rollback/cleanup 无法证明或可能已发布 authority 时，资源进入 `UNAVAILABLE`，不得查询 legacy。
 - 普通重开仍对已发布 canonical 执行完整 active attestation；若唯一差异是 source/manifest/SQLite 的一致 device-number 漂移，resolver 只投影资源局部 `CANONICAL_REATTESTATION_REQUIRED` safe code，不自行修复或创建 legacy port。用户显式操作成功后才由同一 runtime replacement 路径恢复该资源。
+
+配置 JSONL／manifest 内容变化仍按 `SOURCE_DIVERGED` 处理；canonical 与其家族位置仍可证明时，保留原 Lookup/Update。Core 报告位置或身份失效时，Controller 投影资源局部 `UNAVAILABLE` 与原安全失败／恢复 code，停止该资源的新查询、写回、导入与重复激活；不将其改写成 source divergence、ADR-016 device-only re-attestation 或 Fuzzy 验证请求。目录复证由 owner 在操作边界执行，UI 不新增验证按钮或持久目录资格。
+
+该失效锁存由原 Core 家族会话持有。刷新、runtime rebuild、迟到的 query/activation completion 或 Fuzzy 完成通知均不得重新接纳旧 owner、恢复已撤销的结果或重新绑定同路径副本。Controller 继续按 resource/session/operation/generation 的既有身份拒绝过期结果，只消费 Core 明确验证的恢复结果；peer TM、术语与项目由各自状态继续。
 
 ### Apply、确认与写回
 
@@ -320,6 +334,8 @@ sequenceDiagram
 - 非空译文的确认写回由 runtime port 分派：legacy append 保持 JSONL 行为，canonical append 使用 Core `TMRecordDraft`/store port。空或仅含空白的译文由 Controller 跳过全部 TM 写入，沿 Qt 确认合同提交项目状态、导航和保存；不把空记录送入 Core，也不绕过 workspace/Chunk 编辑校验。
 - `Update=false` 资源可参与 Active+Lookup query，但 apply/confirm 不得改变其 bytes。资源导入权限沿用其既有 owner，不在本 Requirement 上扩张。
 
+TM 写回与项目保存是独立结果。资源失效后的确认写回继续遵循原确认/导航合同，不能伪报 TM 写回成功；项目的编辑和保存只依据项目 owner 与既有 workspace/Chunk 约束决定，不因单个 TM unavailable 一并禁用。界面分别说明 TM 写回失败与项目保存成功，保留实际已成功的 peer 结果。
+
 ### macOS lightweight app
 
 ```mermaid
@@ -347,6 +363,7 @@ flowchart LR
 | 4.1–4.7 | SuggestionQueryIdentity、Controller apply/write ports | stale/tamper zero mutation、Update=false bytes |
 | 5.1–5.10 | activation coordinator、Core migration、runtime swap | cancel/failure/LKG/divergence/unavailable |
 | 6.1–6.7 | capability host、resource status projection | closed/expired/recovery/local failure |
+| 5.6, 5.9, 6.5, 6.6, 6.14 | 原家族会话共享、resolver/adapter/Controller 局部停止 | legacy/LKG 前提、位置失效、late completion、peer 可用与独立项目保存 |
 | 7.1–7.7 | matcher handoff、双阈值入口、statusBar feedback | BASIC/TEXT_V1、CJK vectors、keyboard access |
 | 8.1–8.6 | macOS bundle builder、bootstrap | bundle metadata、Finder cold launch、CLI/Linux |
 | 9.1–9.10 | compatibility gates、canonical fixtures | Excel/Trie/JSON/TXT/locality/canonical redline |
@@ -524,7 +541,9 @@ class TMRuntimeSnapshot:
 ```
 
 - resolver 按 repository 顺序逐资源调用 Core canonical-open seam。
-- 返回 `None` 只表示 never-activated/cancelled-first legacy；创建 legacy exact port。
+- composition 为同一资源家族保存 Core owner，并使 runtime、ResourcePort 与冷恢复消费同一会话；resolve/refresh 不为失效资源每次新建 `TMEngine` 或重新绑定配置路径。不同资源登记指向同物理家族时消费 Core 的统一协调或明确拒绝结果，不形成独立且互不知情的 owner。
+- 操作借用、admission/drain、W1 与 generation 复证由 Core 负责，Application 只通过公开 owner port 消费；资源端口 callback 与 runtime swap 在同一 owner 仍有效时闭合。旧 snapshot 的释放等待其活动操作结束，不提前关闭借用中的 owner。
+- 返回 `None` 只表示 Core 确认 never-activated/cancelled-first 且原 legacy 仍可安全使用；创建 legacy exact port。位置或身份失效不得以 `None` 伪装为 legacy。
 - canonical reopen 成功时创建 store-backed handle/append port，并校验 Core resource identity 与 config id。
 - 任意 present-but-invalid/tampered/ambiguous canonical fact产生 `UNAVAILABLE`；不得创建 legacy fallback。
 - ADR-016 的 repairable device-only drift 仍属于普通查询不可用；resolver 只携带安全原因，不能把 repairability 当成 authority 或直接打开 store。
@@ -599,7 +618,7 @@ class TMMigrationService:
 - repairable proof 必须同时证明 persisted source/manifest/SQLite 共用一个旧 device、observed artifacts 共用一个不同的新 device，并逐一闭合 inode、size、SHA-256、resource/store/generation、manifest/binding 与 phase。任意 mixed identity、byte/inode drift、pending terminal/temp/stage 或 recovery 歧义都拒绝且零 mutation。
 - 成功只通过既有 fsync + atomic replace 协议更新 durable device identity，随后重开、query lease 与 health/binding proof 必须证明同一 store id、同一 generation。generation 1+ 不得降级为 generation 0。
 - application worker 在完成前后重新证明 operation resource/store/generation，成功后原子替换 runtime snapshot、epoch 与当前建议；失败保留 resource-local unavailable，peer resources 不受影响。
-- 本操作不读取 Gate D evidence、不调用 Gate D owner、不发布 Context/Fuzzy capability。若 current-source/Gate C identity 因代码变更使 ADR-013 compatibility 失配，Fuzzy 由其独立显式重验流程处理。
+- 本操作不读取 Gate D evidence、不调用 Gate D owner、不发布 Context/Fuzzy capability。若 current-source/Gate C identity 因代码变更使 ADR-013 compatibility 失配，Fuzzy 由其独立显式重验流程处理。活动资源配置位置或身份失效不满足本入口的 device-only 分类，不能通过此动作恢复原会话。
 
 ### EditorController
 
@@ -689,9 +708,11 @@ class MacOSBundleReport:
 | QueryReport local failure | stage/code/retryable projection | 结果与失败并存 | 其他结果保留 |
 | threshold persistence failure | Controller error | statusBar，保留旧值 | query epoch/值不变 |
 | stale/tampered suggestion | apply rejected | statusBar | target/confirmed/dirty/TM/index 不变 |
-| proven first activation failure/cancel | migration safe report | legacy exact-only + failure | JSONL/config 不变且 Core 证明无 canonical authority |
+| proven first activation failure/cancel | migration safe report | Core 证明 legacy 仍可用时保留 exact-only + failure | JSONL/config 与无 canonical authority 事实均由 Core 证明 |
 | ambiguous first activation/recovery | unavailable safe code | 标识资源并停止使用 | 不以 legacy fallback 掩盖可能 authority |
-| canonical update failure | source-diverged/degraded | LKG canonical + failure | 不回落 JSONL |
+| canonical update failure | source-diverged/degraded 或 unavailable | 可验证 LKG + failure；不可证明则停止该资源 | 不回落 JSONL，不提供可疑版本 |
+| 资源位置或身份失效 | 原 resource-local unavailable/recovery code | 停止该资源新操作并显示安全恢复要求；peer 与项目编辑/保存继续 | 不重绑副本、不以 device-only/Fuzzy 验证恢复旧授权 |
+| TM 写回失败、项目保存成功 | 各 owner 的独立结果 | 分别说明写回失败与项目已保存 | 不由 TM 失败推断项目保存失败，也不伪报写回成功 |
 | macOS bundle failure | install/launch report | 明确失败 | 旧 bundle/CLI/Linux 保留 |
 
 错误文案由 UI 对 closed safe codes 做有限映射；未知 code 使用通用安全描述并保留 code，不展示 exception body、source/target 或 proof 内容。
@@ -712,6 +733,8 @@ class MacOSBundleReport:
 - canonical closed/stale capability、source-diverged、present-but-invalid activation facts 和 no-fallback。
 - Apply 对三种类型均显式；project/segment/source/resource/capability/threshold 变化后 stale zero mutation。
 - Active+Lookup query 与 Active+Update append matrix；Update=false 前后 byte hash 相同。
+- runtime 与 ResourcePort 共用失效状态；失效后新查询、写回、导入、重复激活拒绝，refresh 与 late completion 不重新打开同路径副本；健康 peer TM、术语结果继续可用。
+- source divergence 在 canonical/位置有效时仍可 Lookup/Update；目录失效不进入 ADR-016 或 Fuzzy 验证，既有 Fuzzy 完成通知不能恢复失效资源。
 
 ### UI、边界与兼容
 
@@ -719,6 +742,7 @@ class MacOSBundleReport:
 - AST boundary：`qt_editor_window.py`、`qt_settings_dialog.py` 不导入 Core/store/retrieval/evaluator/proof。
 - 原 Qt JSON/TXT、save/dirty/confirmed、legacy exact/Ren'Py、Trie term suggestions、Excel 三态完整回归。
 - 用户本地真实项目仅作人工 smoke，不成为自动化依赖或 Git 输入。
+- 复用既有项目 owner 验证单个 TM 失效后编辑与保存继续，TM 写回失败和项目保存成功分别投影；不新增目录验证按钮或项目持久化 authority，不预先要求新 DTO/enum。
 
 ### macOS 与发布门
 

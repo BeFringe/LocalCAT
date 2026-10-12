@@ -20,6 +20,8 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 
 2026-08-21 canonical identity amendment 由 ADR-016 授权：已完整发布的 generation 在普通冷开时仍严格验证平台文件身份；若 source、manifest、SQLite 与 publication proof 只发生一致的 device-number 漂移，可由用户显式、同 generation、零内容变更地重新证明。该维护动作不运行或授权 Gate D/Fuzzy，也不放宽 inode、bytes、binding、phase 或 pending recovery 的 fail-stop。
 
+本规格的 POSIX 资源局部停止修订对应 5.6、5.9 与 6.14，并消费 `tm-storage-retrieval-index` 7.15–7.18 和 `language-resource-portability` 7.7、8.6–8.7。首次失败的 legacy 保留与更新失败的 last-known-good 保留均以 Core 仍可证明该资源安全可用为前提；配置来源内容分歧仍按原 `SOURCE_DIVERGED` 处理，位置或身份失效则显示资源不可用。其他健康资源及不冲突的项目编辑、保存独立继续；不新增目录资格、验证按钮或 Fuzzy 授权。
+
 ### Windows Compatibility Amendment WA-07
 
 **普通frozen修订范围**：第1、2、5条定义普通frozen的来源和前置要求；source/R4成果保留原范围，数据保护、Core authority及Requirements 1–9的产品语义不变。
@@ -102,10 +104,10 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 3. The LocalCAT Qt 编辑器 shall 不在启动、打开项目、打开设置、刷新或首次查询时自动迁移 legacy 资源
 4. When 用户在正式激活开始前取消, the LocalCAT Qt 编辑器 shall 保持原资源字节、资源配置和 legacy exact-only 可用性不变
 5. While 正式激活正在进行, the 语言资源设置 shall 显示“激活中”、禁用重复激活与取消操作，并保持其他不冲突的编辑功能可用
-6. If 首次激活失败, the LocalCAT Qt 编辑器 shall 不发布部分 canonical 状态，并继续提供原 legacy exact-only 能力
+6. If 首次激活失败, the LocalCAT Qt 编辑器 shall 不发布部分 canonical 状态；只有 Core 确认原 legacy 资源仍可安全使用时才继续提供原 legacy exact-only 能力，否则显示该资源不可用及恢复要求，不自动回落或接管同路径副本
 7. When canonical 激活完整成功, the LocalCAT Qt 编辑器 shall 将该资源显示为 canonical active，并让后续查询使用其 canonical exact 能力
 8. While canonical 资源的 context 或 fuzzy 能力未分别获得当前授权, the LocalCAT Qt 编辑器 shall 不因资源已经激活而开放对应匹配类型
-9. If 已激活资源的外部来源后来发生分歧或显式更新失败, the LocalCAT Qt 编辑器 shall 保留 last-known-good canonical 状态并显示分歧或失败，不得静默回落 legacy 查询
+9. If 已激活资源的外部来源后来发生分歧或显式更新失败且 last-known-good canonical 仍可验证, the LocalCAT Qt 编辑器 shall 保留该 canonical 状态并显示分歧或失败；If Core 无法证明该资源可用, the LocalCAT Qt 编辑器 shall 按资源不可用状态停止使用，不静默回落 legacy 查询
 10. If 已激活资源不存在可验证的可用 canonical 状态, the LocalCAT Qt 编辑器 shall 停止使用该资源并显示明确错误
 11. If 已完整发布的 canonical generation 只因 source、manifest 与 SQLite attestation 的平台 device number 一致漂移而无法重开, the 语言资源设置 shall 将该资源显示为需要重新验证 canonical，并保持其他健康资源可用
 12. When 用户显式请求重新验证该 canonical 资源, the LocalCAT Core shall 在持久资源锁下重新证明精确 inode、size、SHA-256、resource/store/generation、binding 与已完成 publication phase，并只原子更新 device identity attestation
@@ -131,6 +133,8 @@ LocalCAT Feature 5 UI 集成面向在本地 Qt 编辑器中使用翻译记忆的
 11. If 本设备资格缺失、损坏或 compatibility key 失配, the LocalCAT Qt 编辑器 shall 保持 Exact/Context 的当前正式能力、显示“Fuzzy 需重新验证”并只由显式用户操作启动 Gate D
 12. The Gate D compatibility key shall 不包含普通 TM 内容、canonical generation 或 Active/Lookup/Update 配置；这些变化不得单独撤销设备 Fuzzy 资格
 13. When Core 已开放 Fuzzy 且存在时间性能超限, the LocalCAT Qt 编辑器 shall 显示性能不足提示而不禁用已授权功能，并 shall 区分验证进度、Core 可用性和性能报告；Gate C 或相应路径必要条件不成立时不得显示该资源已可用
+
+14. If Core 报告活动资源的位置或身份失效, the LocalCAT Qt 编辑器 shall 显示受影响资源和安全恢复要求，停止对该资源发起新操作，保持其他健康资源及不冲突的项目编辑和保存可用，且不得将目录复证呈现为用户可授予资源能力的新验证按钮
 
 ### Requirement 7：统一文本匹配与 TM 设置入口
 
