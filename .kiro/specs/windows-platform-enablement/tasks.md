@@ -537,6 +537,90 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Boundary: Final Windows Packaged Feature GO_
   - _Depends: 9.2_
 
+## POSIX TM 共享端口与受影响回归
+
+- [ ] 11. 闭合原 root 位置、同对象交接与跨 owner 消费
+
+- [x] 11.0 闭合共享治理与四 owner 实施前置
+  - 治理集成人消费 ADR-033、四 owner 阶段审阅和精确 Git 重放决定，在治理分支形成唯一治理提交；开发基线继承该提交，不把此任务代替人的决定。
+  - 完成时，实际祖先关系与范围 diff 证明四 owner 正式 R/D/T 对应同一治理边界，旧引用/证据保留；未获重放授权不移动受保护引用。
+  - _Boundary: Governance Integration；非并行_
+  - _Depends: ADR-033 与四 owner 阶段审阅、精确 Git 重放授权_
+  - _Requirements: 5.1, 5.3, 5.6, 5.7_
+
+- [ ] 11.1 绑定原root与配置位置关联
+  - 从初次稳定祖先到原 root 保留 no-follow 名称链，派生 authority 继承；后续只比较、不 fresh bind 副本，不把内部观察变成持久资格。
+  - 完成时，原root改名＋同字节副本被位置检查拒绝；祖先、link及合法规范化入口正确；派生authority继承原关联，Windows原语义不变。
+  - _Boundary: POSIX adapter/contracts 的 root 位置关联_
+  - _Depends: 11.0_
+  - _Requirements: 5.1, 5.3, 5.6, 5.7_
+
+- [ ] 11.2 为旧POSIX内容codec提供已绑定对象观察
+  - 只接本 adapter 原 root 签发的 live file，在同一 retained file 上复证父链、regular/single-link、内容和 fstat；平台不导入 TM schema，Windows 不提供伪造数值 inode。
+  - 完成时，从原live file得到dev/inode/size/digest；foreign拒绝，无rawFD、opaque反解或新持久schema。
+  - _Boundary: POSIX adapter/contracts 的可选旧 codec 观察_
+  - _Depends: 11.1_
+  - _Requirements: 5.1, 5.6, 5.7_
+
+- [ ] 11.2a 补齐旧POSIX恢复codec的受绑定目录身份与同步
+  - 通过可选端口观察本 adapter 原 root 或派生 parent 的 live device/inode，并在相应 live lease 下独立同步原目录；前后复证原父链与配置位置，借入 authority 仍由原 owner 关闭。
+  - 完成时，合法初次绑定及派生目录返回对应事实；临时文件已缺席时仍可补做目录同步；foreign、closed、错配 lease、位置失效或同步失败均拒绝成功，原 owner 可保留恢复事实。
+  - 不以 Path、raw FD、历史数值或 opaque 反解获取权限，不为同步制造文件；保持旧 codec、业务恢复状态及 Windows 合同。
+  - _Boundary: 平台 contracts/POSIX adapter 的可选旧 codec 目录操作及对应合同测试_
+  - _Depends: 11.1_
+  - _Requirements: 5.1, 5.6, 5.7_
+
+- [ ] 11.3 将同对象stage交给现有publisher
+  - 仅消费原 reservation、同家族 lease 与预期内容，Core 先关闭全部 SQL；成功转交后旧 reservation 失效，candidate/pending 唯一持有 close 责任；恢复阶段只接原 owner 核验 closure 后取得的 existing live authority。
+  - 完成时，fresh reservation单次转Candidate；同对象发布，转交失败/close归属明确；cold-recovery existing authority不能由任意Path伪造。
+  - _Boundary: POSIX adapter/contracts 的同对象单次转交_
+  - _Depends: 11.1, tm-storage-retrieval-index 同对象交接 Design_
+  - _Requirements: 5.1, 5.3, 5.6, 5.7_
+
+- [ ] 11.4 补齐POSIX现有mutation guard
+  - guard 与 pending 同时 live 比较对象，DB_REPLACED durable 复证后 pending terminal/close 全部成功才由 Core 进入 SQL；guard 不解释业务 phase，不添加 detach/rearm 或 pending 内容更新。
+  - 完成时，与pending同live比较身份；只fstat＋rooted no-follow观察，不额外开关DB FD；SQL期间持续持有，位置失效拒绝，不宣称阻止外部替换。
+  - _Boundary: POSIX adapter/contracts 的 ExistingFileMutationGuard_
+  - _Depends: 11.1_
+  - _Requirements: 5.1, 5.3, 5.6, 5.7_
+
+- [ ] 11.4a 提供原root持锁直接子项metadata观察
+  - 从同adapter原root与exact-parent live lease执行有界、no-follow、无正文的完整直接子项观察，复用中立metadata与取消合同；原root/W1不转交、不另绑Path、不逐项开关文件FD。
+  - 完成时，无关目录、链接及其他不可用项保留原名与类型；foreign issuer、错root/lease、已观察漂移、取消、超限、部分枚举和close失败稳定拒绝，借入root/W1不被关闭；既有ledger、独立discovery和Windows后代检查语义不放宽。
+  - _Boundary: 平台contracts/POSIX adapter及对应合同测试_
+  - _Depends: 11.1_
+  - _Requirements: 2.7, 5.5, 5.6, 5.7_
+
+- [ ] 11.4b 接通POSIX既有文件退休与冷续接
+  - 复用可选ExistingFileRetirement合同，从原root取得受限source-parent/source，核验当前regular/single-link、内容、同issuer/root；与creator-owned退休分开，不以历史identity或任意Path接管。
+  - 以retained目录的no-clobber原语移动同一对象并转交close责任；fresh process只在source absent且target exact时重取退休authority，部分完成可续接，借入root/W1仍归外层。
+  - 完成时，source/target状态组合、内容/位置漂移、外来authority、arm前后/同步/close失败与冷续接符合原合同；不扩大Windows profile、持久格式或业务恢复状态。
+  - _Boundary: 平台contracts/POSIX adapter及既有文件退休合同测试_
+  - _Depends: 11.1_
+  - _Requirements: 5.1, 5.3, 5.6, 5.7_
+
+- [ ] 11.4c 完成POSIX既有双链接交接
+  - 提供可选ExistingLinkPairCompletion，从同issuer原root与exact-root live W1验证两个安全直接子项为同regular对象、恰好两链接及exact内容，只移除已证明临时名；临时名已缺失且final exact/single-link时支持重复完成。
+  - 目录同步、final同对象/single-link/内容、原配置位置及全部自有句柄收尾均完成才返回；借入root/W1不转交、不重入，修改后不明保留事实并交原owner重试。
+  - 完成时，合法pair与fresh续接、异对象/内容、第三链接、symlink、外来authority、可观察漂移及删除/同步/终端/close故障符合合同；不放宽通用single-link端口或Windows专用协议。
+  - _Boundary: 平台contracts/POSIX adapter及既有交接合同测试_
+  - _Depends: 11.1_
+  - _Requirements: 5.1, 5.3, 5.6, 5.7_
+
+- [ ] 11.4d 提供POSIX原资源锁下的后代目录闭集观察
+  - 实现既有可选LockedDescendantNamespaceInspection，以同issuer原root/W1和严格后代普通directory authority执行单目录有界双遍闭集观察，不重新绑定Path或获取后代锁。
+  - 完成时，合法未知条目保留供owner判断，不可用shape、外来authority、错锁、上限、部分枚举、前后漂移与close失败稳定拒绝；借入对象仍可用，exact-parent ledger、root metadata和Windows既有能力语义不变。
+  - _Boundary: POSIX adapter及既有后代闭集合同测试_
+  - _Depends: 11.1_
+  - _Requirements: 5.1, 5.6, 5.7_
+
+- [ ] 11.5 复验实际共享变化的Windows普通frozen
+  - 按实现、依赖、调用合同和运行条件判定回归范围；真实变化触发 root/锁/连接/发布/资源链验证，必要 Core Gate 范围由 Core 判定。保持原 0.5.2 Task10.1 与历史证据范围，不以 POSIX 结果或不同候选片段代答。
+  - 完成时，受影响root/锁/连接/发布和资源旅程在Windows source及普通frozen符合原合同；新候选与旧发行证据分开。
+  - _Boundary: Windows release owner 的实际共享变化集成验证_
+  - _Depends: 11.1, 11.2, 11.2a, 11.3, 11.4, 11.4a, 11.4b, 11.4c, 11.4d, tm-storage-retrieval-index 10.11, language-resource-portability 6.2, feature5-ui-integration 10.2_
+  - _Requirements: 1.1, 1.2, 5.1, 5.2, 5.3, 5.4, 5.5, 5.7, 10.1, 12.1, 12.2, 12.3, 12.4, 12.5, 12.7_
+
 ## Source 维护实施记录
 
 - Task 4.4b：历史 `CHILD_FAILED` 只有包装码且子进程输出被丢弃，无法从旧日志追溯原始偶发失败。新增诊断必须继续限制在白名单安全事实，不记录项目正文、路径、参数或异常原文。

@@ -20,6 +20,7 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 - **相邻规格 / 契约**：当前真实 owning Specs 为 `feature5-ui-integration`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`、`tm-store-module-extraction`、`termbase-column-selection-import`、`qt-editor-mvp`、`qt-editor-json-mvp-increment`；它们分别承载 collaborative、ProjectPackage/workspace、resource、TMX、TM store/activation/snapshot/attestation/recovery 与 Qt consumer contracts。另受 ADR-007/008/009/011/012/013/016/018/019 约束。
 - **交付路线**：source 已完成用户管理 CPython 3.14 x64、venv、`requirements-ui.txt`、source 与轻量入口的产品验收；它不铸造 frozen authority。frozen 按 ADR-028 的普通发行边界独立验收，W3 强证明不作为唯一发行前置。
 - **导出输出收尾修订**：ADR-027 仅修订 Windows ResourcePackage/TMX 正常完成后留下内部协调锁文件的行为；相邻 `language-resource-portability` 6.7–6.8 与 `tmx-context-interchange` 8.8–8.9 分别承载导出结果。既有 Requirement 3 的并发互斥继续成立，其他持久锁、直接 CSV/JSONL 导出与 POSIX 行为不在本修订范围。
+- **POSIX TM 修订范围**：Requirement 5.6–5.7 细化本规格 Requirement 5.1、5.3 的共享端口能力，并消费 Core Requirement 2.4、2.11–2.12、7.5、7.13–7.18 的支持环境与资源停止合同。区分原目录对象有效、配置位置有效及数据库驱动内部访问；只限定 POSIX TM 的稳定命名空间前提，不撤销其他文件格式的外部替换保护，不收窄 Windows Requirement 2、3、4、8。
 - **普通 frozen 修订范围**：Requirement 10–12 与相邻 owner 的修订登记见 [cross-spec-amendments.md](cross-spec-amendments.md)；原验收事实保持原范围。
 
 ## 需求
@@ -82,6 +83,8 @@ Windows source 的平台适配、CPython 3.14 x64 专用 venv、源码与轻量 
 4. The 共享平台边界 shall 为 Windows 与 POSIX 后端运行同一组合同测试，并允许平台专属反例补充验证。
 5. The POSIX/Windows adapters shall 为目录观察和物化提供相同中立语义，不借用 retirement authority；递归选择与格式导出策略由各 Application owner 拥有。
 
+6. When 消费者要求确认资源仍位于本次已授权的配置位置, the 共享平台边界 shall 同时区分原目录对象仍有效与配置位置仍指向该对象；已可观察的位置漂移 shall 拒绝，不能把重新打开同路径副本解释为旧授权的延续。
+7. While POSIX TM 使用稳定本机命名空间与 LocalCAT 协作式资源生命周期, the 共享平台边界 shall 保持应用自行执行的命名操作受已持有的目录授权约束；该保证不得被描述为普通路径数据库驱动的全部内部访问已绑定目录句柄，也不得降低 Windows 专用能力的既有要求。
 
 ### Requirement 6：Windows Qt 启动与基础运行时
 **目标：** 作为 Windows 用户，我希望从干净环境启动 LocalCAT Qt 主程序，以便能够进入与 macOS/Linux 等价的 UI 工作流。

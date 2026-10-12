@@ -4,7 +4,7 @@
 
 source 的平台与业务设计已完成 Task 6.6b 验收。依据已采纳 [ADR-028](../../steering/adr/adr-028.md)，本文定义普通 frozen 的活动发行设计；原 W3 设计与验收范围由 `6531b1e` 及原任务追溯。
 
-保留平台数据/私有权限端口、Core Gate C/D、Host 发布生命周期与构建输入声明。只调整普通 packaged 入口、输入组合、同 EXE worker 和验收接缝；不重开既有数据协议、算法或 source 实现。继承代码和构建前验收不能视为普通发行已实现。
+保留平台数据/私有权限端口、Core Gate C/D、Host 发布生命周期与构建输入声明。普通 packaged 路线调整入口、输入组合、同 EXE worker 和验收接缝；POSIX TM 另按下文 ADR-033 接入原 root 位置关联、同对象交接与 mutation guard，保留既有数据格式、算法和业务状态机。继承代码和构建前验收不能视为普通发行已实现。
 
 ## Overview
 本设计把 LocalCAT 现有 POSIX 文件 authority/lock/publish 语义提炼成一个共享平台能力边界，并新增 fail-closed Windows backend。Windows backend 使用文档化 Win32 handle API 固定 rooted ancestor、拒绝 reparse、比较 volume/file identity、执行跨进程锁和 handle-bound publish；上层 Parser、项目、资源、TM 和协作分工继续拥有各自业务状态机与稳定错误映射。
@@ -31,6 +31,7 @@ source 的平台与业务设计已完成 Task 6.6b 验收。依据已采纳 [ADR
 - `RootedFileSystem`、`MutableFileReservationService`、`OwnedNamespaceRetirement`、`BoundDirectoryPublisher`、`ExistingFileDurability`、`ProcessFileLock`、`ExistingProcessFileLock`、`PrivateStorageProof` 的跨平台合同和 composition factory。
 - ADR-027 的可选 `OutputArtifactLockRetirement` 合同及 Windows 实现；仅重新认证和回收获批输出族的闲置控制载体，不判断业务 receipt、journal 或恢复结果。
 - Windows 11 native handle implementation、支持 volume capability gate、Win32 error normalization 和平台专属反例 harness。
+- 提供原 root 配置位置复证、POSIX 旧 codec 的已绑定文件观察与目录身份／同步操作、同对象 reservation 交接及 POSIX mutation guard；不解释 TM SQL、journal 或业务 phase。
 - 提供 POSIX adapter 参考实现和 parity contract；各 consumer 的现有 POSIX 原语迁移由其 owning Spec amendment 实施并提交可追踪 merge。
 - 定义 Parser、collaborative chunk、项目/资源/TMX、TM activation/snapshot/attestation/recovery 的接入验收合同、amendment dispatch ledger 与最终合并证据，但不越权直接拥有相邻业务实现。
 - Windows 普通 PyInstaller build、输入—产物记录、候选身份、bundle/resource 解析和 same-EXE transport；最终发行矩阵只汇总 owner 证据，不授予业务能力。
@@ -42,6 +43,7 @@ source 的平台与业务设计已完成 Task 6.6b 验收。依据已采纳 [ADR
 - Parser codec、ProjectPackage ZIP carrier、TM canonical SQLite authority、migration/recovery 业务决策；分别由相邻 Spec/ADR 拥有。
 - macOS app bundle/launcher、Linux package format、Windows installer/signing/update。
 - 扩大到 remote SMB、FAT/exFAT 或未经过完整反例矩阵的第三方文件系统。
+- VFS、驱动迁移、新持久格式、新平台层、Mac/Linux frozen 或把内部位置检查变成持久资格/用户验证流程。
 
 ### Allowed Dependencies
 - 普通 frozen 按 ADR-028 信任固定的 CPython/Qt、stock PyInstaller bootloader 与系统加载基础；入口和依赖位置检查用于排除意外开发环境消费，不承诺 pre-Python 全启动链证明。
@@ -57,11 +59,12 @@ source 的平台与业务设计已完成 Task 6.6b 验收。依据已采纳 [ADR
 - PyInstaller/PySide6/Qt/Python/SQLite 版本、构建转换或布局改变：更新候选并验证加载/入口，Core 再判定检索兼容性及性能影响，不把全包变化无差别当作资格失效。
 - 任一相邻模块重新引入直接 POSIX/Win32 primitive，或新增 capability-critical source/fixture。
 - 从 onedir 改为 onefile、支持 remote share/其他文件系统、增加 installer/signing。
+- POSIX root 位置关联、reservation 交接、mutation guard 或共享接口改变时，联动 Core/Resource/UI 并按实际影响复验 Windows source/普通 frozen；POSIX 结果不替代 Windows 实测，纯文档/Git 父链变化不触发全量产品矩阵。
 
 ## Governance Impact
 - **Applicable Steering**: `product.md`、`tech.md`、`structure.md`、`roadmap.md`、`spec-ownership.md`、`delivery-boundaries.md`、`repository-safety.md`。
-- **Applicable ADRs**: ADR-007/008/009/011/012/013/016/018/019 及 ADR-020～029，按各自已有取代关系适用。
-- **ADR disposition**: Follow adopted ADR-028；移除 ADR-022 决策 3–8、10 和 9/12 的强证明派生门，以及 ADR-023 决策 6 的完整 pre-authority native closure。保留构建可追溯、真实 packaged E2E、LOCK-first、`PendingPublication`、MIC 和数据协议；不新立 ADR，也不更改已有 ADR 正文。
+- **Applicable ADRs**: ADR-007/008/009/011/012/013/016/018/019 及 ADR-020～029 及 ADR-033，按各自取代关系适用。
+- **ADR disposition**: Follow adopted ADR-028；移除 ADR-022 决策 3–8、10 和 9/12 的强证明派生门，以及 ADR-023 决策 6 的完整 pre-authority native closure。保留构建可追溯、真实 packaged E2E、LOCK-first、`PendingPublication`、MIC 和数据协议；POSIX TM 子阶段另依 ADR-033 的窄限定；不在业务 Spec 改写已有 ADR 正文。
 - **Contract changes**: 范围见 [跨规格修订登记](cross-spec-amendments.md)。平台只拥有构建/入口/transport/发行汇总；三种身份分别在既有 owning Design 定义，不建立治理层或第二 publisher。原 source/W3 完成事实保留原验收范围。
 - **Steering sync**: `spec-ownership.md`、tech/structure 与 roadmap 的普通入口、依赖和发行边界；共享治理只形成一份变更。
 - **Downstream revalidation**: `feature5-ui-integration`、`qt-editor-json-mvp-increment`、`parser-subsystem-extraction`、`collaborative-job-chunks`、`multi-document-project-workspace`、`language-resource-portability`、`tmx-context-interchange`、`tm-storage-retrieval-index`，以及明确标为 revalidation-only 的 TM store/termbase/旧 Qt 基线。
@@ -70,6 +73,13 @@ source 的平台与业务设计已完成 Task 6.6b 验收。依据已采纳 [ADR
 - **Contract changes**：仅取代 ADR-020 决策 7、ADR-023 决策 1 在 Windows ResourcePackage/TMX 输出 owner 已终结时的永久载体限制。普通持锁、初始化、安全 profile、业务发布/恢复、POSIX 和 frozen 信任启动不变。
 - **Steering sync**：由 Governance owner 在治理分支闭合 ADR-027、ADR 索引及 ADR-020/023 取代关系元数据，再由本分支继承；不重复修改长期层级规则。
 - **Downstream revalidation**：平台 Task 3.3a 交付可选能力；`language-resource-portability` Task 3.3a 与 `tmx-context-interchange` Task 3.4b 分别验证自身终结条件和原始异常语义。三项通过独立评审前不得标记该修订完成。
+
+### ADR-033 POSIX TM 位置与交接边界
+
+- **Directory codec mapping**：原目录身份观察及目录同步落实 ADR-033 决策 4–5 的旧格式兼容与应用 rooted 操作；平台只提供原 live 目录的数值事实和同步结果，Core 仍独占 receipt/handoff 校验与终态清除。既有 v2 字段、发布／恢复顺序、耐久要求与失败语义不变，不新增 ADR 或 Steering 边界。
+- **Contract changes**：Requirement 5.6–5.7 区分原目录对象与配置位置；共享 backend 不代表 Windows private recovery 能力。ADR-033 限定 ADR-020 决策2、12 的 POSIX stock SQLite 内部访问前提与决策9的 DB 命名子阶段；pending retained readback、内容不变及 terminal 检查保持。Windows Requirement 2/3/4/8 和其他 publisher 生命周期不收窄。
+- **Steering sync**：治理 owner 在唯一治理提交同步 ADR-033、ADR 索引/有关取代关系、`delivery-boundaries.md`、`tech.md`、`spec-ownership.md`；平台 Task 11.0 验证开发基线继承及四 owner delta 一致性，不建立永久审批台账。
+- **Downstream revalidation**：Core Task 10.1–10.11、Resource Task 6.1–6.2、UI Task 10.1–10.2 与本规格 11.5；RPY 6.2/6.3 与 Sync 原一致包入口保持交付依赖。
 
 ## Architecture
 
@@ -149,7 +159,7 @@ flowchart LR
 ```text
 platform_fs_contracts.py                 # opaque authority/identity/lock/publish contracts and stable low-level errors
 platform_fs.py                           # adapter composition; returns only validated backend capability
-platform_fs_posix.py                     # current dirfd/flock/fsync behavior, moved without semantic change
+platform_fs_posix.py                     # dirfd/flock/fsync、原root位置关联、v2只读观察、同对象交接与mutation guard
 platform_fs_windows.py                   # Windows rooted walk, handle profiles, locks, publish and ACL proof
 windows_file_api.py                      # ctypes declarations/constants/structures/error conversion only
 frozen_ordinary_entry.py                 # 普通 EXE 的产品/worker 模式分派与安全启动诊断
@@ -176,6 +186,7 @@ tests/test_windows_ordinary_transport.py
 上表对应现有平台与普通构建实现。`frozen_roots.json` 复用 owner 声明；Gate 需要的 contract/vectors 由 Core 决定，普通构建不调用旧 `tools/generate_windows_frozen_manifest.py` 或 `tools/windows_frozen_packaging.py`，不继承 W3 的全量 AST/source-only 验证。`LocalCAT.spec`、Analysis 记录及发行物在指定构建输出目录生成，不能成为手写第二份 authority。`durability_profiles.json` 与硬断电证据仍非输入。
 
 ### Modified Files by Migration Cluster
+- **POSIX TM 端口**：`platform_fs_contracts.py` 定义窄 authority/单次转交合同；`platform_fs_posix.py` 实现位置复证、已绑定文件观察、reservation/existing recovery 交接与 guard；`platform_fs.py` 组合明确能力。`platform_fs_windows.py` 仅处理实际共享接口兼容与原行为验证，平台不导入 TM codec 或改业务 phase。
 - **Amendment Cluster 1 — startup/rooted**: `parser_source.py`、`collaborative_chunk_store.py`、`qt_editor.py`；由 Parser/Chunk/Qt owners 接入 platform factory，删除业务顶层 POSIX import。
 - **Amendment Cluster 2 — project/resource**: `project_package.py`、`project_workspace_intake.py`、`workspace_state.py`、`resource_artifact_save.py`、`resource_package.py`、`resource_importer.py`、`resource_portability.py`、`resource_receipt_ledger.py`、`resource_repository.py`、`termbase_store.py`、`tmx_artifact_save.py`；由 Project/Resource/TMX/Termbase owners 迁移本地 dirfd helper。
 - **Amendment Cluster 3 — TM**: `tm_migration.py`、`tm_content_attestation.py`、`tm_snapshot_artifacts.py`、`tm_snapshot_recovery.py`、`tm_activation_journal.py`、`tm_activation_recovery.py`、`tm_stage_sealer.py`、`tm_schema_upgrade.py`、`tm_sqlite_store.py`、`tm_benchmark*.py` 及直接 identity/fsync consumers；由 Feature 5/Core/Integration owners 交付。
@@ -310,11 +321,11 @@ class PersistentPrivateProof(Protocol):
 
 **Invariants**:
 - 所有 authority objects 都是 context-managed、不可序列化、关闭后不可复用。
-- `MutableFileReservationService`只通过bound parent下的`CREATE_NEW`铸造owner authority，不提供对既有文件的bind/adopt入口。reservation保留origin parent chain、basename与创建时identity；每次`identity()`同时复证retained file仍live/regular/single-link且origin name仍指向同一对象。它只允许SQLite或普通external writer通过pathname修改同一文件，不提供write/publish/journal/rename/unlink；关闭只释放reservation持有的handles，不删除文件或关闭调用方parent。创建后、authority返回前若平台操作性复证失败，映射`RECOVERY_REQUIRED`并保留待owner显式恢复的命名残留，禁止按pathname删除可能已被替换的entry；`TypeError`、`AssertionError`、`AttributeError`等programmer fault仍原样穿透。
+- `MutableFileReservationService`只通过bound parent下的`CREATE_NEW`铸造owner authority，不提供对既有文件的bind/adopt入口。reservation保留origin parent chain、basename与创建时identity；每次`identity()`同时复证retained file仍live/regular/single-link且origin name仍指向同一对象。它只允许SQLite或普通external writer通过pathname修改同一文件，不直接提供write/publish/journal/rename/unlink；POSIX 可经下节限定的单次转交端口消费原 reservation 并生成同对象 Candidate；关闭只释放reservation持有的handles，不删除文件或关闭调用方parent。创建后、authority返回前若平台操作性复证失败，映射`RECOVERY_REQUIRED`并保留待owner显式恢复的命名残留，禁止按pathname删除可能已被替换的entry；`TypeError`、`AssertionError`、`AttributeError`等programmer fault仍原样穿透。
 - `CandidateFile.write_chunks`是one-shot、每块至多64 KiB且受调用方总字节上限约束的流式写入口；`write_all`只是兼容委托。`observe_ledger_entries`只在同父目录live lease下返回有界、排序的namespace observations；这些observations不是authority或CAS，owner必须逐项rooted reopen并复证后才能读取或提交业务状态。
-- `PendingPublication` 是跨越业务 owner durable commit 的opaque、context-managed低层authority，不是业务receipt。`begin_publish`不得返回success；owner必须使用其retained destination完成readback，自行提交并复证业务state，再调用platform `terminal_reproof`，最后关闭。平台不解释或持久化owner phase/generation/compatibility。
+- `PendingPublication` 是跨越业务 owner durable commit 的opaque、context-managed低层authority，不是业务receipt。`begin_publish`不得返回success；owner必须使用其retained destination完成readback，自行提交并复证业务state，再调用platform `terminal_reproof`，最后关闭。平台不解释或持久化owner phase/generation/compatibility。POSIX TM 依 ADR-033 可在原 durable DB_REPLACED 命名子阶段完成此握手；必须先在 pending readback 仍 live 时取得同对象 mutation guard 并比较 live identity，再使 pending terminal 与 close 全部成功，之后才进入会改变 DB 字节的 receipt SQL。该 terminal 不表示 activation 成功，不提前结束 source pending，不增加 detach/rearm 或重写 preliminary；Windows 与其他 publisher 仍按原 owner durable commit 生命周期。
 - `ExistingFileDurability`只同步已由owner写成的既有regular file：同一retained authority先后复证exact identity/content并执行平台文件持久化，不得rename/unlink或改变namespace。POSIX实现执行file fsync后parent directory fsync；Windows实现执行同一file handle的`FlushFileBuffers`并复证parent/root live authority，parent reproof不冒充directory fsync。
-- `ExistingFileMutationGuard`只为必须按pathname打开既有文件的外部writer保留live identity窗口：Windows guard允许READ/WRITE sharing但不允许DELETE sharing，从writer事务前一直存活到owner终端业务复证后，每次都复证root/name仍指向同一regular single-link object。它不读写、flush、publish或解释SQLite状态；平台不能提供该窗口时显式fail closed，不以历史FileId或pathname重开代答。
+- `ExistingFileMutationGuard`只为必须按pathname打开既有文件的外部writer保留live identity窗口：Windows guard允许READ/WRITE sharing但不允许DELETE sharing，从writer事务前一直存活到owner终端业务复证后，每次都复证root/name仍指向同一regular single-link object。POSIX guard 保留同一 regular/single-link 对象及原名称链，以 retained FD 的 fstat 与 rooted no-follow 名称观察复证，不在活 SQL 期间额外打开/关闭同 inode 的 DB 句柄，不声称阻止外部 rename。guard 与 pending 同时 live 比较后持续覆盖 SQL 及收尾，SQL 全部关闭且 final capture 与 guard 同时 live 对象比较完成后才关闭；业务 owner 决定阶段顺序。它不读写、flush、publish或解释SQLite状态；平台不能提供该窗口时显式fail closed，不以历史FileId或pathname重开代答。
 - `PrivateStorageProof`只产生当次physical ACL/MIC evidence；独立的`PersistentPrivateProof`拥有device-secret binding、持久proof mint/verify与terminal consume。具体backend只接受由同一composition issuer签发的exact private evidence/secret/verified类型；公开`WindowsPrivateProof`始终是不可信持久值。device-secret authority独立持有binding handle，调用方关闭原`BoundRegularFile`不撤销它；verified authority只能在backend完成exact issuer/context检查后锁内消费一次，terminal reproof成功或失败都关闭其retained authorities。`PersistentPrivateProof`不并入既有`PlatformFileBackend` aggregate。
 - 上层不能取得 raw Windows HANDLE/dirfd；tests 通过专用 fault seam，而不是调用内部 API。
 - factory 只在 backend self-probe/contract gate 成功后返回 capability object；不存在“布尔值为 true 即可信”。
@@ -460,9 +471,62 @@ stateDiagram-v2
 - 该表示由已采纳的ADR-021、ADR-023与ADR-024共同约束；不得把`os.chmod(0o600)`结果作为Windows pass。
 
 ## POSIX Adapter
-- 把现有 `openat/dir_fd/O_NOFOLLOW/O_DIRECTORY/pread/flock/fsync(directory)` 迁入 adapter，不改 success/failure behavior。
-- 先用 characterization tests 固定 Parser、chunk、project、TM 的 error/receipt/recovery 输出；迁移后运行相同 tests。
-- 平台合同允许 POSIX `(st_dev, st_ino)` 与 Windows `(volume serial, FILE_ID_128)` 采用不同物理表示，但业务只比较 opaque `FileObjectIdentity`。
+
+- 平台独占 `openat/dir_fd/O_NOFOLLOW/O_DIRECTORY/pread/flock/fsync(directory)` 原语，既有 Parser、chunk、project 和非 TM publisher 的成功/失败语义保持。
+- 原 root 的 live identity 与配置位置关联独立。首次绑定按现有规范化/允许系统别名建立从稳定祖先到 root 的 no-follow 名称链，并验证各层 identity；派生 parent/file/lease 继承该关联。`root.reprove_location()` 只比较当前名称与原 live 对象，不能通过 fresh `bind_root()` 或重新 resolve 刷新授权。原 root 被移走、配置路径指向同字节 clone 时必须拒绝。
+- 位置复证返回既有 identity-stale/capability failure；它是操作边界观察，不连续冻结名称，不提供原子 CAS、ABA 消除或 SQLite 内部全部访问的目录绑定。合法的初始规范化入口（如 macOS `/private/var`）保留。
+- `FileObjectIdentity` 仍 opaque/live-only。POSIX 为旧内容 codec 提供可选只读观察端口，只接本 adapter 从原 root 签发的 live `BoundRegularFile`，在同一 retained file 上复证父链、regular/single-link、内容和 fstat，输出 device/inode/size/SHA-256；无 raw FD、任意 Path 输入或 opaque 反解。Core factory 构造原 v2 proof，平台不导入 TM schema；数字不是权限或跨重启证明，Windows 不铸造数值 inode。
+- POSIX 为旧恢复 codec 提供可选的受绑定目录操作，只接本 adapter 签发且仍存活的原 root 或派生 parent。身份观察在同一 retained directory 上取得 device/inode，并前后复证目录对象、原父链与配置位置；结果仅供 Core 构造既有 v2 字段，后续操作仍使用原 live authority。目录同步在相应 live lease 下同步该原目录，即使受管理的临时文件已经缺席也须可独立完成；前后复证或同步失败向原 owner 报错，由其保留恢复记录，不以创建／删除哨兵代替。
+- 目录端口不接受 Path、raw FD 或调用方数值作为授权，不关闭借入 authority；foreign、closed、错配 lease 或已观察位置失效拒绝。平台不解释 TM phase、不删除恢复记录，不解码 opaque identity、不增加持久格式；Windows 不要求或伪造本能力。跨重启由 Core 按原 receipt/handoff 校验本次合法绑定的目录，历史 device/inode 不能独立授予访问权限。
+- 同对象 stage 单次转交只接受原 `MutableFileReservation`、同家族 live lease 与预期内容；Core 先完成 SQL/statement/backup 与 journal 收尾，平台再复证/同步对象并转为同 inode `CandidateFile`，消费旧 reservation，接既有 `begin_publish`。pre-transfer 失败仍由原 owner 持有；转交后 candidate/pending 负责 close，attempt 不再清理旧 reservation；命名后不明交原 recovery owner。此端口不通用化为 Path/裸 identity 文件收养。
+- 冷恢复 existing stage 的准入与 creator reservation 分开：Core 验证本次 root/W1、journal/phase/内容及完整 closure 后取得受限 existing-file live authority，复用 retirement/publisher 机制同对象交接；平台只消费活 authority，不以持久 proof+Path 接管。接缝不足时停止有界技术门并报告，不使用裸 rename 或复制替代。
+- `ExistingFileMutationGuard` 的 POSIX 实现延续既有窄端口，保留对象及位置观察，不声称有 Windows no-delete sharing。Core 在 durable DB_REPLACED 复证后、pending 原 readback 仍 live 时取得 guard 并比较 live identity；pending terminal/close 成功后才 SQL。guard 只 fstat retained FD 与 rooted no-follow 观察，SQL 结束/收尾前不关闭，不临时开关同 inode DB 句柄。
+- 通用 backend 仅提供 rooted/lock/publish 能力。受信 owner composition 明确选择 POSIX_V2 或 WINDOWS_V3；Windows private recovery 仍走显式能力，不以 backend 非空或 Windows 失败后的 fallback 选择 codec。
+
+### POSIX 既有文件的受绑定退休与续接
+
+POSIX adapter 实现既有可选 `ExistingFileRetirement` 合同，与 `OwnedNamespaceRetirement` 的创建者授权分开；不扩大 `PlatformFileBackend` 必选组合，也不改变 Windows 的专用 source-parent profile。Core 在原资源家族/W1 下先核验完整 journal/terminal、prior 与候选内容关系；平台只核验本次 live root、source、target 和内容，不解释业务阶段或从持久数字铸造创建者授权。
+
+- 从原 root 与安全相对路径取得受限 `RetirementSourceDirectoryAuthority`，保留完整 no-follow 名称链和配置位置关联；不 fresh bind 同路径替身。source authority 只接受当前 regular/single-link 文件及 exact size/SHA-256，源、源目录和目标目录须来自同一 adapter issuer 与同一原 root。Core 的 v2 历史对象及内容关系另由 Core 校验，平台 portable 内容输入不能替代该业务证明。
+- 以两个 retained dirfd 执行既有 no-clobber 退休原语，将同一源对象移至专用目标目录；目标已存在时不覆盖。成功后 source 的关闭责任一次性转交 `RetainedRetirement`；源名消失、目标身份和内容、两侧目录及原配置位置均须终端复证，并同步实际涉及的目录。借入 root 和资源锁始终由外层 owner 关闭。
+- fresh process 在业务恢复 owner 已核验完整持久事实后，仅当 source absent、deterministic target 是当前 regular/single-link 且 exact content 匹配时，重取受限 retained retirement authority；以两侧目录和原 root 复证闭合。source/target 同时存在或均不存在、链接、内容不符或已观察位置漂移均拒绝，不删除未知对象或把目标当作新的发布源。逐文件退休可在部分完成后沿同一业务记录幂等继续。
+- arm 前失败不改变名称；arm 后操作性结果不明返回既有 `RECOVERY_REQUIRED` 并保留事实。所有新取得的 authority 在成功和失败路径按唯一 owner 收尾，关闭失败不遮蔽已有主错误；不通过普通 rename/check-then-rename、裸 Path 或复制替代，不把前后复证描述为消除任意外部竞争。
+
+合同验证覆盖创建者退休与既有文件退休的区分、source/target 状态组合、同字节异对象和异内容、foreign issuer/root、配置位置漂移、no-clobber、rename/目录同步/terminal/close 故障及部分退休后的 fresh-process 续接。Core 的取消、已命名失败隔离与恢复决定由 owning 任务验证，不进入平台状态机。
+
+### POSIX 既有双链接交接的受绑定完成
+
+`ExistingLinkPairCompletion` 是可选中立能力，由 POSIX adapter 提供；不增加 `PlatformFileBackend` 必选成员，不放宽 `unlink_owned` 或既有文件退休的 regular/single-link 合同。该能力用于受信 owner 已核验业务记录后，完成既有确定性 final/temp 同对象交接；平台不解析 lineage、journal、SQLite 或业务阶段，也不从持久 inode 取得授权。
+
+`complete_existing_link_pair(root, lease, final_name, temporary_name, expected_content) -> None` 只接受同 adapter 签发的原 live root、精确关联该 root 的 live W1、两个不同的安全直接子项名字及 portable exact size/SHA-256。Core 保留严格 codec、确定性名字、完整 prior/legacy 与 payload 关系的验证职责；调用 owner 先以该资源预期的锁名与 payload 复证 W1，不能由共用父目录推定同一资源。Windows 的专用恢复协议保持不变。
+
+- 临时名存在时，两个名字须 no-follow 指向同一 retained regular 对象，当前恰好两条硬链接，内容与预期完全匹配；在修改前同时复证 retained 对象、两名称、原 root 配置位置和 W1。只移除该已证明临时名的一条链接，不修改 final 正文、不复制或改名、不退休任何其他对象。
+- 临时名已缺失时，只有 final 为 exact regular/single-link 且内容匹配才可按既有完成状态继续同步与终端复证；两名皆缺、仅临时名存在、异对象同字节、第三链接、symlink、内容不符或可观察名称/位置漂移均拒绝。该重复完成不收养未知 temp，不把同路径替身刷新为原授权。
+- 修改后同步实际父目录，确认临时名缺失、final 仍为原 retained 对象且为 single-link、内容不变、原 root/W1 仍有效；本次取得的文件资源全部成功关闭后才返回成功。原 root/W1 始终由外层 owner 关闭，内部不得另取 W1。
+- 修改前失败保留名称；删除或同步后结果不明按既有 `RECOVERY_REQUIRED` 失败语义保留当前事实，由原 owner 在同一合同下重试。关闭失败不能遮蔽已有主错误，也不能被调用者外层无关异常当作本函数已失败而吞掉。前后复证不承诺任意外部竞争下的原子 CAS 或全时序零副作用。
+
+验证覆盖 live 完成与 fresh 重试、exact paired/tail-single-link 两种合法状态、foreign issuer/root/lease、错误内容/对象/链接数、安全名字、配置位置漂移、删除前后、目录同步、终端复证和关闭失败。通用 single-link 删除、既有文件退休、Windows capability 组合与其他 publisher 保持原合同；Core 用真实旧 lineage 交接验证直接消费者。
+
+### POSIX 原资源锁下的后代目录闭集观察
+
+POSIX adapter 实现既有可选 `LockedDescendantNamespaceInspection`，复用 `observe_descendant_entries(root, lease, descendant, limits)` 及既有返回类型。只接受同 issuer 原 root、精确关联该 root 的 live W1、从该 root 派生且严格位于其下的普通 `BoundDirectoryAuthority`；调用 owner 先按该资源锁名/payload 复证 W1。端口不签发另一 root、不重新按 Path 绑定、不重取后代锁，不赋予 `RetirementDirectoryAuthority` 枚举权。
+
+- 仅观察指定后代目录的一层直接条目，沿保留的目录链及配置位置执行有界双遍完整观察；返回唯一排序的名字及既有 regular/single-link 快照。任何无法完整观察的条目、symlink、特殊项或多链接均稳定拒绝，不能静默过滤；未知但 shape 合法的文件必须出现在闭集中，由业务 owner 判定是否外来。
+- 复用 `LedgerEnumerationLimits` 的条目、名字及总字节上限，返回前复证原 root、后代目录、W1与两遍闭集一致；超限、部分枚举、可观察漂移和自有资源关闭失败不返回完整成功。借入 root/后代 authority/W1 保持外层所有权，临时观察资源全部关闭。此观察不读取业务正文、不授权修改或退休，也不是持久目录证明。
+- `BoundDirectoryAuthority.observe_ledger_entries` 继续要求 exact-parent W1；根目录 metadata 观察仍保持对不可用项保留名字的独立语义；Windows 同能力及独立只读目录观察保持原合同。该能力只补原资源锁下后代闭集的组合，不扩大目录替换支持范围。
+
+验证覆盖多层派生但仅一层枚举、空目录、额外合法条目、非法 shape、同路径替身、外来或错 root/lease、上限、双遍变化、枚举/close失败与借入对象存续。Core 对确定性隔离目录进行完整闭集校验后，仍由原取消/rollback owner解释各项业务关系；平台不以候选名或历史inode认定业务所有权。
+
+### 原 root 持锁直接子项观察
+
+`LockedRootDirectoryObservation` 是可选中立能力，由 POSIX adapter 实现；不增加 `PlatformFileBackend` 的必选成员。`observe_root_children(root, lease, limits, cancellation)` 仅接受同 adapter 签发的 live `RootedDirectoryAuthority`、精确绑定该 root 的 live `LockLease`、`DirectoryObservationLimits` 与 `DirectoryObservationCancellation`，返回 `tuple[DirectoryEntryMetadata, ...]`。不接 Path、历史 identity 或 retirement authority，也不签发另一 root。
+
+- 只观察直接子项的名字与 no-follow metadata，不递归、不读取文件正文、不逐项打开/关闭文件 FD。普通目录保留目录事实；链接、特殊项及不安全名字按既有 `DirectoryEntryKind`／unavailable 语义保留原名，不跟随或静默过滤。文件格式筛选、pending 名称规则和业务解释归消费者。
+- `maximum_entries` 限制每遍直接子项数量；`maximum_directory_handles` 只计本次临时目录句柄，借入 root/lease 不计为本次拥有资源；此操作不下降层级。两遍完整有界观察须得到一致的名字及 metadata 闭集，并在入口和返回前复证原名称链、配置位置与 lease。取消、超限、部分枚举、重复名字、可观察漂移和临时资源关闭失败均不得返回完整成功；关闭失败不遮蔽已有主错误。
+- 平台关闭本次枚举流及临时目录资源，始终借用 root/W1；外层 owner 唯一负责其关闭。结果不是文件打开/写入 authority、内容证明或持久资格，后续读取仍须由消费者从原 root 重新取得目标的严格文件 authority。前后及双遍检查不承诺原子目录快照、不消除检查间窗口或不可观察 ABA。
+- 保持 `observe_ledger_entries` 对每项 regular/single-link 的严格闭集合同；保持独立 discovery 的 `ReadOnlyDirectoryObservation` 生命周期及 Windows `LockedDescendantNamespaceInspection` 的严格后代合同。可选能力缺失时明确失败，不以 fresh Path bind 或其他协议代答。
+
+合同测试覆盖含无关目录、链接、特殊项和多链接的完整 metadata，foreign issuer、错 root/lease、关闭的 authority、取消、数量/句柄上限、部分枚举、前后位置漂移及 close 失败；核验无文件正文读取、无逐项文件 FD 开关、借入 root/W1 始终可用。现有 discovery/ledger 与 Windows 可选能力探测语义保持。
 
 ## Consumer Integration
 
@@ -595,6 +659,7 @@ flowchart TD
 | 3.7-3.9 | 已终结导出的安全输出收尾 | Windows lock adapter、Resource/TMX owners | OutputArtifactLockRetirement、OutputLockFinishResult | ADR-027 输出锁闲置回收 |
 | 4.1-4.5 | atomic publish/durability/recovery | publisher, business journals/LKG | BoundDirectoryAuthority, CandidateFile | Atomic Publish |
 | 5.1-5.4 | shared boundary/consumer parity | migration clusters | platform contracts | Consumer Integration |
+| 5.6, 5.7 | 原 root 配置位置、POSIX TM 共享能力与内部访问边界 | POSIX adapter、composition、Core 消费接缝 | 位置复证、已绑定观察、reservation 交接、mutation guard | 原 owner 生命周期与 DB_REPLACED 子阶段 |
 | 6.1-6.6 | dependency/Qt startup/avatar regression、user-managed source entry | Qt composition, avatar catalog, source launcher, release validator | source/runtime smoke | Source + Build + E2E |
 | 7.1-7.4 | project save/reopen | project package/workspace | publisher + project receipts | project vertical slice |
 | 8.1-8.6 | TM activation/restart/unique authority | migration, lock, attestation, recovery | lock/private/identity | TM vertical slice |
@@ -610,6 +675,13 @@ flowchart TD
 - Win32 structure sizes、function signatures、last-error capture、handle close on every failure path。
 - 普通构建输入—产物映射、候选记录排序/digest、缺失声明/意外依赖拒绝；Core 输入 session 与请求关联；不新增全 PYZ 逐字段比较门。
 - business error mapping preserves Parser/Project/TM/Chunk public codes。
+
+### POSIX 位置与同对象交接验证
+
+- 原 root/ancestor rename 与同字节 clone、link/special file、foreign issuer、合法初始规范化入口；派生 authority 继承关联，不能 fresh bind 延续旧授权（5.6–5.7）。
+- live 文件旧 codec 观察、reservation 单次消费及转交失败/close 归属、existing recovery authority 拒绝任意 Path/历史 identity 收养；v2 seal/publish 同对象（5.1、5.3、5.6–5.7）。
+- pending/guard 同时 live identity 比较、guard 位置漂移、SQL 期间不额外开关同 inode DB FD；以 Core 10.3–10.6 真实 create/replace 与两个 DB_REPLACED 恢复窗口验证窄接缝，平台不伪造业务 phase（5.1、5.3、5.6–5.7）。
+- 11.5 等待 Core10.11、Resource6.2 与 UI10.2 后验证实际共享变化的 Windows source/普通 frozen root/锁/连接/发布和资源旅程；原 Windows 保护与发布行为仍满足 Requirement 12，新结果不改签旧发行结论。
 
 ### Windows Adversarial Integration Tests
 - 每个候选实际消费者验证锁竞争、发布失败/进程中断/冷重开、权限与 reparse 拒绝、原数据保全；不能只跑平台 fake consumer。
