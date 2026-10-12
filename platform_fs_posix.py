@@ -35,6 +35,7 @@ from platform_fs_contracts import (
     EntrySnapshot,
     ExistingFileDurability,
     ExistingFileMutationGuard,
+    ExistingRetirementSource,
     FileObjectIdentity,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -49,6 +50,7 @@ from platform_fs_contracts import (
     PlatformFileErrorCode,
     PosixBoundContentFacts,
     PosixBoundContentObservation,
+    PosixStageHandoff,
     PrivateAccessEvidence,
     PrivateStorageProof,
     ProcessFileLock,
@@ -1147,6 +1149,7 @@ class _PosixMutableFileReservation(MutableFileReservation):
         "_descriptor",
         "_entry_name",
         "_created_identity",
+        "_issuer",
     )
 
     def __init__(
@@ -1156,6 +1159,8 @@ class _PosixMutableFileReservation(MutableFileReservation):
         descriptor: int,
         entry_name: str,
         created_identity: FileObjectIdentity,
+        *,
+        issuer: object | None = None,
     ) -> None:
         super().__init__(created_identity)
         self._directory_fds = directory_fds
@@ -1164,6 +1169,7 @@ class _PosixMutableFileReservation(MutableFileReservation):
         self._descriptor = descriptor
         self._entry_name = entry_name
         self._created_identity = created_identity
+        self._issuer = issuer
         try:
             self._reprove_identity()
         except BaseException:
@@ -1451,8 +1457,11 @@ class _PosixCandidateFile(CandidateFile):
         name: str,
         bound_identity: FileObjectIdentity,
         fault_injector: _FaultInjector | None,
+        *,
+        _recovered_content: CandidateContentFacts | None = None,
+        _borrowed_handles: bool = False,
     ) -> None:
-        super().__init__()
+        super().__init__(_recovered_content=_recovered_content)
         try:
             captured_directories = _capture_directory_identities(directory_fds)
             if not (
@@ -1495,9 +1504,10 @@ class _PosixCandidateFile(CandidateFile):
                     retryable=True,
                 )
         except BaseException:
-            _close_fd(descriptor)
-            for retained in reversed(directory_fds):
-                _close_fd(retained)
+            if not _borrowed_handles:
+                _close_fd(descriptor)
+                for retained in reversed(directory_fds):
+                    _close_fd(retained)
             raise
         self._descriptor = descriptor
         self._directory_fds = directory_fds
@@ -1507,7 +1517,7 @@ class _PosixCandidateFile(CandidateFile):
         self._bound_identity = bound_identity
         self._named_destination: str | None = None
         self._fault_injector = fault_injector
-        self._flushed_facts: CandidateContentFacts | None = None
+        self._flushed_facts: CandidateContentFacts | None = _recovered_content
 
     def _reprove_owner(
         self,
@@ -1712,6 +1722,7 @@ class _PosixLockLease(LockLease):
         "_entry_name",
         "_entry_identity",
         "_payload",
+        "_issuer",
     )
 
     def __init__(
@@ -1723,6 +1734,8 @@ class _PosixLockLease(LockLease):
         entry_name: str,
         entry_identity: FileObjectIdentity,
         payload: bytes,
+        *,
+        issuer: object | None = None,
     ) -> None:
         super().__init__()
         self._descriptor = descriptor
@@ -1732,6 +1745,7 @@ class _PosixLockLease(LockLease):
         self._entry_name = entry_name
         self._entry_identity = entry_identity
         self._payload = payload
+        self._issuer = issuer
 
     def _reprove_lock(self, *, check_payload: bool = True) -> None:
         try:
@@ -1848,6 +1862,28 @@ class _PosixLockLease(LockLease):
                 _close_fd(descriptor)
         if unlock_error is not None:
             raise unlock_error from None
+
+
+class _PosixExistingStageSource(ExistingRetirementSource):
+    """Exact existing content borrowed under one continuous owner lease."""
+
+    __slots__ = ("_file", "_lease", "_issuer")
+
+    def __init__(
+        self, source: _PosixBoundRegularFile, lease: _PosixLockLease,
+        expected: CandidateContentFacts, identity: FileObjectIdentity,
+    ) -> None:
+        super().__init__(identity, expected)
+        self._file = source
+        self._lease = lease
+        self._issuer = source._issuer
+
+    def _reprove_source(self) -> BoundContentFacts:
+        self._lease.reprove()
+        return self._file.content_facts()
+
+    def _close_authority(self) -> None:
+        self._file.close()
 
 
 class _PosixPrivateEvidence(PrivateAccessEvidence):
@@ -2155,6 +2191,7 @@ class _PosixDirectoryStream:
 class PosixPlatformAdapter(
     ReadOnlyDirectoryObservation,
     PosixBoundContentObservation,
+    PosixStageHandoff,
     RootedFileSystem,
     MutableFileReservationService,
     OwnedNamespaceRetirement,
@@ -2170,6 +2207,131 @@ class PosixPlatformAdapter(
             raise TypeError("_fault_injector must be callable")
         self._fault_injector = _fault_injector
         self._issuer = object()
+
+    def _open_existing_stage(
+        self, parent: BoundDirectoryAuthority, name: str,
+        owner_lease: LockLease, expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        if (
+            type(parent) not in {_PosixRootedDirectory, _PosixBoundDirectory}
+            or not isinstance(parent, _DirectoryAuthorityMixin)
+            or parent._issuer is not self._issuer
+        ):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        self._stage_lease(owner_lease, parent)
+        directories: tuple[int, ...] | None = None
+        descriptor: int | None = None
+        retained: _PosixBoundRegularFile | None = None
+        source: _PosixExistingStageSource | None = None
+        try:
+            parent.reprove()
+            directories = _duplicate_directory_chain(parent._directory_fds)
+            descriptor = os.open(name, _READ_FLAGS | os.O_NONBLOCK, dir_fd=directories[-1])
+            transferred_directories, transferred_descriptor = directories, descriptor
+            directories, descriptor = None, None
+            retained = _PosixBoundRegularFile(
+                transferred_directories, parent._directory_names,
+                transferred_descriptor, name, self._fault_injector, issuer=self._issuer,
+            )
+            actual = retained.content_facts()
+            if (
+                actual.snapshot.identity.link_count != 1
+                or actual.snapshot.byte_count != expected_content.byte_count
+                or actual.content_sha256 != expected_content.content_sha256
+            ):
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            source = _PosixExistingStageSource(
+                retained, cast(_PosixLockLease, owner_lease), expected_content,
+                actual.snapshot.identity,
+            )
+            source.reprove()
+            self._stage_lease(owner_lease, parent)
+            return source
+        except BaseException as error:
+            if source is not None:
+                source.close()
+            elif retained is not None:
+                retained.close()
+            if isinstance(error, OSError):
+                raise _map_os_error(
+                    error, fallback=PlatformFileErrorCode.IDENTITY_STALE, retryable=True,
+                ) from None
+            raise
+        finally:
+            if descriptor is not None:
+                _close_fd(descriptor)
+            if directories is not None:
+                for item in reversed(directories):
+                    _close_fd(item)
+
+    def _stage_lease(
+        self, lease: LockLease,
+        source: _DirectoryAuthorityMixin | _PosixMutableFileReservation | _PosixBoundRegularFile,
+    ) -> None:
+        if (
+            type(lease) is not _PosixLockLease
+            or lease._issuer is not self._issuer
+            or not lease._matches_parent(
+                source._directory_fds, source._directory_names, source._directory_identities,
+            )
+        ):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+
+    def _handoff_stage(
+        self, source: MutableFileReservation | ExistingRetirementSource,
+        owner_lease: LockLease, expected_content: CandidateContentFacts,
+    ) -> CandidateFile:
+        retained: _PosixMutableFileReservation | _PosixBoundRegularFile
+        if type(source) is _PosixMutableFileReservation and source._issuer is self._issuer:
+            source.identity()
+            retained = source
+        elif type(source) is _PosixExistingStageSource and source._issuer is self._issuer:
+            if source._lease is not owner_lease:
+                raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+            # This checks the expected content fixed at acquisition, before the
+            # handoff's expected value can be used for any later comparison.
+            source.reprove()
+            retained = source._file
+        else:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        self._stage_lease(owner_lease, retained)
+        candidate: _PosixCandidateFile | None = None
+        transferred = False
+        try:
+            # Construct a borrowed candidate shell. No new file or duplicated
+            # file descriptor is made, and failed validation must not close the
+            # source owner's handles. Ownership moves only at the final mark.
+            candidate = _PosixCandidateFile(
+                retained._descriptor, retained._directory_fds, retained._directory_names,
+                retained._directory_identities, retained._entry_name,
+                retained.identity(), self._fault_injector,
+                _recovered_content=expected_content, _borrowed_handles=True,
+            )
+            candidate._publish_facts(PublishMode.CREATE_IF_ABSENT)
+            candidate.flush_content()
+            os.fsync(retained._directory_fds[-1])
+            _hit_fault(self._fault_injector, "stage_after_sync")
+            _hit_fault(self._fault_injector, "stage_before_transfer")
+            self._stage_lease(owner_lease, retained)
+            candidate._publish_facts(PublishMode.CREATE_IF_ABSENT)
+            source._require_open()
+            if type(source) is _PosixExistingStageSource:
+                source._file._mark_authority_transferred()
+            source._mark_authority_transferred()
+            transferred = True
+            _hit_fault(self._fault_injector, "stage_after_transfer")
+            return candidate
+        except BaseException as error:
+            if candidate is not None:
+                if transferred:
+                    candidate.close()
+                else:
+                    candidate._mark_authority_transferred()
+            if isinstance(error, OSError):
+                raise _map_os_error(
+                    error, fallback=PlatformFileErrorCode.DURABILITY_UNAVAILABLE, retryable=False,
+                ) from None
+            raise
 
     def _observe_bound_content(self, source: BoundRegularFile) -> PosixBoundContentFacts:
         if type(source) not in {_PosixBoundRegularFile, _PosixBoundSynchronizedRegularFile}:
@@ -2622,6 +2784,7 @@ class PosixPlatformAdapter(
                 transferred_descriptor,
                 name,
                 created_identity,
+                issuer=self._issuer if parent._issuer is self._issuer else None,
             )
         except (TypeError, AssertionError):
             raise
@@ -2972,6 +3135,7 @@ class PosixPlatformAdapter(
                 name,
                 identity,
                 payload,
+                issuer=self._issuer if parent._issuer is self._issuer else None,
             )
             descriptor = None
             lease_directory_fds = None

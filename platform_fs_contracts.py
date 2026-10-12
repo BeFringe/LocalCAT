@@ -1230,7 +1230,7 @@ class ExistingRetirementSource(OpaqueAuthority, ABC):
     Unlike ``MutableFileReservation`` this authority does not claim creator
     ownership.  It proves exact portable content through a handle opened with
     the platform's rename/delete access and is consumed only by the dedicated
-    existing-file retirement protocol.
+    existing-file retirement protocol or the optional POSIX stage handoff.
     """
 
     __slots__ = ("__identity", "__expected_content")
@@ -2599,6 +2599,96 @@ class ExistingCandidateRecovery(Protocol):
         owner_lease: LockLease,
         mutation_guard: BoundExistingFileMutationGuard,
         require_private: bool,
+    ) -> CandidateFile: ...
+
+
+@runtime_checkable
+class PosixStageHandoff(Protocol):
+    """Optional same-object stage handoff; never a path-based adoption API.
+
+    The owner closes all SQL/statement/backup users and finishes journals first.
+    For cold recovery the owner authenticates its complete business closure
+    before opening an existing source. The adapter only proves live rooted
+    file/lease/content facts, not that business prerequisite. Existing sources
+    do not assert creator ownership or expose the full retirement capability.
+
+    The owner must validate its resource/stage relationship and call
+    lease.reprove_binding with its expected lock name/payload before entry.
+    Exact parent/root matching alone does not distinguish resources sharing a
+    directory. Cold sources additionally retain their original live lease.
+    """
+
+    def open_existing_stage(
+        self,
+        parent: BoundDirectoryAuthority,
+        name: str,
+        *,
+        owner_lease: LockLease,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        if not isinstance(parent, BoundDirectoryAuthority):
+            raise TypeError("parent must be BoundDirectoryAuthority")
+        if not isinstance(owner_lease, LockLease):
+            raise TypeError("owner_lease must be LockLease")
+        if type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts")
+        parent._require_open()
+        owner_lease._require_open()
+        authority = self._open_existing_stage(
+            parent, validate_relative_name(name), owner_lease, expected_content,
+        )
+        try:
+            if not isinstance(authority, ExistingRetirementSource):
+                raise TypeError("backend stage open must return ExistingRetirementSource")
+            authority.reprove()
+            return authority
+        except BaseException:
+            if isinstance(authority, OpaqueAuthority):
+                authority.close()
+            raise
+
+    @abstractmethod
+    def _open_existing_stage(
+        self, parent: BoundDirectoryAuthority, name: str,
+        owner_lease: LockLease, expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource: ...
+
+    def handoff_stage(
+        self,
+        source: MutableFileReservation | ExistingRetirementSource,
+        *,
+        owner_lease: LockLease,
+        expected_content: CandidateContentFacts,
+    ) -> CandidateFile:
+        """Consume source once; failure before transfer leaves its owner intact.
+
+        After transfer only candidate/pending releases the retained handles.
+        The adapter must reject foreign issuers, stale names and other-parent
+        leases, compare actual bytes with expected size/hash and synchronize.
+        """
+        if not isinstance(source, (MutableFileReservation, ExistingRetirementSource)):
+            raise TypeError("source must be a live stage authority")
+        if not isinstance(owner_lease, LockLease):
+            raise TypeError("owner_lease must be LockLease")
+        if type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts")
+        source._require_open()
+        owner_lease._require_open()
+        candidate = self._handoff_stage(source, owner_lease, expected_content)
+        try:
+            if not isinstance(candidate, CandidateFile):
+                raise TypeError("backend handoff must return CandidateFile")
+            candidate._require_publishable()
+            return candidate
+        except BaseException:
+            if isinstance(candidate, CandidateFile):
+                candidate.close()
+            raise
+
+    @abstractmethod
+    def _handoff_stage(
+        self, source: MutableFileReservation | ExistingRetirementSource,
+        owner_lease: LockLease, expected_content: CandidateContentFacts,
     ) -> CandidateFile: ...
 
 

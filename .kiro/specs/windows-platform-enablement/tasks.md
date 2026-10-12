@@ -570,7 +570,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1_
   - _Requirements: 5.1, 5.6, 5.7_
 
-- [ ] 11.3 将同对象stage交给现有publisher
+- [x] 11.3 将同对象stage交给现有publisher
   - 仅消费原 reservation、同家族 lease 与预期内容，Core 先关闭全部 SQL；成功转交后旧 reservation 失效，candidate/pending 唯一持有 close 责任；恢复阶段只接原 owner 核验 closure 后取得的 existing live authority。
   - 完成时，fresh reservation单次转Candidate；同对象发布，转交失败/close归属明确；cold-recovery existing authority不能由任意Path伪造。
   - _Boundary: POSIX adapter/contracts 的同对象单次转交_
@@ -628,6 +628,8 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 - Task 3.3 已规定完整既有 W1 payload 在活身份、私有安全与内容复证后直接进入 `LockFileEx`；无写入的普通取得不执行 `FlushFileBuffers`，首次创建和 strict-prefix 恢复仍须 write/flush/readback。
 
 ## Implementation Notes
+
+- Task 11.3／Core 10.3、10.6：同一目录可承载多个资源及 W1；平台的 issuer、原 root／parent 和 live lease 检查不能单独证明 resource 语义。Core 必须先以私有 borrow 比对 resource／stage，并按预期 lock name／payload 复证 W1；冷恢复的 existing authority 还须保持获取时的同一 live lease。Windows 专用恢复 API 的 guard 参数不构成 POSIX 同对象交接的隐含前置。
 
 - Task 11.2：Linux 上同长度改写可使前后 inode、size、mtime_ns、ctime_ns 全部相等；时间戳不是内容版本号。已绑定观察返回本次读取流的摘要，不验证 expected content，也不提供任意并发写入下的原子快照。Core 消费时仍须闭合家族排空／SQL 生命周期并比较原预期证明，不能用新捕获值覆盖预期后自证一致。
 
