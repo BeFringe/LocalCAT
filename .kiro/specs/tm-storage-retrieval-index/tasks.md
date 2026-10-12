@@ -619,6 +619,114 @@
   - _Boundary: Core 发布验证工具、直接输入生产者、registry 与测试；Store 相邻维护遵循其 Task 5.6 的历史消费与直接架构守卫边界_
   - _Depends: 9.7_
 
+## POSIX 稳定本机资源事务
+
+本组修改现有 owner 端口并复用原 phase machine。10.1–10.2a 提供隔离生命周期机制门，10.3–10.6 提供 v2 同对象门所需全部正常 I/O 与指定恢复窗口；10.6a 补齐 DB 命名前的取消与家族终态；10.2b 在这些前置完整闭合后启用公开生命周期并复核兼容。10.7–10.11 只在两门及10.2b通过后扩展。技术门不代替产品交付，也不扩展 VFS、驱动、新持久格式或永久单进程独占。
+
+- [ ] 10. 贯通 POSIX 家族生命周期、同对象发布与恢复
+
+- [ ] 10.1 实现家族会话与显式操作借用
+  - 普通 operation 先计入 admission、释放 condition 再取 W1；replacement 先停止 admission 并 drain 再取 W1。借用绑定 resource/operation/thread，外层 owner 唯一关闭 root/W1。
+  - 完成时，admission/drain/W1顺序无反转，内部借用不重入，资源失效不能被新engine清除，同物理家族冲突统一协调或拒绝。
+  - _Boundary: 资源家族 coordinator/engine_
+  - _Depends: windows-platform-enablement 11.1_
+  - _Requirements: 2.10, 4.7, 7.15, 7.16, 7.17_
+
+- [ ] 10.2a 验证家族生命周期的有限机制
+  - 在隔离候选中用少量合成记录验证真实已激活store的query/append、lazy view、嵌套health、replacement reservation与已登记家族的并发factory；同家族W1不递归、不自等drain，等待后旧generation不得写新DB，raw close不得破坏活SQL锁，等待有界且count/句柄闭合。
+  - 完成时，双coordinator/双进程及timeout/cancel得到真实机制证据；该结果只允许进入10.3–10.6，不启用日常公开入口，不代表首次激活或全部cold入口完成。正常场景出现超出后续明确前置的缺口时停止并报告，不以mock提前抛错替代continuation。
+  - _Boundary: Core store/query view/health 与 reservation 的有限机制验证_
+  - _Depends: 10.1_
+  - _Requirements: 2.10, 4.7, 7.5, 7.15, 7.16_
+
+- [ ] 10.3 接入POSIX分派、builder与v2 seal
+  - initial reservation 在首次stage动作前由原家族transition停止准入并drain，取得一次W1，向builder/schema/stage SQL/sealer显式借用；不得先持raw W1再drain。通用backend保留，POSIX_V2与WINDOWS_V3一次选择并覆盖真实消费者；Windows专用capability失败不得fallback。全部stage SQL/statement/backup关闭后才raw capture，不copy冒充POSIX seal。
+  - 完成时，正确profile覆盖真实builder/schema初始化、阶段写入和seal；原reservation同对象交接，格式不变，SQL结束后才raw观察；Windows仍使用真实private capability。
+  - _Boundary: Core migration/sealer/content 集成_
+  - _Depends: 10.2a, windows-platform-enablement 11.2, windows-platform-enablement 11.3_
+  - _Requirements: 2.4, 2.9, 2.12, 7.14, 7.15_
+
+- [ ] 10.4 接通DB命名与receipt SQL交接
+  - DB pending 原 readback 仍 live 时取得 guard 并比较双方 live identity；pending terminal 与 close 全部成功后才能 receipt SQL。SQL/statement/backup 关闭后 final capture 与 guard 同时 live 比较，随后关闭 guard；保留原 root/W1，不改 preliminary 或新增 phase。
+  - 完成时，真实DB_REPLACED journal持久复证→live guard交接→pending terminal/close→SQL→final capture；命名terminal不报activation成功；交接失败保留真实phase。
+  - _Boundary: activation recovery 的 DB I/O/receipt 端口_
+  - _Depends: 10.3, windows-platform-enablement 11.4_
+  - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.14, 7.15, 7.16_
+
+- [ ] 10.5 接通正常activation其余应用发布
+  - 仅接fresh create/replace必经的既有owner端口与直接调用者，前移source mutation至家族排空后；source pending与registry/receipt callback闭合条件保留。terminal health/revision/query lease、nested health与callback显式借原root/W1，内部不得重取W1或持condition等待OS锁；不复制activation状态机。
+  - 完成时，fresh create及已有generation replace必经的source/manifest/journal/lineage/backup/terminal都借原root；完整正常Core调用能走到底；排空前不改source，失败不裸路径清理。
+  - _Boundary: activation journal/recovery 正常发布 I/O 端口_
+  - _Depends: 10.4_
+  - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.13, 7.14, 7.16_
+
+- [ ] 10.6 接入DB_REPLACED恢复并验证v2窄旅程
+  - 以平台 11.2–11.4a 和 Core 10.3–10.6 的真实切片完成 v2 同对象门；原 root/W1 连续且 clone 不被接管。proof/交接/正常恢复缺口触发停止，不靠后置消费者、mock 提前抛错或旧 pathname 路线通过。
+  - 完成时，receipt前、commit后/manifest前两个窗口经真实cold recovery闭合；普通父目录中的无关目录/链接不阻断恢复，重复恢复不多增generation；create/replace→receipt→cold query完成设计中的v2门。
+  - 借原root/W1完整观察schema pending名字，仅无匹配时跳过schema收尾；匹配项（包括目录、链接或畸形token）及不完整观察均保留并明确拒绝。实际pending恢复继续由10.8接入。
+  - _Boundary: v2 recovery owner 与 Core 集成_
+  - _Depends: 10.5, windows-platform-enablement 11.4a_
+  - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.14, 7.15, 7.16_
+
+- [ ] 10.6a 接通DB命名前的取消与家族终态
+  - 初次激活与替换借原root/W1接通既有取消owner；正式journal未发布或为PREPARED时，先复证完整prior/legacy authority与DB尚未命名，不能由phase或缺失handle直接推定可取消。
+  - source/prior按既有内容分歧合同复证，本attempt的journal temp、backup、candidate、terminal按原owner收尾，取消记录支持重复恢复；不得退休未知对象、重新绑定同路径或绕过Windows专用能力。初次激活取消使用正确POSIX legacy复证。
+  - 未完成取消/恢复的attempt停止整个资源家族新操作；durable terminal、owned收尾、prior/legacy及外层root/W1收尾均成功才恢复准入。失败保留primary与恢复事实，DB命名/commit不明保持完整恢复或recovery-only。
+  - 完成时，真实journal写入/flush及PREPARED终态后且DB命名前的失败，在完整取消后恢复可证明prior；取消收尾中断时全家族停止，replay闭合后才解除，peer不在待恢复期间继续写，其他资源不受影响。
+  - _Boundary: Core activation取消owner、migration失败交接、coordinator家族终态与直接收尾消费者_
+  - _Depends: 10.6, windows-platform-enablement 11.4b, windows-platform-enablement 11.4c, windows-platform-enablement 11.4d_
+  - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5, 7.13, 7.14, 7.15, 7.16_
+
+- [ ] 10.2b 启用公开生命周期并复核兼容
+  - 在10.3–10.6a已完成initial reservation、builder/seal、同对象发布、receipt/recovery、未命名取消及terminal health/revision/query lease借用的基础上统一启用公开生命周期；本任务不提供v2门所需的前置接线。
+  - 完成时，真实首次激活、替换、失败后last-known-good与既有公开查询/写回回归通过；复跑10.2a及v2门，删除隔离候选的临时测试门控后才启用公开入口。缺口不得以跳过health、放宽断言或伪造borrow处理。
+  - _Boundary: Core initial reservation、runtime terminal与公开生命周期启用_
+  - _Depends: 10.2a, 10.6a_
+  - _Requirements: 2.10, 4.7, 7.5, 7.15, 7.16_
+
+- [ ] 10.7 扩展其余runtime连接与失败入口
+  - 只在家族生命周期门和 v2 同对象门都通过后扩展；canonical 及家族位置可证明的配置 JSONL/manifest 内容分歧继续 Lookup/Update，位置失效则锁存资源停止。
+  - 完成时，余下query/append/health/reconnect实际入口继承借用；缺失DB不隐式创建，取消与晚到结果不复活失效；正常SOURCE_DIVERGED能力保留。
+  - _Boundary: store/engine runtime 消费_
+  - _Depends: 10.2b, 10.6_
+  - _Requirements: 2.10, 2.13, 4.7, 7.5, 7.8, 7.9, 7.10, 7.11, 7.15, 7.16_
+
+- [ ] 10.8 接入schema重开与双连接backup
+  - 源/目标 backup 双连接及 statement 全部收尾后才观察/关闭 raw FD；复用原 schema/recovery profile，不新增格式或模块拆分。
+  - 完成时，schema copy、backup源/目标及旁路stage检查生命周期闭合；SQL前后顺序正确、cold recovery使用原owner，不新增格式。
+  - _Boundary: schema upgrade 与 store backup 端口_
+  - _Depends: 10.7_
+  - _Requirements: 2.9, 2.11, 2.12, 7.14, 7.15, 7.16_
+
+- [ ] 10.9 扩展其余activation恢复和收尾切点
+  - 在未命名取消前置之上扩展其余恢复、rollback 与 cleanup 切点，按真实命名/commit/phase 保留可证明 prior、已发布或 unknown；不删除未知 journal，不重新接管同路径副本。
+  - 完成时，PREPARED、MANIFEST_PUBLISHED、GENERATION_PUBLISHED受影响恢复/rollback端口借原root；完整旧/新或recovery-only，漂移后不盲删/接管。
+  - _Boundary: activation recovery 与失败收尾_
+  - _Depends: 10.6, 10.8_
+  - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.13, 7.14, 7.16_
+
+- [ ] 10.10 接入snapshot/export/refresh
+  - canonical 来源与导出目的 root 独立；完整 snapshot/receipt/refresh/cold recovery 仍由原 owner 闭合，退出后迁移不把 pending/hot-journal 残留直接当一致快照。
+  - 完成时，来源家族与目的root分开，导出完整快照；refresh/receipt/cold recovery闭合，未完成输出不覆盖有效输出。
+  - _Boundary: snapshot artifact/recovery 与 export/refresh 集成_
+  - _Depends: 10.7, 10.9_
+  - _Requirements: 2.7, 2.8, 7.15, 7.16, 7.18_
+
+- [ ] 10.10a 提供私有 JSONL 导出产物的原授权收尾
+  - 复用同一 exporter 与完整 receipt 终态，为原本不存在的私有目标对提供 prepare/discard；保持直接 JSONL 导出合同。
+  - 在来源操作完整结束后交出本实例拥有的 prepared 对象；保留原目的 root/parent/lease 和两文件身份，消费结束按原授权清理并关闭。
+  - 完成时，正常释放不留正文/companion，重复释放无额外写入；普通失败诚实报告部分清理，失效或未知对象不删除，Core 未完成恢复物不被当成可丢弃 stage。
+  - _Boundary: Core export contracts 与 tm_migration.py 的私有导出生命周期；不含 Resource 编排、平台新能力或新 JSONL producer_
+  - _Depends: 10.10_
+  - _Requirements: 2.7, 2.8, 7.15, 7.16, 7.18_
+
+- [ ] 10.11 闭合正常并发恢复与可见漂移矩阵
+  - Mac/Linux source 的 Core 公开 owner 正常链、SOURCE_DIVERGED、hot journal/backup、双进程并发取消及已可见漂移均验证；活事务外部替换另记边界观察，验证检测后停止与诚实结果，不要求全时序零副作用。
+  - 完成时，真实builder已换目录时继续实际代码并拒绝错误访问；正常并发、受影响进程中断/重复恢复闭合；活事务外部替换另报边界观察。
+  - _Boundary: Core 生命周期、恢复与漂移集成验证_
+  - _Depends: 10.7, 10.8, 10.9, 10.10_
+  - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.13, 7.14, 7.15, 7.16, 7.17, 7.18_
+
 ## Implementation Notes
 
 - Task 9.6b：合法非legacy provenance经导出后仍须按实际source逐项保真核对，不能硬编码为legacy来源。SQLite流式游标须在成功和异常路径都关闭，否则异常引用持有的游标会阻止Windows清理。
@@ -704,3 +812,7 @@
 - 2026-08-15 / Tasks 8.6–8.7 v15（重开）：保留 `proof-query-v2` 双域守恒、2048 预算、Retrieval-owned exact-fold reuse 与稀疏路径；密集路径以同一 generation 的短事务生成 U1/K0/R，再由 store-owned 严格有序私有投影和 opaque receipt 重绑定 facts，提交后逐 identity 计算 exact Unicode LCS/U3 并完成 threshold+top-k 双闭合，append/tamper/injected scorer 均资源级 fail-closed且不增加持久 schema。穷举与固定 Unicode 随机向量闭合 `真实分数<=U3<=U2<=U1`；q61 以 300 次真实 scorer 覆盖 3000 identities，40 条 frozen miss 为 42–481 次调用，字面 5000/200 oracle 在 FTS/fallback 均零遗漏；q240 最终分区为 A0=10、A1=293、invocation=303，handoff 的 302 仅是非完整 U3 原型竞争类估计而非最终调用数。q1/q61/short/q226/q240 各 20 个 warm 样本的 nearest-rank p95 分别为 75.359/378.410/12.259/378.988/332.161 ms、峰值 RSS 91.203 MiB。owner 248/248、Cluster N 330/330（1 skip）、changed-file basedpyright 0 errors、diff check 通过，最终原生 xhigh 累计复审无 P0–P3 并批准。
 - 2026-08-15 / Tasks 8.6–8.7 v16：以 `proof-query-v3` 冻结 all-accounted/raw-distinct-ranking/exact-fold-invocation 三域、完整 R 的 U3 pass、最多 32 的 U3-best scorer batch 与残余逐 identity balanced-partition U4/P3；production 只以 threshold 或 threshold-qualified top-k 严格闭合，Oracle 仍要求 threshold+top-k 双闭合，v2 仅允许严格历史解码，任何直接/嵌套重编码均拒绝。穷举/固定 Unicode 向量、single-char/repeat/tie、ordered projection/receipt/binding 伪造、phase2/U4/scorer append race、2049 原子预算及 Cluster N tamper 回归全部闭合；字面 5000/200 oracle 在 FTS/fallback 均 threshold/top-10 零遗漏。以 public migration owner 新建的 100k FTS generation（artifact pre/post 相等）实测 240/240 production 闭合、最大 43 calls、40 miss 最大 0 calls；q61 `oracle_full` 以 300 calls 闭合 3000 identities，q240 以 74 calls 闭合且 top-10 等于 `50040,40046,94009,64049,40900,40498,24009,40091,40421,20040`。六条查询分别 5 次 warmup 后取 20 个只覆盖 binding→ordered reads/LCS→record fetch→真实 scorer→finish/final generation validation 的 production candidate API 样本，q1/q61/q28-short/q183/q226/q240 nearest-rank p95 分别为 23.830/317.532/12.832/390.791/98.852/83.177 ms，查询进程峰值 RSS 117,850,112 bytes。修后 query-process 69/69、M owner+Cluster N 328/328、changed-file basedpyright/py_compile 0 errors、diff check 通过，三路原生 xhigh 最终复审均无 P0–P3 并批准。本轮未运行完整 Gate D；fresh migration 244.866 s 且 per-query health 全扫约 8.3 s，故 Cluster O/Task 8.9 的 migration 与 active-attestation 复用仍诚实 NO-GO。
 - 2026-08-16 / Feature 5 Cluster M→O 最终闭合：`proof-query-v3` 的 U3/U4/P3、2048 budget、batch≤32 与三域守恒保持不变；sealed registry 收束为 StageSealer 在 post-fsync integrity/projection/closure/terminal-rehash 后铸造的 exact registry+reservation 单次 capability，对外仅有 read-only readiness view，active attestation 只在 exact inode+bytes+phase 上复用。274-file immutable epoch fingerprint `1c357b0efcf81eef8bd37498bbb2700e9c3f2fa2add3b830e2f4e3dc7f77fd98` 上 fresh Gate D bundle `071f2787f452c9f07635a85e0626e8538bdb79a1b4f46ea3a37a06d47cf5be7e` 双路径 PASS：FTS exact/fuzzy p95 `0.547/275.833 ms`、migration `65.599 s`、RSS `266.953 MiB`；fallback `0.240/279.757 ms`、`99.223 s`、`291.719 MiB`；两路 5000/200 oracle threshold/top-10 零遗漏且 recall `1.0`。fault `61/61`、acceptance `33/33`、release `86/86 GO`、strict evidence `38/38`、fresh full `1579/1579`（skip 1，含 Qt smoke）与 changed-file basedpyright 0 errors、diff check 全部通过；最终原生 xhigh 对代码、四份 current-source evidence 与 release 输入独立重算后无 P0–P3 并批准。
+
+- Task 10.2a／10.3／10.5：首次激活原先直接持有 W1，终态 health 接入新的 runtime lease 后会再次申请同一把非重入锁，可能在 generation 0 已发布后返回失败。家族排空和一次 W1 必须先于 stage，由 initial reservation 持有并显式借给终态检查；已激活 store 的有限机制通过不能替代首次激活贯通。10.2a 至 10.2b 的 Core 接线保留在隔离候选，临时测试门控在公开回归闭合后删除。
+- Task 10.3：将原家族借用交给 initial reservation 后，保留的真实 POSIX backend 仍可能因旧的“backend 存在”判断进入 Windows private capability 路径。profile 分派须覆盖真实 builder、stage/seal、journal 与发布消费者；不能清空 backend、跳过 health 或伪造 borrow 绕过前置。
+- Task 10.2a／10.6／10.7：已有家族的并发 factory 若在借用前 raw capture 活动 DB，关闭该 FD 可能释放同进程 SQLite 的记录锁，因此 factory 也须纳入家族生命周期。首次未知家族的 cold locator 在确定 resource_id／W1 前读取 sidecar 的入口仍须由真实 cold 门和后续入口闭合；当前机制证据不覆盖该窗口，也不证明 SQLite 内部全部竞争已消除。

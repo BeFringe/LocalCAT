@@ -1,7 +1,7 @@
 {
   "feature_name": "tm-storage-retrieval-index",
   "created_at": "2026-07-27T09:52:52Z",
-  "updated_at": "2026-10-05T03:41:34Z",
+  "updated_at": "2026-10-16",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -23,6 +23,13 @@
     "historical": "既有Requirements 1–9、source与WA-06 R4审批及完成事实保留原范围，9.6c/9.6d完成不代表普通frozen验收。",
     "approved": "用户明确批准 reassessment@3e41130 中 ADR-028 下普通 packaged 的 WA-06 第5条、Design 输入/兼容身份/session/worker 合同与 Tasks 9.6b/9.6e。按现有依赖实施，优先以 9.6e 验证逐输入摘要与实际 fixture/contract 内容的消费接缝，不把摘要伪装为源码 bytes，不以构建记录替代真实 Gate 执行；候选和正式 Gate 尚未验收，超出本轮合同的 delta 仍需审批。",
     "fuzzy_time_admission": "2026-10-05 批准 ADR-029 下 R8.8–10、Retrieval capability publication 的准入/警示/发布/冷恢复 Design 与 Task 9.7。完整、真实且兼容的结果中，仅三项时间超限不再单独禁止对应路径；报告仍失败，512 MiB 与其他必要条件继续限制准入。按合同执行受影响的真实 Gate C/D，不改签旧报告；日常建议异步与 Phase 1 优化不在本轮范围。",
-    "release_artifact_maintenance": "2026-10-05 SHA/Git 专项授权的维护增量：显式运行产物与直接输入链、历史报告消费解耦和对应架构/验证测试；Core 补齐既有 R8.8–10 的发布映射。原审批与完成事实保留，历史报告、runtime、fixture、Gate roots 和资格不变，不据此生成当前 GO。"
+    "release_artifact_maintenance": "2026-10-05 SHA/Git 专项授权的维护增量：显式运行产物与直接输入链、历史报告消费解耦和对应架构/验证测试；Core 补齐既有 R8.8–10 的发布映射。原审批与完成事实保留，历史报告、runtime、fixture、Gate roots 和资格不变，不据此生成当前 GO。",
+    "posix_tm_resource_lifecycle": "2026-10-12 用户明确批准 ADR-033 及本轮 R/D/T 差异。Core 范围为运行与迁移边界、Scope Lineage、R2.4/2.11/2.12/7.5/7.13/7.14 修订及 R7.15–7.18；Design 的显式 POSIX_V2/WINDOWS_V3 选择、原资源家族会话与 admission/drain/W1 借用、真实 SQL/raw-file 生命周期、旧 v2 同对象 proof/stage 交接、DB_REPLACED durable journal→同时存活 guard 身份交接→pending terminal/close 全部成功→receipt SQL→关闭 SQL 后 final capture、应用发布/恢复和资源停止；Tasks 10.1–10.11。保留 SOURCE_DIVERGED 在 canonical 及位置可证明时的 Lookup/Update。不授权 VFS、驱动或 journal mode 变更、新持久格式、新平台层、永久单进程独占或 Mac/Linux frozen；历史完成项和发行/Gate 结论保留原范围，批准不等于两个有限技术门或产品交付通过。正式实施依赖治理闭合；Git 历史重放授权独立处理。",
+    "posix_tm_task_staging": "2026-10-12 用户授权将任务顺序修订直接纳入原 Core 规格提交：10.2 拆为隔离机制验证 10.2a 和公开启用 10.2b；initial 家族排空／W1／builder 借用前置于 10.3，terminal health／revision／query lease 借用前置于 10.5，10.2b 依赖 10.6，10.7 依赖 10.2b。10.2a 至 10.2b 的 Core 改动作为紧密集成候选，临时测试门控保留至公开回归闭合后移除；按完整能力提交。ADR-033 与 Requirements 范围不变，审批不表示技术门或跨平台交付通过。",
+    "posix_root_directory_observation": "2026-10-13 用户批准四文件 D/T 增量，并要求折入原 owner 文档提交。Core Design 明确原 root/W1 下发现 schema pending，Task 10.6 依赖平台 11.4a；隔离 v2 门无 pending 才跳过，有匹配保留并拒绝，真实 pending 恢复仍归 10.8。Requirements、ADR-033、持久格式与恢复阶段不变；不授予实施完成或验收通过。",
+    "posix_unpublished_activation_cancellation": "2026-10-13 用户批准两文件 D/T 增量：从后置恢复任务前移严格 DB 未命名取消为 Core 10.6a，作为 10.2b 的前置。范围为 initial/replacement 的 pre-journal、可证明 DB 尚未命名的 PREPARED、既有取消 terminal/owned cleanup/replay、原 root/W1 下 prior/legacy 复证与全家族准入；已命名或 commit 不明、实际 restore、schema 仍归既定恢复 owner。Requirements、ADR-033、平台接口与持久格式不变；不表示公开启用或跨平台交付通过。增量按独立授权的十提交区间折入原 docs(core)，原检查点与报告保留原 SHA。",
+    "posix_existing_file_retirement": "2026-10-13 用户批准三文件 D/T 增量，新增平台11.4b作为Core10.6a的前置；Requirements、ADR-033、持久格式、Windows专用profile与Mac/Linux source路线不变。Core仅调整10.6a对平台既有文件退休及冷续接的依赖；完整prior/legacy、原root/W1、取消终态、owned收尾和全家族准入仍按原Design。10.9沿原依赖链复用，未前移完整rollback。批准不表示实施完成或产品验收通过；Git按独立授权十提交范围折入原owner文档，历史引用保留原SHA。",
+    "posix_link_pair_and_descendant_observation": "2026-10-13 用户批准三文件 D/T 增量，新增平台11.4c/11.4d作为Core10.6a前置；Requirements、ADR-033、持久格式、Windows专用profile与Mac/Linux source路线不变。Core仅增加10.6a对受绑定双链接完成及原资源锁下后代闭集观察的依赖；既有取消、lineage和rollback终态合同不变，实际restore仍归10.9。批准不表示实施完成或产品验收通过；Git按独立授权十一提交范围折入原owner文档，历史引用保留原SHA。",
+    "private_jsonl_export_lifecycle": "2026-10-16 用户批准私有 JSONL stage 的 D/T 修补：Core 10.10a 提供同一 exporter 的原目的绑定 prepare/discard；Resource 6.3 在 stage 释放后复证来源并发布包。沿用 ADR-020、ADR-033；不改变直接导出、持久格式或平台接口，不表示实施或交付验收完成。"
   }
 }

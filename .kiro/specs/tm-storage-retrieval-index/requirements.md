@@ -12,6 +12,15 @@ LocalCAT 面向个人译者提供完全本地的翻译记忆库。当前能力�
 - **范围外**：Qt 控件、菜单、快捷键、搜索导航和用户偏好持久化；机器翻译、语义向量、云端 TM、在线协作、账号与共享锁；项目文件解析和厂商 TMX 上下文映射。
 - **相邻期望**：Qt 产品通过既有编辑协调入口消费建议和文本匹配结果；旧 Excel 工作流继续只看到 `TM_HIT / TERMS_FOUND / NO_MATCH`；未来 Parser 或 TMX 互操作变更只能触发兼容复验，不改变本规格的用户可见语义。
 
+- **运行与迁移边界**：支持稳定本机资源目录中的正常使用、遵守 LocalCAT 资源协调流程的并发与替换、崩溃恢复、完整资源包导出导入，以及所有使用者退出后的正常迁移。运行期间由外部程序移动或替换活动TM目录、替换活动数据库或直接干预内部数据库／事务恢复文件不受支持；配置JSONL／manifest的外部内容变化仍按既有SOURCE_DIVERGED合同处理，canonical与其家族位置仍可证明时保留原Lookup/Update，逐文件异常仍按原严格规则拒绝。不承诺任意同用户竞争下全时序零副作用。该限制不豁免 LocalCAT 自身的错误访问、遗漏协调或正常恢复缺陷，也不放宽恶意输入、路径穿越、链接、摘要篡改及已观察身份失效的拒绝。离线迁移不把未经恢复的残留文件集合自动视为一致快照。
+
+### Scope Lineage
+
+- **Owning spec**：`tm-storage-retrieval-index`。
+- **被修订的既有范围**：Requirement 2.4、2.9–2.12、7.5、7.13–7.14 的完整版本、资产保全与回退合同；支持环境中的失败保全继续成立，已无法证明位置、身份或恢复状态的资源停止使用。
+- **相邻契约**：`windows-platform-enablement` Requirement 5.6–5.7 区分目录对象与配置位置；`language-resource-portability` Requirement 7.7、8.6–8.7 区分 preview stale、在途失效及最终资源证明；`feature5-ui-integration` Requirement 5.6、5.9、6.14 消费资源停止和独立项目结果。
+- **范围差异**：新增 Requirement 7.15–7.18 的操作阶段检查、资源级停止、其他资源隔离与迁移恢复途径；Requirement 2.13、7.8–7.11 继续适用于 canonical 及其家族位置仍可证明的来源内容分歧，不把位置失效当成普通 `SOURCE_DIVERGED`。
+
 ### Windows Compatibility Amendment WA-06（current R4）
 
 WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿用既有Requirements语义并补齐frozen受信输入与fresh worker pre-build消费合同。`R1`～`R3`保留为dispatch ledger的`SUPERSEDED`历史；既有source evidence保持原始签署锚，不自动成为R4 frozen证据。
@@ -52,15 +61,15 @@ WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿�
 1. When 用户预检一个旧 JSONL TM, the LocalCAT TM 子系统 shall 报告有效记录数、无效记录数、重复 source 数和可保留变体数。
 2. When 旧 JSONL TM 成功迁移, the LocalCAT TM 子系统 shall 报告迁移记录数、保留变体数、跳过记录数和每类问题的可定位信息。
 3. When 迁移完成后查询旧有 exact source, the LocalCAT TM 子系统 shall 返回与迁移前相同的首个精确兼容 target。
-4. If 迁移在解析、校验或写入期间失败, the LocalCAT TM 子系统 shall 保持原始 JSONL 字节和当前可用 TM 不变。
+4. If 迁移在解析、校验或写入期间失败且资源处于支持的运行环境, the LocalCAT TM 子系统 shall 保持原始 JSONL 字节和当前可用 TM 不变；If 已发现外部位置或身份失效, the LocalCAT TM 子系统 shall 按 Requirement 7 的资源级停止规则处理，不声明未经证明的原始资产仍未改变。
 5. If 迁移失败, the LocalCAT TM 子系统 shall 返回可操作的失败原因，并允许用户在修正问题后安全重试。
 6. When 用户重复执行同一迁移, the LocalCAT TM 子系统 shall 不静默创建额外的重复变体。
 7. When 用户请求兼容导出, the LocalCAT TM 子系统 shall 生成可核对的本地 TM 数据，并报告导出记录数、跳过记录数和错误。
 8. If 兼容导出失败, the LocalCAT TM 子系统 shall 不用不完整输出替换先前有效的目标文件。
 9. When 迁移或本地 TM 存储升级报告成功, the LocalCAT TM 子系统 shall 只发布一个完整的活动 TM 版本，使全部已接受记录和该版本声明可用的查询能力同时就绪，并且不暴露部分准备的版本。
 10. While 活动 TM 版本正在切换, the LocalCAT TM 子系统 shall 使每个查询或保存操作只观察到切换前或切换后的完整版本，而不观察到混合、部分或过渡性空版本。
-11. If 新版本激活或重新载入失败且存在先前活动版本, the LocalCAT TM 子系统 shall 报告失败阶段并继续提供切换前的可用版本。
-12. If 首次迁移的新版本激活或重新载入失败且不存在先前 canonical 版本, the LocalCAT TM 子系统 shall 报告失败阶段并继续提供原 JSONL 兼容能力。
+11. If 新版本激活或重新载入失败且存在仍可验证的先前活动版本, the LocalCAT TM 子系统 shall 报告失败阶段并继续提供该完整版本；If 先前版本的位置、身份或恢复状态无法证明, the LocalCAT TM 子系统 shall 停止使用该资源并报告恢复要求，不提供可疑版本。
+12. If 首次迁移的新版本激活或重新载入失败、不存在先前 canonical 版本且原 JSONL 的身份与可用状态仍可证明, the LocalCAT TM 子系统 shall 报告失败阶段并继续提供原 JSONL 兼容能力；If 原 JSONL 或未完成激活状态无法证明, the LocalCAT TM 子系统 shall 停止使用该资源，不自动回落或接管同路径副本。
 13. If 原 JSONL 内容与当前活动 canonical TM 所绑定的来源不一致, the LocalCAT TM 子系统 shall 报告 `SOURCE_DIVERGED`、保持当前 canonical TM 为活动资源，并且既不得使用变化后的 JSONL 隐式替换或重建 canonical TM，也不得使用 canonical TM 隐式修改或替换发生分歧的原 JSONL。
 
 ### Requirement 3: 多译文、上下文与来源可追溯性
@@ -132,7 +141,7 @@ WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿�
 2. The LocalCAT TM 子系统 shall 不向网络发送 source、target、上下文、provenance、查询或性能样本。
 3. The LocalCAT TM 子系统 shall 不要求账号、云端服务或遥测才能使用本规格能力。
 4. If 一个 TM 资源损坏或不可读取, the LocalCAT TM 子系统 shall 报告具体资源和失败原因，而不静默丢弃错误。
-5. If 资源更新后无法重新载入, the LocalCAT TM 子系统 shall 保留更新前最后一组可用查询结果来源。
+5. If 资源更新后无法重新载入且更新前最后一组查询结果的资源来源仍可验证, the LocalCAT TM 子系统 shall 保留该可用来源；If 该来源的位置或身份失效, the LocalCAT TM 子系统 shall 停止使用该来源并报告受影响资源。
 6. If 向一个可写 TM 资源保存译文失败, the LocalCAT TM 子系统 shall 标识失败资源，并不得把该失败报告为成功写入。
 7. While 多个 TM 资源同时启用, the LocalCAT TM 子系统 shall 隔离各资源的数据、错误和 provenance。
 8. While 一个 `SOURCE_DIVERGED` 资源保持 Active 和 Lookup, the LocalCAT TM 子系统 shall 继续从其 last-known-good canonical TM 提供查询结果。
@@ -140,8 +149,13 @@ WA-06 `R3`依据ADR-024/025取代`R2`；`R4`于2026-09-19获人工批准，沿�
 10. When 确认译文成功写入一个 `SOURCE_DIVERGED` 资源, the LocalCAT TM 子系统 shall 保持该资源的 divergence 状态，直到显式消歧成功。
 11. When 确认译文成功写入一个 `SOURCE_DIVERGED` 资源, the LocalCAT TM 子系统 shall 不修改发生分歧的原 JSONL。
 12. When 用户或操作者显式请求 import 或 rebuild 且完整验证与激活均成功, the LocalCAT TM 子系统 shall 清除 `SOURCE_DIVERGED` 并报告新的活动版本。
-13. If 显式 import 或 rebuild 未通过验证或激活, the LocalCAT TM 子系统 shall 保持 `SOURCE_DIVERGED`、last-known-good canonical TM 和发生分歧的原 JSONL 不变。
-14. If 待激活 TM 的资源身份或来源绑定与配置资源不一致, the LocalCAT TM 子系统 shall 拒绝激活、标识受影响资源并保留先前可用版本。
+13. If 显式 import 或 rebuild 未通过验证或激活且资源处于支持的运行环境, the LocalCAT TM 子系统 shall 保持 `SOURCE_DIVERGED`、last-known-good canonical TM 和发生分歧的原 JSONL 不变；If 已发现位置或身份失效, the LocalCAT TM 子系统 shall 保留可确认的恢复事实并停止该资源，不把可疑资产当作 last-known-good。
+14. If 待激活 TM 的资源身份或来源绑定与配置资源不一致, the LocalCAT TM 子系统 shall 拒绝激活并标识受影响资源；先前版本仍可验证时保留其可用性，否则停止该资源且不得将同路径副本重新接纳为原活动资源。
+
+15. When 一次资源操作开始或进入改变资源的下一阶段, the LocalCAT TM 子系统 shall 检查配置位置仍对应本次已确认的资源，并拒绝已可观察的位置或身份变化。
+16. If 操作中发现资源位置或身份失效, the LocalCAT TM 子系统 shall 停止该资源的新操作，保留可确认的恢复事实，不盲目覆盖、删除恢复文件或立即接管同路径副本，并且不把无法确认的提交结果报告为成功。
+17. While 单个资源因位置或身份失效停止使用, the LocalCAT TM 子系统 shall 保持其他健康资源按各自状态可用，不把该失败扩展为全部资源失效。
+18. When 用户需要迁移或恢复资源, the LocalCAT TM 子系统 shall 提供通过完整资源快照导出导入继续使用的途径，并要求直接移动本机资源前退出所有使用者；重新打开须先通过既有恢复与资源验证，不能视为自动修复。
 
 ### Requirement 8: 十万条 TM 性能门与可观察报告
 

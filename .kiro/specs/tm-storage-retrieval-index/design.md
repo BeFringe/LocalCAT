@@ -31,6 +31,7 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 - `TextMatcher text-v1` 的 case-fold projection、UAX #29 word boundary、pure CJK tailoring。
 - `TextMatcher` 的三态 capability、验证证据解析、用途门控与同一快照结果信封。
 - 旧 `TMEngine.query_exact/save_record` 的 compatibility facade 与非 Qt benchmark。
+- 本机资源家族会话、操作准入/排空、SQL 与原始文件观察生命周期、v2 同对象交接、资源级失效和真实恢复阶段；平台仅提供文件、命名与进程锁原语。
 
 ### Out of Boundary
 
@@ -39,6 +40,7 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 - 项目/格式 parser 与 TMX context interchange。
 - speaker alias/avatar 和其他展示 profile。
 - 网络、协作与跨端同步。
+- VFS、驱动或 journal mode 变更、新持久格式、持久目录资格、新平台层、永久单进程独占与 Mac/Linux frozen。外部在线目录/活动数据库替换不属于正常使用保证；配置源内容分歧仍服从 `SOURCE_DIVERGED` 合同。
 
 ### Allowed Dependencies
 
@@ -46,6 +48,7 @@ Feature 5 把当前内存 JSONL exact engine 演进为每资源隔离、可迁�
 - SQLite FTS5 是可探测 fast-path capability，不是正确性唯一依赖。
 - Core 可以读取中立 raw records，不得依赖 PySide6、xlwings、Controller、workspace state 或 Parser 实现。
 - Compatibility facade 可依赖新 Core ports；新 Core 不反向依赖旧 `TMEngine`。
+- Application 经 Core 公开 owner 共享资源家族会话；Core 消费现有 `platform_fs_contracts.py`，不取得 raw FD、不反解 opaque identity。ResourcePort 借 Core 事务，源包只提供独立只读输入 authority，导出目标有自己的 publisher owner。
 
 ### Windows Compatibility Amendment WA-06（current R4）
 
@@ -116,6 +119,16 @@ Core继续拥有严格request/result codec、独立fresh migration/query child�
 - `TextMatcher` semantics version、验证 cohort/fixture/evaluator/artifact digest、word-break data 或 offset contract 改变。
 - JSONL snapshot binding schema、显式 import/rebuild/export 行为或 `SOURCE_DIVERGED` 状态转换改变。
 - Qt adapter、Parser record adapter 或 TMX interchange 开始消费 canonical context。
+- 家族生命周期、真实连接/backup/reopen、内容采集、sealer、publication/recovery 或共享端口改变时，重验对应 Core/Resource/UI 及 Windows source/普通 frozen 消费；纯文档或 Git 父节点变化不触发无关全量性能测试。
+
+## Governance Impact
+
+- **Applicable Steering**：`product.md`、`tech.md`、`structure.md`、`spec-ownership.md`、`delivery-boundaries.md`、`repository-safety.md`。
+- **Applicable ADRs**：既有 ADR-007/008/012/013/016/020/021/024/025/028/029/031 及 ADR-033。
+- **ADR disposition**：ADR-033 限定 ADR-020 决策2、12 的 POSIX stock SQLite 内部访问前提和决策9的 DB 命名子阶段，限定 ADR-007 决策2、4 的可用性前提，澄清 ADR-008 决策6。应用 rooted 操作、Windows 保护和其他 publisher 合同继续成立。
+- **Scope amendment**：Requirement 2.4、2.11–2.12、7.5、7.13–7.18；正常失败保全、完整版本与 `SOURCE_DIVERGED` 保留，已观察位置/身份失效进入资源级停止。SQLite、v2/v3 codec、generation、既有 durable phases 和 Fuzzy 准入不变。
+- **Steering sync**：治理 owner 在唯一治理提交中更新 `adr/README.md`、`delivery-boundaries.md`、`tech.md`、`spec-ownership.md` 和有关 ADR 的取代关系引用；开发基线继承该提交，闭合依赖由平台 Task 11.0 承载。
+- **Downstream revalidation**：平台 Task 11.1–11.5、Resource Task 6.1–6.2、UI Task 10.1–10.2；RPY 6.2/6.3 保持跨设备包与交付出口，Sync 只复验原 validate/preview/apply 入口，不取得 raw SQLite 同步所有权。
 
 ## 架构
 
@@ -229,6 +242,19 @@ Cluster F 行为、命名空间与冷恢复矩阵闭合后增加 snapshot artifa
 - `tests/test_excel_adapter_contract.py` — 增加 sidecar 激活后的三态 parity。
 - `backend_throughput_harness.py` 不扩展为 fuzzy harness；保留旧路径基线。
 
+### POSIX 资源事务接线文件
+
+| 文件 | 既有责任内的修改 |
+| --- | --- |
+| `tm_sqlite_store.py`、`tm_engine.py` | 家族会话、admission/drain、外层操作借用、generation、query view/health/append 与 cold-open 入口 |
+| `tm_migration.py` | profile 消费、原 reservation 下的 initial/replacement builder、source 发布、export/refresh 编排 |
+| `tm_stage_sealer.py`、`tm_content_attestation.py` | 原 root/live file 的内容采集、v2 proof factory、SQL/raw-file 顺序与同对象 seal 交接 |
+| `tm_activation_journal.py`、`tm_activation_recovery.py` | 既有 journal/phase/receipt/manifest/lineage/backup、命名交接、冷恢复与失败收尾端口 |
+| `tm_schema_upgrade.py` | backup 双连接、schema copy、旁路重开和原恢复 owner 接线 |
+| `tm_snapshot_artifacts.py`、`tm_snapshot_recovery.py` | snapshot 原始观察、rooted 发布、receipt recovery 与 owned cleanup |
+
+只修改这些既有端口和直接调用者，不复制 activation 状态机、不顺带拆分模块。`tm_application_composition.py` 的共享会话组合由 UI owner、`tm_resource_port.py` 的借用与终态消费由 Resource owner 实施；平台合同与 adapter 由平台 owner 实施。
+
 ## 系统流程
 
 ### JSONL migration
@@ -237,14 +263,15 @@ Cluster F 行为、命名空间与冷恢复矩阵闭合后增加 snapshot artifa
 flowchart TD
     Source[Original JSONL] --> Preflight[Read only preflight]
     Preflight -->|invalid fatal| Report[Failure report]
-    Preflight --> Stage[Build mutable staged database]
+    Preflight --> Admission[Family admission and required drain]
+    Admission --> W1[Acquire W1 and reprove original root and generation]
+    W1 --> Stage[Build mutable staged database]
     Stage --> Index[Build all candidate indexes]
     Index --> Validate[Integrity FK counts exact parity source binding]
     Validate -->|fail| Quarantine[Quarantine staged database]
     Validate -->|pass| Close[Close connections and fsync]
     Close --> Seal[Create immutable SealedStage]
-    Seal --> Drain[Coordinator drains operation leases]
-    Drain --> Activate[Backup replace fsync reopen]
+    Seal --> Activate[Same owner backup publish receipt and reopen]
     Activate -->|health pass| Canonical[Publish one canonical generation]
     Canonical --> Exact[Enable exact read and save facade]
     Canonical --> ContextGate{context correctness passed?}
@@ -252,13 +279,15 @@ flowchart TD
     Canonical --> FuzzyGate{benchmark-v1 passed?}
     FuzzyGate -->|yes| Fuzzy[Enable fuzzy capability]
     FuzzyGate -->|no| Exact
-    Activate -->|health fail| Restore[Restore last known good]
-    Report --> Source
-    Quarantine --> Source
-    Restore --> Source
+    Activate -->|health fail| Recover[Owner verifies prior and recovery facts]
+    Report --> Recover
+    Quarantine --> Recover
+    Recover -->|verified prior| Prior[Use complete prior generation]
+    Recover -->|verified first activation cancellation and source| Legacy[Use original legacy JSONL]
+    Recover -->|location identity or recovery unknown| Stop[Stop this resource and retain recovery facts]
 ```
 
-原 JSONL 在所有迁移路径中保持不变。重复相同 SHA-256 migration 通过 completed `tm_origin_batch(kind='migration')` 返回既有结果，不重复插入。只有 `ResourceStoreCoordinator.activate(sealed_stage)` 能替换 canonical sidecar；mutable path、裸 `Path` 或尚未闭合索引的工作副本都不是可激活参数。
+支持的运行环境中，原 JSONL 在迁移失败时保持不变；已发现外部位置或身份失效时保留可确认的事实并停止该资源，不声明未经证明的字节未变。重复相同 SHA-256 migration 通过 completed `tm_origin_batch(kind='migration')` 返回既有结果，不重复插入。只有 `ResourceStoreCoordinator.activate(sealed_stage)` 能替换 canonical sidecar；mutable path、裸 `Path` 或尚未闭合索引的工作副本都不是可激活参数。
 
 physical/canonical gate 只决定运行时数据权威和 exact/save 可用性；Gate C correctness 决定同 source raw CONTEXT 分类是否开放；fuzzy benchmark gate 只决定 FUZZY 外部能力是否开放；matcher gate 只决定 `TextMatcher` 哪些用途已经通过验证。fuzzy benchmark 失败时 canonical SQLite 仍继续提供 exact、已经验证的 CONTEXT 和保存，不回退 JSONL。
 
@@ -289,7 +318,7 @@ sequenceDiagram
 
 ## 需求追踪
 
-以下映射覆盖 9 项需求的全部 86 条验收标准；Tasks 必须在此映射基础上生成逐条 coverage matrix，不得把范围行当作一个测试。
+以下映射覆盖本规格的需求；Tasks 必须在此映射基础上生成逐条 coverage matrix，不得把范围行当作一个测试。
 
 | 需求 | 摘要 | 组件 / 接口 |
 |------|------|-------------|
@@ -305,6 +334,7 @@ sequenceDiagram
 | 7.1–7.7 | 本地性、隔离、恢复 | per-resource Store, QueryReport, Coordinator |
 | 7.8–7.13 | divergence 期间 canonical Lookup/Update 与显式消歧 | SourceBindingMonitor, CanonicalAuthority, explicit import/rebuild |
 | 7.14 | 待激活版本资源身份和来源绑定校验 | StageValidationEvidence, SealedStage, Coordinator |
+| 7.15, 7.16, 7.17, 7.18 | 原配置位置复证、资源级停止、健康资源隔离与一致快照迁移 | 原资源家族会话、操作借用、v2 activation/recovery、snapshot/export |
 | 8.1–8.7 | 100k latency/migration/RSS/report 与超限失败 | TMBenchmark, FuzzyCapabilityGate |
 | 9.1–9.6 | Core 三态、基础/完整证据与用途集合 | MatcherCapabilityEvaluator, MatcherCapabilitySnapshot |
 | 9.7–9.12 | fail-closed、同次快照、摘要与单一权威 | CapabilityGatedTextMatcher, validation manifest |
@@ -695,6 +725,75 @@ class BenchmarkReport:
 
 所有相似度/overlap 在 `[0.0, 1.0]`，limit 为正整数，source/target/resource id 非空，handle order 唯一且非负。fuzzy 必须有 evidence；exact/context 不得伪造 scorer evidence。候选阶段计数均非负且按规定顺序出现；`UNION.output_unique_count == union_unique_count`，deduplicate/truncate 前后可对账，`scored_count <= recall.candidate_budget`，`truncated` 与 TRUNCATE dropped count 一致。fuzzy/context available 为 false 时对应 unavailable code 必须非空且不得返回该类型结果，true 时 code 必须为空。Success 必须有 digest/generation，Failure 必须有 stage/error/retryable 和资产保持标志；普通失败无法证明 unchanged 时必须给 recovery locator 并 fail-stop。若 receipt 与新 pair 已 durable commit、禁止回滚旧 destination，但 deterministic cleanup/handoff 尚未闭合，`ExportFailure.publication_committed` 为 true：结果仍 fail-stop，保留已知 before/observed digest，且不得给出会暗示恢复旧 destination 的 locator；若 completion probe 本身失败、ledger commit 状态不可判定且自动回滚同样不安全，则互斥地设置 `publication_commit_ambiguous`，以同样的 fail-stop/no-locator 规则保留真实证据但绝不宣称已经 commit。原 destination 不存在时才可使用 `NOT_APPLICABLE`。公开 diagnostics 只保存 code、stage、line/record id 和安全摘要，不包含正文。
 
+### POSIX 资源家族与恢复 profile
+
+受信 Application composition 在构造资源 owner 时一次选择 `POSIX_V2` 或 `WINDOWS_V3`，只选择既有 codec/流程，不接受包或 UI 指定；通用 backend 始终保留，不能以 `backend is not None` 推导 Windows。`_recover_existing_initial_activation`、initial journal/publish、`apply_snapshot_payload` replacement、StageSealer 及受影响 schema recovery 消费同一 profile。Windows 的 private recovery capability 必须真实存在，失败不能改走 POSIX。
+
+既有 coordinator/engine 持有窄的资源家族会话，保存最初 root、配置位置关联、resource/target identity 及失效锁存。runtime、ResourcePort 和冷恢复入口共享该 owner；不能新建 `TMEngine` 或重新 `bind_root` 清除失效。同一物理家族的多个资源登记共用协调边界或拒绝冲突，不铸造互不知情的 owner。
+
+外层 operation 持有一次 W1，并签发不可序列化、绑定 resource/operation/thread 的借用。stage、seal、receipt、health、callback、recovery 只借用，不递归 acquire；只有外层 owner 关闭 root/W1。会话 root 在 operation 释放后继续保留至会话明确关闭。source package 输入和导出目标各有独立 authority，不成为目的资源授权。
+
+锁顺序固定如下：
+
+1. 普通操作短持 coordinator condition 取得 admission/active count，释放 condition 后取得 W1，再复证原 root 与当前完整 generation；跨进程等待前的旧 generation 不可用于等待后的新 DB。
+2. replacement/recovery 先停止新 admission，释放 condition、排空本地 lease 后才取得 W1；不得持 W1 等 drain，也不得持 condition 等 OS 锁。配置 source 的首次发布必须在家族准入与排空后。
+3. 借用覆盖懒 query view、cursor、statement 与 backup 至关闭；内部 health 与查询子阶段不重入。操作收尾完成、terminal 复证后释放 W1，再归还 active count。timeout/cancel 沿原 busy/failure 语义，有界等待且不泄漏 count/lease；漂移锁存不能被 finally 恢复为 READY。
+
+同一资源按外层短操作串行，不永久单进程独占；其他资源独立。正常并发等待与取消由家族生命周期技术门验证，失败停止后续消费者扩展。
+
+#### 原 root 复证与 SQL/raw-file 顺序
+
+平台保留从初次确认的稳定祖先至 root 的 no-follow 名称链；派生 parent/file/lease 继承关联。`root.reprove_location()` 只确认当前名称仍对应原 live root，失败为既有 identity-stale/capability failure，不重绑同路径副本。首次绑定保留既有规范化和允许系统别名（如 macOS `/private/var`），之后不通过 resolve 刷新授权。
+
+取得 W1 后、首次 mutation 前、每个真实连接/事务入口、SQL 阶段后、应用 publication 前后与业务成功前复证。检查不冻结命名空间、不消除检查间窗口或 ABA，也不宣称 stock SQLite 的内部 I/O 绑定 retained root。
+
+真实 connection 入口消费 operation borrow 与明确用途，仍向 SQL owner 返回 exact stdlib `sqlite3.Connection`；已有 DB/reservation 禁止隐式创建，fresh stage 先由原 owner 排他创建。DELETE/FULL/FK 与既有 busy 策略保持，读取连接也可能触发 hot-journal recovery。
+
+同一数据库的 SQL connection/statement/backup 存活时，不为 hash/copy 额外开关同 inode 的 raw FD；已持 reservation/guard 不得中途 close。SQL 及全部相关连接关闭后，在持续原 root/W1 内采集对象与内容事实。Windows 原 shared-read profile 独立保留，不能机械移植到 POSIX。
+
+| 真实入口 | 借用和关闭责任 |
+| --- | --- |
+| `_build_stage`、`initialize_stage_schema`、随后构造的 stage store | migration 将同一 borrow 传给 schema、append/revision/issued receipt 各真实连接；builder 结束全部 SQL 才 raw capture |
+| `_open_configured_connection`、`_open_leased_connection`、query view lazy connection | store/query view 持有 operation 借用；view invalidate 先关懒连接，再归还外层 lease |
+| StageSealer read/write/reopen、`_restore_stage_unpublished` | sealer 借原 reservation/root，关闭所有验证连接后才同步/内容观察 |
+| `_publish_activation_receipt`、`_complete_recovered_receipt`、store port connection | activation owner 按下节 guard 交接；回滚/关闭完毕之前不释放 guard |
+| completed-authority read、`_open_health_connection`、`_store_health_snapshot` | 原 store owner 将 POSIX SQL 与额外 raw 观察分阶段，nested health 借用当前 operation |
+| schema backup/copy/version 与 reusable-stage/sidecar preflight | 源/目标 backup 双连接都关闭后才 raw hash；旁路入口也消费同一 family borrow |
+| cold runtime/activation recovery、snapshot/export/refresh | 第一次 DB pathname 读取前取得本次 family/W1，来源与导出目标 root 分开，原 owner 闭合 receipt 与 recovery |
+
+#### v2 内容证明与同对象 stage 交接
+
+`tm_content_attestation` 增加借已有 root 或 live file 的内部 capture factory，保留 `LegacyPosixContentFileProof(device, inode, size, sha256)`。POSIX 可选观察端口只接本 adapter 从原 root 签发的 live `BoundRegularFile`，在同一 retained 文件上复证父链、regular/single-link、内容及 fstat，返回旧 codec 所需四项观察。Core 不反解 opaque bytes、不取得 raw FD；平台不导入 TM codec，Windows 不必提供数值 inode。历史数字不提供跨重启授权。
+
+fresh stage 在构建 SQL 全部关闭、journal 收尾/同步及 seal 对象和内容匹配后，由原 `MutableFileReservation`、同家族 lease 和预期内容作一次性交接，转为同对象 `CandidateFile`，再使用既有 `begin_publish`。转交前失败仍由原 owner 持有；成功后旧 reservation 被消费，attempt/sealer 不再清理它；随后 candidate/pending 拥有 close 责任，命名不明保留原 recovery facts。禁止任意 Path/裸 identity 收养，也不复制新 inode 冒充 sealed stage。
+
+冷恢复既有 stage 不冒充本次 creator reservation。v2 recovery owner 先核验本次 root/W1、journal/phase、内容和完整 closure，再取得受限 existing-file live authority，复用既有 retirement/publisher 的同对象交接；历史 proof+Path 不能单独授权。现有机制不能闭合该接缝时停止技术门并报告缺口，不改为裸 rename。
+
+#### DB_REPLACED 命名子阶段与 receipt SQL
+
+`PendingPublication` 保持原 retained destination 与 preliminary 身份/内容不变式；不增加 detach/rearm，不在 receipt SQL 后改写 preliminary。ADR-033 对 ADR-020 决策9的限定只适用于下列 POSIX TM 子阶段，Windows 与其他 publisher 保持原生命周期。
+
+1. `_replace_activation_database` 从原 reservation 转交的 Candidate rooted 命名，保留 DB pending 与 SEALED 字节 readback；`advance_after_effect(DB_REPLACED)` 使用原 root 写入、同步并独立复证既有 durable journal。DB 对象仍匹配 seal；coordinator 保持 ACTIVATING，新 generation 不可见。
+2. **DB pending 原 readback 仍 live 且 SQL 尚未开始时**，通过原 root 与 canonical 相对名取得 `guard_existing_for_mutation`，比较 pending 与 guard 同时存活的 live identity。POSIX guard 保留同一 regular/single-link 对象和原名称链，仅以 retained FD 的 fstat 与 rooted no-follow 名称观察复证，不在活 SQL 期间额外打开/关闭同 inode DB 句柄。随后 pending 的 terminal 与 close **全部成功**才可进入 SQL；原 root/W1/activation handle 连续持有，guard 持续保留同一对象。
+3. `_publish_activation_receipt` 消费该 borrow/guard，复证 root/guard 后打开已有 DB，按原 receipt/binding/meta 规则执行 SEALED→ACTIVE。原事务内 `_capture_content_file` 的额外 open/close 前移到 SQL 前；SQL 依原逻辑约束与持续 guard 执行，不将撤去 raw 检查解释成消除外部竞争。全部 SQL/statement/backup 关闭后复证并捕获 final 内容，采集句柄与 guard 同时 live 比较对象，之后才关闭 guard。
+4. manifest、MANIFEST_PUBLISHED、generation、terminal 和 registry 继续原状态机。DB 命名 terminal 不是 activation 成功，也不提前结束 source pending；source/manifest 等不变字节 publication 仍覆盖各自 owner durable commit。
+
+DB_REPLACED 未可靠持久化时保留最后 PREPARED 与实际命名事实；已持久化但 guard、terminal、close 或 SQL 失败时保留 DB_REPLACED，停止新操作，不伪造回到 prior。receipt commit 不明时依原恢复核验 SEALED/issued 或 ACTIVE/completed，不立即重写/删除日志。guard 在 SQL 回滚/关闭收尾完成前不得 close；外部漂移时不宣称 SQLite 内部收尾无副作用。
+
+冷恢复不继承上次进程 live handle；先验证本次 root/W1、journal/phase、source 与完整 DB closure，再取得本次 guard。receipt 前和 commit 后/manifest 前两窗口均须闭合且重复恢复不多增 generation，不增加持久 phase 或 codec。
+
+#### 应用发布与资源停止
+
+source、DB、manifest、journal、terminal、lineage、backup 与 cleanup 的应用命名操作借原 root/publisher，保留各 v2 owner；registry/receipt callback、最终 cold reopen 和成功投影在外层 owner 仍有效时闭合。位置/身份失效锁存后停止该资源新查询、写回、导入和发布，撤销未提交结果；不重绑、不盲目回滚、不删未知 journal。SQLite owner 仍完成自己的连接收尾，结果区分可证明 prior、已发布但位置失联和 unknown/recovery-required。
+
+对于首次激活或已有 generation 替换，正式 journal 尚未发布或仍为 PREPARED 时，只有在原 root/W1 下复证完整 prior authority，并证明新 DB 尚未命名，才允许进入既有取消协议；phase 名称或本次调用没有返回 handle 都不能单独证明这一条件。source 与 prior/legacy 按既有内容分歧合同复证；取消沿原 owner 收尾精确属于本 attempt 的 journal temp、backup、candidate 与 terminal，保留取消记录的幂等 replay；不得借恢复重新绑定路径或退休未知对象。初次激活的取消终态须以 POSIX legacy authority 复证，不能仅因存在通用 backend 而调用 Windows 专用恢复能力。
+
+失败 attempt 尚未完成取消或恢复时，同资源家族的所有 coordinator、engine、factory 统一停止新查询、写回和替换；同一 owner 的状态不能代替家族准入。只有取消的 durable terminal、全部 owned 收尾、原 prior/legacy authority 复证及外层 root/W1 收尾均成功，才能恢复正常准入和可证明的 last-known-good；失败保留 primary 与恢复事实。DB 命名或 receipt commit 已发生、无法证明未发生，或 prior 不完整时，继续使用既有完整恢复或 recovery-only 状态，不套用未命名取消，也不盲目回滚或清除停止。需要恢复已改变的 DB/source/manifest、schema pending 或其他实际 backup restore 的情况仍由对应恢复 owner 处理。
+
+配置 JSONL/manifest 的内容变化继续由 `SourceBindingMonitor` 分类；canonical 与家族位置可证明时保留 Lookup/Update，逐文件异常仍严格拒绝。根位置失效不属于普通 SOURCE_DIVERGED、ADR-016 device-only re-attestation 或 Fuzzy 资格验证。其他健康资源和项目编辑/保存由各自 owner 继续；重新打开需原 recovery 完整核验，不等于自动修复。迁移只使用一致包或原 owner 认可快照，释放全部使用者后也不把未经恢复的 pending/hot-journal 文件集合视为一致快照。
+
+POSIX schema pending 的发现借用当前家族操作的原 root/W1，经平台 `LockedRootDirectoryObservation` 完整观察直接子项，再按原始名字识别 `.{store}.localcat-schema-upgrade.*.pending`。不能先丢弃目录、链接或其他 unavailable 项，不能从当前数据库没有升级 marker 推断历史 pending 不存在。只有完整观察且没有匹配时才可跳过该次 schema 收尾；观察失败或不完整不得宣称已无 pending。存在匹配时由 schema owner 从原 root 严格核验名称、regular/single-link、内容与恢复状态，再按既有协议 promote/cleanup；观察结果本身不授权读取、删除或发布。失败保留恢复事实，不以重新绑定同路径延续旧授权。
+
 ### SQLiteTMStore
 
 ```python
@@ -708,7 +807,7 @@ class TMStore(Protocol):
 
 **连接配置**
 
-- 每个公开 operation 先从 per-resource coordinator 获得 generation lease，再在所属线程建立短生命周期 connection；connection 不跨线程共享，也不泄露到 Store API 外。
+- 每个公开 operation 按家族 admission→W1→root/generation 复证顺序取得 generation lease 与操作借用，再在所属线程建立短生命周期 connection；connection 不跨线程共享，也不泄露到 Store API 外。
 - `TMRetrievalService` 的一次单资源查询是一个组合 operation：只取得一次 query lease，并在其生命周期内通过 module-private、只读的 generation view 完成 health、raw exact、candidate recall 与 candidate record 批量读取。view 不暴露 append/export/activation/update 端口，不得在内部重新取得 lease，退出后立即失效；进入 `DRAINING` 前已经签发的 view 可完成当前查询并阻塞 generation 发布，`DRAINING` 后不得签发新 view。该约束保证同一资源的查询事实来自一个完整 generation，但不要求跨多个短连接持有同一个 SQLite transaction。
 - `journal_mode=DELETE`、`synchronous=FULL`、`foreign_keys=ON`、`busy_timeout=5000`。
 - write 使用显式 transaction；失败 rollback；read cursor 尽快关闭。
@@ -720,10 +819,10 @@ class TMStore(Protocol):
 - `StageBuilder` 只产出 mutable working stage。records、FTS/gram indexes、origin batches、snapshot receipt 与 manifest temporary file 全部构建后，`StageSealer` 才执行 integrity/FK/record-index count/exact parity/source binding/index version/receipt-manifest digest 校验，关闭全部连接并 fsync 文件和 parent，最后生成 `SealedStage`。
 - `SealedArtifactRef` 是 module-private、由 StageSealer 工厂创建并登记到 coordinator-owned sealed registry 的 opaque 引用，绑定 staged DB path、manifest temporary path 及二者 digest；调用方不能自行构造或替换其 path。`SealedStage` 携带该引用并作为不可变、单次消费的 capability object。registry 的 reservation/commit/release 与 token lifecycle 只存在于 coordinator/StageSealer 私有 adapter；公开 surface 仅可取得 exact read-only readiness view。commit 只消费 StageSealer 在 post-fsync integrity/projection/closure/terminal-rehash 全部通过后铸造、绑定 exact registry+reservation 且单次消费的私有 verified capability，不接受调用方分别提供 mutable stage/evidence/generation/attestation；任何 sealed artifact 都必须经过同一 `StageSealer` 内容↔语义 epoch 闭合链。
 - seal 后任何文件 digest 变化、registry/ref 不一致、token 重用、过期 expected generation、资源/目标路径不匹配都必须拒绝。禁止把裸 `Path`、working stage 或布尔 `validated=True` 传给 coordinator。
-- `ResourceStoreCoordinator.activate(sealed_stage)` 是唯一 sidecar replace API。它只通过 registry 解析 artifact path，从 sealed evidence 生成并单次消费绑定同一 artifact id 的 `ActivationToken`，排空旧 leases，复核 resource、target identity、prior generation、DB/manifest digests 和 snapshot binding。
+- `ResourceStoreCoordinator.activate(sealed_stage)` 是唯一 sidecar replace API。它只通过 registry 解析 artifact path，从 sealed evidence 生成并单次消费绑定同一 artifact id 的 `ActivationToken`，在外层操作进入前完成旧 leases 排空、取得 W1 后复核 resource、target identity、prior generation、DB/manifest digests 和 snapshot binding；内部 activate 借用该 owner，不持 W1 重等 drain。
 - coordinator 在 replace 前写同目录 durable activation journal，至少包含 activation nonce、artifact/sealed digest、expected generation、prior binding snapshot id、prior manifest digest/backup path、new receipt id、new manifest final digest，以及 `PREPARED / DB_REPLACED / MANIFEST_PUBLISHED / GENERATION_PUBLISHED` phase；成功发布后标记 consumed。重复 nonce、已 consumed token 或与 journal 不一致的 replay 均拒绝。
-- 替换现有 store 前创建同目录 recovery backup；`os.replace(stage, canonical)` 后 fsync parent，重新 capture 并严格比对 post-fsync sealed attestation 的 inode+SHA，再 open 复核 schema 与 `SEALED` marker。完整 `integrity_check` / `foreign_key_check` 已绑定该精确不可变 sealed byte identity，不得在仅发生 rename 且 inode+SHA 未变时重复；后续 active receipt 仍完整重算 record/index candidate semantic 与 logical closure。任何 byte/inode/phase 漂移都不得复用 sealed 证明。
-- reopen、receipt 与 manifest 发布/复核全部成功后才一次性发布新 generation、canonical exact/save capability 和来源绑定。crash recovery 若能复核新 DB、receipt、manifest 与同一 token，便幂等完成该 token；否则同时恢复 prior DB、prior manifest/binding，fsync parent 并重新验证，不能只恢复 DB。首次激活失败则删除/隔离未发布 manifest、保留原 JSONL 为 active legacy path，并隔离失败 sidecar。进程在 DB replace 后、generation 发布前崩溃时不得暴露半发布 generation。
+- 替换现有 store 前创建同目录 recovery backup；经原 root 的同对象 Candidate/`PendingPublication` 命名并完成 DB_REPLACED durable journal；按上节 live guard→pending terminal/close→SQL 顺序复核 schema 与 `SEALED` marker，SQL 前 capture 严格比对 post-fsync sealed attestation 的 inode+SHA。完整 `integrity_check` / `foreign_key_check` 已绑定该精确不可变 sealed byte identity，不得在仅发生 rename 且 inode+SHA 未变时重复；后续 active receipt 仍完整重算 record/index candidate semantic 与 logical closure。任何 byte/inode/phase 漂移都不得复用 sealed 证明。
+- reopen、receipt 与 manifest 发布/复核全部成功后才一次性发布新 generation、canonical exact/save capability 和来源绑定。crash recovery 若能复核新 DB、receipt、manifest 与同一 token，便幂等完成该 token；否则仅在 prior 成套资产及原位置/身份仍可证明时恢复 prior DB、prior manifest/binding，fsync parent 并重新验证，不能只恢复 DB；不能证明时保留实际 phase 与恢复事实并停止资源。首次激活失败只按已证明的 owned authority 删除/隔离未发布资产；原 JSONL 身份与未完成激活 closure 仍可证明时保留 active legacy，否则停止该资源并保留恢复事实。进程在 DB replace 后、generation 发布前崩溃时不得暴露半发布 generation。
 - 查询/写入在 drain 超时后得到 resource-local busy failure；不得绕过 coordinator 打开 canonical path。
 - physical activation 后，context correctness gate 与 fuzzy benchmark gate 分别发布；fuzzy 未通过只关闭 FUZZY，不改变 canonical exact/save 或已验证 CONTEXT。matcher capability 由另一套 evidence state machine 控制。
 
@@ -733,9 +832,9 @@ Activation recovery 固定为：
 |---------------|--------------|----------|
 | `PREPARED` | 尚未 replace | 取消 token，prior DB/manifest/binding 不变 |
 | `DB_REPLACED` | 新 DB + receipt + manifest temp 全部匹配 | 发布新 manifest，继续同一 token |
-| `DB_REPLACED` | 任一新资产不匹配 | 恢复 prior DB + prior manifest/binding |
+| `DB_REPLACED` | 新资产不能闭合且 prior 成套资产仍可证明 | 经原 owner 恢复 prior DB + prior manifest/binding；位置/身份或提交不明则保留 phase 并停止资源 |
 | `MANIFEST_PUBLISHED` | 新 DB/manifest/receipt 全部匹配 | 发布唯一新 generation |
-| `MANIFEST_PUBLISHED` | 任一新资产不匹配 | 恢复 prior DB + prior manifest/binding |
+| `MANIFEST_PUBLISHED` | 新资产不能闭合且 prior 成套资产仍可证明 | 经原 owner 恢复 prior DB + prior manifest/binding；位置/身份或提交不明则保留 phase 并停止资源 |
 | `GENERATION_PUBLISHED` | 新 generation 健康 | 幂等标记 token consumed |
 
 每个恢复分支都 fsync 受影响文件及 parent directory；不得把新 manifest 留给旧 DB，也不得生成第二个 generation。
@@ -897,24 +996,26 @@ class TMMigrationService:
 - preflight 流式读取 UTF-8 JSONL，计算 SHA-256、有效/无效/重复/变体统计和可定位 diagnostics；valid row 明确定义为 JSON object 且 source/target 是非空字符串，last-valid 只在 accepted rows 中计算。
 - migration 在同目录 staged path 建库；accepted rows 按原 ordinal 全部保存。
 - migration/import 建立一个 origin batch；facade `save_record()`/store append 为每次本地写入建立 `local_write` batch，batch 与 record/index 必须同事务提交或回滚。
-- staged DB 只有在 records 与所有声明的 candidate indexes 完成后，才在 seal transaction 内执行 `foreign_key_check`、counts、exact parity probes、source binding、candidate semantic validator、全行 projection digest、logical closure 与 `SEALED` marker；commit、close、fsync 后在同一只读 snapshot 内对最终 sealed bytes 执行唯一完整 `integrity_check`，重算全行 projection digest 与 closure 并终端复证同一 inode+SHA 后才生成 attestation，再交给 per-resource coordinator 排空连接、备份、替换、reopen 验证与发布。
+- staged DB 只有在 records 与所有声明的 candidate indexes 完成后，才在 seal transaction 内执行 `foreign_key_check`、counts、exact parity probes、source binding、candidate semantic validator、全行 projection digest、logical closure 与 `SEALED` marker；commit、close、fsync 后在同一只读 snapshot 内对最终 sealed bytes 执行唯一完整 `integrity_check`，重算全行 projection digest 与 closure，POSIX 在关闭这次 SQL snapshot 后再于原 root/W1 中终端复证同一 inode+SHA，才生成 attestation；随后借同一外层 coordinator 完成备份、替换、reopen 验证与发布，不重新取得 W1 或重复 drain。
 - destination 是 deterministic sidecar；原 JSONL 不修改。
 - 同 digest completed batch 幂等；failed batch 不作为 completed activation。
 - 首次迁移激活时为原 JSONL 建立 `MIGRATION_SOURCE` receipt，把 `resource id + canonical store id + exported revision + JSONL digest + record count + format version` 同时写入 canonical ledger 与相邻 `name.jsonl.localcat-snapshot.json` manifest，再由 `SnapshotBinding` 指向这对只读资产。
 - 已激活 sidecar 遇到配置 JSONL/manifest 不能与 canonical ledger 中同一 completed receipt 核对时拒绝自动覆盖并标记 `SOURCE_DIVERGED`；继续保留 last-known-good canonical，必须走显式 canonical import/rebuild。
 - `resource_importer.py` 的普通 merge import 在 sidecar 已激活时必须把按输入顺序保留、未按 source 折叠的 validated rows 作为 `import` origin batch 直接提交 canonical store；不得先改 JSONL 再让 facade 猜测哪份数据更新。merge import 不修改 snapshot binding，也不清除 divergence。未激活资源继续走 legacy JSONL last-write-wins 原子导入。
-- `SOURCE_DIVERGED` 期间普通 `save_record()` 继续以 `local_write` 写 canonical，同步保持 divergence 和原 JSONL 字节。只有用户明确选择“以该快照消歧”的 `import_snapshot()` 或 `rebuild_from_snapshot()` 才走全量 stage、验证、seal 和 activate；成功后更新 binding 并清除状态，任何中途失败保持 prior canonical、divergence、JSONL 与 manifest 不变。
+- `SOURCE_DIVERGED` 期间普通 `save_record()` 继续以 `local_write` 写 canonical，同步保持 divergence 和原 JSONL 字节。只有用户明确选择“以该快照消歧”的 `import_snapshot()` 或 `rebuild_from_snapshot()` 才走全量 stage、验证、seal 和 activate；成功后更新 binding 并清除状态，支持运行环境内的中途失败保持 prior canonical、divergence、JSONL 与 manifest 不变；已观察位置或身份失效则保留可确认事实并停止该资源，不声明未证明的资产未变。
 - schema upgrade 先 `Connection.backup()` 到 timestamped recovery file，再 transaction/copy-swap。
 - export 按 `record_id ASC` 写出全部 canonical variants，使最新 compatibility winner 在同 source 的历史中最后出现；字段顺序/version 固定，temporary JSONL flush/fsync 后替换，失败不覆盖有效目标。
 
 ### Canonical authority 与 JSONL snapshot binding
+
+本节的 SOURCE_DIVERGED Lookup/Update 以 canonical 及其家族位置仍可证明为前提；配置源/manifest 内容变化继续按本节处理，根位置失效则由资源家族会话停止新操作。逐文件异常和不明 recovery 不因支持范围限定而放宽。
 
 激活前，配置 JSONL 可以继续作为 legacy runtime store；激活后，SQLite canonical 是唯一查询与写入权威。正常 canonical append、import batch 或 head revision 变化不修改 JSONL/manifest，也不因“快照落后于当前记录”触发 divergence。`SourceBindingMonitor` 核对 JSONL digest、相邻 manifest receipt、canonical ledger receipt、resource id 与 canonical store id；当 receipt 的 `exported_revision` 是该 store 的已知历史 revision 时，状态为 `VERIFIED_HISTORY`（若等于 head 则为 `VERIFIED_CURRENT`）。它不把 JSONL 内容与当前 SQLite 全量内容做等值比较。
 
 显式 export 分两种：
 
 1. 导出到任意其他路径：在稳定 SQLite read snapshot 上生成 JSONL 与相邻 manifest temporary files，flush/fsync 并验证 digest/count 后发布；对应 receipt 同样按 `issued → JSONL replace → manifest replace → completed/cancelled` 写入 canonical ledger 并复用下述崩溃恢复协议，`ExportReport` 返回 canonical generation/exported revision/snapshot id。它不修改活动 binding；其失败、删除或外部修改不影响活动资源的 `SourceBindingState`，也不能清除 `SOURCE_DIVERGED`。
-2. 显式导出并刷新配置 JSONL 快照：只允许当前资源未 diverged。在稳定 read snapshot 上生成并验证两个 temporary files；先在 canonical ledger 提交 `issued` receipt，再 `os.replace(JSONL)`、fsync parent，最后 `os.replace(manifest)`、fsync parent，并把 receipt/binding 标为 completed。manifest 是该双文件快照的发布标记。
+2. 显式导出并刷新配置 JSONL 快照：只允许当前资源未 diverged。在稳定 read snapshot 上生成并验证两个 temporary files；先在 canonical ledger 提交 `issued` receipt，关闭相关 SQL 后经原 root 的 publisher 依次命名 JSONL、manifest 并同步各自 parent，再按原 owner 协议把 receipt/binding 标为 completed。manifest 是该双文件快照的发布标记。
 
 恢复矩阵固定如下：
 
@@ -929,7 +1030,7 @@ class TMMigrationService:
 
 issued receipt 的 versioned artifact handoff 同时记录排他 temp/recovery copy 身份、其真实直接父目录的 device/inode，以及发布前 final pair 的 identity/digest/明确缺席事实。handoff 必须跨越 completed/cancelled 终态事务继续存在；只有先验证 terminal receipt 的 resource/canonical identity、revision ancestry、配置/任意路径分类、authority alias、完整真实父目录链与 durable parent identity，再按 exact identity+digest 清理 owned artifact、通过绑定该 parent identity 的 no-follow directory descriptor 执行 fsync、严格复核父目录未替换且四个 deterministic artifact path 均缺席后，才可清除 handoff。任何外来同字节 inode、symlink、hardlink、目录、父目录替换或 fsync 失败都保持文件与 handoff、返回 `BLOCKED`/cleanup-pending failure；不得在 cleanup 未闭合时报告成功。预先锁存的配置 divergence 只阻止 configured terminal replay，不得永久阻塞与 binding/divergence 无关的任意路径 terminal cleanup。任意路径 export replay 始终不改变 active binding 或 divergence；配置 refresh replay 仍受资源级可重入 observation gate 串行化。
 
-路径字符串和相同字节不是命名空间授权。每个 replace/rename/delete 必须遵循同一 mutation-proof 模型：从稳定 root 逐段 no-follow 绑定直接父目录，以 durable handoff/receipt 确定允许的 source、destination 和先前缺席/身份事实，在最后一个可观测 fault seam 返回后、紧邻 mutation 之前同时复证 source 与 destination，使用该 dirfd 执行变更，然后复核 final 就是已交接 source inode、fsync parent 并持久化状态转换。父目录 rename/ABA、source 或 destination 在复证窗口被替换、多链接、同字节外来 inode 或无法复核的 post-mutation 结果均不得继续完成/清理，必须保留 durable replay 证据并 fail-closed。
+路径字符串和相同字节不是命名空间授权。每个 replace/rename/delete 必须遵循同一 mutation-proof 模型：由平台从该操作原先持有的 root 逐段 no-follow 绑定直接父目录并复证原配置位置，以 durable handoff/receipt 确定允许的 source、destination 和先前缺席/身份事实，在最后一个可观测 fault seam 返回后、紧邻 mutation 之前同时复证 source 与 destination，通过平台对该 retained parent 执行变更，然后复核 final 就是已交接 source inode、同步 parent 并持久化状态转换。可观察的父目录 rename/ABA、source 或 destination 在复证窗口被替换、多链接、同字节外来 inode 或无法复核的 post-mutation 结果均不得继续完成/清理；单次检查不宣称消除了检查间竞争或不可观察 ABA，必须保留 durable replay 证据并 fail-closed。
 
 Windows 配置 refresh 在 issued receipt 的同一事务内写入 receipt-scoped portable handoff；该严格版本化值绑定 prior completed binding snapshot id、prior JSONL/manifest 摘要，以及由 receipt 确定的新 pair 摘要，不记录绝对路径、volume、FileId、device 或 inode，也不依赖 `created_at` 推断 predecessor。handoff 跨越 cancelled/completed 终态继续存在，直到对应 receipt 的 final pair、owner 状态和内部残留全部闭合后才可清除。fresh process 在同一 resource W1 下重新认证 W2 owner chain、sidecar mutation guard 与 configured rooted family；live handle 经稳定 size、全量 hash 与 terminal identity/size 复证且摘要匹配 handoff/receipt 后，才把本次观测到的 byte count 与 digest 组成 retirement content facts。四个允许角色及其 basename 只能从 configured pair 派生，并以 receipt digest 和角色派生唯一 retirement target；仅将满足证明的 regular/single-link/reparse-free 内部残留无覆盖移入同一 root 下的 `.localcat-snapshot-refresh-retirement-v1/<receipt-digest>/` 隔离闭集，source 缺失时只可重新绑定角色一致、内容完全匹配的既有 target，任何 unknown entry、source/target 并存或不匹配都保持 recovery-required。manifest 重建若发现 source-only exact candidate，则在同一 rooted authority 下重新同步并取得可发布能力；若只剩 receipt target，则先无覆盖恢复到确定 source basename 后取得同一能力；两处并存或内容不符仍保持 `BLOCKED`。该能力不接收 shared final path，最终 manifest 替换仍必须消费既有 `begin_publish(REPLACE_UNDER_LOCK)`、destination prior proof 与 `PendingPublication`。只有单一合法 issued receipt 且 final pair 可稳定观察时才进入旧 pair 取消、新 JSONL 重建 manifest、新 pair 完成或明确不匹配的 divergence 四态；ledger/binding 无效或歧义、不可安全观察及内部隔离冲突均返回 `BLOCKED` 且不得锁存 divergence。receipt/binding、final pair、canonical revision、W1/W2/root 复证及隔离闭集全部终态成立后才完成或取消业务状态；issued 前的候选仍是 unjournaled evidence，保留旧 completed pair 且不自动接管。POSIX/legacy 路径继续使用上一段的 versioned artifact handoff 与 dirfd identity；Windows 不持久化 FileId，也不以 content-only 证明授权 shared user pathname 的覆盖、删除或业务完成。
 
@@ -1160,11 +1261,11 @@ Core 内部的 `MatcherValidationEvidence` manifest 至少绑定 evidence schema
 ### LegacyTMFacade
 
 - ResourceConfig 继续暴露旧 JSONL compatibility path 与既有资源身份；facade 通过内部 deterministic mapping 找到 `name.jsonl.sqlite3`，不得要求 UI 改写资源路径。
-- sidecar 未完成首次 physical activation 时继续旧 engine 行为；一旦激活，exact/query/save 全部只获得 canonical generation lease，JSONL 永不再作为隐式 fallback。
+- sidecar 未完成首次 physical activation 且原 JSONL 身份与恢复状态仍可证明时继续旧 engine 行为；一旦激活，exact/query/save 全部只获得 canonical generation lease，JSONL 永不再作为隐式 fallback。
 - `SourceBindingMonitor` 核对配置 JSONL digest、相邻 manifest 与 canonical ledger receipt；不是同一 canonical 的 completed/可恢复 issued receipt 时保留 last-known-good canonical、报告 `SOURCE_DIVERGED`，不静默切换数据源或双向覆盖。
 - `query_exact(source)` 只返回 compatibility EXACT winner，不暴露 context/fuzzy。
 - `save_record()` 对 canonical store append，最新 record 成为之后的 exact winner。
-- sidecar open/health 失败由 coordinator 恢复 prior generation 并报告；只有首次 physical activation 尚未成功时才可继续 legacy JSONL。
+- sidecar open/health 失败由 coordinator 在 prior 仍可证明时恢复完整 generation 并报告；仅首次 activation 尚未成功且原 JSONL/恢复 closure 可证明时继续 legacy。位置/身份或恢复状态不明时停止资源，禁止自动回退。
 - fuzzy gate 失败只使 FUZZY unavailable；已通过 Gate C 的 CONTEXT、canonical exact/save 和 Excel 三态继续运行。matcher gate 与 facade exact/save 独立。
 - Excel `LogicController` 不调用 full query，因此仍只有三态。
 
@@ -1172,7 +1273,7 @@ facade 每次进程级打开都必须重建同一权威判定，不得把“本�
 
 | 冷启动可观察状态 | facade 权威 | 必须保持的语义 |
 |------------------|-------------|--------------------|
-| 从未完成首次激活，或首次 `PREPARED` 已可证取消且无 canonical generation | legacy JSONL | 只有这两种状态可以使用 JSONL runtime |
+| 从未完成首次激活，或首次 `PREPARED` 已可证取消且无 canonical generation；原 JSONL/位置可证明 | legacy JSONL | 只有这些前提闭合时可以使用 JSONL runtime |
 | completed binding 指向当前 head | canonical / `VERIFIED_CURRENT` | 恢复唯一 generation，exact/save 不回退 JSONL |
 | 合法 append 或 merge import 使 head 超过 completed binding | canonical / `VERIFIED_HISTORY` | 冷重开仍必须成功；历史 snapshot 不是激活损坏 |
 | 配置 JSONL/manifest 与 ledger 不再一致 | canonical / `SOURCE_DIVERGED` | 冷重开后 Lookup/Update 继续，divergence 保持锁存，不修改 JSONL |
@@ -1184,7 +1285,7 @@ facade 每次进程级打开都必须重建同一权威判定，不得把“本�
 
 合法append后的DB不再匹配历史active attestation，冷重开仍须完整验证当前DB，但不能因此在同一进程、同一generation、未变内容的后续health里反复执行相同索引语义扫描。Core coordinator私有地保留一份当前验证结果，绑定exact coordinator/view、resource/store/generation、当前DB完整size/SHA-256与本次rooted观察的文件身份，以及实际验证过的schema/index能力。它不是activation authority，不修改历史attestation、journal、receipt、generation或持久格式，不跨进程恢复，不由UI、caller布尔值或公开构造参数注入。
 
-首次portable hydration仅在完整candidate validator、其后的DB/namespace终端复证与owned handle关闭全部成功后保存当前结果。health消费它之前仍以新rooted handle完整捕获DB，并独立证明当前文件authority；历史记录的FileId不得代替当前活句柄证明。exact view/generation不匹配时不复用，当前文件身份漂移拒绝，稳定内容变化回到完整validator。health的SQLite只读事务和retained DB读取窗口覆盖验证/复用与终端复证；失败或close异常不发行新结果。失败时撤销索引语义复用，但保留该exact view已验证的身份锚点，禁止把第一次拒绝的外来替换在第二次重试时重新接纳；锚点只用于否决漂移，不能代替新rooted proof或授予语义复用。后续合法写入造成的新内容只在重新全验并闭合相同窗口后替换旧结果。
+首次portable hydration仅在完整candidate validator、其后的DB/namespace终端复证与owned handle关闭全部成功后保存当前结果。health消费它之前仍以新rooted handle完整捕获DB，并独立证明当前文件authority；历史记录的FileId不得代替当前活句柄证明。exact view/generation不匹配时不复用，当前文件身份漂移拒绝，稳定内容变化回到完整validator。Windows health 的 SQLite 只读事务和 retained DB 读取窗口覆盖验证/复用与终端复证；POSIX health 在同一 operation/root/W1 内先结束 SQL，再进行额外 raw 内容捕获，以原 generation、身份锚点与语义事实关联同一对象；失败或close异常不发行新结果。失败时撤销索引语义复用，但保留该exact view已验证的身份锚点，禁止把第一次拒绝的外来替换在第二次重试时重新接纳；锚点只用于否决漂移，不能代替新rooted proof或授予语义复用。后续合法写入造成的新内容只在重新全验并闭合相同窗口后替换旧结果。
 
 该结果只决定是否重复调用candidate索引validator。meta、generation、当前ledger/binding检查与历史active attestation的独立命中条件保持原样；不能把当前record_count或receipt塞回历史attestation。JSONL/manifest分歧继续归SourceBindingMonitor。恢复namespace、W1/W2、publication及terminal证明均不因本项跳过或缓存；跨线程交接不携带SQLite连接或尚未结束的临时句柄。
 
@@ -1209,7 +1310,7 @@ Task 8.3 的迁移 child 在专用 run root 内完成激活、reopen 与健康�
 
 Task 8.8 的性能修正不删除迁移口径中的任何阶段。fresh mutable stage 只在新建路径执行一次完整语义校验；既有 stage 的 reuse validator 不再重复校验刚构建的同一对象。StageSealer 在一个 `BEGIN IMMEDIATE` 边界内流式完成 exact parity、schema/index/fold/count 与 logical closure 校验并写入 `SEALED` marker，随后 close/fsync，生成 registry-owned `SealedContentAttestation`。coordinator 不公开 concrete registry；registry 的 reservation/commit/release 与 token lifecycle 仅存在于私有 adapter，Gate B 只消费 exact read-only readiness view。私有 commit 只能消费唯一 StageSealer 链在 post-fsync 验证后铸造、绑定 exact registry+reservation 且单次消费的 verified capability；普通 dataclass、跨 registry/reservation、replay 或调用方分别注入 evidence/generation/attestation 均拒绝。`tm-logical-closure-v2` 逐行闭合 metadata/ancestry/receipt/binding/record/schema 权威域；gram/block/FTS 由同一事务内唯一一次完整 `validate_candidate_proof_index` 验证，并在该 transaction snapshot 中另以 SQLite-native、有界 50,000-row chunks 生成覆盖每个实际 projection row 的私有 SHA-256。post-fsync snapshot 只按同一 rowid/canonical row order 重算该 projection digest，不重复执行 fold/gram/block/FTS 语义推导，也不新增 persistent schema/index；digest、pre-activation closure 与终端 database proof 必须同时匹配，故首次 content capture 前的同 inode、同表行数 projection 篡改不能借新 bytes proof 混入 attestation。attestation 绑定 DB/manifest/source 的 SHA-256、device/inode、schema/index/fold/closure version、counts、exact-parity 与 closure digest。
 
-激活前和 lease drain 后的两次 Gate B 均保留；每次必须经 no-follow regular/single-link pre/post identity capture 重新计算完整文件 SHA-256 并与 sealed attestation 比较，但不重复展开 record/index 语义扫描。seal transaction 提交并 fsync 后，在同一只读 snapshot 中执行唯一完整 `integrity_check`、重算完整 candidate projection digest 与 pre-activation logical closure并核对事务内 facts，随后对同一 database proof 做终端完整 rehash；只有 page integrity 与 bytes↔semantic binding 全部闭合后才铸造 sealed attestation。replace 后只证明 canonical inode/digest 等于该 attestation 并 reopen 核对 schema/`SEALED` marker，不重复 integrity/FK 页级扫描。receipt owner 在获得写锁后再完整 rehash canonical DB，只有仍等于 sealed attestation 才写入封闭的 receipt/binding/meta 转换；写后执行一次 active-set 全语义校验并生成 `ActiveContentAttestation`。active 语义验证保留 exact parity、完整 candidate projection validator 和 v2 logical closure，并对刚以 exact sealed bytes 完成且仅由 owner SQL 转换的同一 live object复用 post-fsync sealed integrity/FK 结论，不再重扫整个 page tree。之后的 manifest/generation/final closure 只可在 exact bytes、当前live lineage与phase facts均匹配该attestation时复用。POSIX journal/terminal继续按其同一live epoch的device/inode、bytes与phase恢复；Windows v3 journal/terminal只持久化portable size/hash与phase，fresh process按下述Windows对抗恢复的当前rooted authority语义重新绑定。fresh hydration/health的索引语义复用只对canonical DB做完整rehash，并核对小型meta/binding/count；DB字节变化回到完整runtime validator，retained-handle窗口内的identity漂移fail-stop。配置JSONL/manifest的缺失、内容或可读性变化不单独触发未变DB的全量索引复验，由SourceBindingMonitor继续分类SOURCE_DIVERGED；publication、sealed/active journal之间的三文件phase证明不变。四个journal phase、两次Gate B、parent fsync、replace、reopen与last-known-good语义均不改变。
+激活前和 lease drain 后的两次 Gate B 均保留；每次必须经 no-follow regular/single-link pre/post identity capture 重新计算完整文件 SHA-256 并与 sealed attestation 比较，但不重复展开 record/index 语义扫描。seal transaction 提交并 fsync 后，在同一只读 snapshot 中执行唯一完整 `integrity_check`、重算完整 candidate projection digest 与 pre-activation logical closure并核对事务内 facts，POSIX 先关闭该 SQL snapshot，再在持续原 root/W1 下对同一 database proof 做终端完整 rehash；Windows 保留原 shared-read profile；只有 page integrity 与 bytes↔semantic binding 全部闭合后才铸造 sealed attestation。replace 后只证明 canonical inode/digest 等于该 attestation 并 reopen 核对 schema/`SEALED` marker，不重复 integrity/FK 页级扫描。POSIX receipt owner 在 SQL 前完整 rehash canonical DB 并核对 sealed attestation，按 DB_REPLACED 子阶段将 pending 同时 live 交给 guard、完成 pending terminal/close 后取得 SQL 写锁并写入封闭的 receipt/binding/meta 转换；Windows 保留原 shared-read profile 与写锁内复证；写后执行一次 active-set 全语义校验；POSIX 结束全部 SQL 后通过与 guard 同时 live 的 capture 闭合 final 内容才生成 `ActiveContentAttestation`，Windows 保留原窗口。active 语义验证保留 exact parity、完整 candidate projection validator 和 v2 logical closure，并对刚以 exact sealed bytes 完成且仅由 owner SQL 转换的同一 live object复用 post-fsync sealed integrity/FK 结论，不再重扫整个 page tree。之后的 manifest/generation/final closure 只可在 exact bytes、当前live lineage与phase facts均匹配该attestation时复用。POSIX journal/terminal继续按其同一live epoch的device/inode、bytes与phase恢复；Windows v3 journal/terminal只持久化portable size/hash与phase，fresh process按下述Windows对抗恢复的当前rooted authority语义重新绑定。fresh hydration/health的索引语义复用只对canonical DB做完整rehash，并核对小型meta/binding/count；DB字节变化回到完整runtime validator，retained-handle窗口内的identity漂移fail-stop。配置JSONL/manifest的缺失、内容或可读性变化不单独触发未变DB的全量索引复验，由SourceBindingMonitor继续分类SOURCE_DIVERGED；publication、sealed/active journal之间的三文件phase证明不变。四个journal phase、两次Gate B、parent fsync、replace、reopen与last-known-good语义均不改变。
 
 Windows portable seal 不另行创建进程锁。首次激活调用方的 `_InitialActivationResourceReservation` 唯一拥有 platform backend、retained sidecar-parent root 与 `LockLease`，只向 StageSealer 移交绑定同一 resource/backend 的 non-closing reproof borrow。DB 与 temporary manifest 必须经该 borrow 的既有 root 打开并同步；configured source 使用独立 rooted handle。borrow 随 registry-owned live artifact 贯穿 seal、两次 Gate B、token 与 consume/cancel terminal，每次只复证调用方仍持有原 lock/root；registry terminal 仅撤销 borrow并关闭 stage/source handles，不关闭调用方的 base root/lease，后者仍由最外层 reservation context 唯一释放。portable seal 缺少该 borrow、borrow 与 resource/backend 不匹配或 lock/root 漂移时，在 registry/`SEALED` mutation 前 fail closed；首轮 Gate B 或 token 发行前拒绝必须退休未发行 portable entry。显式 import/rebuild/schema upgrade 尚无对应调用方 reservation 时不得借此获得 Windows seal authority。
 
@@ -1264,6 +1365,16 @@ Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CP
 - 样本数、digest、环境或 contract 字段不一致直接失败，不能只比较四个性能数字。
 - FTS5 trigram fast path 与无 FTS5 的 1/2/3-gram fallback 必须分别执行和报告。fallback 在 100k 上超限时按 Requirement 8.7 把对应性能报告标记失败；功能准入另按 8.8–10，不放宽数值或用 fast path 的成功掩盖失败。
 
+### 私有 JSONL 导出 stage 的生命周期
+
+ResourcePackage 的私有 JSONL stage 复用 `export_jsonl` 的同一快照捕获、编码、JSONL/manifest 发布与 receipt 闭合。Core 提供 `prepare_jsonl_export(store, destination)` 与 `discard_prepared_jsonl_export(prepared)`：前者只在完整导出及来源操作终结成功后签发本实例拥有的 opaque prepared 对象，携带原 `ExportReport` 并保留原目的 root、parent、lease 及该次 JSONL/manifest 的确切文件身份。prepare 只接受原本不存在的私有目标对，不覆盖用户已有文件；不改变直接 `export_jsonl` 的返回值和最终产物语义。
+
+prepared 对象不携带新的 canonical 权限，不能由 path、digest 或公开 receipt 重建；它仅延长这次私有产物的读取与销毁责任。来源家族操作和 SQLite snapshot 按原边界结束，不为封包过程长持来源事务或将目的 lease 当成来源锁。Core 在签发前完成自身失败/不明提交的处理；失败不签发可任意 discard 的对象，也不把仍需恢复的 journal、LKG 或 receipt handoff 转为普通临时文件。
+
+销毁由原 owner 在原目的绑定下执行，先复核 JSONL 与 companion 均为本次对象，再分别使用既有平台 owned-unlink 和目录同步能力；完成后关闭所持权威。同一对象重复释放不重复 mutation。文件或配置位置已观察失效时停止，保留未知对象和失败事实，不通过重新 bind 同路径刷新授权。普通删除失败必须区分已删除项与仍保留项，并尝试关闭所有持有权威；不承诺双文件删除原子性，不新增冷端扫描或历史残留清理。已有主异常保持，清理错误作为附加事实而不能替换它。
+
+本段对应 Requirements 2.7、2.8、7.15、7.16、7.18。此接缝归 `tm_migration.py` 及其既有 export contracts；仍以同一 exporter 为唯一 producer。验证覆盖 private prepare/discard 的正常及失败终态，并复核 direct JSONL pair、receipt 和原恢复行为。沿用 ADR-020、ADR-033 的 ownership 与 rooted 操作范围，不修改持久格式、平台接口或驱动。Resource 必须在用户 package publication 前消费该生命周期；UI 与跨平台交付按实际受影响出口重验。
+
 ## 数据一致性与迁移
 
 ### 一致性边界
@@ -1289,9 +1400,10 @@ Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CP
 | 类别 | 示例 | 响应 |
 |------|------|------|
 | Input | 空 source/target、无效 threshold/limit | typed validation error |
-| Migration | malformed JSONL、磁盘满、parity 失败 | `MigrationFailure` 保留 JSONL/active generation，报告 stage/retryable/diagnostics |
+| Migration | malformed JSONL、磁盘满、parity 失败 | 支持环境中 `MigrationFailure` 保留 JSONL/active generation，报告 stage/retryable/diagnostics；身份失效按资源停止处理 |
 | Store | locked、corrupt、schema too new | resource-local failure，其他资源继续 |
-| Activation | stale/used/mutated token、资源或 binding 不符 | 拒绝替换，保留 prior generation，隔离 stage |
+| Activation | stale/used/mutated token、资源或 binding 不符 | 拒绝替换；prior 仍可证明时保留，不能证明则保留恢复事实并停止资源 |
+| Resource binding | 已观察 root 配置位置或对象漂移 | 锁存 resource-local unavailable/recovery-required，不接管同路径副本，不报未经证明的成功，peer 资源继续 |
 | Snapshot | 配置 JSONL digest/binding 不符 | `SOURCE_DIVERGED`，canonical Lookup/Update 继续，禁止隐式覆盖 |
 | Capability | FTS5 不可用 | gram fallback + candidate capability metadata |
 | Context gate | raw context classification correctness 未过 | canonical exact/save 继续，CONTEXT 不对外开放 |
@@ -1319,7 +1431,7 @@ Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CP
 - candidate proof 对稀疏 frontier 以 block-level 保守上界 best-first 打开小批量 record；当保守 maxima 退化为近全量 block 或 top-k 低分前沿仍广泛竞争时，切换为确定性的两阶段 set-based refinement，禁止用每 block 一次连接/事务/count 复证实现同一密集扫描。phase 1 只取长度与精确 bigram，phase 2 只为 owner 派生的 `R` 读取 generation-bound ordered folded-source 投影并计算 LCS 上界；两个短事务之间和之后均复核同一 binding。query-view 的 candidate connection 可请求 `PRAGMA threads=1`，sealed/active 全量 proof-index validator 可请求 `PRAGMA threads=2`，分别允许 SQLite sorter 使用至多一个或两个辅助 worker；runtime 返回更低值时继续同一精确 SQL，这些设置不持久化且不得进入证明或 capability 事实。mode selector 与 sorter worker 都只影响性能路径，不能成为 completeness 事实；两种模式共享 scorer-v1、fold-equivalence、budget 与双闭合语义，上界只能多取，不能漏取。
 - migration 的私有 fresh-stage builder 先在未暴露的 `UNPUBLISHED` stage 上暂缓可重建 secondary indexes，以有界 20,000-record chunk 完成 record/gram/FTS 与 chunk-local block/max 聚合；record 经 generator-backed `executemany`，gram 在原事务内保持 term-major 顺序，使用最多 128 行且不超过 SQLite 实际变量上限的参数化多行 `VALUES`，避免二次全 chunk row-list 物化。随后用冻结的原 schema SQL 批量重建并重验 schema digest 后才暴露 stage；transaction 与 RSS 由 100k gate 约束。
 - FTS5/gram seed 只控制 execution path 与有界路径诊断；gram seed 沿用 4096 条真实 postings 的确定性 cap，不要求全库 record-major 聚合。proof 队列与完备性由共同的 versioned bound proof 独立决定，默认 scorer budget 写入 versioned contract。
-- sealed/active attestation 只消除同一 immutable byte identity 上的重复语义扫描；seal 事务内闭合 schema/FK/parity/proof-index、完整 projection digest、logical closure 与 `SEALED` marker，commit+fsync 后对最终 sealed bytes 执行唯一完整 `integrity_check`，并在同一 snapshot 重算 projection digest/closure 后写入 inode+SHA attestation。后续 DB rename/reopen 只在 exact sealed inode+SHA 不变时复用该 post-fsync integrity 事实，active receipt 写入后仍完整重算 candidate semantic/logical closure；任何字节、inode、phase 或 durable evidence 漂移都重新进入完整验证或 fail-stop，不能以 stat/mtime/size 或缓存布尔值代替。
+- sealed/active attestation 只消除同一 immutable byte identity 上的重复语义扫描；seal 事务内闭合 schema/FK/parity/proof-index、完整 projection digest、logical closure 与 `SEALED` marker，commit+fsync 后对最终 sealed bytes 执行唯一完整 `integrity_check`，并在同一 SQL snapshot 重算 projection digest/closure；POSIX 关闭该 snapshot 后于持续原 root/W1 中捕获同一对象内容，再写入 inode+SHA attestation。后续 DB rename/reopen 只在 exact sealed inode+SHA 不变时复用该 post-fsync integrity 事实，active receipt 写入后仍完整重算 candidate semantic/logical closure；任何字节、inode、phase 或 durable evidence 漂移都重新进入完整验证或 fail-stop，不能以 stat/mtime/size 或缓存布尔值代替。
 - read connection 不长时间持有 transaction；rollback journal 下 write transaction 保持短小。
 - WAL 不作为首版性能优化；升级前必须先解决当前 3.51.2 advisory。
 
@@ -1338,16 +1450,35 @@ Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CP
 
 - JSONL preflight/migrate/retry/export，原字节不变、`export → migrate` record/variant/exact-winner parity。
 - mutable stage 建完全部索引后才能 seal；seal 后篡改、token 重用、stale generation、错资源/路径均拒绝。
-- activation 在 DB replace/manifest publish/generation publish 各 phase 崩溃时，要么幂等完成同一 token，要么同时恢复 prior DB 与 prior manifest/binding。
+- activation 在 DB replace/manifest publish/generation publish 各 phase 崩溃时，幂等完成同一 token 或成套恢复可证明的 prior DB/manifest/binding；位置/身份或提交不明时保留 recovery-only，不伪造回滚成功。
 - physical activation 成功而 fuzzy benchmark 失败时，SQLite exact/save 继续且 JSONL 不再成为 runtime。
 - QueryReport 分别区分“CONTEXT/FUZZY 可用但本次无命中”与“对应 gate 未开放”，并在 global limit 后对账每资源 returned count。
-- canonical 正常写入不触发/清除 divergence；外部 JSONL 变化触发，显式 import/rebuild 失败保持三方资产，成功才换 generation 并清除。
+- canonical 正常写入不触发/清除 divergence；外部 JSONL 变化触发，支持环境内显式 import/rebuild 失败保持三方资产，成功才换 generation 并清除；已观察位置失效按资源停止规则处理。
 - 配置快照 refresh 的 issued receipt 在 crash 后按 digest 完成、取消或进入 divergence，不回滚 canonical。
 - snapshot publication/recovery 的 mutation-proof 矩阵覆盖 ancestor/direct-parent rename/ABA、symlink/hardlink/multi-link、source/destination 在最后复证后被同字节或异字节 inode 替换、每个 fsync/replace/completion/cleanup 边界的进程死亡、durable temp/handoff 缺失或损坏、terminal replay 幂等和外来 inode 不删不覆盖。
 - same-source variants：winner EXACT、positive context CONTEXT、no evidence retained-only。
 - multi-resource query：stable global order、partial failure、resource provenance。
 - facade 激活前后 `query_exact/save_record` 一致。
 - corrupt/locked/schema upgrade/backup recovery 和 last-known-good。
+
+### POSIX 家族生命周期与 v2 技术门
+
+- Task 10.1–10.2a 在隔离候选中用真实短 query/append、replacement reservation、nested health、lazy view、已登记家族的并发 factory 和少量合成数据验证两个 coordinator/线程、两个进程、timeout/cancel。完成条件为无 W1 重入/自等 drain、旧 generation 不写新 DB、raw close 不破坏 SQL 锁、count/lease 正确归还。该机制门不启用公开生命周期，不代表首次激活或全部 cold 入口完成；超出后续明确前置的正常场景失败报告等待预算并停止扩展，不改永久单 owner。
+- 平台 11.2–11.4a 与 Core 10.3–10.6 贯通真实 fresh create/已有 generation replace 的 builder→seal→同对象 publish→receipt→cold query；覆盖 DB_REPLACED receipt 前、commit 后/manifest 前及重复恢复。原 root/W1 连续，pending terminal/close 后 guard 覆盖 SQL，旧 codec 不变且 clone 不被接管。proof/交接/恢复不能闭合时停止扩展，不 copy 冒充 stage、不 Path 收养、不转向 VFS。
+- 两门、Task 10.6a 的未命名取消与 Task 10.2b 共同决定是否进入 Task 10.7–10.11，不代替产品完成；v2 门所需正常 source/manifest/journal/lineage/backup/terminal I/O 全部由 10.3–10.6 前置，不能依赖后置任务、旧 pathname 路线或立即抛异常的 mock。initial reservation 在 10.3 的 stage 动作前完成家族排空与一次 W1；10.5 使 terminal health/revision/query lease 显式借用原 root/W1，这些均是 10.6 的前置。10.6a 前置闭合尚未 DB 命名的失败取消、家族停止与 prior/legacy 复证；10.2b 在这些接线基础上完成首次激活、替换和既有公开回归，并复跑两门后才启用公开生命周期，不作为 v2 门隐藏的后置接线。
+
+- 未命名取消门覆盖初次激活与替换的 journal 候选写入/flush、PREPARED durable terminal/close 后但 DB 命名前的失败，以及取消收尾再次中断和 replay；原资源有效时恢复可证明 prior，尚未闭合时同家族 peer 不得继续写入，其他资源独立。DB 已命名或提交不明的反例不得走本取消分支，完整恢复完成前保持 recovery-only，不能由本门推导可取消。
+
+- 10.6 的隔离 v2 门覆盖普通父目录含无关目录/链接且无 schema pending 的恢复；完整观察后发现任何匹配 pending 则保留并明确拒绝。真实 pending 的恢复仍由 10.8 接入，未闭合前不宣称完整 schema 恢复或产品交付通过。平台 11.4a 是该观察前置，不能借后置 schema 接线或裸路径扫描代答。
+
+### POSIX 正常链与失效矩阵
+
+- Mac/Linux source 各走实际 Application→TM owner 的 create/replace→query/append→export→独立进程 cold reopen，覆盖托管及已登记 source/default 路径，不静默搬迁资源。Core10.11 验证 Core 公开 owner 路径；实际 Application 共享会话组合后的完整旅程由 Resource6.2、UI10.2 及平台11.5 联合闭合，不让 Core10.11 提前依赖后置 UI/Resource 实现。
+- 保留配置 JSONL/manifest 外部内容变化的 SOURCE_DIVERGED Lookup/Update，以及包 grammar、路径穿越、symlink/hardlink/special file、摘要/计数、preview stale 和 foreign artifact 拒绝。
+- 正常并发/取消、hot journal、schema 双连接 backup 和受影响 PREPARED/DB_REPLACED/MANIFEST_PUBLISHED/GENERATION_PUBLISHED 进程中断，结果为完整旧/新或 recovery-only，重复恢复不增加 generation。
+- 在真实 builder 入口 rename 原目录并放同字节 clone 后继续真实代码；另在首次 mutation、reconnect、应用 publication 与业务终态前注入已可见漂移。检查原/新目录的实际 DB、journal、callback、registry/receipt，不以立即抛错代替实际 continuation。
+- 失效资源的新查询/写回/导入被拒绝，晚到结果/refresh 不恢复旧授权；peer 资源与项目保存独立。跨设备完整包经目标 validate/preview/apply 建立本地身份，不携 live SQLite/journal 或设备资格；退出后的重定位仍经原 recovery。
+- 活事务内外部替换另做独立进程边界实验，记录原/新 DB、journal 和 commit/rollback/close 的实际事实，检查检测后停止与诚实结果；不要求全时序零副作用，不作为正常产品通过条件或自动扩大架构的理由。
 
 ### Compatibility regression
 
@@ -1368,7 +1499,7 @@ Windows Task 9.6a保留current-source产品发布证据范围：当前Windows/CP
 
 1. **Gate A — Contracts / algorithms**：冻结 1–9 公共契约、TextMatcher pure algorithm、capability evidence evaluator 和 scorers。
 2. **Gate B — Canonical physical store**：完成 SQLite schema、snapshot binding、mutable stage、完整 candidate index、StageSealer、coordinator 和 exact parity；只接受 SealedStage 原子激活。
-3. **Physical activation**：成功后立即把 exact/query/save compatibility facade 切到 canonical SQLite，并完成 Excel/core regression；只有首次激活失败且无 prior canonical 时才继续原 JSONL。
+3. **Physical activation**：成功后立即把 exact/query/save compatibility facade 切到 canonical SQLite，并完成 Excel/core regression；只有首次激活失败、无 prior canonical 且原 JSONL 与恢复 closure 仍可证明时才继续原 JSONL。
 4. **Gate C — Retrieval correctness**：先以 raw same-source vectors 验证并开放 CONTEXT，再完成 phased candidate metadata、FUZZY pipeline、事务和局部失败矩阵；oracle recall 未过只关闭 FUZZY。
 5. **Gate D — benchmark-v1**：FTS5 与 fallback 分别完成真实 100k 验证，按 Requirement 8.8–10 发布逐路径决定；性能超限如实报告，必要准入条件失败只关闭相应 Fuzzy，不撤销 canonical authority。
 6. **Matcher gate**：由独立 validation manifest 发布 UNAVAILABLE/BASIC/TEXT_V1；不从 sidecar、FTS5 或 benchmark 状态推断。
