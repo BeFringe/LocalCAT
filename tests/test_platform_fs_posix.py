@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import builtins
+from contextlib import ExitStack
 import errno
 import hashlib
 import importlib.util
 import inspect
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -506,6 +508,240 @@ class PosixAdapterRuntimeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_root_location_rejects_same_bytes_clone_without_refreshing_binding(self) -> None:
+        configured = self.root_path / "family"
+        configured.mkdir()
+        (configured / "source.txt").write_bytes(b"same bytes")
+        root = self.adapter.bind_root(configured)
+        with root:
+            root.reprove_location()
+            moved = self.root_path / "moved"
+            configured.rename(moved)
+            shutil.copytree(moved, configured)
+            # A distinct new authorization does not refresh the old one.
+            fresh = self.adapter.bind_root(configured)
+            with fresh:
+                fresh.reprove_location()
+                with mock.patch.object(
+                    self.adapter, "bind_root", side_effect=AssertionError("fresh bind")
+                ), mock.patch.object(Path, "resolve", side_effect=AssertionError("resolve")):
+                    with self.assertRaises(PlatformFileError) as caught:
+                        root.reprove_location()
+            self.assertEqual(caught.exception.code, "PLATFORM.FS.IDENTITY_STALE")
+        self.assertEqual((moved / "source.txt").read_bytes(), b"same bytes")
+        self.assertEqual((configured / "source.txt").read_bytes(), b"same bytes")
+
+    def test_root_location_rejects_replaced_ancestor_even_with_original_root(self) -> None:
+        ancestor = self.root_path / "namespace"
+        configured = ancestor / "family"
+        configured.mkdir(parents=True)
+        root = self.adapter.bind_root(configured)
+        with root:
+            ancestor.rename(self.root_path / "old-namespace")
+            ancestor.mkdir()
+            (self.root_path / "old-namespace" / "family").rename(configured)
+            with self.assertRaises(PlatformFileError) as caught:
+                root.reprove_location()
+            self.assertEqual(caught.exception.code, "PLATFORM.FS.IDENTITY_STALE")
+
+    def test_derived_authorities_keep_original_root_location_after_parents_close(self) -> None:
+        configured = self.root_path / "family"
+        (configured / "data").mkdir(parents=True)
+        (configured / "data" / "source.txt").write_bytes(b"same bytes")
+        with ExitStack() as stack:
+            root = self.adapter.bind_root(configured)
+            stack.enter_context(root)
+            parent = self.adapter.bind_parent(root, PurePosixPath("data/source.txt"))
+            stack.enter_context(parent)
+            bound = self.adapter.open_regular(root, PurePosixPath("data/source.txt"))
+            stack.enter_context(bound)
+            candidate = parent.create_candidate("next", private=False)
+            stack.enter_context(candidate)
+            candidate.write_all(b"candidate")
+            candidate.flush_content()
+            reservation = self.adapter.reserve_mutable_file(parent, "stage")
+            stack.enter_context(reservation)
+            lease = self.adapter.acquire(
+                parent, "family.lock", b"family-v1", LockPolicy(LockWait.FAIL_FAST)
+            )
+            stack.enter_context(lease)
+            root.close()
+            self.assertEqual(bound.read_all(), b"same bytes")
+            parent.reprove()
+            parent.close()
+            self.assertEqual(candidate.identity().kind, "regular")
+            reservation.identity()
+            lease.reprove()
+            moved = self.root_path / "moved"
+            configured.rename(moved)
+            shutil.copytree(moved, configured)
+            for operation, code in (
+                (bound.read_all, "PLATFORM.FS.IDENTITY_STALE"),
+                (candidate.identity, "PLATFORM.FS.IDENTITY_STALE"),
+                (reservation.identity, "PLATFORM.FS.IDENTITY_STALE"),
+                (lease.reprove, "PLATFORM.FS.LOCK_UNAVAILABLE"),
+            ):
+                with self.subTest(operation=operation):
+                    with self.assertRaises(PlatformFileError) as caught:
+                        operation()
+                    self.assertEqual(caught.exception.code, code)
+        self.assertEqual((configured / "data" / "source.txt").read_bytes(), b"same bytes")
+
+    def test_bound_parent_rejects_root_move_before_named_mutation(self) -> None:
+        configured = self.root_path / "family"
+        configured.mkdir()
+        with ExitStack() as stack:
+            root = self.adapter.bind_root(configured)
+            stack.enter_context(root)
+            parent = self.adapter.bind_parent(root, PurePosixPath("item"))
+            stack.enter_context(parent)
+            root.close()
+            configured.rename(self.root_path / "moved")
+            configured.mkdir()
+            with self.assertRaises(PlatformFileError) as caught:
+                parent.create_candidate("next", private=False)
+            self.assertEqual(caught.exception.code, "PLATFORM.FS.IDENTITY_STALE")
+        self.assertEqual(tuple(configured.iterdir()), ())
+        self.assertEqual(tuple((self.root_path / "moved").iterdir()), ())
+
+    def test_root_location_rejects_missing_name_and_symlink_to_original(self) -> None:
+        for replacement in ("absent", "symlink"):
+            with self.subTest(replacement=replacement):
+                configured = self.root_path / replacement
+                configured.mkdir()
+                root = self.adapter.bind_root(configured)
+                with root:
+                    moved = self.root_path / (replacement + "-moved")
+                    configured.rename(moved)
+                    if replacement == "symlink":
+                        configured.symlink_to(moved, target_is_directory=True)
+                    with self.assertRaises(PlatformFileError) as caught:
+                        root.reprove_location()
+                    self.assertEqual(caught.exception.code, (
+                        "PLATFORM.FS.REPARSE_REJECTED" if replacement == "symlink"
+                        else "PLATFORM.FS.IDENTITY_STALE"
+                    ))
+
+    def test_initial_root_binding_rejects_arbitrary_link_components(self) -> None:
+        (self.root_path / "real").mkdir()
+        (self.root_path / "real" / "family").mkdir()
+        (self.root_path / "link").symlink_to(self.root_path / "real", target_is_directory=True)
+        for root_path in (
+            self.root_path / "link", self.root_path / "link" / "family",
+            self.root_path / "link" / ".." / "data",
+        ):
+            with self.subTest(root_path=root_path):
+                with self.assertRaises(PlatformFileError) as caught:
+                    self.adapter.bind_root(root_path)
+                self.assertEqual(caught.exception.code, "PLATFORM.FS.REPARSE_REJECTED")
+
+    def test_initial_normalization_and_macos_system_alias_remain_usable(self) -> None:
+        (self.root_path / "normal").mkdir()
+        configured = self.root_path / "normal" / ".." / "data"
+        root = self.adapter.bind_root(configured)
+        with root:
+            root.reprove_location()
+        if sys.platform == "darwin":
+            for alias in ("/var", "/tmp", "/etc"):
+                root = self.adapter.bind_root(Path(alias))
+                with self.subTest(alias=alias), root:
+                    with mock.patch.object(Path, "resolve", side_effect=AssertionError("resolve")):
+                        root.reprove_location()
+            with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+                root = self.adapter.bind_root(Path(directory))
+                with root:
+                    root.reprove_location()
+                    parent = self.adapter.bind_parent(root, PurePosixPath("item"))
+                    with parent:
+                        parent.reprove()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin system aliases")
+    def test_normalized_root_reentry_accepts_system_alias_with_same_derived_binding(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            canonical = Path("/private/tmp") / Path(directory).name
+            (canonical / "source.txt").write_bytes(b"same object")
+            for index, prefix in enumerate(("/tmp", "/../tmp", "/private/../tmp", "/tmp/../../tmp")):
+                with self.subTest(prefix=prefix), ExitStack() as stack:
+                    root = self.adapter.bind_root(Path(prefix) / canonical.name)
+                    stack.enter_context(root)
+                    canonical_root = self.adapter.bind_root(canonical)
+                    stack.enter_context(canonical_root)
+                    with mock.patch.object(Path, "resolve", side_effect=AssertionError("resolve")):
+                        root.reprove_location()
+                        name = f"item-{index}"
+                        (canonical / name).write_bytes(b"old")
+                        parent = self.adapter.bind_parent(root, PurePosixPath(name))
+                        stack.enter_context(parent)
+                        target = self.adapter.bind_parent(canonical_root, PurePosixPath(name))
+                        stack.enter_context(target)
+                        source = self.adapter.open_regular(root, PurePosixPath("source.txt"))
+                        stack.enter_context(source)
+                        self.assertEqual(source.read_all(), b"same object")
+                        lease = self.adapter.acquire(
+                            parent, "family.lock", b"v1", LockPolicy(LockWait.FAIL_FAST),
+                        )
+                        stack.enter_context(lease)
+                        lease.reprove_binding(target, "family.lock", b"v1")
+                        candidate = parent.create_candidate("next", private=False)
+                        candidate.write_all(b"published")
+                        candidate.flush_content()
+                        pending = target.begin_publish(
+                            candidate, name, mode=PublishMode.REPLACE_UNDER_LOCK, lease=lease,
+                        )
+                        stack.enter_context(pending)
+                        self.assertEqual(pending.retained_destination().read_all(), b"published")
+                        pending.terminal_reproof()
+
+    def test_normalized_and_canonical_roots_keep_same_parent_publication_binding(self) -> None:
+        (self.root_path / "normal").mkdir()
+        configured = self.root_path / "normal" / ".." / "data"
+        with ExitStack() as stack:
+            root = self.adapter.bind_root(configured)
+            stack.enter_context(root)
+            parent = self.adapter.bind_parent(root, PurePosixPath("item"))
+            stack.enter_context(parent)
+            canonical = self.adapter.bind_root(self.root_path / "data")
+            stack.enter_context(canonical)
+            target = self.adapter.bind_parent(canonical, PurePosixPath("item"))
+            stack.enter_context(target)
+            candidate = parent.create_candidate("next", private=False)
+            candidate.write_all(b"published")
+            candidate.flush_content()
+            pending = target.begin_publish(
+                candidate, "item", mode=PublishMode.CREATE_IF_ABSENT, lease=None,
+            )
+            with pending:
+                self.assertEqual(pending.retained_destination().read_all(), b"published")
+                pending.terminal_reproof()
+
+    def test_root_binding_failure_closes_every_opened_ancestor(self) -> None:
+        real_open = os.open
+        real_close = os.close
+        for failure in (
+            OSError(errno.EIO, "failure"), PermissionError(errno.EACCES, "denied"),
+            KeyboardInterrupt(),
+        ):
+            opened: list[int] = []
+
+            def fail_at_leaf(
+                path: str | os.PathLike[str], flags: int, mode: int = 0o777,
+                *, dir_fd: int | None = None,
+            ) -> int:
+                if path == "data":
+                    raise failure
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                opened.append(descriptor)
+                return descriptor
+
+            expected = PlatformFileError if isinstance(failure, OSError) else KeyboardInterrupt
+            with self.subTest(failure=type(failure).__name__), mock.patch(
+                "platform_fs_posix.os.open", side_effect=fail_at_leaf,
+            ), mock.patch("platform_fs_posix.os.close", wraps=real_close) as close_spy:
+                with self.assertRaises(expected):
+                    self.adapter.bind_root(self.root_path / "data")
+            self.assertTrue(opened)
+            self.assertEqual([call.args[0] for call in close_spy.call_args_list], list(reversed(opened)))
 
     def test_rooted_read_uses_retained_handles_and_rejects_symlink(self) -> None:
         source = self.root_path / "data" / "source.txt"
@@ -1370,13 +1606,35 @@ raise SystemExit(0)
         with adapter.bind_root(self.root_path) as root:
             with adapter.bind_parent(root, PurePosixPath("data/item.bin")) as parent:
                 original_close = os.close
+                original_open = os.open
+                original_dup = os.dup
+                opened: list[int] = []
+
+                def record_open(
+                    path: str | os.PathLike[str], flags: int, mode: int = 0o777,
+                    *, dir_fd: int | None = None,
+                ) -> int:
+                    descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                    opened.append(descriptor)
+                    return descriptor
+
+                def record_dup(descriptor: int) -> int:
+                    duplicate = original_dup(descriptor)
+                    opened.append(duplicate)
+                    return duplicate
+
                 with mock.patch(
                     "platform_fs_posix.os.close",
                     wraps=original_close,
-                ) as close_spy:
+                ) as close_spy, mock.patch(
+                    "platform_fs_posix.os.open", side_effect=record_open,
+                ), mock.patch(
+                    "platform_fs_posix.os.dup", side_effect=record_dup,
+                ):
                     with self.assertRaises(KeyboardInterrupt):
                         adapter.create_private_directory(parent, "private-transfer")
-                self.assertEqual(close_spy.call_count, 3)
+                self.assertTrue(opened)
+                self.assertCountEqual([call.args[0] for call in close_spy.call_args_list], opened)
         self.assertFalse((self.root_path / "data" / "private-transfer").exists())
 
     def test_unlink_owned_maps_unexpected_fault_and_preserves_entry(self) -> None:

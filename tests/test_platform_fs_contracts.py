@@ -769,6 +769,7 @@ class PlatformFileContractArchitectureTests(unittest.TestCase):
 
     def test_service_port_method_shapes_do_not_expose_backend_representation(self) -> None:
         expected_parameters = {
+            RootedDirectoryAuthority.reprove_location: ("self",),
             RootedFileSystem.bind_root: ("self", "root"),
             RootedFileSystem.open_regular: ("self", "root", "relative"),
             RootedFileSystem.bind_parent: ("self", "root", "relative"),
@@ -2167,12 +2168,27 @@ class PlatformFileAuthorityContractTests(unittest.TestCase):
                         PlatformFileErrorCode.CAPABILITY_UNAVAILABLE.value,
                     )
 
+    def test_root_location_reproof_preserves_backend_checks_and_return_guard(self) -> None:
+        directory = _Directory()
+        with mock.patch.object(directory, "_reprove", return_value=None) as reprove:
+            self.assertIsNone(directory.reprove_location())
+            reprove.assert_called_once_with()
+        with mock.patch.object(directory, "_reprove", return_value=True):
+            with self.assertRaises(TypeError):
+                directory.reprove_location()
+        error = PlatformFileError(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+        with mock.patch.object(directory, "_reprove", side_effect=error):
+            with self.assertRaises(PlatformFileError) as caught:
+                directory.reprove_location()
+        self.assertIs(caught.exception, error)
+
     def test_directory_and_lock_operations_fail_after_close(self) -> None:
         directory = _Directory()
         lease = _Lease()
         directory.close()
         for operation in (
             directory.reprove,
+            directory.reprove_location,
             lambda: directory.inspect_entry("entry.json"),
             lambda: directory.create_candidate("candidate.json", private=False),
             lambda: directory.unlink_owned("entry.json", _identity()),

@@ -548,7 +548,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: ADR-033 与四 owner 阶段审阅、精确 Git 重放授权_
   - _Requirements: 5.1, 5.3, 5.6, 5.7_
 
-- [ ] 11.1 绑定原root与配置位置关联
+- [x] 11.1 绑定原root与配置位置关联
   - 从初次稳定祖先到原 root 保留 no-follow 名称链，派生 authority 继承；后续只比较、不 fresh bind 副本，不把内部观察变成持久资格。
   - 完成时，原root改名＋同字节副本被位置检查拒绝；祖先、link及合法规范化入口正确；派生authority继承原关联，Windows原语义不变。
   - _Boundary: POSIX adapter/contracts 的 root 位置关联_

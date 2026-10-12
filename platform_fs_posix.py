@@ -900,8 +900,8 @@ def _open_directory_chain(
     components: tuple[str, ...],
 ) -> tuple[tuple[int, ...], tuple[str | None, ...]]:
     root._reprove()
-    descriptors: list[int] = [_duplicate_fd(root._directory_fd)]
-    names: list[str | None] = [None]
+    descriptors = list(_duplicate_directory_chain(root._directory_fds))
+    names = list(root._directory_names)
     try:
         for component in components:
             descriptor = os.open(
@@ -2234,26 +2234,65 @@ class PosixPlatformAdapter(
         )
 
     def _bind_root(self, root: Path) -> RootedDirectoryAuthority:
-        descriptor: int | None = None
+        descriptors: list[int] = []
+        names: list[str | None] = [None]
         try:
-            descriptor = os.open(root, _DIRECTORY_FLAGS)
-            transferred = descriptor
-            descriptor = None
+            descriptors.append(os.open(root.anchor, _DIRECTORY_FLAGS))
+            # These OS-owned Darwin aliases are accepted only at initial bind.
+            # Retain the canonical no-follow chain; never resolve it on reproof.
+            pending = list(reversed(root.parts[1:]))
+            while pending:
+                component = pending.pop()
+                if (
+                    sys.platform == "darwin"
+                    and len(descriptors) == 1
+                    and component in {"var", "tmp", "etc"}
+                ):
+                    entry = os.stat(component, dir_fd=descriptors[0], follow_symlinks=False)
+                    if stat.S_ISLNK(entry.st_mode):
+                        target = os.readlink(component, dir_fd=descriptors[0])
+                        if target not in {f"private/{component}", f"/private/{component}"}:
+                            raise _platform_error(
+                                PlatformFileErrorCode.REPARSE_REJECTED, retryable=False,
+                            )
+                        pending.extend((component, "private"))
+                        continue
+                descriptors.append(os.open(
+                    component, _DIRECTORY_FLAGS, dir_fd=descriptors[-1],
+                ))
+                names.append(component)
+                if component == "..":
+                    # Normalize only after proving every traversed component;
+                    # lexical collapse must never hide a symlink on entry.
+                    identities = list(_capture_directory_identities(tuple(descriptors)))
+                    _reprove_directory_chain(tuple(descriptors), tuple(names), tuple(identities))
+                    predecessor = identities[-3] if len(identities) > 2 else identities[0]
+                    if not _same_identity(identities[-1], predecessor):
+                        raise _platform_error(
+                            PlatformFileErrorCode.IDENTITY_STALE, retryable=True,
+                        )
+                    _close_fd(descriptors.pop())
+                    names.pop()
+                    if len(descriptors) > 1:
+                        _close_fd(descriptors.pop())
+                        names.pop()
+            transferred = tuple(descriptors)
+            descriptors.clear()
             return _PosixRootedDirectory(
-                (transferred,),
-                (None,),
-                self._fault_injector,
+                transferred, tuple(names), self._fault_injector,
             )
-        except PlatformFileError:
-            raise
         except OSError as error:
-            if descriptor is not None:
-                _close_fd(descriptor)
+            if error.errno == errno.ENOTDIR:
+                raise _platform_error(
+                    PlatformFileErrorCode.REPARSE_REJECTED, retryable=False,
+                ) from None
             raise _map_os_error(
-                error,
-                fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                error, fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
                 retryable=False,
             ) from None
+        finally:
+            for descriptor in reversed(descriptors):
+                _close_fd(descriptor)
 
     def _open_regular(
         self,

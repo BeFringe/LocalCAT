@@ -2035,7 +2035,15 @@ class BoundDirectoryAuthority(OpaqueAuthority, ABC):
 
 
 class RootedDirectoryAuthority(BoundDirectoryAuthority, ABC):
-    pass
+    def reprove_location(self) -> None:
+        """Check that the original configured location still names this root.
+
+        This live observation does not renew authority by reopening a path,
+        freeze the namespace, or bind an external database driver's accesses.
+        Backends retain their existing rooted reproof semantics.
+        """
+
+        self.reprove()
 
 
 @runtime_checkable
