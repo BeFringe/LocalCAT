@@ -6,7 +6,7 @@
 
 v1 关闭两个 profile：
 
-- `localcat-tm-jsonl-v1`：字节只能由 `TMMigrationService.export_jsonl()` 产生；
+- `localcat-tm-jsonl-v1`：字节只能由 Core 的同一 JSONL exporter 产生；direct 使用 `export_jsonl()`，package 使用其 prepared 生命周期入口；
 - `localcat-termbase-csv-v1`：字节只能由 `TermbaseStore` 管理快照 encoder 产生，保留 legacy/v1 行事实。
 
 两个产品出口使用同一 profile payload：
@@ -92,6 +92,13 @@ ResourcePackage 可以复用或后续抽取以下无语义原语：
 - **Steering sync**：继承 Governance owner 的 ADR-027 与 ADR-020/023 取代元数据，不由本 Spec 重复修改 Steering。
 - **Downstream revalidation**：Task 3.3a 依赖平台 Task 3.3a；重新验证 package 三种既有 payload profile 的 success/ledger failure/terminal failure 和 direct CSV/JSONL 不触发回收。Qt 仍只消费原 outcome，receipt/pending schema 不扩展。
 
+### POSIX TM 资源生命周期
+
+- **Applicable Steering / ADRs**：遵循 `delivery-boundaries.md`、`tech.md`、`structure.md`、`repository-safety.md` 与 ADR-033；ADR-020 的其他 publisher、Windows 合同及 ADR-027 的输出收尾保持原范围。
+- **Scope amendment**：7.7、8.6、8.7、12.3、12.4 区分预览失效、在途位置或身份失效与仍可验证的 prior resource。资源包只消费 Core 家族会话与原 activation/recovery 事务，不取得 SQLite、seal、generation 或恢复 phase 权威。
+- **Steering sync**：由共享治理 owner 提供 ADR-033 及 POSIX 支持边界；本 Spec 继承该治理提交，实施时只核对实际 ResourcePortability 依赖与边界。
+- **Downstream revalidation**：本 Spec Task 6、Feature5 UI Task 10、平台 Task 11.5 的实际共享变化回归，以及 `rpy-project-codec` 6.2/6.3 的资源包交付出口。Sync 仍只调用原 validate/preview/apply，不新增 snapshot 通路或凭设计完成开放消费。
+
 ## Architecture
 
 ### Dependency Map
@@ -120,13 +127,15 @@ flowchart LR
 | `resource_platform_io.py` | retained regular-file bounded stream/digest/copy；不持有 manifest/profile/resource 语义 |
 | `resource_portability.py` | profile dispatch、direct/package export、validate/preview/apply/recovery coordination |
 | `resource_receipt_ledger.py` | generic exact receipt persistence and path-free pending recovery inventory; no resource grammar/provider authority |
-| `tm_resource_port.py` | narrow adapter over public TM export/import/rebuild facts; no JSONL grammar |
+| `tm_resource_port.py` | narrow adapter over public TM export/import/rebuild facts；借用 runtime 共用的原 Core 资源家族会话，保持终态借用；不拥有 JSONL grammar 或 SQLite |
 | `termbase_resource_port.py` | narrow adapter over TermbaseStore snapshot encode/validate/replace facts; no Parser column grammar |
 | `resource_repository.py` | add staged-create/registry publication seam while retaining local identity authority |
 | `editor_controller.py` | typed commands/projections and runtime refresh |
 | `qt_settings_dialog.py` | async actions/dialog/feedback only |
 
 最终文件分配可在 Cluster 0 characterization 后窄调整，但 owner/依赖方向不得改变。
+
+POSIX TM 接线修改 `tm_resource_port.py` 的 owner 获取及事务借用、`resource_portability.py` 的 apply/callback/final 编排。`resource_repository.py` 与 `resource_receipt_ledger.py` 只修改实际受影响的 registry/receipt 终态接缝，保留各自格式和发布 authority；Resource Task 6.1/6.2 以 Core 提供并注入的真实 owner 验证资源端口及事务，Application runtime 与 port 的实际会话共享由 Feature5 UI Task 10.1 的 `tm_application_composition.py` 组合，完整 Application 消费由 UI Task 10.2 闭合；资源端口任务不以前述 UI 装配完成为前置。验证复用 `tests/test_resource_portability_exports.py`、`tests/test_resource_portability_recovery.py`、`tests/test_resource_portability_architecture.py` 及 `tests/test_tm_resource_snapshot_posix.py` 的真实 owner 入口，不在资源层直接打开 SQLite。
 
 ### Cluster Placement of Publication / Receipt / Recovery
 
@@ -140,7 +149,7 @@ Windows ledger listing 只消费 platform 返回的有界 observation；每个�
 
 ### `localcat-tm-jsonl-v1`
 
-- **Producer**：`TMMigrationService.export_jsonl()` only。
+- **Producer**：Core JSONL exporter only；`export_jsonl()` 与私有 `prepare_jsonl_export()` 共用同一 producer，后者只改变产物生命周期。
 - **Bytes**：该 service 发布前已验证的 UTF-8 JSONL destination bytes。
 - **Validation**：TM owner 的 preflight/snapshot reader；ResourcePackage 只核对 member byte count/digest 与 returned valid/skipped counts。
 - **Apply**：TM owner 的 full snapshot replacement transaction。
@@ -444,7 +453,7 @@ sequenceDiagram
     end
 ```
 
-直接 TM JSONL 不在 `export_jsonl()` 外再套一次 replace/LKG 协议；Core 已经把用户路径与 adjacent SnapshotManifest 作为同一 destination family，成功只返回零 skipped/diagnostics 的 `ExportReport`，失败恢复 exact prior pair。Application 只复证 outcome 闭合并做产品投影。ResourcePackage 私有 stage 仍由同一 exporter 产生 JSONL+companion，但只封装 JSONL payload，stage companion 在封装后清理且不冒充 package manifest。
+直接 TM JSONL 不在 `export_jsonl()` 外再套一次 replace/LKG 协议；Core 已经把用户路径与 adjacent SnapshotManifest 作为同一 destination family，成功只返回零 skipped/diagnostics 的 `ExportReport`，失败恢复 exact prior pair。Application 只复证 outcome 闭合并做产品投影。ResourcePackage 私有 stage 由同一 exporter 的 prepared 生命周期产生 JSONL+companion，只封装 JSONL payload；TM snapshot port 在验证 snapshot facts 前取得并持有原 owner 的释放能力。companion 不作为 package manifest。
 
 ### Direct Termbase CSV/v1 Export
 
@@ -508,6 +517,14 @@ sequenceDiagram
     A-->>C: result + receipt
 ```
 
+#### POSIX TM 的同一 owner 操作
+
+TM runtime、ResourcePort 与冷恢复消费同一 Core 资源家族会话。`tm_resource_port.py` 不为每次 apply/export 新建 `TMEngine` 或重新绑定配置路径清除原会话的失效；同物理家族的冲突登记由 Core 统一协调或拒绝。ResourcePort 只消费 Core 公开 owner 的显式操作借用，既有 backend 保留，POSIX v2 与 Windows v3 的恢复/attestation profile 由受信 composition 一次选择，不能由 package/UI 指定，也不以 backend 存在推导 Windows。
+
+首次可能改动 destination 的 source 发布之前，Core 必须已完成家族 admission、排空受影响 lease 并取得原 W1。stage、seal、receipt、health 与 owner callback 只借用这一外层操作，不递归取锁、不提前释放 root/W1。source package 自身保留独立只读 authority，导出目标与 Repository/ledger 各自保留原 publisher authority；资源家族借用不授权操作其他 owner 的资产。
+
+图中的 owner outcome、cold reopen、registry/runtime switch 与 receipt 是同一次操作内的逻辑步骤，不表示 POSIX TM owner 在 callback 前释放家族会话。owner publication、final local resource 冷重开、registry 可见性、receipt 与最终成功投影须在该 owner 仍有效时闭合；callback 进入和业务 success 前消费 Core 的复证结论，已失效的操作不能因 callback 返回、刷新或新建 engine 重新获得成功资格。新 generation 的完整可见性、DB 命名与 receipt SQL 的阶段交接、恢复事实及连接关闭顺序仍由 Core 负责，资源层不复制状态机。
+
 #### `create_new`
 
 Repository 需增加一个 staged create seam：先在 managed root 分配 local id/path 和私有 registry candidate，但不让新资源进入 public list/runtime；profile owner 将 payload 发布到该本地 authority 并冷重开成功后，Repository 才发布 registry。如 registry publication 失败，coordinator 必须删除仅由本 operation 创建且身份已证明的新资源，或返回 recovery-required；不删除未知文件。
@@ -518,7 +535,7 @@ Preview 绑定 exact local `ResourceConfig`、path regular-file identity/digest�
 
 #### Publication Ordering
 
-1. source/destination/profile plan revalidation；
+1. source/destination/profile plan revalidation；POSIX TM 在首次 source mutation 前完成原家族准入与排空；
 2. owner-owned prepared replacement + prior LKG/recovery proof；
 3. owner publication；
 4. independent owner cold reopen and semantic digest/count proof；
@@ -528,9 +545,23 @@ Preview 绑定 exact local `ResourceConfig`、path regular-file identity/digest�
 
 若 owner publication 已经 durable，但 runtime/receipt cleanup 失败，不得回滚已证明的新 canonical authority 到一个无法证明的旧态；返回 recovery-required，冷恢复以 owner journal + receipt ledger 事实判定 complete/rollback/hand-off。
 
+preview 后、首次本地 mutation 前已可观察的 source/destination/lifecycle/baseline 变化返回原 stable stale code，保持零 mutation。在途发现位置或身份失效后，停止受影响资源的后续操作；只对仍可验证的 prior resource 执行保留或恢复，无法证明的发布结果返回原 recovery-required/failure report，分别保留 prior 可证、已提交或 unknown 事实。不盲目回滚、覆盖或删除未知 journal/资产，不重绑同路径副本，也不能只用 failure 标签掩盖已经发生的错误发布。最终冷重开必须确认配置位置仍对应原 owner 接受的 final local resource，并与 semantic digest、counts、新 local authority、registry 可见性和 receipt 对账。
+
+配置 JSONL／manifest 的外部内容分歧仍由 Core 的 `SOURCE_DIVERGED` 合同分类；canonical 与其家族位置有效时，原 Lookup/Update 保留。资源位置失效不属于该分类。SQLite 活事务内部发生外部目录替换时，仍核对检测后的停止、不接管与诚实结果，但不承诺其 commit/rollback/close 全时序无副作用；该残余边界不减弱 ResourcePackage 导出目标、术语 CSV/v1 发布或恶意输入拒绝。
+
 ## Export Publication and Recovery
 
 Termbase direct export 与 ResourcePackage export 可共用 `ResourceArtifactSaveService`，但每种 artifact validator 是 exact profile behavior。TM direct JSONL 保留 `TMMigrationService.export_jsonl()` 已有的独立发布/恢复权威，不被新 service 双重包装。
+
+### TM package 私有 stage 的消费顺序
+
+`TMResourceSnapshotPort.prepare_package_snapshot(resource, destination)` 调用 Core 的 `prepare_jsonl_export`，投影既有 `PortableResourceSnapshot` 并保留 exact Core prepared 对象。对应 `discard_package_snapshot(prepared)` 仅委托原 Core owner；Resource 不从 snapshot facts、随机名字或 fresh-bind 取得删除权。direct export 继续使用原 `export_snapshot`，不被 package 生命周期包装。snapshot 投影、digest/count 校验或来源复证失败时，同一 port 仍负责释放已取得的对象；若 Core 尚未签发 prepared，保留其原失败/恢复语义。
+
+包导出顺序为：取得完整私有 snapshot → 原字节封包并独立校验 candidate → 释放 JSONL 与 companion 及其目的 lease → 复证来源 snapshot → 开始 package receipt/pending 与目标发布。持有 prepared 目的 lease 期间只消费该次已取得的字节与 facts，不重新进入 canonical owner；来源复证始终在释放后、用户目标发布前执行，避免同资源导出按“来源锁→目的锁”运行时形成逆序等待。释放完成前不改变用户目标、不签发 package 成功；释放失败投影为 body-safe `RESOURCE.EXPORT.STAGE_FAILED`，保留目标未发布事实与 Core 的安全清理诊断。已存在主异常时保留原异常并附加清理失败事实；程序异常不伪装为输入错误。
+
+正常成功、port 校验失败、source 复证失败、封包/冷校验失败均必须消费同一 stage 生命周期。部分清理或进程中断可留下本地事实，不能凭随机文件名扫描删除；未完成 Core export 的恢复仍由原 owner 负责。本接缝只修复当前操作拥有的 JSONL 正文及 companion，不清理历史随机残留，不改变 Termbase、TMX、package publisher、ledger 或目标回滚协议。
+
+本段对应 Requirements 2.2、2.3、2.4、9.7、12.3、12.4、12.7。修改范围为 `tm_resource_port.py` 的 TM 专属 prepared/discard 投影与 `resource_portability.py` 的消费顺序，测试在既有 snapshot/export/cleanup 模块覆盖真实 canonical TM。以 Core 10.10a 为前置，重验 ResourcePackage JSONL 与 direct JSONL、Mac/Linux source 和受影响 Windows ordinary frozen 出口；RPY 6.2/6.3 仍依赖实际交付。沿用 ADR-020、ADR-033，不新增通用 stage 包装、平台能力、持久格式或同步入口。
 
 ### Destination Binding
 
@@ -693,7 +724,9 @@ Port 不暴露 path、member lookup、manifest parser 或 apply handle。Provide
 
 - 真实 active canonical store -> `export_jsonl()` -> exact direct/package payload；
 - generation/revision/receipt digest/count 闭合，skipped/error 阻断 package；
-- import/rebuild 只经 owner transaction，prior generation 保留/恢复；
+- import/rebuild 只经同一 owner transaction；支持环境中的正常失败验证 prior generation 保留/恢复，位置或身份失效则验证可确认事实与 recovery-required 分类；
+- Mac/Linux source 从实际 Application→ResourcePort→TM owner 完成 create/replace→query/append→export→独立进程 cold reopen，覆盖托管及已登记的 source/default 资源路径，不静默迁移资源；
+- 配置 JSONL／manifest 内容分歧与位置失效分别验证，前者在 canonical 有效时保留原 Lookup/Update；
 - JSONL 记录字段与 context/provenance 字节由 owner round-trip 验收，package 测试不重写 grammar。
 
 ### Termbase Profile
@@ -709,7 +742,10 @@ Port 不暴露 path、member lookup、manifest parser 或 apply handle。Provide
 - first export LKG None，existing target exact restore，unknown target 不删除；
 - terminal cleanup 中断的 fresh recovery idempotence；
 - create-new registry publication 与 resource publication 故障矩阵；
-- replace-selected 的 source/destination/resource graph/generation stale 零 mutation。
+- replace-selected 的 source/destination/resource graph/generation stale 在首次 mutation 前零修改；
+- 原 parent rename＋同字节 clone 后继续真实 builder，及首次 mutation、reconnect、应用 publication、终态前的持续可观察失效，检查原/新目录实际文件、callback、registry、receipt 与再次请求，不用立即抛异常代替 continuation；
+- 活事务内的外部目录替换独立列为边界实验，记录原/新主库、journal、commit/rollback/close 的实际结果；验证检测后停止与不虚假成功，不以全时序零副作用作为正常产品完成门；
+- 包 grammar、路径穿越、symlink/hardlink/special file、摘要/计数/profile、preview stale 与 foreign artifact 拒绝保留；source package 在正常 create/replace 与失败后保持不变，receipt 不超出实际已证明事实。
 
 ### Controller / Qt / Architecture
 
@@ -736,6 +772,8 @@ Port 不暴露 path、member lookup、manifest parser 或 apply handle。Provide
 | 10 Controller/Qt | commands/workers/dialog | QtTest user journeys |
 | 11 Sync/TMX boundary | transfer metadata port/guards | negative capability/import tests |
 | 12 Completion | cumulative suites/evidence | current-source acceptance + review |
+| 7.7, 8.3, 8.4, 8.6, 8.7, 9.4, 9.6 | 同一 Core 家族会话、ResourcePort apply/callback、registry/receipt/final | 首次 mutation stale、在途失效、真实 create/replace 与 final cold reopen |
+| 11.1, 11.2, 11.3, 12.3, 12.4, 12.7 | immutable artifact port、owner recovery 与失败分类 | 包输入保护、source package 保留、可证 prior/已提交/不明事实与独立边界实验 |
 
 ## Completion Conditions
 

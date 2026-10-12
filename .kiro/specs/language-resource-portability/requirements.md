@@ -10,6 +10,7 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 
 - **范围内**：TM 直接兼容 JSONL 导出；术语 managed CSV/v1 直接导出；单资源 ResourcePackage manifest/carrier/profile；导出、冷验证、预览、新建/替换导入、apply、receipt、recovery 与冷重开；Controller/Qt 手工入口；供后续 sync 消费的 immutable bytes/metadata port。
 - **范围外**：TMX payload/export/context/provenance/loss semantics；ProjectPackage 及项目身份；live SQLite/sidecar/journal/stage 传输；provider、S3/WebDAV、凭据、加密、remote listing、同步调度/冲突合并；TM Store canonical authority；Fuzzy 资格；TM CONTEXT UI。
+- **POSIX TM 运行与迁移边界**：支持稳定本机资源目录中的正常资源包导入、替换、导出、冷重开、协作并发与崩溃恢复；外部程序在线移动或替换活动 TM 目录不受支持，但已经可观察的位置或身份失效仍须拒绝。配置 JSONL／manifest 的内容分歧与资源位置失效分别处理；canonical 与其位置仍可证明时保留原 `SOURCE_DIVERGED` 能力。完整资源包交换与所有使用者退出后的正常迁移保留，重开仍须通过既有恢复与资源验证。此边界不豁免恶意输入、正常发布错误或恢复缺陷，不改变导出目标与术语资源的保护规则。
 - **相邻期望**：`tmx-context-interchange` 未来可在新的 approved profile-set 版本中增加 TMX payload adapter，但不取得 ResourcePackage container/apply authority；`cross-device-sync-plugin` 未来只传 package bytes+metadata 并调用同一 preview/apply 事务。
 
 ### Scope Lineage
@@ -19,6 +20,8 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 - **Borrowed lesson, not authority**：`multi-document-project-workspace` C2C 的 sealed source、strict ZIP、preview/apply stale binding、candidate/LKG/readback/recovery 经验；不复用其 manifest 或项目身份。
 - **Contract state**：本 R/D/T 已冻结并可实施；本文只描述目标合同，不表示 runtime 已实现。
 - **导出输出收尾修订**：ADR-027 已获批准，修订本规格 6.5 成功完成后的 Windows ResourcePackage 输出文件收尾，依赖 `windows-platform-enablement` 3.7–3.9；只覆盖 `.localcat-resource` 导出，直接 CSV/JSONL、导入、其他持久锁与 POSIX 行为保持不变。
+
+- **POSIX TM 生命周期修订**：本规格修订 7.7、8.6、8.7、12.3、12.4，对应 `tm-storage-retrieval-index` 2.4、2.9–2.12、7.5、7.13–7.18 与 `windows-platform-enablement` 5.6–5.7。区别首次 mutation 前的预览失效与在途资源失效；仅对仍可验证的 prior resource 承诺保留或恢复，成功必须来自配置位置对应的最终资源。package grammar/profile、receipt、TM/Termbase 与同步边界不变。
 
 ### Windows Compatibility Amendment WA-04
 
@@ -121,7 +124,7 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 4. When 用户选择 `create_new` 或明选 `replace_selected` destination 时，the preview shall 绑定 sealed source identity/digest、destination resource id/kind/path identity/current digest，以及 TM generation/revision 或 termbase baseline digest。
 5. The public preview shall 只显示 resource kind/profile、record/legacy/v1/skipped/warning counts、create/replace mode、destination 是否存在与 blocking reasons，不包含记录正文、provenance 值、绝对路径或 raw manifest。
 6. The preview shall 只是一次性 capability，不可串行化为可重放授权 token；cancel 不修改 destination。
-7. If source/destination/resource lifecycle/baseline 在 preview 后变化，the apply shall 以 stable stale code 在首次本地 mutation 前拒绝。
+7. If source、destination、资源生命周期或基线在 preview 后、首次本地 mutation 前发生可观察变化, the apply shall 以 stable stale code 拒绝；If 在途操作随后发现位置或身份失效, the apply shall 停止受影响资源的后续操作并交由其 owner 处理恢复，不重新绑定同路径副本继续原计划。
 
 ### Requirement 8：Import/Apply 完整快照事务
 
@@ -134,8 +137,8 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 3. When `replace_selected` apply 运行时，the Application shall 要求 destination kind 与 package kind 一致，并在首次 mutation 前复证 preview 的 exact local resource/baseline/lifecycle facts。
 4. For TM payload，the apply shall 调用 TM owner 的快照 import/rebuild stage/seal/activation/rollback/recovery 面，不直接复制或打开 live SQLite。
 5. For termbase payload，the apply shall 调用 `TermbaseStore` 公开 snapshot validate/prepare-replace/commit/recovery 面，不经 Parser 两列 merge 丢失 v1 事实。
-6. If profile validation、stage、publication、registry switch、runtime reload 或 cold reopen 任一步失败，the apply shall 保留或恢复 prior resource/registry/runtime；无法证明时返回 recovery-required 而不报成功。
-7. When apply 成功时，the service shall 从 final local resource 经对应业务 owner 冷重开，核对 payload semantic digest、record/profile counts 与新 local authority 状态。
+6. If profile validation、stage、publication、registry switch、runtime reload 或 cold reopen 任一步失败且 prior resource 仍可验证, the apply shall 保留或恢复 prior resource、registry 与 runtime；If 资源位置、身份或发布结果无法证明, the apply shall 返回 recovery-required、保留可确认的恢复事实且不报成功，不覆盖或删除未知资产。
+7. When apply 成功时, the service shall 从配置位置所对应的 final local resource 经业务 owner 冷重开，核对 payload semantic digest、record/profile counts、新 local authority 与 registry 可见性；未能证明这些事实 shall 不签发成功结果。
 8. The source ResourcePackage shall 保持不变；apply 不将本地 generation、journal、sidecar 或 stage 回写进 package。
 
 ### Requirement 9：Structured Report、Receipt 与 Cold Reopen
@@ -185,8 +188,8 @@ LocalCAT 已有 canonical TM 的安全 JSONL 兼容导出，也有能完整读�
 
 1. The implementation shall 保持现有 TMX import、TM Exact/Context/Fuzzy availability、JSONL migration/refresh/export/recovery、术语 CSV/XLSX 列选择 merge、legacy matching、v1 CRUD 和资源 hot reload。
 2. The acceptance shall 使用至少一个真实 active canonical TM 和一个同时含 legacy/v1 行的真实术语表，分别完成 direct export 与 package export→cold validate→preview→create/replace apply→cold reopen。
-3. The fault matrix shall 覆盖 source/destination parent replacement、hardlink/symlink/special file、manifest/member/CRC/digest/count/profile 篡改、preview 后 source/destination 变化、stage/fsync/replace/readback/receipt-ledger/cleanup/recovery 故障。
-4. When 验收失败路径时，the tests shall 证明旧导出文件、prior TM generation/store、prior termbase bytes、registry/runtime 与 source package 的各自保留事实。
+3. The fault matrix shall 覆盖操作边界前已可观察的 source/destination parent replacement、应用发布期间的命名失效、hardlink/symlink/special file、manifest/member/CRC/digest/count/profile 篡改、preview 后 source/destination 变化及 stage/fsync/replace/readback/receipt-ledger/cleanup/recovery 故障；活动 TM 事务内部的外部目录替换 shall 另列为不受支持的边界实验，记录实际副作用与检测后的停止行为，不将全时序零副作用作为完成条件。
+4. When 验收支持环境中的失败路径时, the tests shall 证明旧导出文件、prior TM generation/store、prior termbase bytes、registry/runtime 与 source package 的各自保留事实；When 检验外部在线替换边界时, the tests shall 分别记录已确认保留、已提交、不可达或结果不明的事实，验证已发现失效后不继续接管或报告未经证明的成功，不推定所有 prior 字节未变。
 5. The architecture guards shall 证明 ResourcePackage 不读 JSONL/CSV record grammar、不读 live SQLite，Qt/Controller 不读 carrier，ProjectPackage/ResourcePackage 没有共同 authority。
 6. The implementation shall 全程本地执行，不向网络发送 package、资源、receipt 或诊断。
 7. If Requirements/Design/Tasks 一致性、定点故障、冷重开、架构边界或 current-source regression 任一未通过，the feature shall 保持 NO-GO，不得供 sync 消费。

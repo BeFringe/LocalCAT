@@ -85,7 +85,7 @@ Cluster 0 治理/characterization
   - _Requirements: 1.1–1.6, 4.1–4.6, 9.1–9.7_
 
 - [x] 2.2 建立 TM portable snapshot adapter
-  - 以 public `TMMigrationService.export_jsonl()` 作为唯一 producer，将 `ExportReport`/`ExportFailure` 投影为中立 snapshot outcome。
+  - 以 public Core JSONL exporter 作为唯一 producer，将 `ExportReport`/`ExportFailure` 投影为中立 snapshot outcome；direct 入口为 `export_jsonl()`，package 的 prepared 生命周期由 6.3 接入。
   - 成功必须零 skipped/error，destination digest/count/generation/revision/SnapshotReceipt digest 闭合。
   - adapter 不扫描 SQLite、不调用 `_export_jsonl_row`、不重编码 payload。
   - _Requirements: 2.1–2.6, 9.2–9.4, 12.1_
@@ -298,6 +298,39 @@ Cluster 0 治理/characterization
   - 退出条件：本 owner 直接测试、Parser 源码枚举及已删除工具分类检查通过，活动消费者不再要求旧快照；fixture、Gate 与运行时兼容性依据保持不变。
   - _Requirements: 12.4、12.5、12.8_
   - _Boundary: 本 Spec 测试/合同及其静态快照、生成器；跨 owner 仅处理这四项共同的快照消费依赖_
+
+## POSIX TM 资源包事务与失效分类
+
+本组消费共享平台 Task 11.0 的非并行治理闭合前置：治理 owner 提供唯一 ADR-033 治理提交及开发基线继承关系，四个 owning Spec 的范围差异一致后再进入实现。Core 的家族生命周期与 v2 同对象技术门沿下列依赖先闭合；本组不重新建立治理任务或把技术门等同于产品完成。
+
+- [ ] 6. 贯通 POSIX 资源包事务与终态
+
+- [ ] 6.1 集成 POSIX 包 create/replace 与同一资源 owner 的终态
+  - 资源端口消费 Core 提供并由调用方注入的原家族会话，在首次 source 发布前完成家族准入与排空；子阶段及回调只借用外层操作，不通过新建 engine 或路径重绑清除失效。真实 owner 的端口与事务接线属于本任务，runtime 与 port 的实际 composition 由 UI 10.1 消费该接缝完成。
+  - 在 owner 仍有效时闭合 publication、registry callback、既有 runtime callback 接缝、receipt 与 final local resource 冷重开；source package 只作只读输入，不复制 live SQLite 或恢复文件。
+  - 完成时，真实 create/replace 返回的 payload semantic digest、counts、新 local authority 与 registry/receipt 一致；无法证明的发布或重开结果返回 recovery-required，保留可确认恢复事实且不签发成功。
+  - 保留原 immutable artifact 与同一 validate/preview/apply 入口，跨设备交付仍由 RPY 6.2/6.3 闭合。
+  - _Boundary: ResourcePortabilityService 与 TM snapshot port 的 owner 事务集成；Repository/ReceiptLedger 仅限受影响终态接缝_
+  - _Depends: windows-platform-enablement 11.0, tm-storage-retrieval-index 10.6, tm-storage-retrieval-index 10.9, tm-storage-retrieval-index 10.10_
+  - _Requirements: 7.7, 8.3, 8.4, 8.6, 8.7, 9.4, 9.6, 11.1, 11.2, 11.3_
+
+- [ ] 6.2 验证包安全、正常失败与资源漂移分类
+  - 通过注入真实 Core owner 的 ResourcePort 入口验证包 create/replace、callback、receipt 与独立冷重开；支持环境中的故障继续证明 prior resource、registry/runtime callback 与 source package 的各自保留事实。本任务覆盖资源端口集成，实际 runtime/port composition 及完整 Application 消费由 UI 10.1/10.2 闭合。
+  - 保留 closed grammar、路径穿越、链接/special file、摘要/计数/profile、preview stale 与 foreign artifact 拒绝；首次 mutation 前 stale 保持零修改，不能借在线替换边界弱化输入保护。
+  - 在真实 builder 入口 rename 原 parent 并建立同字节 clone 后继续实际代码，另覆盖首次 mutation、reconnect、应用 publication 与终态检查；完成时原/新目录实际内容、callback、registry 与 receipt 证明不接管副本、不报告未经证明的成功。
+  - 在途失效分别记录 prior 可证、已提交和 unknown/recovery-required；活动 TM 事务内部外部目录替换另列边界实验，记录实际副作用与检测后停止，不要求全时序零副作用。
+  - 完成时，导出目标与术语发布原合同保留，R/D/T、故障和 cold reopen 任一不闭合仍阻断 sync 消费。
+  - _Boundary: ResourcePortability 包安全、owner 集成及恢复验证_
+  - _Depends: 6.1, tm-storage-retrieval-index 10.11_
+  - _Requirements: 7.7, 8.6, 8.7, 12.3, 12.4, 12.7_
+
+- [ ] 6.3 闭合 JSONL 包私有 stage 的消费与收尾
+  - TM snapshot port 获取 Core prepared 生命周期，完成 facts 投影及失败释放；Resource 在 candidate 完整校验后释放 JSONL、companion 和目的 lease，再复证来源、进入目标 publication；持 prepared 期间不重入 canonical owner。
+  - 完成时，正常出包及封包前失败不遗留本次正文/companion；清理失败不发布目标，原主异常、旧目标和未知对象保留，已清理与仍保留项不混淆。
+  - 通过真实 canonical TM 验证成功、port/source/candidate 校验故障、清理失败及同资源同输出目录的双操作锁顺序，复核 direct JSONL 与既有 package receipt/recovery 合同；受影响 source/frozen 出口进入后续交付验证。
+  - _Boundary: TM snapshot port 与 ResourcePackage JSONL export 编排；不新增 JSONL producer、平台操作或冷端清扫_
+  - _Depends: 6.2, tm-storage-retrieval-index 10.10a_
+  - _Requirements: 2.2, 2.3, 2.4, 9.7, 12.3, 12.4, 12.7_
 
 ## 明确禁止
 

@@ -1,7 +1,7 @@
 {
   "feature_name": "language-resource-portability",
   "created_at": "2026-08-22T17:48:16+08:00",
-  "updated_at": "2026-10-05T03:11:20Z",
+  "updated_at": "2026-10-16",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -19,5 +19,5 @@
     }
   },
   "ready_for_implementation": true,
-  "approval_scope": "用户明确批准 reassessment@3e41130 中本 Spec 普通 frozen Requirements 来源、Design 适用范围与 Tasks 依赖/验收修订，按已列明 owner 依赖实施。未修改的业务合同及 8890813 以前已完成 source/实现成果保留原审批和证据范围；本批准不重签验收，不预填候选或正式 Gate PASS。 静态源码快照维护：以当前 owner 架构与行为断言替代机械 SHA/数量/跨 JSON 摘要链，移除本 owner 快照和生成器；真实历史报告、fixture、Gate roots 与运行时兼容性依据不变。"
+  "approval_scope": "用户明确批准 reassessment@3e41130 中本 Spec 普通 frozen Requirements 来源、Design 适用范围与 Tasks 依赖/验收修订，按已列明 owner 依赖实施。未修改的业务合同及 8890813 以前已完成 source/实现成果保留原审批和证据范围；本批准不重签验收，不预填候选或正式 Gate PASS。 静态源码快照维护：以当前 owner 架构与行为断言替代机械 SHA/数量/跨 JSON 摘要链，移除本 owner 快照和生成器；真实历史报告、fixture、Gate roots 与运行时兼容性依据不变。 2026-10-12 用户明确批准 ADR-033 及本轮 POSIX TM 最小修订中本 Spec 的 Requirements、Design 与 Tasks 差异。范围为 R7.7、8.6、8.7、12.3、12.4，同一 Core 资源家族会话下的 POSIX create/replace、callback/registry/receipt/final 冷重开与失败事实分类，以及 Task 6.1/6.2 和其 Core 10.6/10.9/10.10/10.11 依赖。恶意输入、导出目标与术语发布原保护、package/profile/receipt 格式及 Sync/RPY 原交付出口保留；新增任务未完成，本批准不签发实现、技术门或产品验收 PASS。 2026-10-16 用户批准私有 JSONL stage 的 D/T 修补：Core 10.10a 提供同一 exporter 的原目的绑定 prepare/discard；Resource 6.3 在 stage 释放后复证来源并发布包。沿用 ADR-020、ADR-033；不改变直接导出、持久格式或平台接口，不表示实施或交付验收完成。"
 }
