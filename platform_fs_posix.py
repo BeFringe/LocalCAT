@@ -47,6 +47,8 @@ from platform_fs_contracts import (
     PendingPublication,
     PlatformFileError,
     PlatformFileErrorCode,
+    PosixBoundContentFacts,
+    PosixBoundContentObservation,
     PrivateAccessEvidence,
     PrivateStorageProof,
     ProcessFileLock,
@@ -427,6 +429,7 @@ _DIRECTORY_AUTHORITY_SLOTS = (
     "_directory_names",
     "_directory_identities",
     "_fault_injector",
+    "_issuer",
 )
 
 
@@ -438,6 +441,8 @@ class _DirectoryAuthorityMixin:
         directory_fds: tuple[int, ...],
         directory_names: tuple[str | None, ...],
         fault_injector: _FaultInjector | None,
+        *,
+        issuer: object | None = None,
     ) -> None:
         try:
             super().__init__()
@@ -453,6 +458,9 @@ class _DirectoryAuthorityMixin:
         self._directory_names = directory_names
         self._directory_identities = identities
         self._fault_injector = fault_injector
+        # None keeps legacy/foreign-derived authorities ineligible for the
+        # optional observation port without changing their existing behavior.
+        self._issuer = issuer
 
     @property
     def _directory_fd(self) -> int:
@@ -806,6 +814,7 @@ class _DirectoryAuthorityMixin:
                 transferred_descriptor,
                 destination,
                 self._fault_injector,
+                issuer=self._issuer,
             )
             _hit_fault(self._fault_injector, "published_after_open")
             facts = authority._publish_facts(preliminary_facts.mode)
@@ -949,6 +958,7 @@ class _PosixBoundRegularFile(BoundRegularFile):
         "_entry_name",
         "_bound_identity",
         "_fault_injector",
+        "_issuer",
     )
 
     def __init__(
@@ -958,6 +968,8 @@ class _PosixBoundRegularFile(BoundRegularFile):
         descriptor: int,
         entry_name: str,
         fault_injector: _FaultInjector | None,
+        *,
+        issuer: object | None = None,
     ) -> None:
         super().__init__()
         self._directory_fds = directory_fds
@@ -985,6 +997,7 @@ class _PosixBoundRegularFile(BoundRegularFile):
         self._entry_name = entry_name
         self._bound_identity = identity
         self._fault_injector = fault_injector
+        self._issuer = issuer
 
     def _reprove(self) -> os.stat_result:
         try:
@@ -1374,6 +1387,8 @@ class _PosixBoundSynchronizedRegularFile(
         descriptor: int,
         entry_name: str,
         fault_injector: _FaultInjector | None,
+        *,
+        issuer: object | None = None,
     ) -> None:
         super().__init__(
             directory_fds,
@@ -1381,6 +1396,7 @@ class _PosixBoundSynchronizedRegularFile(
             descriptor,
             entry_name,
             fault_injector,
+            issuer=issuer,
         )
         if self._bound_identity.link_count != 1:
             self._close_authority()
@@ -2138,6 +2154,7 @@ class _PosixDirectoryStream:
 
 class PosixPlatformAdapter(
     ReadOnlyDirectoryObservation,
+    PosixBoundContentObservation,
     RootedFileSystem,
     MutableFileReservationService,
     OwnedNamespaceRetirement,
@@ -2152,6 +2169,36 @@ class PosixPlatformAdapter(
         if _fault_injector is not None and not callable(_fault_injector):
             raise TypeError("_fault_injector must be callable")
         self._fault_injector = _fault_injector
+        self._issuer = object()
+
+    def _observe_bound_content(self, source: BoundRegularFile) -> PosixBoundContentFacts:
+        if type(source) not in {_PosixBoundRegularFile, _PosixBoundSynchronizedRegularFile}:
+            raise _platform_error(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+            )
+        retained = cast(_PosixBoundRegularFile, source)
+        if retained._issuer is not self._issuer:
+            raise _platform_error(
+                PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+            )
+        try:
+            before = retained._reprove()
+            if before.st_nlink != 1:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            before_snapshot = _snapshot_from_stat(before)
+            _hit_fault(self._fault_injector, "bound_content_before_read")
+            content = _digest_fd_exact(retained._descriptor, before.st_size)
+            _hit_fault(self._fault_injector, "bound_content_after_read")
+            after = retained._reprove()
+            if after.st_nlink != 1 or _snapshot_from_stat(after) != before_snapshot:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            return PosixBoundContentFacts(
+                after.st_dev, after.st_ino, after.st_size, content.content_sha256,
+            )
+        except OSError as error:
+            raise _map_os_error(
+                error, fallback=PlatformFileErrorCode.IDENTITY_STALE, retryable=True,
+            ) from None
 
     def _bind_observation_root(
         self, root: Path, resources: DirectoryHandleBudget,
@@ -2280,6 +2327,7 @@ class PosixPlatformAdapter(
             descriptors.clear()
             return _PosixRootedDirectory(
                 transferred, tuple(names), self._fault_injector,
+                issuer=self._issuer,
             )
         except OSError as error:
             if error.errno == errno.ENOTDIR:
@@ -2328,6 +2376,7 @@ class PosixPlatformAdapter(
                 transferred_descriptor,
                 components[-1],
                 self._fault_injector,
+                issuer=self._issuer if root._issuer is self._issuer else None,
             )
         except PlatformFileError:
             if descriptor is not None:
@@ -2386,6 +2435,7 @@ class PosixPlatformAdapter(
                 transferred_descriptor,
                 components[-1],
                 self._fault_injector,
+                issuer=self._issuer if root._issuer is self._issuer else None,
             )
         except PlatformFileError:
             if descriptor is not None:
@@ -2426,6 +2476,7 @@ class PosixPlatformAdapter(
         return _PosixBoundDirectory(
             _duplicate_directory_chain(parent._directory_fds),
             parent._directory_names, self._fault_injector,
+            issuer=self._issuer if cast(_PosixRootedDirectory | _PosixBoundDirectory, parent)._issuer is self._issuer else None,
         )
 
     def open_export_directory(
@@ -2471,6 +2522,7 @@ class PosixPlatformAdapter(
             retained = child = None
             return _PosixBoundDirectory(
                 descriptors, parent._directory_names + (name,), self._fault_injector,
+                issuer=self._issuer if cast(_PosixRootedDirectory | _PosixBoundDirectory, parent)._issuer is self._issuer else None,
             )
         except Exception as error:
             if created:
@@ -2507,6 +2559,7 @@ class PosixPlatformAdapter(
                 directories,
                 directory_names,
                 self._fault_injector,
+                issuer=self._issuer if root._issuer is self._issuer else None,
             )
         except PlatformFileError:
             raise
@@ -2647,6 +2700,7 @@ class PosixPlatformAdapter(
                 result_fds,
                 result_names,
                 self._fault_injector,
+                issuer=self._issuer if parent._issuer is self._issuer else None,
             )
         except (TypeError, AssertionError, AttributeError):
             raise
@@ -3065,6 +3119,7 @@ class PosixPlatformAdapter(
                 transferred_chain,
                 directory_names,
                 self._fault_injector,
+                issuer=self._issuer if parent._issuer is self._issuer else None,
             )
         except BaseException as error:
             if chain is not None:

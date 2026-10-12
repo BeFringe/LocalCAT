@@ -555,7 +555,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.0_
   - _Requirements: 5.1, 5.3, 5.6, 5.7_
 
-- [ ] 11.2 为旧POSIX内容codec提供已绑定对象观察
+- [x] 11.2 为旧POSIX内容codec提供已绑定对象观察
   - 只接本 adapter 原 root 签发的 live file，在同一 retained file 上复证父链、regular/single-link、内容和 fstat；平台不导入 TM schema，Windows 不提供伪造数值 inode。
   - 完成时，从原live file得到dev/inode/size/digest；foreign拒绝，无rawFD、opaque反解或新持久schema。
   - _Boundary: POSIX adapter/contracts 的可选旧 codec 观察_
@@ -628,6 +628,8 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
 - Task 3.3 已规定完整既有 W1 payload 在活身份、私有安全与内容复证后直接进入 `LockFileEx`；无写入的普通取得不执行 `FlushFileBuffers`，首次创建和 strict-prefix 恢复仍须 write/flush/readback。
 
 ## Implementation Notes
+
+- Task 11.2：Linux 上同长度改写可使前后 inode、size、mtime_ns、ctime_ns 全部相等；时间戳不是内容版本号。已绑定观察返回本次读取流的摘要，不验证 expected content，也不提供任意并发写入下的原子快照。Core 消费时仍须闭合家族排空／SQL 生命周期并比较原预期证明，不能用新捕获值覆盖预期后自证一致。
 
 - Task 9.1：对实际变化的最终路径、内容捕获、W1、输出锁和 SOURCE 窗口补验时，激活用例须复用既有 Windows 长路径清理 helper；不吞清理失败。SOURCE 用例分别证明 Windows 活句柄以 sharing violation 阻断写入、POSIX 在发生变化后终端拒绝，不能用任意 PermissionError 跳过或将两种机制混写。测试修正不改变普通候选或 Core 兼容身份；跨平台和最终候选验收范围继续分别记账。
 

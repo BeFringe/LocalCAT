@@ -184,6 +184,40 @@ class BoundContentFacts(_LiveOnlyValue):
 
 
 @dataclass(frozen=True, slots=True)
+class PosixBoundContentFacts(_LiveOnlyValue):
+    """Live POSIX codec observations, never authority or a persistent proof.
+
+    Numeric identity fields come from the retained file's fstat, not from
+    decoding FileObjectIdentity. The digest covers the complete-length byte
+    stream actually read from that file during this finite capture. It does
+    not validate caller-expected content; the consumer owns that comparison
+    and its codec/schema. These facts are not an atomic file snapshot under
+    concurrent writes: multiple reads can capture a mixed stream, and content
+    can change after the last read but before the facts are returned.
+    """
+
+    device: int
+    inode: int
+    byte_count: int
+    content_sha256: bytes
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("device", self.device),
+            ("inode", self.inode),
+            ("byte_count", self.byte_count),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be exact int")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if type(self.content_sha256) is not bytes:
+            raise TypeError("content_sha256 must be exact bytes")
+        if len(self.content_sha256) != hashlib.sha256().digest_size:
+            raise ValueError("content_sha256 must be an exact SHA-256 digest")
+
+
+@dataclass(frozen=True, slots=True)
 class BoundContentCapture(_LiveOnlyValue):
     """Materialized bytes and facts from one exact live-handle capture."""
 
@@ -2566,6 +2600,33 @@ class ExistingCandidateRecovery(Protocol):
         mutation_guard: BoundExistingFileMutationGuard,
         require_private: bool,
     ) -> CandidateFile: ...
+
+
+@runtime_checkable
+class PosixBoundContentObservation(Protocol):
+    """Optional POSIX-only observation of an already-issued live file.
+
+    The adapter must reject foreign issuers, reprove the original root/name
+    chain and regular/single-link file around same-descriptor content capture.
+    It rejects observed fstat/metadata differences and length/EOF changes.
+    Equal metadata samples do not prove unchanged content throughout the call;
+    this finite capture neither checks caller-expected content nor provides
+    an atomic snapshot or excludes changes between the last read and return.
+    It retains close ownership with the caller and never reopens the file.
+    Windows and PlatformFileBackend do not require numeric inode observations.
+    """
+
+    def observe_bound_content(self, source: BoundRegularFile) -> PosixBoundContentFacts:
+        if not isinstance(source, BoundRegularFile):
+            raise TypeError("source must be BoundRegularFile")
+        source._require_open()
+        facts = self._observe_bound_content(source)
+        if type(facts) is not PosixBoundContentFacts:
+            raise TypeError("backend observation must return PosixBoundContentFacts")
+        return facts
+
+    @abstractmethod
+    def _observe_bound_content(self, source: BoundRegularFile) -> PosixBoundContentFacts: ...
 
 
 @runtime_checkable
