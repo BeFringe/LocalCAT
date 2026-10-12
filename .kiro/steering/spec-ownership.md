@@ -35,6 +35,8 @@ owner 指拥有 Requirement、Design、Task 与业务合同解释权的 Spec，�
 
 `windows-platform-enablement` 的已批准 scope 只覆盖 backend-neutral 文件/锁/发布/private-proof contracts、POSIX/Windows adapters 与 composition、Windows frozen bootstrap/build composition、amendment merge ledger 和 release evidence。Parser/Chunk/Project/Resource/TMX/TM/Feature5/Qt 继续拥有各自业务状态机、错误、receipt、journal/LKG、DTO 与产品交互；Windows 线只能通过 owning branch 已批准 amendment 接入，不能复制或就地改写相邻 Spec。`tmx-context-interchange` 的唯一 owner branch 为 `ui-mvp`。Qt speaker avatar 只进入 Windows 索引/解码/fallback 功能回归，不改变现有资源语义、ignore 规则或打包 ownership。
 
+`maintenance/project-codec-adjacency` 可承载ADR-033对应的Core、共享平台、ResourcePortability与Feature 5 UI amendment；各owner继续独占自己的R/D/T、运行时合同和验证结论，按owner分别形成语义提交。范围限于POSIX TM分派、同资源家族生命周期、配置位置复证、rooted应用发布、资源级失效投影及其实际交付回归；在此精确范围内补充上表可写边界，其他相邻范围保持只读。同步只消费原包事务入口，不开放Core检索、持久格式、全局平台或其他UI重构。
+
 ## 当前规格权威顺序
 
 1. 已批准的 `requirements.md`、`design.md`、`tasks.md` 及 `spec.json` 审批状态；

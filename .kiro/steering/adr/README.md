@@ -20,8 +20,8 @@
 | ADR-004 | 已取代（ADR-015） | Parser 与 Engine 依赖方向 |
 | ADR-005 | 已取代（ADR-015） | Parser 抽象入口 |
 | ADR-006 | 已采纳（部分被 ADR-007 取代） | legacy TM 精确索引策略 |
-| ADR-007 | 已采纳 | SQLite canonical TM 与外部源兼容边界 |
-| ADR-008 | 已采纳 | sealed/active 内容证明发布链 |
+| ADR-007 | 已采纳（可用性前提由 ADR-033 限定） | SQLite canonical TM 与外部源兼容边界 |
+| ADR-008 | 已采纳（POSIX 检查边界由 ADR-033 澄清） | sealed/active 内容证明发布链 |
 | ADR-009 | 已采纳 | 证据门与 fail-closed 能力发布 |
 | ADR-010 | 已采纳 | 有界 fuzzy 候选证明 |
 | ADR-011 | 已采纳 | Feature 5 与 UI 的冻结合同集成 |
@@ -33,7 +33,7 @@
 | ADR-017 | 已采纳 | TM candidate storage port 与 SQLite candidate 数据面责任分离 |
 | ADR-018 | 已采纳 | ProjectPackage 作为多文档工作区持久权威 |
 | ADR-019 | 已采纳 | ProjectPackage v1 确定性单文件 ZIP carrier |
-| ADR-020 | 已采纳（ADR-023/025/026 修订；Windows 导出锁回收由 ADR-027 收窄） | 跨平台 rooted 文件权威、锁与耐久发布边界 |
+| ADR-020 | 已采纳（ADR-023/025/026 修订；Windows 导出锁回收由 ADR-027 收窄；POSIX TM 由 ADR-033 限定） | 跨平台 rooted 文件权威、锁与耐久发布边界 |
 | ADR-021 | 已采纳（security profile由ADR-023修订；provider矩阵由ADR-024收窄） | Windows 设备本地私有证明与跨重启重新证明表示 |
 | ADR-022 | 部分被 ADR-028 取代 | Windows frozen onedir/windowed 发行所有权与可信源码闭包 |
 | ADR-023 | 部分被 ADR-025/027/028 取代 | Windows pre-authority 证明时序细化与安全 profile 修订 |
@@ -46,5 +46,6 @@
 | ADR-030 | 部分被 ADR-032 取代 | 显式目录选择、单文档项目包与中立格式导出 |
 | ADR-031 | 已采纳 | 可选协议适配与手动包同步状态 |
 | ADR-032 | 已采纳 | 分离导出目录准备与文件发布 |
+| ADR-033 | 已采纳 | 稳定本机目录中的 TM 资源事务与外部在线替换边界 |
 
 新记录使用 `.kiro/settings/templates/adr.md`。创建、取代和 Steering 同步遵循 `.kiro/settings/rules/governance.md` 与 `../steering-sync-mechanism.md`。

@@ -69,6 +69,8 @@ Windows 轻量入口固定专用 venv 的绝对 `pythonw.exe`，以 `-I` 启动 
 
 LocalCAT JSON canonical writer 由 codec 只生成确定性 bytes，`parser_source.py` 在 rooted target parent 内执行独占临时文件、file fsync、原子 replace 与 readback receipt；resource/store 与 normalized CLI 继续拥有各自事务。任何入口只有在 verified terminal 后才可提交，整体解析、consumer 或 commit 失败不得改变目标字节。托管资源删除先改名为 tombstone，再提交清单并在失败时回滚；外部资源只取消登记。
 
+TM的通用rooted/lock/publish backend与Windows专用恢复能力分别组合。应用自行执行的资源命名和清理消费原retained root与同资源家族上下文；标准SQLite在经过操作边界复证的稳定命名空间中工作，前后复证不构成其全部内部I/O的目录句柄绑定。保留既有驱动、POSIX v2／Windows v3格式及coordinator；不通过清空backend绕过授权，也不将opaque文件身份解码为持久权威。POSIX TM命名publication与后续SQL的子阶段交接遵循[ADR-033](adr/adr-033.md)，不改变pending自身的内容不变与terminal约束。
+
 ## 开发与测试标准
 
 - 跨层契约使用 `@dataclass(frozen=True)` 和 tuple 集合。
