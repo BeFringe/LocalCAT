@@ -27,6 +27,7 @@ from tm_sqlite_store import (
     SQLiteStoreLifecycleError,
     SQLiteStoreSchemaError,
     SQLiteTMStore,
+    _check_resource_family_path,
 )
 
 
@@ -75,7 +76,13 @@ class TMMatch:
 def _configured_jsonl_path(tm_path: Path) -> Path:
     """Resolve the configured JSONL path used for canonical identity."""
 
-    return tm_path.expanduser().resolve()
+    try:
+        _check_resource_family_path(tm_path)
+        resolved = tm_path.expanduser().resolve()
+        _check_resource_family_path(resolved)
+        return resolved
+    except SQLiteStoreLifecycleError as error:
+        raise ValueError(_CANONICAL_UNHEALTHY_CODE) from error
 
 
 def _canonical_artifact_paths(

@@ -30,6 +30,7 @@ import time
 from typing import Any, NoReturn, Protocol, cast
 import unicodedata
 import uuid
+import weakref
 
 import tm_contracts as contract_module
 import tm_candidate_store_contracts as candidate_contracts
@@ -105,6 +106,9 @@ from platform_fs_contracts import (
     ExistingFileRetirement,
     FileObjectIdentity,
     LedgerEnumerationLimits,
+    LockLease,
+    LockPolicy,
+    LockWait,
     LockedDescendantNamespaceInspection,
     MutableFileReservation,
     OpaqueAuthority,
@@ -3753,6 +3757,320 @@ def _rehydrate_completed_initial_authority_only(
     return report
 
 
+_FAMILY_REGISTRY_LOCK = threading.RLock()
+_FAMILY_SESSIONS: dict[Path, _ResourceFamilySession] = {}
+
+
+def _family_path(path: Path) -> Path:
+    # Do not resolve here: a previously registered spelling must be checked
+    # against its retained root before any alias can point at a new family.
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def _check_resource_family_path(path: Path) -> None:
+    """Check a retained session before engine bootstrap reads a pathname."""
+
+    if sys.platform == "win32":
+        return
+    with _FAMILY_REGISTRY_LOCK:
+        session = _FAMILY_SESSIONS.get(_family_path(path))
+        if session is not None:
+            session.reprove()
+
+
+class _ResourceOperationBorrow:
+    """Live, thread-bound permission; only its outer context owns the lease."""
+
+    __slots__ = ("_family", "_token", "_thread", "_live", "_lease")
+
+    def __init__(self, family: _ResourceFamilySession, lease: LockLease) -> None:
+        self._family = family
+        self._token = object()
+        self._thread = threading.get_ident()
+        self._live = True
+        self._lease = lease
+
+    def __reduce_ex__(self, protocol: object) -> NoReturn:
+        raise TypeError("resource operation borrow is live-only")
+
+    def __copy__(self) -> NoReturn:
+        raise TypeError("resource operation borrow is live-only")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> NoReturn:
+        raise TypeError("resource operation borrow is live-only")
+
+    def reprove(self, coordinator: ResourceStoreCoordinator) -> None:
+        if (
+            not self._live
+            or self._thread != threading.get_ident()
+            or coordinator._family is not self._family
+            or coordinator._family_closed
+            or self._family._operation_tokens.get(self._thread) is not self._token
+        ):
+            raise self._family.error("STORE.OPERATION_BORROW_INVALID")
+        self._family.reprove()
+        try:
+            self._lease.reprove()
+        except (PlatformFileError, OSError) as error:
+            self._family.fail()
+            raise self._family.error("STORE.RESOURCE_IDENTITY_STALE") from error
+
+
+class _ResourceFamilySession:
+    """Original root, shared admission, and resource-local fail-stop latch.
+
+    SQL consumers attach explicitly in 10.2. This owner never lends closing
+    authority and never waits for W1 while holding its admission condition.
+    """
+
+    def __init__(self, identity: CanonicalResourceIdentity) -> None:
+        from platform_fs import compose_platform_file_backend
+
+        self._identity = identity
+        self._condition = threading.Condition()
+        self._state = "READY"
+        self._active_count = 0
+        self._admitted_threads: dict[int, str] = {}
+        self._operation_tokens: dict[int, object] = {}
+        self._owners: set[str] = set()
+        self._lock_name = (
+            f".{identity.canonical_sidecar_path.name}.localcat-initial-activation.lock"
+        )
+        self._payload = (
+            "localcat-initial-activation-lock-v1\0"
+            f"{identity.target_identity}\n"
+        ).encode("ascii")
+        self._backend = compose_platform_file_backend(identity.configured_jsonl_path.parent)
+        self._root = self._backend.bind_root(identity.configured_jsonl_path.parent)
+        self._lock_identity: FileObjectIdentity | None = None
+        try:
+            self.reprove()
+            existing = self._root.inspect_entry(self._lock_name)
+            if existing is not None:
+                self._lock_identity = existing.identity
+        except BaseException:
+            self._root.close()
+            raise
+
+    def error(self, code: str, *, retryable: bool = False) -> SQLiteStoreLifecycleError:
+        return SQLiteStoreLifecycleError(
+            code, resource_id=self._identity.resource_id,
+            generation=0, retryable=retryable,
+        )
+
+    def fail(self) -> None:
+        with self._condition:
+            self._state = "FAILED"
+            self._condition.notify_all()
+
+    def reprove(self) -> None:
+        with self._condition:
+            if self._state in {"FAILED", "CLOSED"}:
+                raise self.error("STORE.RESOURCE_IDENTITY_STALE")
+        try:
+            self._root.reprove_location()
+            if self._lock_identity is not None:
+                current = self._root.inspect_entry(self._lock_name)
+                if current is None or current.identity != self._lock_identity:
+                    self.fail()
+                    raise self.error("STORE.RESOURCE_IDENTITY_STALE")
+        except (PlatformFileError, OSError) as error:
+            self.fail()
+            raise self.error("STORE.RESOURCE_IDENTITY_STALE") from error
+
+    def _check_cancel(self, cancelled: threading.Event | None) -> None:
+        if cancelled is not None and cancelled.is_set():
+            raise self.error("STORE.OPERATION_CANCELLED")
+
+    def _acquire(self, deadline: float, cancelled: threading.Event | None) -> LockLease:
+        while True:
+            self._check_cancel(cancelled)
+            self.reprove()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self.error("STORE.FAMILY_BUSY", retryable=True)
+            try:
+                return self._backend.acquire(
+                    self._root, self._lock_name, self._payload,
+                    LockPolicy(LockWait.TIMEOUT, float(min(remaining, 0.05))),
+                )
+            except PlatformFileError as error:
+                if error.code == "PLATFORM.FS.LOCK_CONTENDED":
+                    continue
+                self.fail()
+                raise self.error("STORE.RESOURCE_IDENTITY_STALE") from error
+
+    @contextmanager
+    def operation(
+        self,
+        coordinator: ResourceStoreCoordinator,
+        *,
+        transition: bool,
+        timeout_seconds: float,
+        cancelled: threading.Event | None,
+    ) -> Iterator[_ResourceOperationBorrow]:
+        deadline = time.monotonic() + _require_timeout(timeout_seconds)
+        thread = threading.get_ident()
+        self._check_cancel(cancelled)
+        with self._condition:
+            if coordinator._owner_nonce not in self._owners:
+                raise self.error("STORE.OPERATION_BORROW_INVALID")
+            if thread in self._admitted_threads:
+                raise self.error("STORE.FAMILY_REENTRY")
+            if self._state in {"FAILED", "CLOSED"}:
+                raise self.error("STORE.RESOURCE_IDENTITY_STALE")
+            if self._state != "READY":
+                raise self.error("STORE.RESOURCE_DRAINING", retryable=True)
+            self._admitted_threads[thread] = coordinator._owner_nonce
+            if transition:
+                self._state = "DRAINING"
+                self._condition.notify_all()
+            else:
+                self._active_count += 1
+        lease: LockLease | None = None
+        borrow: _ResourceOperationBorrow | None = None
+        try:
+            if transition:
+                with self._condition:
+                    while self._active_count:
+                        self._check_cancel(cancelled)
+                        if self._state == "FAILED":
+                            raise self.error("STORE.RESOURCE_IDENTITY_STALE")
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise self.error("STORE.FAMILY_BUSY", retryable=True)
+                        self._condition.wait(min(remaining, 0.05))
+                    if self._state == "FAILED":
+                        raise self.error("STORE.RESOURCE_IDENTITY_STALE")
+                    self._state = "ACTIVATING"
+            lease = self._acquire(deadline, cancelled)
+            self._check_cancel(cancelled)
+            # The lock file is independent from the SQLite DB. Comparing its
+            # opaque live identity neither opens the DB nor decodes platform
+            # identity bytes. A physical alias cannot establish another owner.
+            current = self._root.inspect_entry(self._lock_name)
+            if current is None:
+                self.fail()
+                raise self.error("STORE.RESOURCE_IDENTITY_STALE")
+            with _FAMILY_REGISTRY_LOCK:
+                # Reproof can trigger cyclic GC and a same-thread finalizer
+                # can reenter this RLock to retire an unrelated registry entry.
+                for session in tuple(_FAMILY_SESSIONS.values()):
+                    if session is not self and _live_family_lock_identity(session) == current.identity:
+                        self.fail()
+                        raise self.error("STORE.FAMILY_CONFLICT")
+                if self._lock_identity is not None and self._lock_identity != current.identity:
+                    self.fail()
+                    raise self.error("STORE.RESOURCE_IDENTITY_STALE")
+                self._lock_identity = current.identity
+            borrow = _ResourceOperationBorrow(self, lease)
+            with self._condition:
+                self._operation_tokens[thread] = borrow._token
+            borrow.reprove(coordinator)
+            yield borrow
+        finally:
+            try:
+                try:
+                    if borrow is not None:
+                        borrow.reprove(coordinator)
+                finally:
+                    if borrow is not None:
+                        borrow._live = False
+                    if lease is not None:
+                        try:
+                            lease.close()
+                        except BaseException:
+                            self.fail()
+                            raise
+            finally:
+                with self._condition:
+                    self._operation_tokens.pop(thread, None)
+                    self._admitted_threads.pop(thread)
+                    if transition:
+                        if self._state != "FAILED":
+                            self._state = "READY"
+                    else:
+                        self._active_count -= 1
+                    self._condition.notify_all()
+
+
+def _live_family_lock_identity(session: _ResourceFamilySession) -> FileObjectIdentity | None:
+    """Cross-path comparison needs a current live binding, never a tombstone."""
+    if not session._owners or session._root.closed or session._state == "FAILED":
+        return None
+    try:
+        session.reprove()
+    except SQLiteStoreLifecycleError:
+        return None
+    return session._lock_identity
+
+
+def _join_resource_family(identity: CanonicalResourceIdentity, owner: str) -> _ResourceFamilySession:
+    key = _family_path(identity.configured_jsonl_path)
+    with _FAMILY_REGISTRY_LOCK:
+        session = _FAMILY_SESSIONS.get(key)
+        if session is None:
+            try:
+                session = _ResourceFamilySession(identity)
+            except (PlatformFileError, OSError) as error:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.RESOURCE_IDENTITY_STALE", resource_id=identity.resource_id,
+                    generation=0, retryable=False,
+                ) from error
+            if session._lock_identity is not None and any(
+                _live_family_lock_identity(other) == session._lock_identity
+                # Finalizers may retire entries while each snapshot member is
+                # reproved; _live_family_lock_identity rejects retired members.
+                for other in tuple(_FAMILY_SESSIONS.values())
+            ):
+                session._root.close()
+                raise session.error("STORE.FAMILY_CONFLICT")
+            _FAMILY_SESSIONS[key] = session
+            try:
+                session.reprove()
+            except BaseException:
+                session.fail()
+                session._root.close()
+                raise
+        else:
+            session.reprove()
+        if session._identity != identity:
+            raise session.error("STORE.FAMILY_CONFLICT")
+        session._owners.add(owner)
+        return session
+
+
+def _leave_resource_family(session: _ResourceFamilySession, owner: str) -> None:
+    """Owner release, also used by the non-owning coordinator finalizer."""
+    with _FAMILY_REGISTRY_LOCK:
+        with session._condition:
+            if owner not in session._owners:
+                return
+            if owner in session._admitted_threads.values():
+                raise session.error("STORE.FAMILY_BUSY", retryable=True)
+            session._owners.remove(owner)
+            if session._owners:
+                return
+            failed = session._state == "FAILED"
+            if not failed:
+                try:
+                    session.reprove()
+                except SQLiteStoreLifecycleError:
+                    # Closing is a terminal observation too. Release the FD,
+                    # but do not forget drift first observed during shutdown.
+                    failed = True
+            try:
+                session._root.close()
+            except BaseException:
+                session.fail()
+                raise
+            # A failed session remains a closed tombstone, without live FDs.
+            # Last-owner release must never authorize a same-path clone.
+            if not failed:
+                session._state = "CLOSED"
+                _FAMILY_SESSIONS.pop(_family_path(session._identity.configured_jsonl_path), None)
+
+
 class ResourceStoreCoordinator:
     """Own one resource's leases, sealed registry, and activation authority."""
 
@@ -3872,6 +4190,92 @@ class ResourceStoreCoordinator:
         ) = None
         self._refresh_gate_owner: int | None = None
         self._refresh_gate_depth = 0
+        self._family_closed = False
+        # Independent unpublished stage stores remain builder-owned. They do
+        # not implicitly enter the active resource's admission/W1 protocol.
+        self._family = (
+            _join_resource_family(identity, self._owner_nonce)
+            if sys.platform != "win32" and stage is None
+            else None
+        )
+        self._family_finalizer = (
+            None if self._family is None else weakref.finalize(
+                self, _leave_resource_family, self._family, self._owner_nonce,
+            )
+        )
+
+    def _ensure_family_available(self) -> None:
+        if self._family_closed:
+            raise SQLiteStoreLifecycleError(
+                "STORE.RESOURCE_IDENTITY_STALE", resource_id=self.resource_id,
+                generation=0, retryable=False,
+            )
+        if self._family is not None:
+            self._family.reprove()
+
+    @contextmanager
+    def _family_operation(
+        self,
+        *,
+        borrow: _ResourceOperationBorrow | None = None,
+        timeout_seconds: float | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> Iterator[_ResourceOperationBorrow]:
+        self._ensure_family_available()
+        if self._family is None:
+            raise SQLiteStoreLifecycleError(
+                "STORE.FAMILY_UNAVAILABLE", resource_id=self.resource_id,
+                generation=0, retryable=False,
+            )
+        if borrow is not None:
+            if type(borrow) is not _ResourceOperationBorrow:
+                raise self._family.error("STORE.OPERATION_BORROW_INVALID")
+            borrow.reprove(self)
+            yield borrow
+            borrow.reprove(self)
+            return
+        with self._family.operation(
+            self, transition=False,
+            timeout_seconds=self._drain_timeout_seconds if timeout_seconds is None else timeout_seconds,
+            cancelled=cancelled,
+        ) as issued:
+            yield issued
+
+    @contextmanager
+    def _family_transition(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> Iterator[_ResourceOperationBorrow]:
+        self._ensure_family_available()
+        if self._family is None:
+            raise SQLiteStoreLifecycleError(
+                "STORE.FAMILY_UNAVAILABLE", resource_id=self.resource_id,
+                generation=0, retryable=False,
+            )
+        with self._family.operation(
+            self, transition=True,
+            timeout_seconds=self._drain_timeout_seconds if timeout_seconds is None else timeout_seconds,
+            cancelled=cancelled,
+        ) as issued:
+            yield issued
+
+    def close_family_session(self) -> None:
+        """Release this owner; the last owner alone closes the retained root."""
+        if self._family_closed:
+            return
+        with self._condition:
+            if self._active_lease_count:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.FAMILY_BUSY", resource_id=self.resource_id,
+                    generation=0, retryable=True,
+                )
+            if self._family is not None:
+                _leave_resource_family(self._family, self._owner_nonce)
+            self._family_closed = True
+            if self._family_finalizer is not None:
+                self._family_finalizer.detach()
 
     @property
     def resource_id(self) -> str:
@@ -3959,6 +4363,8 @@ class ResourceStoreCoordinator:
 
     @property
     def state(self) -> str:
+        if self._family is not None and self._family._state == "FAILED":
+            return "FAILED"
         with self._condition:
             return self._state
 
@@ -4028,7 +4434,13 @@ class ResourceStoreCoordinator:
 
     @contextmanager
     def _operation_lease(self) -> Iterator[_SQLiteGenerationView]:
+        self._ensure_family_available()
         with self._condition:
+            if self._family_closed:
+                raise SQLiteStoreLifecycleError(
+                    "STORE.RESOURCE_IDENTITY_STALE", resource_id=self.resource_id,
+                    generation=0, retryable=False,
+                )
             view = self._view
             deferred_owner = self._deferred_runtime_open_owner
             deferred_authorized = (
@@ -4089,6 +4501,7 @@ class ResourceStoreCoordinator:
         cannot deadlock against leases or draining.
         """
 
+        self._ensure_family_available()
         timeout = (
             _REFRESH_RESERVATION_TIMEOUT_SECONDS
             if timeout_seconds is None

@@ -625,7 +625,7 @@
 
 - [ ] 10. 贯通 POSIX 家族生命周期、同对象发布与恢复
 
-- [ ] 10.1 实现家族会话与显式操作借用
+- [x] 10.1 实现家族会话与显式操作借用
   - 普通 operation 先计入 admission、释放 condition 再取 W1；replacement 先停止 admission 并 drain 再取 W1。借用绑定 resource/operation/thread，外层 owner 唯一关闭 root/W1。
   - 完成时，admission/drain/W1顺序无反转，内部借用不重入，资源失效不能被新engine清除，同物理家族冲突统一协调或拒绝。
   - _Boundary: 资源家族 coordinator/engine_
