@@ -577,7 +577,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1, tm-storage-retrieval-index 同对象交接 Design_
   - _Requirements: 5.1, 5.3, 5.6, 5.7_
 
-- [ ] 11.4 补齐POSIX现有mutation guard
+- [x] 11.4 补齐POSIX现有mutation guard
   - guard 与 pending 同时 live 比较对象，DB_REPLACED durable 复证后 pending terminal/close 全部成功才由 Core 进入 SQL；guard 不解释业务 phase，不添加 detach/rearm 或 pending 内容更新。
   - 完成时，与pending同live比较身份；只fstat＋rooted no-follow观察，不额外开关DB FD；SQL期间持续持有，位置失效拒绝，不宣称阻止外部替换。
   - _Boundary: POSIX adapter/contracts 的 ExistingFileMutationGuard_

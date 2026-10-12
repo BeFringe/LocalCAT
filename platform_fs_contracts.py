@@ -2758,13 +2758,21 @@ class ExistingFileMutationGuard(Protocol):
         root._require_open()
         checked_relative = validate_relative_path(relative)
         authority = self._guard_existing_for_mutation(root, checked_relative)
-        if not isinstance(authority, BoundExistingFileMutationGuard):
-            raise TypeError(
-                "backend mutation guard must return BoundExistingFileMutationGuard"
-            )
-        authority._require_open()
-        authority.reprove()
-        return authority
+        try:
+            if not isinstance(authority, BoundExistingFileMutationGuard):
+                raise TypeError(
+                    "backend mutation guard must return BoundExistingFileMutationGuard"
+                )
+            authority._require_open()
+            authority.reprove()
+            return authority
+        except BaseException as error:
+            if isinstance(authority, BoundExistingFileMutationGuard):
+                try:
+                    authority.close()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+            raise
 
     @abstractmethod
     def _guard_existing_for_mutation(

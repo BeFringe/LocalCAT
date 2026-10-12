@@ -1141,6 +1141,75 @@ class _PosixBoundRegularFile(BoundRegularFile):
             _close_fd(descriptor)
 
 
+def _close_mutation_guard_descriptors(descriptors: tuple[int, ...]) -> None:
+    first_error: BaseException | None = None
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    # Never retry a failed POSIX close: the numeric FD may already be reused.
+    if isinstance(first_error, OSError):
+        raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False) from None
+    if first_error is not None:
+        raise first_error
+
+
+class _PosixExistingFileMutationGuard(BoundExistingFileMutationGuard):
+    """Retain an object across pathname-writer activity without reopening it."""
+
+    __slots__ = (
+        "_directory_fds", "_directory_names", "_directory_identities",
+        "_descriptor", "_entry_name", "_bound_identity",
+    )
+
+    def __init__(
+        self,
+        directory_fds: tuple[int, ...],
+        directory_names: tuple[str | None, ...],
+        directory_identities: tuple[FileObjectIdentity, ...],
+        descriptor: int,
+        entry_name: str,
+        identity: FileObjectIdentity,
+    ) -> None:
+        super().__init__(identity)
+        self._directory_fds = directory_fds
+        self._directory_names = directory_names
+        self._directory_identities = directory_identities
+        self._descriptor = descriptor
+        self._entry_name = entry_name
+        self._bound_identity = identity
+
+    def _reprove_guard(self) -> FileObjectIdentity:
+        try:
+            _reprove_directory_chain(
+                self._directory_fds, self._directory_names, self._directory_identities,
+            )
+            retained = _identity_from_stat(os.fstat(self._descriptor))
+            named = _identity_from_stat(os.stat(
+                self._entry_name, dir_fd=self._directory_fds[-1], follow_symlinks=False,
+            ))
+            if not (
+                retained.kind == named.kind == "regular"
+                and retained.link_count == named.link_count == 1
+                and _same_identity(retained, self._bound_identity)
+                and _same_identity(named, self._bound_identity)
+            ):
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            _reprove_directory_chain(
+                self._directory_fds, self._directory_names, self._directory_identities,
+            )
+            return retained
+        except OSError as error:
+            raise _map_os_error(
+                error, fallback=PlatformFileErrorCode.IDENTITY_STALE, retryable=True,
+            ) from None
+
+    def _close_authority(self) -> None:
+        _close_mutation_guard_descriptors((self._descriptor, *reversed(self._directory_fds)))
+
+
 class _PosixMutableFileReservation(MutableFileReservation):
     __slots__ = (
         "_directory_fds",
@@ -2623,11 +2692,56 @@ class PosixPlatformAdapter(
         root: RootedDirectoryAuthority,
         relative: PurePath,
     ) -> BoundExistingFileMutationGuard:
-        del root, relative
-        raise _platform_error(
-            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
-            retryable=False,
-        )
+        if type(root) is not _PosixRootedDirectory or root._issuer is not self._issuer:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        descriptors: list[int] = []
+        descriptor: int | None = None
+        try:
+            root._reprove()
+            for original in root._directory_fds:
+                descriptors.append(os.dup(original))
+                os.set_inheritable(descriptors[-1], False)
+            names = list(root._directory_names)
+            for component in relative.parts[:-1]:
+                descriptors.append(os.open(component, _DIRECTORY_FLAGS, dir_fd=descriptors[-1]))
+                names.append(component)
+            directories = tuple(descriptors)
+            directory_names = tuple(names)
+            identities = _capture_directory_identities(directories)
+            _reprove_directory_chain(directories, directory_names, identities)
+            # O_NONBLOCK prevents a FIFO from hanging before regular-file proof.
+            descriptor = os.open(relative.name, _READ_FLAGS | os.O_NONBLOCK, dir_fd=directories[-1])
+            _hit_fault(self._fault_injector, "mutation_guard_after_open")
+            identity = _identity_from_stat(os.fstat(descriptor))
+            if identity.kind != "regular":
+                raise _platform_error(PlatformFileErrorCode.REPARSE_REJECTED, retryable=False)
+            if identity.link_count != 1:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            guard = _PosixExistingFileMutationGuard(
+                directories, directory_names, identities, descriptor, relative.name, identity,
+            )
+            guard.reprove()
+            _hit_fault(self._fault_injector, "mutation_guard_before_return")
+            return guard
+        except BaseException as error:
+            failure = error
+            if isinstance(error, OSError):
+                if error.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+                    failure = _platform_error(PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+                elif error.errno == errno.ENOTDIR:
+                    failure = _platform_error(PlatformFileErrorCode.REPARSE_REJECTED, retryable=False)
+                else:
+                    failure = _map_os_error(
+                        error, fallback=PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+                    )
+            owned = () if descriptor is None else (descriptor,)
+            try:
+                _close_mutation_guard_descriptors(owned + tuple(reversed(descriptors)))
+            except BaseException as cleanup_error:
+                raise failure from cleanup_error
+            if failure is not error:
+                raise failure from None
+            raise
 
     def duplicate_export_directory(
         self, parent: BoundDirectoryAuthority,
