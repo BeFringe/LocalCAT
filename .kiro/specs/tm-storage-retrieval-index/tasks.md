@@ -684,7 +684,7 @@
   - _Depends: 10.2a, 10.6a_
   - _Requirements: 2.10, 4.7, 7.5, 7.15, 7.16_
 
-- [ ] 10.7 扩展其余runtime连接与失败入口
+- [x] 10.7 扩展其余runtime连接与失败入口
   - 只在家族生命周期门和 v2 同对象门都通过后扩展；canonical 及家族位置可证明的配置 JSONL/manifest 内容分歧继续 Lookup/Update，位置失效则锁存资源停止。
   - 完成时，余下query/append/health/reconnect实际入口继承借用；缺失DB不隐式创建，取消与晚到结果不复活失效；正常SOURCE_DIVERGED能力保留。
   - _Boundary: store/engine runtime 消费_
@@ -730,6 +730,10 @@
 ## Implementation Notes
 
 - Task 10.9／10.10：恢复期间持久 journal 可能已推进，自动回滚须复证原对象与当前记录，不能沿用入口阶段；已完成首次发布的 lineage 不能转成无 prior 的 legacy 终态。隔离资产仍按 stage／canonical receipt 角色核验，搬入隔离目录不改变其内容证明规则。
+
+- Task 10.7／10.8：读取连接也可能先完成 hot-journal 恢复；health 的内容复用基线须建立在这次正常恢复之后。额外 raw 内容观察仍须等全部 SQL 连接与 statement 关闭，再在原 root/W1 内复证，不能把正常恢复造成的字节变化误判为篡改。
+
+- Task 10.7／10.10：通用 rooted reader 支持合法双链接交接，不代表配置 JSONL/manifest 可以省略单链接输入约束。来源内容窗口从真实 open 建立，已观察到的 unsafe 不能被后续安全对象冲掉；打开后的身份、内容与终端观察须闭合，文件内容分歧不能刷新原家族位置授权。
 
 - Task 10.2b／10.9：外层 root/W1 收尾失败会晚于真实发布或恢复完成；结果须连续保留这些可靠事实，不能由内存 generation 推断，也不能因关闭报错抹去已发布状态。cold SEALED 的 SQL 前字节检查与事务内语义闭包检查各有作用，不能用前者代替后者或在活 SQL 中恢复 raw FD 检查。
 

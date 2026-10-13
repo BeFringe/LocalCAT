@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 from typing import cast
@@ -423,7 +424,9 @@ def import_tmx(
 
     try:
         source = _validate_tmx_selection(input_path)
-        target = target_path.expanduser().resolve()
+        target = target_path.expanduser()
+        # POSIX family ownership retains the configured path spelling.
+        target = target.resolve() if sys.platform == "win32" else Path(os.path.abspath(target))
         staged = _stage_parser_resource(
             source,
             purpose=EffectivePurpose.TRANSLATION_MEMORY,

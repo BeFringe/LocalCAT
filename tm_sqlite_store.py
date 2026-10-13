@@ -2221,7 +2221,7 @@ class _CoordinatorStorePort:
             canonical_store_id=canonical_store_id,
             head_revision=head_revision,
             cumulative_record_counts=cumulative_record_counts,
-            **({"caller_borrow": self.posix_activation_borrow} if self.posix_activation_borrow is not None else {}),
+            caller_borrow=self.posix_activation_borrow,
         )
         if any(
             code in {"SOURCE_BINDING.JSONL_UNSAFE", "SOURCE_BINDING.MANIFEST_UNSAFE"}
@@ -4664,10 +4664,27 @@ class ResourceStoreCoordinator:
                     except SQLiteStoreSchemaError:
                         self._family.fail()
                         raise
+                    operation_primary: BaseException | None = None
                     try:
                         yield operation
+                    except BaseException as error:
+                        operation_primary = error
+                        raise
                     finally:
-                        operation.reprove()
+                        try:
+                            operation.reprove()
+                        except SQLiteStoreLifecycleError as terminal_error:
+                            if operation_primary is None or terminal_error is operation_primary:
+                                raise
+                            # Keep the terminal public error and its prior
+                            # reproof facts while exposing this body's cause.
+                            if (terminal_error.__cause__ is not None
+                                    and terminal_error.__cause__ is not operation_primary):
+                                _append_owned_close_facts(
+                                    terminal_error, terminal_error.__cause__,
+                                    context="Runtime terminal reproof cause",
+                                )
+                            raise terminal_error from operation_primary
             else:
                 yield view
         finally:
@@ -11241,6 +11258,9 @@ class SourceBindingMonitor:
                                 cumulative_record_counts=(
                                     facts.cumulative_record_counts
                                 ),
+                                operation_lease=(
+                                    lease if type(lease) is _SQLiteOperationLease else None
+                                ),
                             )
                         )
 
@@ -11307,6 +11327,7 @@ class SourceBindingMonitor:
                         private_binding.receipt.record_count,
                     ),
                 ),
+                operation_lease=lease if type(lease) is _SQLiteOperationLease else None,
             )
             if pair_diagnostics:
                 if any(code.endswith("_MISSING") for code in pair_diagnostics):
@@ -11931,6 +11952,7 @@ def _configured_pair_diagnostics(
     head_revision: int,
     cumulative_record_counts: tuple[tuple[int, int], ...],
     caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
+    operation_lease: _SQLiteOperationLease | None = None,
 ) -> tuple[str, ...]:
     diagnostics: list[str] = []
     try:
@@ -11960,9 +11982,15 @@ def _configured_pair_diagnostics(
     ):
         diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
 
-    jsonl_state, jsonl_digest, _jsonl_identity = _strict_pair_file_state(
+    def pair_state(path: Path) -> tuple[str, str | None, object]:
+        if operation_lease is not None:
+            return _runtime_pair_file_state(operation_lease, path)
+        return _strict_pair_file_state(
+            path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
+        )
+
+    jsonl_state, jsonl_digest, _jsonl_identity = pair_state(
         identity.configured_jsonl_path,
-        **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
     )
     if jsonl_state == "absent":
         diagnostics.append("SOURCE_BINDING.JSONL_MISSING")
@@ -11972,7 +12000,7 @@ def _configured_pair_diagnostics(
         diagnostics.append("SOURCE_BINDING.JSONL_DIGEST_MISMATCH")
 
     manifest_state, manifest_digest, _manifest_identity = (
-        _strict_pair_file_state(identity.snapshot_manifest_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
+        pair_state(identity.snapshot_manifest_path)
     )
     expected_bytes = contract_to_json(binding.manifest).encode("utf-8")
     if manifest_state == "absent":
@@ -17034,7 +17062,10 @@ def _exact_records_body(
             "WHERE source_raw = ? ORDER BY record_id DESC",
             (source_raw,),
         ).fetchall()
-    return tuple(_record_from_row(row) for row in rows)
+    records = tuple(_record_from_row(row) for row in rows)
+    if type(lease) is _SQLiteOperationLease:
+        lease.reprove()
+    return records
 
 
 def _validate_records_by_id_input(
@@ -17076,6 +17107,8 @@ def _records_by_id_body(
         record.record_id: record
         for record in (_record_from_row(row) for row in rows)
     }
+    if type(lease) is _SQLiteOperationLease:
+        lease.reprove()
     return tuple(
         by_id[record_id]
         for record_id in record_ids
@@ -18201,8 +18234,119 @@ def _source_binding_health_state(
     return state, tuple(sorted(set(diagnostics)))
 
 
+def _close_runtime_file(
+    lease: _SQLiteOperationLease, opened: BoundRegularFile,
+    primary: BaseException | None,
+) -> None:
+    """Preserve the exact owned reader when its close needs recovery."""
+    try:
+        opened.close()
+    except BaseException as error:
+        def retry_close() -> BaseException | None:
+            try:
+                opened.close()
+            except BaseException as retry_error:
+                return retry_error
+            return None
+        lease.coordinator._stop_posix_recovery_admission(pending_close=retry_close)
+        if primary is None:
+            raise
+        if isinstance(primary, PlatformFileError):
+            # Platform errors are immutable and cannot carry close notes.
+            mapped = SQLiteStoreSchemaError(primary.code)
+            _append_owned_close_facts(mapped, error, context="Runtime reader close failed")
+            raise mapped from primary
+        _append_owned_close_facts(primary, error, context="Runtime reader close failed")
+
+
+def _posix_runtime_database_capture(
+    lease: _SQLiteOperationLease,
+) -> tuple[ContentFileProof, BoundContentFacts]:
+    """Observe this operation's DB only outside every SQLite connection."""
+    lease.reprove()
+    family = lease.borrow._family
+    if not isinstance(family._backend, PosixBoundContentObservation):
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+    opened = family._backend.open_regular(
+        family._root, PurePath(lease.stage.staged_db_path.name),
+    )
+    primary: BaseException | None = None
+    try:
+        before = opened.snapshot()
+        proof = _capture_posix_bound_content(family._backend, opened)
+        after = opened.snapshot()
+        lease.reprove()
+        if (before != after or after.identity != lease.database_identity
+                or after.byte_count != proof.size):
+            family.fail()
+            raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+        facts = BoundContentFacts(after, bytes.fromhex(proof.sha256))
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        _close_runtime_file(lease, opened, primary)
+    lease.reprove()
+    return proof, facts
+
+
+def _runtime_pair_file_state(
+    lease: _SQLiteOperationLease, path: Path,
+) -> tuple[str, str | None, FileObjectIdentity | None]:
+    """Classify pair content without refreshing the operation's root."""
+    lease.reprove()
+    family = lease.borrow._family
+    identity = lease.stage.resource_identity
+    if path not in {identity.configured_jsonl_path, identity.snapshot_manifest_path}:
+        raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
+    opened: BoundRegularFile | None = None
+    primary: BaseException | None = None
+    result: tuple[str, str | None, FileObjectIdentity | None]
+    try:
+        observed = family._root.inspect_entry(path.name)
+        if observed is None:
+            result = ("absent", None, None)
+        elif (observed.identity.kind != "regular" or observed.identity.link_count != 1
+              or not observed.reparse_free):
+            result = ("unsafe", None, None)
+        else:
+            # A safe replacement before open may start a new content window.
+            opened = family._backend.open_regular(family._root, PurePath(path.name))
+            before = opened.snapshot()
+            if (before.identity.kind != "regular" or before.identity.link_count != 1
+                    or not before.reparse_free):
+                result = ("unsafe", None, None)
+            else:
+                facts = opened.content_facts()
+                after = opened.snapshot()
+                if (before != facts.snapshot or facts.snapshot != after
+                        or after.identity.kind != "regular" or after.identity.link_count != 1
+                        or not after.reparse_free):
+                    result = ("unsafe", None, None)
+                else:
+                    result = ("present", facts.content_sha256.hex(), facts.snapshot.identity)
+    except (PlatformFileError, OSError):
+        # A refused individual file remains ordinary source divergence only
+        # if the canonical DB and original family location still reprove.
+        try:
+            lease.reprove()
+        except BaseException as error:
+            primary = error
+            raise
+        result = ("unsafe", None, None)
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        if opened is not None:
+            _close_runtime_file(lease, opened, primary)
+    lease.reprove()
+    return result
+
+
 def _active_attestation_for_health(
     lease: _SQLiteGenerationView | _SQLiteOperationLease,
+    *, _database_proof: ContentFileProof | None = None,
 ) -> ActiveContentAttestation | PortableActiveContentAttestation | None:
     """Re-prove one immutable active byte set for semantic-health reuse.
 
@@ -18234,17 +18378,10 @@ def _active_attestation_for_health(
     ):
         raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
     try:
-        if type(lease) is _SQLiteOperationLease:
-            lease.reprove()
-            family = lease.borrow._family
-            if not isinstance(family._backend, PosixBoundContentObservation):
-                raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
-            opened = family._backend.open_regular(family._root, PurePath(identity.canonical_sidecar_path.name))
-            try:
-                database = _capture_posix_bound_content(family._backend, opened)
-                lease.reprove()
-            finally:
-                opened.close()
+        if _database_proof is not None:
+            database = _database_proof
+        elif type(lease) is _SQLiteOperationLease:
+            database, _facts = _posix_runtime_database_capture(lease)
         else:
             database = _capture_content_file(identity.canonical_sidecar_path)
     except ContentAttestationError as error:
@@ -18410,7 +18547,16 @@ def _store_health_snapshot(
 ) -> StoreHealth:
     """Build one health snapshot from one already-held canonical lease."""
 
-    active_attestation = _active_attestation_for_health(lease)
+    database_before: BoundContentFacts | None = None
+    reuse_current_index = False
+    if type(lease) is _SQLiteOperationLease:
+        proof, database_before = _posix_runtime_database_capture(lease)
+        active_attestation = _active_attestation_for_health(lease, _database_proof=proof)
+        reuse_current_index = _current_index_validation_matches(
+            coordinator, lease, database_before,
+        )
+    else:
+        active_attestation = _active_attestation_for_health(lease)
     validated_database: BoundContentFacts | None = None
     with _open_health_connection(lease) as connection, ExitStack() as captures:
         connection.execute("BEGIN")
@@ -18433,8 +18579,7 @@ def _store_health_snapshot(
             index_kind = meta["candidate_index_kind"]
             if type(index_kind) is not str or not index_kind.strip():
                 raise SQLiteStoreSchemaError("STORE.META_INCOMPLETE")
-            database_facts: BoundContentFacts | None = None
-            reuse_current_index = False
+            database_facts = database_before
             if type(active_attestation) is PortableActiveContentAttestation:
                 database_facts = captures.enter_context(
                     _portable_health_database_window(lease, coordinator)
@@ -18496,6 +18641,14 @@ def _store_health_snapshot(
         except Exception:
             connection.rollback()
             raise
+    if database_before is not None:
+        assert type(lease) is _SQLiteOperationLease
+        _proof, terminal_database = _posix_runtime_database_capture(lease)
+        if terminal_database != database_before:
+            raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+        # All SQL and raw handles have closed; these exact bytes now bind the
+        # validated (or independently reused) semantics to this operation.
+        validated_database = terminal_database
     state, binding_codes = _source_binding_health_state(facts)
     exact_available = activation_status == "ACTIVE"
     availability_codes = (
@@ -19024,6 +19177,7 @@ def _open_configured_connection(
     expected_file: _ReservedStageFile | None = None,
     require_existing: bool = False,
     _stage_borrow: _StageSQLBorrow | None = None,
+    _runtime_lease: _SQLiteOperationLease | None = None,
     purpose: str = "store",
     _close_connection: Callable[[sqlite3.Connection], None] | None = None,
 ) -> Iterator[sqlite3.Connection]:
@@ -19032,10 +19186,15 @@ def _open_configured_connection(
     _require_absolute_path(database_path, "database_path")
     database, uri = _sqlite_connection_target(
         database_path,
-        require_existing=(expected_file is not None or require_existing or _stage_borrow is not None),
+        require_existing=(expected_file is not None or require_existing
+                          or _stage_borrow is not None or _runtime_lease is not None),
     )
     if _stage_borrow is not None:
         _stage_borrow.enter_sql(database_path, purpose)
+    if _runtime_lease is not None:
+        if database_path != _runtime_lease.stage.staged_db_path:
+            raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
+        _runtime_lease.reprove()
     connection: sqlite3.Connection | None = None
     operation_error: BaseException | None = None
     try:
@@ -19043,6 +19202,8 @@ def _open_configured_connection(
             database, timeout=BUSY_TIMEOUT_MS / 1000,
             isolation_level=None, uri=uri,
         )
+        if _runtime_lease is not None:
+            _runtime_lease.reprove()
         if _stage_borrow is not None:
             _stage_borrow.reprove_sql(database_path, purpose)
         if expected_file is not None:
@@ -19068,6 +19229,8 @@ def _open_configured_connection(
             raise SQLiteStoreSchemaError("STORE.FOREIGN_KEYS_DISABLED")
         if _pragma_int(connection, "busy_timeout") != BUSY_TIMEOUT_MS:
             raise SQLiteStoreSchemaError("STORE.BUSY_TIMEOUT_MISMATCH")
+        if _runtime_lease is not None:
+            _runtime_lease.reprove()
         yield connection
     except BaseException as error:
         operation_error = error
@@ -19100,6 +19263,8 @@ def _open_configured_connection(
         try:
             if _stage_borrow is not None and not deferred_connection:
                 _stage_borrow.exit_sql(database_path, purpose)
+            if _runtime_lease is not None:
+                _runtime_lease.reprove()
         except BaseException as error:
             if closing_error is None:
                 closing_error = error
@@ -19230,6 +19395,7 @@ def _open_leased_connection(
             lease.stage.staged_db_path,
             require_existing=type(lease) is _SQLiteOperationLease,
             _stage_borrow=lease.stage_borrow if isinstance(lease, _SQLiteStageView) else None,
+            _runtime_lease=lease if type(lease) is _SQLiteOperationLease else None,
             purpose=purpose,
         ) as connection:
             if type(lease) is _SQLiteOperationLease:
@@ -19351,7 +19517,11 @@ def _leased_connection_scope(
     if connection is not None:
         if connection.in_transaction:
             raise SQLiteStoreSchemaError("STORE.CANDIDATE_PROOF_INVALID")
+        if type(lease) is _SQLiteOperationLease:
+            lease.reprove()
         yield connection
+        if type(lease) is _SQLiteOperationLease:
+            lease.reprove()
         return
     with _open_leased_connection(lease) as opened:
         yield opened

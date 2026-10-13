@@ -25,6 +25,7 @@ from tm_activation_journal import (
     _parse_activation_lineage_marker_bytes,
     _activation_journal_temp_path,
     _activation_terminal_temp_path,
+    _append_owned_close_facts,
 )
 from tm_contracts import CanonicalResourceIdentity, TMRecordDraft
 from tm_sqlite_store import (
@@ -81,11 +82,13 @@ class TMMatch:
 
 
 def _configured_jsonl_path(tm_path: Path) -> Path:
-    """Resolve the configured JSONL path used for canonical identity."""
+    """Preserve the POSIX configured spelling used by the retained family."""
 
     try:
         _check_resource_family_path(tm_path)
-        resolved = tm_path.expanduser().resolve()
+        resolved = (Path(os.path.abspath(tm_path.expanduser()))
+                    if sys.platform != 'win32'
+                    else tm_path.expanduser().resolve())
         _check_resource_family_path(resolved)
         return resolved
     except SQLiteStoreLifecycleError as error:
@@ -175,6 +178,7 @@ def _journal_activation_facts(
     journal: Path,
     *,
     expected_journal_path: Path,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[str, str]:
     """Bootstrap identity facts from one durable journal/terminal record.
 
@@ -184,12 +188,15 @@ def _journal_activation_facts(
     """
 
     try:
-        journal_identity = _lstat_activation_journal_identity(journal)
+        journal_identity = _lstat_activation_journal_identity(
+            journal, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
+        )
         if journal_identity is None:
             raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
         payload, observed_identity = _read_activation_journal_file(
             journal,
             journal_identity,
+            **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
         )
         if observed_identity != journal_identity:
             raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
@@ -226,15 +233,17 @@ def _activation_facts(configured_jsonl: Path, *, caller_borrow: _CallerHeldPosix
         return None
     if _lstat_any_entry(sidecar, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
         return _sidecar_activation_facts(sidecar, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
-    if _lstat_any_entry(journal):
+    if _lstat_any_entry(journal, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
         return _journal_activation_facts(
             journal,
             expected_journal_path=journal,
+            caller_borrow=caller_borrow,
         )
-    if _lstat_any_entry(terminal):
+    if _lstat_any_entry(terminal, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
         return _journal_activation_facts(
             terminal,
             expected_journal_path=journal,
+            caller_borrow=caller_borrow,
         )
     raise ValueError(_CANONICAL_AMBIGUOUS_CODE)
 
@@ -250,7 +259,11 @@ def canonical_authority_facts(
     """
 
     path = _configured_jsonl_path(configured_jsonl)
-    facts = _activation_facts(path)
+    facts = (
+        _posix_maintenance_authority_facts(path)
+        if sys.platform != "win32"
+        else _activation_facts(path)
+    )
     if facts is None:
         return None
     resource_id, canonical_store_id = facts
@@ -262,6 +275,59 @@ def canonical_authority_facts(
     ):
         raise ValueError(_CANONICAL_AMBIGUOUS_CODE)
     return resource_id, canonical_store_id
+
+
+def _posix_maintenance_authority_facts(path: Path) -> tuple[str, str] | None:
+    """Read maintenance hints under family W1 without hydrating authority."""
+    identity = _known_resource_family_identity(path)
+    retained = None
+    coordinator = None
+    primary: BaseException | None = None
+    try:
+        if identity is None:
+            from platform_fs import compose_platform_file_backend
+            backend = compose_platform_file_backend(path.parent)
+            root = backend.bind_root(path.parent)
+            retained = (backend, root)
+            resource_id = _posix_cold_resource_locator(path, backend, root)
+            if resource_id is None:
+                return None
+            identity = CanonicalResourceIdentity.from_configured_jsonl(resource_id, path)
+        coordinator = ResourceStoreCoordinator(
+            resource_identity=identity, canonical_store_id="maintenance.bootstrap",
+            _family_root=retained,
+        )
+        if retained is not None and coordinator._family is not None and coordinator._family._root is retained[1]:
+            retained = None
+        with coordinator._family_transition(recovery=True) as borrow:
+            with coordinator._posix_recovery_port(borrow=borrow) as port:
+                return _activation_facts(path, caller_borrow=port.posix_activation_borrow)
+    except (SQLiteStoreSchemaError, SQLiteStoreLifecycleError,
+            sqlite3.DatabaseError, OSError, PlatformFileError) as error:
+        primary = ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+        raise primary from error
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_error = None
+        if coordinator is not None:
+            try:
+                coordinator.close_family_session()
+            except BaseException as error:
+                close_error = error
+        if retained is not None:
+            try:
+                retained[1].close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+                else:
+                    _append_owned_close_facts(close_error, error, context="Maintenance retained root close failed")
+        if close_error is not None:
+            if primary is None:
+                raise close_error
+            _append_owned_close_facts(primary, close_error, context="Maintenance authority close failed")
 
 
 def _rehydrate_canonical_runtime_authority(
@@ -301,15 +367,25 @@ def _posix_cold_resource_locator(path: Path, backend: Any, root: Any) -> str | N
         if root.inspect_entry(candidate.name) is None:
             continue
         opened = backend.open_regular(root, PurePath(candidate.name))
+        primary: BaseException | None = None
         try:
             payload = b"".join(opened.iter_exact_chunks(opened.snapshot()))
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            primary = sys.exception()
             try:
                 opened.close()
-            except BaseException:
+            except BaseException as error:
                 if primary is None:
                     raise
+                if isinstance(primary, PlatformFileError):
+                    # Platform errors cannot carry notes. Keep the exact
+                    # cause and code under the callers' existing mapping.
+                    mapped = SQLiteStoreSchemaError(primary.code)
+                    _append_owned_close_facts(mapped, error, context="Cold locator reader close failed")
+                    raise mapped from primary
+                _append_owned_close_facts(primary, error, context="Cold locator reader close failed")
         root.reprove_location()
         if candidate == marker:
             resource_id = json.loads(payload).get("resource_id")
@@ -333,6 +409,10 @@ def open_canonical_tm_store(
 ) -> SQLiteTMStore | None:
     """Reserve the original family before the first cold database pathname read."""
     path = _configured_jsonl_path(configured_jsonl)
+    if expected_resource_id is not None and type(expected_resource_id) is not str:
+        raise TypeError("expected_resource_id must be a built-in string or None")
+    if type(expected_resource_id) is str and not expected_resource_id.strip():
+        raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
     if sys.platform == "win32":
         return _open_canonical_tm_store_reserved(path, expected_resource_id=expected_resource_id,
             drain_timeout_seconds=drain_timeout_seconds)
@@ -341,6 +421,9 @@ def open_canonical_tm_store(
     coordinator = None
     store = None
     try:
+        if (identity is not None and expected_resource_id is not None
+                and identity.resource_id != expected_resource_id):
+            raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
         if identity is None:
             if expected_resource_id is None:
                 from platform_fs import compose_platform_file_backend
@@ -413,10 +496,6 @@ def _open_canonical_tm_store_reserved(
     """
 
     path = _configured_jsonl_path(configured_jsonl)
-    if expected_resource_id is not None and type(expected_resource_id) is not str:
-        raise TypeError("expected_resource_id must be a built-in string or None")
-    if type(expected_resource_id) is str and not expected_resource_id.strip():
-        raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
 
     if sys.platform == "win32":
         sidecar, manifest, journal, terminal, marker = _canonical_artifact_paths(path)
