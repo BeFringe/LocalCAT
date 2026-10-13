@@ -423,6 +423,7 @@ class _SourceFunctionDefaults:
 class _DataclassFieldShape:
     name: str
     has_default: bool
+    default_value: object
     init: bool
     repr: bool
     compare: bool
@@ -441,6 +442,8 @@ class _GeneratedCallableShape:
 @dataclass(frozen=True, slots=True)
 class _DataclassSourceShape:
     qualname: str
+    base_module_name: str | None
+    base_qualname: str | None
     init: bool
     repr: bool
     eq: bool
@@ -532,7 +535,10 @@ def _dataclass_decorator_options(
     }
 
 
-def _dataclass_field_shape(node: ast.AnnAssign) -> _DataclassFieldShape:
+def _dataclass_field_shape(
+    node: ast.AnnAssign,
+    named_defaults: dict[str, object],
+) -> _DataclassFieldShape:
     if not isinstance(node.target, ast.Name):
         raise RuntimeError("dataclass field name must be static")
     options = {
@@ -542,7 +548,7 @@ def _dataclass_field_shape(node: ast.AnnAssign) -> _DataclassFieldShape:
         "kw_only": False,
     }
     hash_value: bool | None = None
-    has_default = node.value is not None
+    default_node = node.value
     if (
         isinstance(node.value, ast.Call)
         and isinstance(node.value.func, ast.Name)
@@ -568,13 +574,19 @@ def _dataclass_field_shape(node: ast.AnnAssign) -> _DataclassFieldShape:
                     "dataclass field hash must be bool or None"
                 )
             hash_value = cast(bool | None, raw_hash)
-        has_default = any(
-            keyword.arg in {"default", "default_factory"}
-            for keyword in node.value.keywords
+        if any(keyword.arg == "default_factory" for keyword in node.value.keywords):
+            raise RuntimeError("dataclass default factory is unsupported")
+        default_node = next(
+            (keyword.value for keyword in node.value.keywords if keyword.arg == "default"),
+            None,
         )
     return _DataclassFieldShape(
         name=node.target.id,
-        has_default=has_default,
+        has_default=default_node is not None,
+        default_value=(
+            MISSING if default_node is None
+            else _source_default_value(default_node, named_defaults)
+        ),
         init=options["init"],
         repr=options["repr"],
         compare=options["compare"],
@@ -587,17 +599,27 @@ def _dataclass_source_shape(
     node: ast.ClassDef,
     qualname: str,
     options: dict[str, bool],
+    *,
+    base_shape: _DataclassSourceShape | None = None,
+    base_module_name: str | None = None,
+    named_defaults: dict[str, object] | None = None,
 ) -> _DataclassSourceShape:
-    field_shapes = tuple(
-        _dataclass_field_shape(item)
+    own_field_shapes = tuple(
+        _dataclass_field_shape(item, {} if named_defaults is None else named_defaults)
         for item in node.body
         if isinstance(item, ast.AnnAssign)
     )
+    inherited_fields = {
+        field.name: field
+        for field in (() if base_shape is None else base_shape.fields)
+    }
+    inherited_fields.update((field.name, field) for field in own_field_shapes)
+    field_shapes = tuple(inherited_fields.values())
     prototype_fields: list[tuple[str, type[object], object]] = []
-    for shape in field_shapes:
+    for shape in own_field_shapes:
         if shape.has_default:
             prototype_field = dataclass_field(
-                default=None,
+                default=shape.default_value,
                 init=shape.init,
                 repr=shape.repr,
                 compare=shape.compare,
@@ -635,6 +657,7 @@ def _dataclass_source_shape(
     prototype = make_dataclass(
         node.name,
         prototype_fields,
+        bases=(() if base_shape is None else (base_shape.prototype_class,)),
         namespace=namespace,
         init=options["init"],
         repr=options["repr"],
@@ -701,6 +724,8 @@ def _dataclass_source_shape(
             )
     return _DataclassSourceShape(
         qualname=qualname,
+        base_module_name=base_module_name,
+        base_qualname=None if base_shape is None else base_shape.qualname,
         init=options["init"],
         repr=options["repr"],
         eq=options["eq"],
@@ -739,6 +764,8 @@ def _source_declarations(
     *,
     path: Path,
     named_defaults: dict[str, object],
+    module_name: str = "",
+    resolve_imported_base: Callable[[str, str], _DataclassSourceShape] | None = None,
 ) -> tuple[
     ast.Module,
     tuple[str, ...],
@@ -830,11 +857,36 @@ def _source_declarations(
                 classes.append(qualname)
                 dataclass_options = _dataclass_decorator_options(node)
                 if dataclass_options is not None:
+                    base_shape = None
+                    base_module_name = None
+                    if node.bases:
+                        if len(node.bases) != 1 or not isinstance(node.bases[0], ast.Name):
+                            raise RuntimeError("dataclass requires one static source base")
+                        base_name = node.bases[0].id
+                        local_name = f"{prefix}.{base_name}" if prefix else base_name
+                        base_shape = next(
+                            (shape for shape in dataclass_shapes if shape.qualname == local_name),
+                            None,
+                        )
+                        base_module_name = module_name
+                        if base_shape is None:
+                            imported = tuple(
+                                (origin, exported)
+                                for local, origin, exported in core_imports
+                                if local == base_name and exported
+                            )
+                            if len(imported) != 1 or resolve_imported_base is None:
+                                raise RuntimeError("dataclass base has no bound source")
+                            base_module_name, exported = imported[0]
+                            base_shape = resolve_imported_base(base_module_name, exported)
                     dataclass_shapes.append(
                         _dataclass_source_shape(
                             node,
                             qualname,
                             dataclass_options,
+                            base_shape=base_shape,
+                            base_module_name=base_module_name,
+                            named_defaults=resolved_defaults,
                         )
                     )
                 visit_body(node.body, qualname)
@@ -905,12 +957,14 @@ class _ModuleSourceCodeAnchor:
         path: Path,
         source_authority: RootedSourceAuthority | _FrozenCapabilitySource | _OrdinaryCapabilityInputs,
         named_defaults: dict[str, object] | None = None,
+        base_anchors: tuple[_ModuleSourceCodeAnchor, ...] = (),
     ) -> _ModuleSourceCodeAnchor:
         source = _TrackedFileAnchor.capture(path, source_authority)
         return cls.capture_from_tracked(
             module_name=module_name,
             source=source,
             named_defaults=named_defaults,
+            base_anchors=base_anchors,
         )
 
     @classmethod
@@ -920,6 +974,7 @@ class _ModuleSourceCodeAnchor:
         module_name: str,
         source: _TrackedFileAnchor,
         named_defaults: dict[str, object] | None = None,
+        base_anchors: tuple[_ModuleSourceCodeAnchor, ...] = (),
     ) -> _ModuleSourceCodeAnchor:
         """Compile declarations from bytes already pinned by source authority."""
 
@@ -927,6 +982,17 @@ class _ModuleSourceCodeAnchor:
             raise TypeError("module source anchor requires a module name")
         if type(source) is not _TrackedFileAnchor:
             raise TypeError("module source anchor requires tracked source")
+        bound_bases = {anchor.module_name: anchor for anchor in base_anchors}
+
+        def resolve_imported_base(origin: str, qualname: str) -> _DataclassSourceShape:
+            anchor = bound_bases.get(origin)
+            if anchor is None or not anchor.source.is_current():
+                raise RuntimeError("dataclass base has no bound source")
+            shape = anchor.dataclass_shape(qualname)
+            if shape is None:
+                raise RuntimeError("dataclass base is not a source dataclass")
+            return shape
+
         tree, functions, classes, defaults, core_imports, dataclass_shapes = (
             _source_declarations(
                 source.content,
@@ -934,6 +1000,8 @@ class _ModuleSourceCodeAnchor:
                 named_defaults=(
                     {} if named_defaults is None else named_defaults
                 ),
+                module_name=module_name,
+                resolve_imported_base=resolve_imported_base,
             )
         )
         return cls(
@@ -1036,7 +1104,11 @@ class _PendingModuleSourceCodeAnchor:
             named_defaults=frozen_defaults,
         )
 
-    def materialize(self) -> _ModuleSourceCodeAnchor:
+    def materialize(
+        self,
+        *,
+        base_anchors: tuple[_ModuleSourceCodeAnchor, ...] = (),
+    ) -> _ModuleSourceCodeAnchor:
         if not self.source.is_current():
             raise RuntimeError("tracked module source changed before compilation")
         try:
@@ -1044,6 +1116,7 @@ class _PendingModuleSourceCodeAnchor:
                 module_name=self.module_name,
                 source=self.source,
                 named_defaults=dict(self.named_defaults),
+                base_anchors=base_anchors,
             )
         except (SyntaxError, TypeError, ValueError) as error:
             raise RuntimeError(
@@ -1287,7 +1360,6 @@ def _generated_callable_matches(
     *,
     prototype_class: type[object],
     runtime_class: type[object],
-    compare_defaults: bool,
 ) -> bool:
     closure_values = (
         None
@@ -1305,25 +1377,23 @@ def _generated_callable_matches(
             prototype_class=prototype_class,
             runtime_class=runtime_class,
         )
-    defaults_match = True
-    if compare_defaults:
-        defaults_match = _generated_value_matches(
-            function.__defaults__,
-            expected.positional_defaults,
-            prototype_class=prototype_class,
-            runtime_class=runtime_class,
-        )
-        keyword_defaults = (
-            None
-            if function.__kwdefaults__ is None
-            else tuple(sorted(function.__kwdefaults__.items()))
-        )
-        defaults_match = defaults_match and _generated_value_matches(
-            keyword_defaults,
-            expected.keyword_defaults,
-            prototype_class=prototype_class,
-            runtime_class=runtime_class,
-        )
+    defaults_match = _generated_value_matches(
+        function.__defaults__,
+        expected.positional_defaults,
+        prototype_class=prototype_class,
+        runtime_class=runtime_class,
+    )
+    keyword_defaults = (
+        None
+        if function.__kwdefaults__ is None
+        else tuple(sorted(function.__kwdefaults__.items()))
+    )
+    defaults_match = defaults_match and _generated_value_matches(
+        keyword_defaults,
+        expected.keyword_defaults,
+        prototype_class=prototype_class,
+        runtime_class=runtime_class,
+    )
     return (
         _code_fingerprint(function.__code__) == expected.code
         and defaults_match
@@ -1377,6 +1447,13 @@ def _dataclass_shape_is_current(
             or runtime_field.compare is not expected_field.compare
             or runtime_field.hash is not expected_field.hash_value
             or runtime_field.kw_only is not expected_field.kw_only
+            or runtime_field.default_factory is not MISSING
+            or not _generated_value_matches(
+                runtime_field.default,
+                expected_field.default_value,
+                prototype_class=shape.prototype_class,
+                runtime_class=value,
+            )
         ):
             return False
     for member_name, expected_codes in shape.generated_codes:
@@ -1400,9 +1477,6 @@ def _dataclass_shape_is_current(
                 expected_callable,
                 prototype_class=shape.prototype_class,
                 runtime_class=value,
-                compare_defaults=not any(
-                    field.has_default for field in shape.fields
-                ),
             ):
                 return False
     return True
@@ -1444,6 +1518,14 @@ class _RuntimeClassIdentity:
     def is_current(self, anchor: _ModuleSourceCodeAnchor) -> bool:
         value = self.value
         shape = anchor.dataclass_shape(self.qualname)
+        expected_base = (
+            object
+            if shape is None or shape.base_qualname is None
+            else _resolve_static_object(
+                cast(ModuleType, sys.modules.get(shape.base_module_name or anchor.module_name)),
+                shape.base_qualname,
+            )
+        )
         return (
             _resolve_static_object(
                 cast(ModuleType, sys.modules[anchor.module_name]),
@@ -1466,7 +1548,10 @@ class _RuntimeClassIdentity:
             and all(state.is_current() for state in self.callable_states)
             and (
                 shape is None
-                or _dataclass_shape_is_current(value, shape)
+                or (
+                    value.__bases__ == (expected_base,)
+                    and _dataclass_shape_is_current(value, shape)
+                )
             )
         )
 
@@ -2458,12 +2543,16 @@ class _RealGateCExecution:
                 anchors = self.__module_anchors
                 if binding is None or checkout is None or anchors is None:
                     validation_anchor = self.__validation_module_seed.materialize()
-                    anchors = tuple(
-                        seed.materialize()
-                        if type(seed) is _PendingModuleSourceCodeAnchor
-                        else cast(_ModuleSourceCodeAnchor, seed)
-                        for seed in self.__module_anchor_seeds
-                    )
+                    materialized: list[_ModuleSourceCodeAnchor] = []
+                    for seed in self.__module_anchor_seeds:
+                        # Build inputs retain each source at startup. Static
+                        # dataclass bases must precede their consumers here.
+                        materialized.append(
+                            seed.materialize(base_anchors=tuple(materialized))
+                            if type(seed) is _PendingModuleSourceCodeAnchor
+                            else cast(_ModuleSourceCodeAnchor, seed)
+                        )
+                    anchors = tuple(materialized)
                     core_graphs = tuple(
                         _loaded_module_binding(anchor) for anchor in anchors
                     )

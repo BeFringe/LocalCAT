@@ -39,6 +39,7 @@ from unittest.mock import patch
 
 import tm_activation_journal as journal_module
 import tm_sqlite_store as store_module
+import platform_fs_posix as posix_module
 from tests.test_tm_activation_journal import (
     SOURCE_BYTES,
     _candidate,
@@ -470,45 +471,22 @@ class ActivationCandidateRetirementTests(unittest.TestCase):
                         identity,
                         record,
                     )
-                    real_rename = journal_module._quarantine_candidate_rename
-                    real_fsync = journal_module._fsync_activation_directory
+                    real_fault = posix_module._hit_fault
                     state = {"count": 0, "failed": False}
-
-                    if seam == "rename":
-
-                        def fail_second_rename(source: Path, target: Path) -> None:
-                            state["count"] += 1
-                            if state["count"] == 2:
-                                state["failed"] = True
-                                raise OSError("injected quarantine rename")
-                            real_rename(source, target)
-
-                        injection = (
-                            "tm_activation_journal._quarantine_candidate_rename",
-                            fail_second_rename,
-                        )
-                    else:
-
-                        def fail_first_quarantine_fsync(path: Path) -> None:
-                            if (
-                                not state["failed"]
-                                and Path(path) == quarantine_dir
-                            ):
-                                state["failed"] = True
-                                raise OSError("injected quarantine fsync")
-                            real_fsync(path)
-
-                        injection = (
-                            "tm_activation_journal._fsync_activation_directory",
-                            fail_first_quarantine_fsync,
-                        )
-
+                    selected = ('existing_retirement_before_arm' if seam == 'rename'
+                                else 'existing_retirement_after_arm')
+                    def fail_retirement(injector, window):
+                        if window == selected:
+                            state['count'] += 1
+                            if state['count'] == (2 if seam == 'rename' else 1):
+                                state['failed'] = True
+                                raise OSError('injected quarantine ' + seam)
+                        return real_fault(injector, window)
                     first = _fresh(identity)
-                    with patch(*injection):
-                        with self.assertRaises(
-                            ActivationPreparationError
-                        ) as raised:
+                    with patch.object(posix_module, '_hit_fault', fail_retirement):
+                        with self.assertRaises(ActivationPreparationError) as raised:
                             first.recover_durable_activation()
+                    self.assertTrue(state['failed'])
                     self.assertEqual(
                         raised.exception.code,
                         "ACTIVATION.QUARANTINE_FAILED",
@@ -567,22 +545,24 @@ class ActivationCandidateRetirementTests(unittest.TestCase):
             record = journal._record
             candidate_db = record.candidate_stage_db_path
             journal_path = journal.journal_path
-            real_rename = journal_module._quarantine_candidate_rename
+            real_rename = posix_module._hit_fault
             state = {"count": 0}
 
-            def fail_first_rename(source: Path, target: Path) -> None:
-                state["count"] += 1
-                if state["count"] == 1:
-                    raise OSError("injected quarantine rename")
-                real_rename(source, target)
+            def fail_first_rename(injector, window) -> None:
+                if window == 'existing_retirement_before_arm':
+                    state["count"] += 1
+                    if state["count"] == 1:
+                        raise OSError("injected quarantine rename")
+                real_rename(injector, window)
 
             first = _fresh(identity)
             with patch(
-                "tm_activation_journal._quarantine_candidate_rename",
+                "platform_fs_posix._hit_fault",
                 side_effect=fail_first_rename,
             ):
                 with self.assertRaises(ActivationPreparationError):
                     first.recover_durable_activation()
+            self.assertEqual(state['count'], 1)
             # Terminal is durable and the main journal is retired, so a
             # foreign replacement of the candidate stage path is the
             # crash window for the fail-closed retirement rule.
@@ -946,20 +926,24 @@ class ActivationLineageMarkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity, journal_path = _db_replaced_pending(root)
-            real_write = journal_module._write_activation_journal_bytes
+            from platform_fs_contracts import CandidateFile
+            real_write = CandidateFile.write_all
+            hits = []
 
-            def fail_marker_write(descriptor: int, payload: bytes) -> None:
+            def fail_marker_write(candidate, payload: bytes) -> None:
                 if b'"lineage_version"' in payload:
+                    hits.append(True)
                     raise OSError("injected marker write")
-                real_write(descriptor, payload)
+                real_write(candidate, payload)
 
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._write_activation_journal_bytes",
-                side_effect=fail_marker_write,
+            with patch.object(
+                CandidateFile, "write_all",
+                new=fail_marker_write,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
+            self.assertEqual(hits, [True])
             self.assertEqual(
                 raised.exception.code,
                 "ACTIVATION.LINEAGE_MARKER_INVALID",
@@ -1669,22 +1653,24 @@ class ActivationExternalDeletionTests(unittest.TestCase):
             record = journal._record
             candidate_db = record.candidate_stage_db_path
             journal_path = journal.journal_path
-            real_rename = journal_module._quarantine_candidate_rename
+            real_rename = posix_module._hit_fault
             state = {"count": 0}
 
-            def fail_first_rename(source: Path, target: Path) -> None:
-                state["count"] += 1
-                if state["count"] == 1:
-                    raise OSError("injected quarantine rename")
-                real_rename(source, target)
+            def fail_first_rename(injector, window) -> None:
+                if window == 'existing_retirement_before_arm':
+                    state["count"] += 1
+                    if state["count"] == 1:
+                        raise OSError("injected quarantine rename")
+                real_rename(injector, window)
 
             first = _fresh(identity)
             with patch(
-                "tm_activation_journal._quarantine_candidate_rename",
+                "platform_fs_posix._hit_fault",
                 side_effect=fail_first_rename,
             ):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
+            self.assertEqual(state['count'], 1)
             self.assertEqual(
                 raised.exception.code,
                 "ACTIVATION.QUARANTINE_FAILED",

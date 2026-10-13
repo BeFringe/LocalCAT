@@ -592,12 +592,14 @@ class CapabilityHostGateDTests(unittest.TestCase):
             *,
             path: Path,
             named_defaults: dict[str, object],
+            **kwargs: object,
         ) -> object:
             declaration_modules.append(path.stem)
             return source_declarations(
                 content,
                 path=path,
                 named_defaults=named_defaults,
+                **kwargs,
             )
 
         with patch.object(

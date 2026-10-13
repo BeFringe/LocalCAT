@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import platform_fs_windows
 import tm_migration
+import tm_activation_recovery as activation_recovery
 from tm_contracts import (
     AssetKind,
     AssetPreservationEvidence,
@@ -359,7 +360,7 @@ class InitialActivationRecoveryTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            identity, _coordinator, service = _fixture(Path(temporary))
+            identity, coordinator, service = _fixture(Path(temporary))
             target = (
                 patch.object(
                     platform_fs_windows.WindowsPlatformAdapter,
@@ -367,12 +368,13 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                     side_effect=TypeError("programmer stage freeze type"),
                 )
                 if sys.platform == "win32"
-                else patch(
-                    "tm_migration._ExportParentHandle.bind",
+                else patch.object(
+                    type(coordinator._family._backend),
+                    "reserve_mutable_file",
                     side_effect=TypeError("programmer stage freeze type"),
                 )
             )
-            with target:
+            with target as hit:
                 with self.assertRaisesRegex(
                     TypeError,
                     "programmer stage freeze type",
@@ -381,6 +383,8 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
+
+            hit.assert_called()
 
     def test_cleanup_programmer_type_error_crosses_public_seam(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -392,8 +396,9 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                     side_effect=TypeError("programmer cleanup type"),
                 )
                 if sys.platform == "win32"
-                else patch(
-                    "tm_migration._exclusive_initial_quarantine_move",
+                else patch.object(
+                    type(coordinator._family._backend),
+                    "retire_owned_exclusive",
                     side_effect=TypeError("programmer cleanup type"),
                 )
             )
@@ -403,7 +408,7 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                     "_seal_stage",
                     side_effect=StageSealError("SEALER.STAGE_INVALID"),
                 ),
-                cleanup_target,
+                cleanup_target as hit,
             ):
                 with self.assertRaisesRegex(
                     TypeError,
@@ -413,6 +418,7 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
+            hit.assert_called()
             if sys.platform == "win32":
                 _remove_windows_initial_artifacts(Path(temporary))
 
@@ -431,9 +437,8 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                             side_effect=programmer_error,
                         )
                         if sys.platform == "win32"
-                        else patch.object(
-                            ResourceStoreCoordinator,
-                            "rehydrate_runtime_authority",
+                        else patch(
+                            "tm_migration._require_proven_initial_platform_legacy_state",
                             side_effect=programmer_error,
                         )
                     )
@@ -445,7 +450,7 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                                 "SEALER.STAGE_INVALID"
                             ),
                         ),
-                        rehydrate_target,
+                        rehydrate_target as hit,
                     ):
                         with self.assertRaisesRegex(
                             type(programmer_error),
@@ -455,6 +460,7 @@ class InitialActivationRecoveryTests(unittest.TestCase):
                                 identity.configured_jsonl_path,
                                 identity.resource_id,
                             )
+                    hit.assert_called()
                     if sys.platform == "win32":
                         _remove_windows_initial_artifacts(Path(temporary))
 
@@ -505,8 +511,8 @@ class InitialActivationRecoveryTests(unittest.TestCase):
             identity, coordinator, service = _fixture(Path(temporary))
             real_publish = coordinator.publish_activation
 
-            def publish_then_raise(*args: Any) -> int:
-                real_publish(*args)
+            def publish_then_raise(*args: Any, **kwargs: Any) -> int:
+                real_publish(*args, **kwargs)
                 raise OSError("tail return lost")
 
             with (
@@ -537,11 +543,11 @@ class InitialActivationRecoveryTests(unittest.TestCase):
             def fail_first_verify(**kwargs: Any) -> None:
                 nonlocal verify_calls
                 verify_calls += 1
+                real_verify(**kwargs)
                 if verify_calls == 1:
                     raise MigrationPreflightError(
                         "MIGRATION.INITIAL_RUNTIME_REOPEN_FAILED"
                     )
-                real_verify(**kwargs)
 
             with (
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
@@ -559,7 +565,7 @@ class InitialActivationRecoveryTests(unittest.TestCase):
             self.assertIs(type(outcome), MigrationReport)
             assert isinstance(outcome, MigrationReport)
             self.assertEqual(outcome.activated_generation, 0)
-            self.assertEqual(verify_calls, 3)
+            self.assertEqual(verify_calls, 2)
             self.assertEqual(coordinator.current_generation, 0)
 
     def test_published_tail_recovers_same_generation_without_rebuild(self) -> None:
@@ -568,10 +574,10 @@ class InitialActivationRecoveryTests(unittest.TestCase):
             real_publish = coordinator.publish_activation
             publish_calls = 0
 
-            def publish_then_raise(*args: Any) -> int:
+            def publish_then_raise(*args: Any, **kwargs: Any) -> int:
                 nonlocal publish_calls
                 publish_calls += 1
-                real_publish(*args)
+                real_publish(*args, **kwargs)
                 raise OSError("tail return lost")
 
             with (
@@ -757,27 +763,21 @@ class InitialActivationRecoveryTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             identity, coordinator, service = _fixture(Path(temporary))
-            with (
-                patch("tm_sqlite_store._probe_fts5", return_value=False),
-                patch.object(
-                    coordinator,
-                    "publish_activation",
-                    side_effect=OSError("publication interrupted"),
-                ),
-                patch.object(
-                    coordinator,
-                    "rollback_durable_activation",
-                    side_effect=ActivationPreparationError(
-                        "ACTIVATION.ROLLBACK_RESTORE_FAILED",
-                        retryable=True,
-                    ),
-                ),
-            ):
+            actual_replace = activation_recovery._replace_activation_database
+            hits = []
+            def named_then_failed(*args, **kwargs):
+                actual_replace(*args, **kwargs)
+                self.assertTrue(identity.canonical_sidecar_path.is_file())
+                hits.append(True)
+                raise OSError("sensitive publication payload")
+            with patch.object(activation_recovery, '_replace_activation_database', named_then_failed):
                 interrupted = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
 
+            self.assertEqual(hits, [True])
+            self.assertTrue(coordinator._family._recovery_required)
             self.assertIs(type(interrupted), MigrationFailure)
             assert isinstance(interrupted, MigrationFailure)
             self.assertTrue(interrupted.canonical_authority_ambiguous)

@@ -90,6 +90,7 @@ from tm_content_attestation import (
     PortableContentFileProof,
     PortableSealedContentAttestation,
     _capture_content_file,
+    _capture_posix_bound_content,
     _capture_platform_content_file,
     _create_portable_active_content_attestation,
 )
@@ -101,6 +102,8 @@ from platform_fs_contracts import (
     BoundSynchronizedRegularFile,
     CandidateContentFacts,
     CandidateFile,
+    DirectoryObservationCancellation,
+    DirectoryObservationLimits,
     ExistingCandidateRecovery,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
@@ -110,9 +113,11 @@ from platform_fs_contracts import (
     LockPolicy,
     LockWait,
     LockedDescendantNamespaceInspection,
+    LockedRootDirectoryObservation,
     MutableFileReservation,
     OpaqueAuthority,
     PendingPublication,
+    PosixBoundContentObservation,
     PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
@@ -122,6 +127,9 @@ from platform_fs_contracts import (
 
 
 from tm_activation_journal import (
+    _append_owned_close_facts,
+    _with_owned_close_facts,
+    _CallerHeldPosixActivationBorrow,
     ActivationBackupEvidence,
     ActivationPreparationError,
     ActivationRecoveryReport,
@@ -1768,8 +1776,14 @@ class _CoordinatorStorePort:
     this module means the recovery module never imports ``tm_sqlite_store``.
     """
 
-    def __init__(self, coordinator: ResourceStoreCoordinator) -> None:
+    def __init__(self, coordinator: ResourceStoreCoordinator,
+                 posix_borrow: _CallerHeldPosixActivationBorrow | None = None) -> None:
         self._coordinator = coordinator
+        self.posix_activation_borrow = posix_borrow
+        self.receipt_handoff: Any = None
+        self._posix_recovery_completed = False
+        self.posix_recovery_report: ActivationRecoveryReport | None = None
+        self._posix_live_cancellation_preparation: _ActivationPreparation | None = None
 
     @property
     def resource_identity(self) -> CanonicalResourceIdentity:
@@ -2149,9 +2163,18 @@ class _CoordinatorStorePort:
         *,
         require_existing: bool = False,
     ) -> Any:
+        if self.receipt_handoff is None and self.posix_activation_borrow is not None:
+            return _open_configured_connection(database_path, require_existing=True,
+                _stage_borrow=self.posix_activation_borrow, purpose="activation-validation")
+        if self.receipt_handoff is None:
+            return _open_configured_connection(
+                database_path, require_existing=require_existing,
+            )
         return _open_configured_connection(
-            database_path,
-            require_existing=require_existing,
+            database_path, require_existing=True,
+            _stage_borrow=self.receipt_handoff,
+            purpose="activation-receipt",
+            _close_connection=_close_activation_receipt_connection,
         )
 
     def read_meta(self, connection: sqlite3.Connection) -> dict[str, str]:
@@ -2166,14 +2189,14 @@ class _CoordinatorStorePort:
     def read_source_binding_facts(
         self,
         connection: sqlite3.Connection,
-        lease: _SQLiteGenerationView,
+        lease: _SQLiteGenerationView | _SQLiteOperationLease,
     ) -> Any:
         return _read_source_binding_facts(connection, lease)
 
     def read_source_binding_facts_in_transaction(
         self,
         connection: sqlite3.Connection,
-        lease: _SQLiteGenerationView,
+        lease: _SQLiteGenerationView | _SQLiteOperationLease,
     ) -> Any:
         return _read_source_binding_facts_in_transaction(connection, lease)
 
@@ -2198,6 +2221,7 @@ class _CoordinatorStorePort:
             canonical_store_id=canonical_store_id,
             head_revision=head_revision,
             cumulative_record_counts=cumulative_record_counts,
+            **({"caller_borrow": self.posix_activation_borrow} if self.posix_activation_borrow is not None else {}),
         )
         if any(
             code in {"SOURCE_BINDING.JSONL_UNSAFE", "SOURCE_BINDING.MANIFEST_UNSAFE"}
@@ -2242,6 +2266,7 @@ class _CoordinatorStorePort:
         return inspect_stage_schema(
             stage_ref,
             canonical_store_id=canonical_store_id,
+            **({"_stage_borrow": self.receipt_handoff or self.posix_activation_borrow} if self.receipt_handoff is not None or self.posix_activation_borrow is not None else {}),
             _allow_diverged_runtime=_allow_diverged_runtime,
             _allow_legacy_schema=_allow_legacy_schema,
             _allow_sealed=_allow_sealed,
@@ -2286,13 +2311,14 @@ class _CoordinatorStorePort:
             record,
             journal_path,
             expected_final_identity=expected_final_identity,
+            **({"caller_borrow": self.posix_activation_borrow} if self.posix_activation_borrow is not None else {}),
         )
 
     def write_terminal(
         self,
         record: _ActivationJournalRecord,
     ) -> _ActivationFileIdentity:
-        return self._coordinator._write_activation_terminal_locked(record)
+        return self._coordinator._write_activation_terminal_locked(record, **({"caller_borrow": self.posix_activation_borrow} if self.posix_activation_borrow is not None else {}))
 
     @property
     def stage_seal_error(self) -> type[RuntimeError]:
@@ -2398,6 +2424,7 @@ class _CoordinatorStorePort:
             next_generation=next_generation,
             activation_digest=activation_digest,
             active_content_attestation=active_content_attestation,
+            **({"caller_borrow": self.posix_activation_borrow} if self.posix_activation_borrow is not None else {}),
         )
 
 
@@ -2553,7 +2580,7 @@ def _rehydrate_runtime_authority(
         terminal_path = _activation_terminal_path(identity)
         try:
             journal_identity = _lstat_activation_journal_identity(
-                journal_path
+                journal_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
             )
         except ActivationPreparationError as error:
             raise ActivationPreparationError(
@@ -2563,7 +2590,7 @@ def _rehydrate_runtime_authority(
             ) from error
         try:
             terminal_identity = _lstat_activation_terminal_identity(
-                terminal_path
+                terminal_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
             )
         except ActivationPreparationError as error:
             raise ActivationPreparationError(
@@ -2572,8 +2599,8 @@ def _rehydrate_runtime_authority(
                 reason_code=error.code,
             ) from error
         if (
-            _lstat_any_entry(_activation_journal_temp_path(journal_path))
-            or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+            _lstat_any_entry(_activation_journal_temp_path(journal_path), **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+            or _lstat_any_entry(_activation_terminal_temp_path(terminal_path), **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
             or (journal_identity is not None and terminal_identity is not None)
         ):
             return recover_durable_activation(port)
@@ -3299,8 +3326,8 @@ def _prove_and_hydrate_completed_activation(
             retryable=False,
         )
     if (
-        _lstat_any_entry(record.candidate_stage_db_path)
-        or _lstat_any_entry(record.candidate_manifest_temp_path)
+        _lstat_any_entry(record.candidate_stage_db_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+        or _lstat_any_entry(record.candidate_manifest_temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     ):
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
@@ -3322,7 +3349,7 @@ def _prove_and_hydrate_completed_activation(
         activation_digest=activation_digest,
     )
     try:
-        database = _capture_content_file(identity.canonical_sidecar_path)
+        database = (_capture_content_file(identity.canonical_sidecar_path) if port.posix_activation_borrow is None else port.posix_activation_borrow.capture(identity.canonical_sidecar_path))
     except ContentAttestationError as error:
         code = (
             "ACTIVATION.ACTIVE_ATTESTATION_ASSET_MISSING"
@@ -3605,9 +3632,9 @@ def _rehydrate_completed_activation(
     report, view = _prove_and_hydrate_completed_activation(port, record)
     port.view = view
     identity = port.resource_identity
-    _ensure_activation_lineage_marker(identity)
+    _ensure_activation_lineage_marker(identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     port._activate_candidate_store_id(record.canonical_store_id)
-    _remove_journal_proven_backups(record)
+    _remove_journal_proven_backups(record, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     return report
 
 
@@ -3767,21 +3794,40 @@ def _family_path(path: Path) -> Path:
     return Path(os.path.abspath(path.expanduser()))
 
 
-def _check_resource_family_path(path: Path) -> None:
-    """Check a retained session before engine bootstrap reads a pathname."""
-
+def _known_resource_family_identity(path: Path) -> CanonicalResourceIdentity | None:
+    """Read the original in-process identity before bootstrap touches the DB."""
     if sys.platform == "win32":
-        return
+        return None
     with _FAMILY_REGISTRY_LOCK:
         session = _FAMILY_SESSIONS.get(_family_path(path))
         if session is not None:
             session.reprove()
+            if session._recovery_required and (session._recovery_preparations or session._pending_activation_closes):
+                raise session.error("STORE.RECOVERY_REQUIRED", retryable=True)
+            return session._identity
+    return None
+
+
+def _check_resource_family_path(path: Path) -> None:
+    """Check a retained session before engine bootstrap reads a pathname."""
+    _known_resource_family_identity(path)
+
+
+class _StageSQLBorrow(Protocol):
+    def reprove_sql(self, path: Path, purpose: str) -> None: ...
+    def enter_sql(self, path: Path, purpose: str) -> None: ...
+    def exit_sql(self, path: Path, purpose: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class _SQLiteStageView(_SQLiteGenerationView):
+    stage_borrow: _StageSQLBorrow | None = None
 
 
 class _ResourceOperationBorrow:
     """Live, thread-bound permission; only its outer context owns the lease."""
 
-    __slots__ = ("_family", "_token", "_thread", "_live", "_lease")
+    __slots__ = ("_family", "_token", "_thread", "_live", "_lease", "_recovery_completed")
 
     def __init__(self, family: _ResourceFamilySession, lease: LockLease) -> None:
         self._family = family
@@ -3789,6 +3835,7 @@ class _ResourceOperationBorrow:
         self._thread = threading.get_ident()
         self._live = True
         self._lease = lease
+        self._recovery_completed = False
 
     def __reduce_ex__(self, protocol: object) -> NoReturn:
         raise TypeError("resource operation borrow is live-only")
@@ -3816,19 +3863,79 @@ class _ResourceOperationBorrow:
             raise self._family.error("STORE.RESOURCE_IDENTITY_STALE") from error
 
 
+@dataclass(frozen=True)
+class _SQLiteOperationLease:
+    """One SQL operation's explicit, non-closing borrow of its generation."""
+
+    view: _SQLiteGenerationView
+    coordinator: ResourceStoreCoordinator
+    borrow: _ResourceOperationBorrow
+    database_identity: FileObjectIdentity
+
+    @property
+    def stage(self) -> _StoreRuntimeRef:
+        return self.view.stage
+
+    @property
+    def canonical_store_id(self) -> str:
+        return self.view.canonical_store_id
+
+    @property
+    def generation(self) -> int:
+        return self.view.generation
+
+    @property
+    def fts5_available(self) -> bool:
+        return self.view.fts5_available
+
+    @property
+    def active_content_attestation(self) -> ActiveContentAttestation | PortableActiveContentAttestation | None:
+        return self.view.active_content_attestation
+
+    def reprove(self) -> None:
+        self.borrow.reprove(self.coordinator)
+        family = self.borrow._family
+        try:
+            observed = family._root.inspect_entry(self.stage.staged_db_path.name)
+            if (
+                observed is None
+                or observed.identity != self.database_identity
+                or observed.identity.kind != "regular"
+                or observed.identity.link_count != 1
+                or not observed.reparse_free
+            ):
+                family.fail()
+                raise family.error("STORE.RESOURCE_IDENTITY_STALE")
+        except (PlatformFileError, OSError) as error:
+            family.fail()
+            raise family.error("STORE.RESOURCE_IDENTITY_STALE") from error
+        if self.coordinator._view is not self.view:
+            raise SQLiteStoreLifecycleError(
+                "STORE.GENERATION_CHANGED", resource_id=self.coordinator.resource_id,
+                generation=self.generation, retryable=True,
+            )
+
+
+def _generation_view(lease: _SQLiteGenerationView | _SQLiteOperationLease) -> _SQLiteGenerationView:
+    return lease.view if isinstance(lease, _SQLiteOperationLease) else lease
+
+
 class _ResourceFamilySession:
     """Original root, shared admission, and resource-local fail-stop latch.
 
-    SQL consumers attach explicitly in 10.2. This owner never lends closing
+    SQL consumers attach through explicit operation leases. This owner never lends closing
     authority and never waits for W1 while holding its admission condition.
     """
 
-    def __init__(self, identity: CanonicalResourceIdentity) -> None:
+    def __init__(self, identity: CanonicalResourceIdentity, retained_root: tuple[PlatformFileBackend, RootedDirectoryAuthority] | None = None) -> None:
         from platform_fs import compose_platform_file_backend
 
         self._identity = identity
         self._condition = threading.Condition()
         self._state = "READY"
+        self._recovery_required = False
+        self._pending_activation_closes: list[Callable[[], BaseException | None]] = []
+        self._recovery_preparations: dict[str, tuple[weakref.ReferenceType[ResourceStoreCoordinator], _ActivationPreparation]] = {}
         self._active_count = 0
         self._admitted_threads: dict[int, str] = {}
         self._operation_tokens: dict[int, object] = {}
@@ -3840,8 +3947,12 @@ class _ResourceFamilySession:
             "localcat-initial-activation-lock-v1\0"
             f"{identity.target_identity}\n"
         ).encode("ascii")
-        self._backend = compose_platform_file_backend(identity.configured_jsonl_path.parent)
-        self._root = self._backend.bind_root(identity.configured_jsonl_path.parent)
+        if retained_root is None:
+            self._backend = compose_platform_file_backend(identity.configured_jsonl_path.parent)
+            self._root = self._backend.bind_root(identity.configured_jsonl_path.parent)
+        else:
+            self._backend, self._root = retained_root
+            self._root.reprove_location()
         self._lock_identity: FileObjectIdentity | None = None
         try:
             self.reprove()
@@ -3861,6 +3972,12 @@ class _ResourceFamilySession:
     def fail(self) -> None:
         with self._condition:
             self._state = "FAILED"
+            self._condition.notify_all()
+
+    def require_recovery(self) -> None:
+        """Stop ordinary admission while retaining the original recovery root."""
+        with self._condition:
+            self._recovery_required = True
             self._condition.notify_all()
 
     def reprove(self) -> None:
@@ -3908,6 +4025,8 @@ class _ResourceFamilySession:
         transition: bool,
         timeout_seconds: float,
         cancelled: threading.Event | None,
+        recovery: bool = False,
+        wait_for_transition: bool = False,
     ) -> Iterator[_ResourceOperationBorrow]:
         deadline = time.monotonic() + _require_timeout(timeout_seconds)
         thread = threading.get_ident()
@@ -3917,10 +4036,20 @@ class _ResourceFamilySession:
                 raise self.error("STORE.OPERATION_BORROW_INVALID")
             if thread in self._admitted_threads:
                 raise self.error("STORE.FAMILY_REENTRY")
+            # Initial activation peers serialize before admission and W1.
+            # Ordinary queries still reject DRAINING; no waiter owns a lease.
+            while wait_for_transition and self._state in {"DRAINING", "ACTIVATING"}:
+                self._check_cancel(cancelled)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self.error("STORE.FAMILY_BUSY", retryable=True)
+                self._condition.wait(min(remaining, 0.05))
             if self._state in {"FAILED", "CLOSED"}:
                 raise self.error("STORE.RESOURCE_IDENTITY_STALE")
             if self._state != "READY":
                 raise self.error("STORE.RESOURCE_DRAINING", retryable=True)
+            if self._recovery_required and not recovery:
+                raise self.error("STORE.RESOURCE_DRAINING", retryable=False)
             self._admitted_threads[thread] = coordinator._owner_nonce
             if transition:
                 self._state = "DRAINING"
@@ -3929,6 +4058,8 @@ class _ResourceFamilySession:
                 self._active_count += 1
         lease: LockLease | None = None
         borrow: _ResourceOperationBorrow | None = None
+        completed = False
+        operation_error: BaseException | None = None
         try:
             if transition:
                 with self._condition:
@@ -3968,22 +4099,34 @@ class _ResourceFamilySession:
                 self._operation_tokens[thread] = borrow._token
             borrow.reprove(coordinator)
             yield borrow
+            completed = True
+        except BaseException as error:
+            operation_error = error
+            raise
         finally:
+            primary = operation_error
+            close_error: BaseException | None = None
             try:
-                try:
-                    if borrow is not None:
-                        borrow.reprove(coordinator)
-                finally:
-                    if borrow is not None:
-                        borrow._live = False
-                    if lease is not None:
-                        try:
-                            lease.close()
-                        except BaseException:
-                            self.fail()
-                            raise
+                if borrow is not None:
+                    borrow.reprove(coordinator)
+            except BaseException as error:
+                close_error = error
             finally:
+                if borrow is not None:
+                    borrow._live = False
+                if lease is not None:
+                    try:
+                        lease.close()
+                    except BaseException as error:
+                        self.fail()
+                        if close_error is None:
+                            close_error = error
                 with self._condition:
+                    if (completed and borrow is not None
+                            and borrow._recovery_completed
+                            and primary is None and close_error is None
+                            and not self._pending_activation_closes):
+                        self._recovery_required = False
                     self._operation_tokens.pop(thread, None)
                     self._admitted_threads.pop(thread)
                     if transition:
@@ -3992,6 +4135,8 @@ class _ResourceFamilySession:
                     else:
                         self._active_count -= 1
                     self._condition.notify_all()
+            if primary is None and close_error is not None:
+                raise close_error
 
 
 def _live_family_lock_identity(session: _ResourceFamilySession) -> FileObjectIdentity | None:
@@ -4005,13 +4150,15 @@ def _live_family_lock_identity(session: _ResourceFamilySession) -> FileObjectIde
     return session._lock_identity
 
 
-def _join_resource_family(identity: CanonicalResourceIdentity, owner: str) -> _ResourceFamilySession:
+def _join_resource_family(identity: CanonicalResourceIdentity, owner: str, retained_root: tuple[PlatformFileBackend, RootedDirectoryAuthority] | None = None) -> _ResourceFamilySession:
     key = _family_path(identity.configured_jsonl_path)
     with _FAMILY_REGISTRY_LOCK:
+        if retained_root is not None:
+            retained_root[1].reprove_location()
         session = _FAMILY_SESSIONS.get(key)
         if session is None:
             try:
-                session = _ResourceFamilySession(identity)
+                session = _ResourceFamilySession(identity, retained_root)
             except (PlatformFileError, OSError) as error:
                 raise SQLiteStoreLifecycleError(
                     "STORE.RESOURCE_IDENTITY_STALE", resource_id=identity.resource_id,
@@ -4081,6 +4228,8 @@ class ResourceStoreCoordinator:
         canonical_store_id: str,
         resource_identity: CanonicalResourceIdentity | None = None,
         drain_timeout_seconds: float = 5.0,
+        _stage_borrow: _StageSQLBorrow | None = None,
+        _family_root: tuple[PlatformFileBackend, RootedDirectoryAuthority] | None = None,
         _allow_legacy_schema: bool = False,
         _allow_active: bool = False,
         _expected_active_generation: int | None = None,
@@ -4123,17 +4272,19 @@ class ResourceStoreCoordinator:
             snapshot = inspect_stage_schema(
                 private_stage,
                 canonical_store_id=canonical_store_id,
+                _stage_borrow=_stage_borrow,
                 _allow_diverged_runtime=True,
                 _allow_legacy_schema=_allow_legacy_schema,
                 _allow_active=_allow_active,
                 _expected_active_generation=_expected_active_generation,
                 _expected_activation_digest=_expected_activation_digest,
             )
-            view: _SQLiteGenerationView | None = _SQLiteGenerationView(
+            view: _SQLiteGenerationView | None = _SQLiteStageView(
                 stage=private_stage,
                 canonical_store_id=canonical_store_id,
                 generation=snapshot.generation,
                 fts5_available=snapshot.fts5_available,
+                stage_borrow=_stage_borrow,
             )
         else:
             identity = _snapshot_store_identity(resource_identity)
@@ -4183,6 +4334,8 @@ class ResourceStoreCoordinator:
         # Only this coordinator's formal durable recovery paths clear the
         # latch after returning a proven recovery report.
         self._initial_activation_authority_unavailable = False
+        self._initial_activation_failure_source_digest: str | None = None
+        self._failed_posix_journal_temporary: tuple[Path, ContentFileProof] | None = None
         self._owner_nonce = uuid.uuid4().hex
         self._schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None
         self._schema_upgrade_locator_snapshot: (
@@ -4194,7 +4347,7 @@ class ResourceStoreCoordinator:
         # Independent unpublished stage stores remain builder-owned. They do
         # not implicitly enter the active resource's admission/W1 protocol.
         self._family = (
-            _join_resource_family(identity, self._owner_nonce)
+            _join_resource_family(identity, self._owner_nonce, _family_root)
             if sys.platform != "win32" and stage is None
             else None
         )
@@ -4247,6 +4400,8 @@ class ResourceStoreCoordinator:
         *,
         timeout_seconds: float | None = None,
         cancelled: threading.Event | None = None,
+        recovery: bool = False,
+        wait_for_transition: bool = False,
     ) -> Iterator[_ResourceOperationBorrow]:
         self._ensure_family_available()
         if self._family is None:
@@ -4258,6 +4413,8 @@ class ResourceStoreCoordinator:
             self, transition=True,
             timeout_seconds=self._drain_timeout_seconds if timeout_seconds is None else timeout_seconds,
             cancelled=cancelled,
+            recovery=recovery,
+            wait_for_transition=wait_for_transition,
         ) as issued:
             yield issued
 
@@ -4304,11 +4461,18 @@ class ResourceStoreCoordinator:
         with self._condition:
             return None if self._view is None else self._view.generation
 
-    def _mark_initial_activation_authority_unavailable(self) -> None:
+    def _mark_initial_activation_authority_unavailable(self, source_before: str) -> None:
         """Fail-stop later first-activation attempts on this coordinator."""
 
         with self._condition:
             self._initial_activation_authority_unavailable = True
+            self._initial_activation_failure_source_digest = source_before
+
+    def _initial_activation_failure_digest(self) -> str | None:
+        """Retain prior evidence for a fail-stop projection without new I/O."""
+        with self._condition:
+            return (self._initial_activation_failure_source_digest
+                    if self._initial_activation_authority_unavailable else None)
 
     def _initial_activation_authority_is_unavailable(self) -> bool:
         """Return the coordinator-owned first-activation fail-stop state."""
@@ -4325,6 +4489,7 @@ class ResourceStoreCoordinator:
         with self._condition:
             if report is not None:
                 self._initial_activation_authority_unavailable = False
+                self._initial_activation_failure_source_digest = None
 
     def _seal_stage(
         self,
@@ -4335,6 +4500,7 @@ class ResourceStoreCoordinator:
         schema_upgrade: bool = False,
         platform: object | None = None,
         caller_borrow: object | None = None,
+        recovery_profile: object | None = None,
     ) -> SealedStage:
         """Run the sole verified seal factory and pass caller-held authority."""
 
@@ -4354,6 +4520,7 @@ class ResourceStoreCoordinator:
             registry=self._sealed_registry,
             canonical_store_id=canonical_store_id,
             platform=platform,
+            recovery_profile=recovery_profile,
         ).seal(
             mutable_stage,
             expected_prior_generation=expected_prior_generation,
@@ -4380,13 +4547,17 @@ class ResourceStoreCoordinator:
         silently treated as absent.
         """
 
+        return self._read_durable_activation_phase()
+
+    def _read_durable_activation_phase(self, *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None) -> str | None:
         with self._condition:
             journal_path = _activation_journal_path(
                 self._resource_identity
             )
             try:
                 journal_identity = _lstat_activation_journal_identity(
-                    journal_path
+                    journal_path,
+                    **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
                 )
             except ActivationPreparationError:
                 raise
@@ -4396,6 +4567,7 @@ class ResourceStoreCoordinator:
                 disk_bytes, _disk_identity = _read_activation_journal_file(
                     journal_path,
                     journal_identity,
+                    **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
                 )
                 disk_record = _parse_activation_journal_bytes(
                     disk_bytes,
@@ -4433,7 +4605,13 @@ class ResourceStoreCoordinator:
             return True
 
     @contextmanager
-    def _operation_lease(self) -> Iterator[_SQLiteGenerationView]:
+    def _operation_lease(
+        self,
+        *,
+        borrow: _ResourceOperationBorrow | None = None,
+        timeout_seconds: float | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> Iterator[_SQLiteGenerationView | _SQLiteOperationLease]:
         self._ensure_family_available()
         with self._condition:
             if self._family_closed:
@@ -4464,7 +4642,34 @@ class ResourceStoreCoordinator:
                 )
             self._active_lease_count += 1
         try:
-            yield view
+            if self._family is not None:
+                with self._family_operation(
+                    borrow=borrow, timeout_seconds=timeout_seconds, cancelled=cancelled,
+                ) as issued:
+                    observed = self._family._root.inspect_entry(view.stage.staged_db_path.name)
+                    if observed is None or view.stage.staged_db_path != self._resource_identity.canonical_sidecar_path:
+                        self._family.fail()
+                        raise self._family.error("STORE.RESOURCE_IDENTITY_STALE")
+                    operation = _SQLiteOperationLease(view, self, issued, observed.identity)
+                    operation.reprove()
+                    # Read the full store/generation identity after W1 waits,
+                    # never authorize a new DB using the pre-wait view alone.
+                    with _open_leased_connection(operation):
+                        pass
+                    # That SQL connection has closed. An old generation is
+                    # rejected above before comparing its old physical proof
+                    # with a legitimately replaced current database.
+                    try:
+                        _active_attestation_for_health(operation)
+                    except SQLiteStoreSchemaError:
+                        self._family.fail()
+                        raise
+                    try:
+                        yield operation
+                    finally:
+                        operation.reprove()
+            else:
+                yield view
         finally:
             with self._condition:
                 self._active_lease_count -= 1
@@ -4943,6 +5148,7 @@ class ResourceStoreCoordinator:
         sealed_stage: SealedStage,
         *,
         _schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None,
+        _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> _ActivationPreparation:
         """Prepare one registered same-store-id sealed stage (Task 5.5).
 
@@ -4972,6 +5178,7 @@ class ResourceStoreCoordinator:
             sealed_stage,
             replacement=False,
             schema_upgrade_ticket=_schema_upgrade_ticket,
+            _posix_borrow=_posix_borrow,
         )
 
     def activate_replacement(
@@ -4979,6 +5186,7 @@ class ResourceStoreCoordinator:
         sealed_stage: SealedStage,
         *,
         _schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None,
+        _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> _ActivationPreparation:
         """Explicitly prepare a replacement stage with a different store id.
 
@@ -4997,7 +5205,7 @@ class ResourceStoreCoordinator:
                 "ACTIVATION.UPGRADE_TICKET_INVALID",
                 retryable=False,
             )
-        return self._activate(sealed_stage, replacement=True)
+        return self._activate(sealed_stage, replacement=True, _posix_borrow=_posix_borrow)
 
     def activate_portable_replacement(
         self,
@@ -5442,6 +5650,7 @@ class ResourceStoreCoordinator:
         *,
         replacement: bool,
         schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None,
+        _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> _ActivationPreparation:
         """Shared preparation pipeline for ordinary and replacement stages.
 
@@ -5476,7 +5685,8 @@ class ResourceStoreCoordinator:
             journal_path = _activation_journal_path(self._resource_identity)
             try:
                 journal_identity = _lstat_activation_journal_identity(
-                    journal_path
+                    journal_path,
+                    **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                 )
             except ActivationPreparationError as error:
                 raise ActivationPreparationError(
@@ -5490,6 +5700,7 @@ class ResourceStoreCoordinator:
                         _read_activation_journal_file(
                             journal_path,
                             journal_identity,
+                            **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                         )
                     )
                     disk_record = _parse_activation_journal_bytes(
@@ -5510,7 +5721,7 @@ class ResourceStoreCoordinator:
                         "ACTIVATION.RECOVERY_PENDING",
                         retryable=False,
                     )
-            if _lstat_any_entry(_activation_journal_temp_path(journal_path)):
+            if _lstat_any_entry(_activation_journal_temp_path(journal_path), **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {})):
                 raise ActivationPreparationError(
                     "ACTIVATION.RECOVERY_PENDING",
                     retryable=False,
@@ -5518,7 +5729,8 @@ class ResourceStoreCoordinator:
             terminal_path = _activation_terminal_path(self._resource_identity)
             try:
                 terminal_identity = _lstat_activation_terminal_identity(
-                    terminal_path
+                    terminal_path,
+                    **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                 )
             except ActivationPreparationError as error:
                 raise ActivationPreparationError(
@@ -5532,15 +5744,18 @@ class ResourceStoreCoordinator:
                 )
                 pair_present = (
                     _lstat_any_entry(
-                        self._resource_identity.canonical_sidecar_path
+                        self._resource_identity.canonical_sidecar_path,
+                        **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                     )
                     or _lstat_any_entry(
-                        self._resource_identity.snapshot_manifest_path
+                        self._resource_identity.snapshot_manifest_path,
+                        **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                     )
                     or (
                         self._view is not None
                         and _lstat_any_entry(
-                            self._view.stage.staged_db_path
+                            self._view.stage.staged_db_path,
+                            **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                         )
                     )
                 )
@@ -5552,7 +5767,8 @@ class ResourceStoreCoordinator:
                     try:
                         marker_identity = (
                             _lstat_activation_lineage_marker_identity(
-                                marker_path
+                                marker_path,
+                                **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                             )
                         )
                     except ActivationPreparationError as error:
@@ -5562,7 +5778,8 @@ class ResourceStoreCoordinator:
                             reason_code=error.code,
                         ) from error
                     if marker_identity is not None or _lstat_any_entry(
-                        _activation_lineage_marker_temp_path(marker_path)
+                        _activation_lineage_marker_temp_path(marker_path),
+                        **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                     ):
                         raise ActivationPreparationError(
                             "ACTIVATION.RECOVERY_PENDING",
@@ -5577,9 +5794,20 @@ class ResourceStoreCoordinator:
                     # wrong-identity, or wrong-byte temporary fails closed
                     # and is never deleted or overwritten.
                     try:
+                        if (_posix_borrow is not None
+                                and _posix_borrow.exists(_activation_lineage_marker_temp_path(marker_path))):
+                            if self._view is None:
+                                raise ActivationPreparationError("ACTIVATION.RECOVERY_PENDING", retryable=False)
+                            # Completing an old pair mutates its temporary link;
+                            # first authenticate the whole current prior set.
+                            _capture_prior_assets(
+                                _CoordinatorStorePort(self, _posix_borrow), self._view,
+                                identity=self._resource_identity, replacement=replacement,
+                            )
                         marker_identity = (
                             _activation_lineage_marker_state_complete(
-                                self._resource_identity
+                                self._resource_identity,
+                                **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                             )
                         )
                     except ActivationPreparationError as error:
@@ -5629,10 +5857,22 @@ class ResourceStoreCoordinator:
                 initial_view,
                 identity=self._resource_identity,
                 replacement=replacement,
+                **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
             )
         except BaseException:
             try:
-                registry.retire_unissued_portable(sealed_stage)
+                # Gate denial does not grant this coordinator ownership of
+                # a foreign/consumed stage. Only an entry still owned here
+                # and never issued can need portable live-authority cleanup.
+                try:
+                    entry = registry._match_entry(sealed_stage)
+                except stage_seal_error as membership_error:
+                    if membership_error.error_code != "SEALER.REGISTRY_MISMATCH":
+                        raise
+                else:
+                    if (entry.state is contract_module.ActivationCapabilityState.SEALED
+                            and entry.token is None):
+                        registry.retire_unissued_portable(sealed_stage)
             except stage_seal_error as cleanup_error:
                 raise ActivationPreparationError(
                     "ACTIVATION.CLEANUP_FAILED",
@@ -5798,10 +6038,11 @@ class ResourceStoreCoordinator:
             )
             preparation_id = f"preparation.{uuid.uuid4().hex}"
             if initial_view is None:
-                _require_first_activation_absence(self._resource_identity)
+                _require_first_activation_absence(self._resource_identity, **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}))
                 source_capture = _capture_activation_file(
                     self._resource_identity.configured_jsonl_path,
                     asset_kind="SOURCE",
+                    **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                 )
                 if source_capture.digest != (
                     sealed_stage.evidence.source_binding.receipt.jsonl_digest
@@ -5810,7 +6051,7 @@ class ResourceStoreCoordinator:
                         "ACTIVATION.POST_DRAIN_VALIDATION_FAILED",
                         retryable=False,
                     )
-                _require_first_activation_absence(self._resource_identity)
+                _require_first_activation_absence(self._resource_identity, **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}))
                 _require_same_asset_captures(
                     pre_drain_captures,
                     (source_capture,),
@@ -5818,7 +6059,7 @@ class ResourceStoreCoordinator:
                 prior_manifest_absent = False
             else:
                 captures = _capture_prior_assets(
-                    _CoordinatorStorePort(self),
+                    _CoordinatorStorePort(self, _posix_borrow),
                     initial_view,
                     identity=self._resource_identity,
                     replacement=replacement,
@@ -5843,8 +6084,9 @@ class ResourceStoreCoordinator:
                     preparation_id=preparation_id,
                     owned_paths=owned_paths,
                     manifest_absent=prior_manifest_absent,
+                    **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}),
                 )
-                _revalidate_prior_assets(captures)
+                _revalidate_prior_assets(captures, **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}))
             with self._condition:
                 if (
                     self._state != "ACTIVATING"
@@ -5902,7 +6144,7 @@ class ResourceStoreCoordinator:
                 owned_paths=tuple(owned_paths),
             )
             try:
-                _remove_recovery_backups(cleanup_reservation.owned_paths)
+                _remove_recovery_backups(cleanup_reservation.owned_paths, **({"caller_borrow": _posix_borrow} if _posix_borrow is not None else {}))
                 if token is not None:
                     registry.cancel(token)
                 else:
@@ -5937,8 +6179,19 @@ class ResourceStoreCoordinator:
     def cancel_prepared_activation(
         self,
         preparation: _ActivationPreparation,
+        *, _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> None:
         """Fail-safe cancellation before Task 5.6 writes a journal."""
+
+        if _posix_borrow is not None:
+            try:
+                self._cancel_posix_unpublished_activation(preparation, _posix_borrow)
+            except PlatformFileError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.RECOVERY_MISMATCH", retryable=error.retryable,
+                    reason_code=error.code,
+                ) from error
+            return
 
         stage_seal_error = getattr(
             importlib.import_module("tm_stage_sealer"),
@@ -6013,6 +6266,53 @@ class ResourceStoreCoordinator:
                 self._cleanup_in_progress = False
                 self._condition.notify_all()
 
+    def _cancel_posix_unpublished_activation(
+        self, preparation: _ActivationPreparation,
+        borrow: _CallerHeldPosixActivationBorrow,
+    ) -> None:
+        """Prove the complete live closure before cancelling a never-named DB."""
+        self._stop_posix_recovery_admission()
+        with self._posix_recovery_port(activation_borrow=borrow) as port:
+            if self._preparation is not preparation or self._cleanup_reservation is not None:
+                raise ActivationPreparationError("ACTIVATION.PREPARATION_NOT_ACTIVE", retryable=False)
+            # This task cannot consume pending schema authority, even if all
+            # activation paths still look unchanged.
+            _finish_cold_schema_upgrade_pending(
+                self._resource_identity.canonical_sidecar_path,
+                completed=None, caller_borrow=borrow,
+            )
+            # Full live stage/prior/source/backup proof happens before this
+            # existing owner republishes or replays the exact PREPARED record.
+            failed_temporary = self._failed_posix_journal_temporary
+            if failed_temporary is not None:
+                temporary, expected = failed_temporary
+                if borrow.capture(temporary) != expected:
+                    raise ActivationPreparationError("ACTIVATION.JOURNAL_TEMP_EXISTS", retryable=False)
+                borrow.remove(temporary, _ActivationFileIdentity(expected.device, expected.inode), expected.sha256)
+                self._failed_posix_journal_temporary = None
+            # If a second persistence attempt fails, retain its exact temporary
+            # as a cold recovery barrier. Only this still-live owner may clean
+            # it after current identity/content proof; cold recovery rejects it.
+            borrow.preserve_failed_journal = True
+            try:
+                handle = _publish_activation_journal(port, preparation)
+            finally:
+                borrow.preserve_failed_journal = False
+                if borrow.failed_journal_temporary is not None:
+                    self._failed_posix_journal_temporary = borrow.failed_journal_temporary
+                    borrow.failed_journal_temporary = None
+            _complete_prepared_cancellation(port, handle._record, handle.file_identity)
+            self._sealed_registry.cancel(preparation._token)
+            self._preparation = None
+            self._cleanup_reservation = None
+            assert self._family is not None
+            self._family._recovery_preparations.pop(self._owner_nonce, None)
+            self._finish_cold_recovery_pending(port, None)
+            borrow.reprove()
+            self._state = "READY"
+            self._initial_activation_authority_unavailable = False
+            self._condition.notify_all()
+
     def retry_failed_activation_cleanup(self) -> None:
         """Retry strict cleanup for a preparation that failed before return."""
 
@@ -6062,6 +6362,8 @@ class ResourceStoreCoordinator:
     def publish_prepared_activation(
         self,
         preparation: _ActivationPreparation,
+        *,
+        _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> _ActivationJournalHandle:
         """Durably publish the PREPARED activation journal (Task 5.6).
 
@@ -6095,7 +6397,7 @@ class ResourceStoreCoordinator:
                     retryable=True,
                 )
             return _publish_activation_journal(
-                _CoordinatorStorePort(self),
+                _CoordinatorStorePort(self, _posix_borrow),
                 preparation,
             )
 
@@ -10170,6 +10472,7 @@ class ResourceStoreCoordinator:
         self,
         preparation: _ActivationPreparation,
         handle: _ActivationJournalHandle,
+        *, _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> int:
         """Publish one sealed DB/manifest set and exactly one generation.
 
@@ -10184,12 +10487,169 @@ class ResourceStoreCoordinator:
 
         with self._condition:
             return publish_activation(
-                _CoordinatorStorePort(self),
+                _CoordinatorStorePort(self, _posix_borrow),
                 preparation,
                 handle,
             )
 
-    def recover_durable_activation(self) -> ActivationRecoveryReport | None:
+    @staticmethod
+    def _preserve_verified_recovery(
+        error: BaseException, port: _CoordinatorStorePort | None,
+    ) -> BaseException:
+        report = None if port is None else port.posix_recovery_report
+        if report is None:
+            return error
+        mapped = error
+        if isinstance(error, PlatformFileError):
+            mapped = ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True, reason_code=error.code)
+            mapped.__cause__ = error
+        setattr(mapped, "_verified_recovery_report", report)
+        mapped.add_note(f"Verified activation recovery: {report.action}; generation={report.generation}; owned close/reproof incomplete")
+        return mapped
+
+    @contextmanager
+    def _posix_recovery_port(
+        self, *, borrow: _ResourceOperationBorrow | None = None,
+        activation_borrow: _CallerHeldPosixActivationBorrow | None = None,
+    ) -> Iterator[_CoordinatorStorePort]:
+        """Drain before W1; nested recovery consumes the original owner borrow."""
+        if activation_borrow is not None:
+            activation_borrow.reprove()
+            if activation_borrow.identity != self._resource_identity or self._family is None or activation_borrow.root is not self._family._root:
+                raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+            port = None
+            try:
+                self._retry_pending_activation_closes(activation_borrow)
+                port = _CoordinatorStorePort(self, activation_borrow)
+                with self._condition:
+                    yield port
+                activation_borrow.reprove()
+            except BaseException as error:
+                self._stop_posix_recovery_admission()
+                mapped = self._preserve_verified_recovery(error, port)
+                if mapped is not error:
+                    raise mapped from error
+                raise
+            return
+        if self._family is None:
+            with self._condition:
+                yield _CoordinatorStorePort(self)
+            return
+        if borrow is None:
+            admitted = False
+            port: _CoordinatorStorePort | None = None
+            try:
+                with self._family_transition(recovery=True) as issued:
+                    admitted = True
+                    with self._posix_recovery_port(borrow=issued) as port:
+                        yield port
+            except BaseException as error:
+                if admitted:
+                    self._stop_posix_recovery_admission()
+                mapped = self._preserve_verified_recovery(error, port)
+                if mapped is not error:
+                    raise mapped from error
+                raise
+            return
+        borrow.reprove(self)
+        borrow._recovery_completed = False
+        family = borrow._family
+        def no_fresh_stage(expected: ContentFileProof) -> CandidateFile:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        issued_activation = _CallerHeldPosixActivationBorrow(
+            identity=self._resource_identity, backend=family._backend,
+            root=family._root, lease=borrow._lease,
+            owner_reproof=lambda: borrow.reprove(self), owner_failure=family.fail,
+            handoff_stage=no_fresh_stage,
+            defer_close=lambda close: self._stop_posix_recovery_admission(pending_close=close),
+        )
+        port = None
+        try:
+            self._retry_pending_activation_closes(issued_activation)
+            port = _CoordinatorStorePort(self, issued_activation)
+            with self._condition:
+                yield port
+            issued_activation.reprove()
+            if port._posix_recovery_completed:
+                borrow._recovery_completed = True
+        except BaseException as error:
+            self._stop_posix_recovery_admission()
+            mapped = self._preserve_verified_recovery(error, port)
+            if mapped is not error:
+                raise mapped from error
+            raise
+        finally:
+            issued_activation.release()
+
+    def _retry_pending_activation_closes(self, borrow: _CallerHeldPosixActivationBorrow) -> None:
+        """Close retained owned inputs before recovery can read or publish assets."""
+        borrow.reprove()
+        if self._family is None or borrow.root is not self._family._root:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        first: BaseException | None = None
+        for close in tuple(self._family._pending_activation_closes):
+            error = close()
+            if error is not None:
+                if first is None:
+                    first = error
+                else:
+                    _append_owned_close_facts(first, error, context="Additional owned recovery close failed")
+            else:
+                self._family._pending_activation_closes.remove(close)
+        if first is not None:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True) from first
+        borrow.reprove()
+
+    def _stop_posix_recovery_admission(
+        self, *,
+        pending_close: Callable[[], BaseException | None] | None = None,
+    ) -> None:
+        """Keep durable/view facts, but never expose a failed recovery tail."""
+        if self._family is not None:
+            self._family.require_recovery()
+            if pending_close is not None:
+                self._family._pending_activation_closes.append(pending_close)
+            if self._preparation is not None:
+                self._family._recovery_preparations[self._owner_nonce] = (
+                    weakref.ref(self), self._preparation,
+                )
+        with self._condition:
+            self._state = "ACTIVATING"
+            self._condition.notify_all()
+
+    def _finish_cold_recovery_pending(
+        self, port: _CoordinatorStorePort,
+        report: ActivationRecoveryReport | None,
+    ) -> None:
+        """Close pending discovery even when full recovery proved only legacy.
+
+        None carries no schema promotion/cleanup decision. Its POSIX path is
+        metadata observation only, on this operation's original family/W1.
+        """
+        view = self._view
+        has_view = report is not None and view is not None
+        if port.posix_activation_borrow is not None or has_view:
+            pending_root = (_recovered_schema_upgrade_pending_root(port, view)
+                            if has_view and view is not None
+                            else self._resource_identity.canonical_sidecar_path)
+            try:
+                _finish_cold_schema_upgrade_pending(
+                    pending_root,
+                    completed=None if report is None else report.action == "COMPLETED",
+                    **({"caller_borrow": port.posix_activation_borrow}
+                       if port.posix_activation_borrow is not None else {}),
+                )
+            except PlatformFileError as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_PENDING_UNSAFE", retryable=False,
+                    reason_code=error.code,
+                ) from error
+        port._posix_recovery_completed = True
+
+    def recover_durable_activation(
+        self, *, _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
+        _defer_initial_fail_stop_clear: bool = False,
+    ) -> ActivationRecoveryReport | None:
         """Idempotently finish exactly one durable activation (Task 5.8).
 
         Reconstructs the activation authority from the adjacent durable
@@ -10219,26 +10679,84 @@ class ResourceStoreCoordinator:
         state without relying on bare absence or caller memory.
         """
 
-        with self._condition:
-            port = _CoordinatorStorePort(self)
+        with self._posix_recovery_port(activation_borrow=_posix_borrow) as port:
+            borrow = port.posix_activation_borrow
+            if borrow is not None and self._family is not None:
+                pending = self._family._recovery_preparations.get(self._owner_nonce)
+                if pending is not None and pending[1] is self._preparation:
+                    port._posix_live_cancellation_preparation = self._preparation
+                # Two pre-journal I/O failures can leave the complete closure
+                # solely in the original live preparation. A peer must retry
+                # that owner under this same root/W1, never discover the old
+                # terminal and accidentally declare the attempt complete.
+                if self._family._recovery_preparations:
+                    journal = _activation_journal_path(self._resource_identity)
+                    durable = journal if borrow.exists(journal) else _activation_terminal_path(self._resource_identity)
+                    record = None
+                    if borrow.exists(durable):
+                        payload, _ = borrow.read_journal(durable, None)
+                        record = _parse_activation_journal_bytes(payload, expected_journal_path=journal)
+                    for reference, preparation in tuple(self._family._recovery_preparations.values()):
+                        pending_owner = reference()
+                        if (pending_owner is not None and pending_owner._preparation is preparation
+                                and (pending_owner._failed_posix_journal_temporary is not None
+                                     or record is None or record.preparation_id != preparation.preparation_id)):
+                            pending_owner._cancel_posix_unpublished_activation(preparation, borrow)
             report = recover_durable_activation(port)
-            view = self._view
-            if report is not None and view is not None:
-                # A recovered v2 store will not mint another upgrade
-                # ticket, so the cold terminal completion path resolves
-                # any pending schema-upgrade artifacts deterministically:
-                # completed activations retain one stable reported backup,
-                # cancelled/rolled-back outcomes leave no hidden copies.
-                # A completed recovery rehydrates the view at the
-                # canonical sidecar, so the pending family is resolved
-                # against the original store path of the retained
-                # terminal closure.
-                _finish_cold_schema_upgrade_pending(
-                    _recovered_schema_upgrade_pending_root(port, view),
-                    completed=(report.action == "COMPLETED"),
-                )
-            self._clear_initial_activation_fail_stop_after_recovery(report)
+            port.posix_recovery_report = report
+            self._finish_cold_recovery_pending(port, report)
+            if not _defer_initial_fail_stop_clear:
+                self._clear_initial_activation_fail_stop_after_recovery(report)
+            self._finish_posix_recovered_owners(port)
+            if self._family is not None and self._family._recovery_preparations:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_STATE_INVALID", retryable=True)
             return report
+
+    def _finish_posix_recovered_owners(self, port: _CoordinatorStorePort) -> None:
+        """Project the authenticated terminal to its original live owner.
+
+        Ordinary admission is still stopped until the enclosing operation has
+        reproved and closed W1. Only this terminal's exact preparation matches;
+        a completed old generation cannot clear a different pending attempt.
+        """
+        borrow = port.posix_activation_borrow
+        if borrow is None or self._family is None:
+            return
+        journal = _activation_journal_path(self._resource_identity)
+        terminal = journal if borrow.exists(journal) else _activation_terminal_path(self._resource_identity)
+        if not borrow.exists(terminal):
+            return
+        payload, _ = borrow.read_journal(terminal, None)
+        record = _parse_activation_journal_bytes(
+            payload, expected_journal_path=_activation_journal_path(self._resource_identity),
+        )
+        if record.phase not in {_ActivationJournalPhase.PREPARED, _ActivationJournalPhase.GENERATION_PUBLISHED}:
+            return
+        for key, (reference, preparation) in tuple(self._family._recovery_preparations.items()):
+            pending_owner = reference()
+            if preparation.preparation_id != record.preparation_id:
+                continue
+            if pending_owner is not None:
+                if record.phase is _ActivationJournalPhase.GENERATION_PUBLISHED:
+                    # Preserve the existing DB_REPLACED completion route. Its
+                    # fully verified new generation is adopted through the
+                    # existing owner, never treated as unpublished cancellation.
+                    pending_owner.adopt_recovered_authority(self)
+                    self._family._recovery_preparations.pop(key, None)
+                    continue
+                if pending_owner._preparation is preparation:
+                    pending_owner._sealed_registry.cancel(preparation._token)
+                with pending_owner._condition:
+                    pending_owner._view = port.view
+                    if port.view is not None:
+                        pending_owner._canonical_store_id = port.view.canonical_store_id
+                    pending_owner._preparation = None
+                    pending_owner._cleanup_reservation = None
+                    pending_owner._initial_activation_authority_unavailable = False
+                    pending_owner._initial_activation_failure_source_digest = None
+                    pending_owner._state = "READY"
+                    pending_owner._condition.notify_all()
+            self._family._recovery_preparations.pop(key, None)
 
     def reattest_completed_authority(self) -> ActivationRecoveryReport:
         """Repair only a fully proven cross-restart ``st_dev`` drift.
@@ -10264,7 +10782,7 @@ class ResourceStoreCoordinator:
             )
 
     def rehydrate_runtime_authority(
-        self,
+        self, *, _borrow: _ResourceOperationBorrow | None = None,
     ) -> ActivationRecoveryReport | None:
         """Rehydrate the durable activation authority for a fresh facade.
 
@@ -10280,18 +10798,9 @@ class ResourceStoreCoordinator:
         implicit fallback.
         """
 
-        with self._condition:
-            port = _CoordinatorStorePort(self)
+        with self._posix_recovery_port(borrow=_borrow) as port:
             report = _rehydrate_runtime_authority(port)
-            view = self._view
-            if report is not None and view is not None:
-                # Mirror the cold completion wrapper: a completed runtime
-                # open resolves any pending schema-upgrade artifacts
-                # deterministically against the retained closure.
-                _finish_cold_schema_upgrade_pending(
-                    _recovered_schema_upgrade_pending_root(port, view),
-                    completed=(report.action == "COMPLETED"),
-                )
+            self._finish_cold_recovery_pending(port, report)
             self._clear_initial_activation_fail_stop_after_recovery(report)
             return report
 
@@ -10315,7 +10824,7 @@ class ResourceStoreCoordinator:
             return report
 
     def rollback_durable_activation(
-        self,
+        self, *, _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> ActivationRecoveryReport | None:
         """Roll back one pending/inconsistent activation (Task 5.9).
 
@@ -10334,20 +10843,12 @@ class ResourceStoreCoordinator:
         :meth:`recover_durable_activation`.
         """
 
-        with self._condition:
-            port = _CoordinatorStorePort(self)
+        with self._posix_recovery_port(activation_borrow=_posix_borrow) as port:
             report = rollback_durable_activation(port)
-            view = self._view
-            if report is not None and view is not None:
-                # A cold rollback restores the prior authority: any
-                # pending schema-upgrade crash orphans are strictly swept
-                # (proven-unchanged outcomes leave no pending or stable
-                # hidden full-copy artifacts).
-                _finish_cold_schema_upgrade_pending(
-                    _recovered_schema_upgrade_pending_root(port, view),
-                    completed=False,
-                )
+            port.posix_recovery_report = report
+            self._finish_cold_recovery_pending(port, report)
             self._clear_initial_activation_fail_stop_after_recovery(report)
+            self._finish_posix_recovered_owners(port)
             return report
 
     def adopt_recovered_authority(
@@ -10472,11 +10973,12 @@ class ResourceStoreCoordinator:
         next_generation: int | None = None,
         activation_digest: str | None = None,
         active_content_attestation: Any | None = None,
+        caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> _ActivationJournalHandle:
         """Advance only after re-proving the phase-specific durable effect."""
 
         return _advance_activation_journal_after_effect(
-            _CoordinatorStorePort(self),
+            _CoordinatorStorePort(self, caller_borrow),
             preparation,
             handle,
             next_phase,
@@ -10491,6 +10993,7 @@ class ResourceStoreCoordinator:
         journal_path: Path,
         *,
         expected_final_identity: _ActivationFileIdentity | None,
+        caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> _ActivationJournalHandle:
         """Publish one journal record with strict exclusive temp + fsync order.
 
@@ -10505,6 +11008,7 @@ class ResourceStoreCoordinator:
                 record,
                 journal_path,
                 expected_final_identity=expected_final_identity,
+                **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
             )
         except OSError as error:
             raise ActivationPreparationError(
@@ -10515,6 +11019,8 @@ class ResourceStoreCoordinator:
     def _write_activation_terminal_locked(
         self,
         record: _ActivationJournalRecord,
+        *,
+        caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> _ActivationFileIdentity:
         """Publish one terminal record with strict exclusive temp + fsync.
 
@@ -10523,7 +11029,7 @@ class ResourceStoreCoordinator:
         fault-injection tests.
         """
 
-        return _write_activation_terminal(self._resource_identity, record)
+        return _write_activation_terminal(self._resource_identity, record, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
 
     def _transition_generation(
         self,
@@ -10940,7 +11446,7 @@ class _SourceBindingFacts:
 
 def _read_source_binding_facts(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> _SourceBindingFacts:
     if connection.in_transaction:
         raise SQLiteStoreSchemaError("STORE.READ_SNAPSHOT_NESTED")
@@ -10956,7 +11462,7 @@ def _read_source_binding_facts(
 
 def _read_source_binding_facts_in_transaction(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> _SourceBindingFacts:
     if not connection.in_transaction:
         raise SQLiteStoreSchemaError("STORE.READ_SNAPSHOT_MISSING")
@@ -11341,9 +11847,16 @@ def _binding_from_ledger_row(row: tuple[object, ...]) -> SnapshotBinding:
 
 def _strict_pair_file_state(
     path: Path,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[str, str | None, tuple[int, int] | None]:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
+    if caller_borrow is not None:
+        if not caller_borrow.exists(path):
+            return "absent", None, None
+        proof = caller_borrow.capture(path)
+        return "regular", proof.sha256, (proof.device, proof.inode)
     return snapshot_artifacts_module._strict_pair_file_state(
         path=path,
     )
@@ -11417,6 +11930,7 @@ def _configured_pair_diagnostics(
     canonical_store_id: str,
     head_revision: int,
     cumulative_record_counts: tuple[tuple[int, int], ...],
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[str, ...]:
     diagnostics: list[str] = []
     try:
@@ -11447,7 +11961,8 @@ def _configured_pair_diagnostics(
         diagnostics.append("SOURCE_BINDING.ANCESTRY_INVALID")
 
     jsonl_state, jsonl_digest, _jsonl_identity = _strict_pair_file_state(
-        identity.configured_jsonl_path
+        identity.configured_jsonl_path,
+        **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
     )
     if jsonl_state == "absent":
         diagnostics.append("SOURCE_BINDING.JSONL_MISSING")
@@ -11457,7 +11972,7 @@ def _configured_pair_diagnostics(
         diagnostics.append("SOURCE_BINDING.JSONL_DIGEST_MISMATCH")
 
     manifest_state, manifest_digest, _manifest_identity = (
-        _strict_pair_file_state(identity.snapshot_manifest_path)
+        _strict_pair_file_state(identity.snapshot_manifest_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
     )
     expected_bytes = contract_to_json(binding.manifest).encode("utf-8")
     if manifest_state == "absent":
@@ -11583,7 +12098,7 @@ def _file_sha256(path: Path) -> str:
 
 
 def _latch_source_divergence(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     expected_fingerprint: str,
 ) -> bool:
@@ -11994,7 +12509,7 @@ def _recovery_store_retryable(error: Exception) -> bool:
 
 def _require_bound_refresh_effect_snapshot(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     expected_receipt: snapshot_recovery_module.IssuedReceiptFacts,
     expected_handoff: snapshot_recovery_module._BoundRefreshHandoffFacts,
@@ -12128,6 +12643,7 @@ class SQLiteTMStore:
         *,
         canonical_store_id: str,
         drain_timeout_seconds: float = 5.0,
+        _stage_borrow: _StageSQLBorrow | None = None,
     ) -> None:
         if type(canonical_store_id) is not str:
             raise TypeError("canonical_store_id must be a built-in string")
@@ -12138,6 +12654,7 @@ class SQLiteTMStore:
             stage,
             canonical_store_id=self._canonical_store_id,
             drain_timeout_seconds=drain_timeout_seconds,
+            _stage_borrow=_stage_borrow,
         )
         self._source_binding_monitor = SourceBindingMonitor(
             self._coordinator,
@@ -12255,9 +12772,16 @@ class SQLiteTMStore:
             timeout_seconds=timeout_seconds,
         )
 
-    def canonical_revision(self) -> CanonicalRevisionSnapshot:
-        with self._coordinator._operation_lease() as lease:
-            with _open_leased_connection(lease) as connection:
+    def canonical_revision(
+        self, *, _borrow: _ResourceOperationBorrow | None = None,
+    ) -> CanonicalRevisionSnapshot:
+        with self._coordinator._operation_lease(borrow=_borrow) as lease:
+            with _open_leased_connection(
+                lease,
+                **({"purpose": "stage-revision"}
+                   if isinstance(lease, _SQLiteStageView) and lease.stage_borrow is not None
+                   else {}),
+            ) as connection:
                 return _canonical_revision_from_connection(
                     connection,
                     lease,
@@ -12438,7 +12962,12 @@ class SQLiteTMStore:
                 != lease.canonical_store_id
             ):
                 raise ValueError("issued receipt identity does not match store")
-            with _open_leased_connection(lease) as connection:
+            with _open_leased_connection(
+                lease,
+                **({"purpose": "stage-issued-receipt"}
+                   if isinstance(lease, _SQLiteStageView) and lease.stage_borrow is not None
+                   else {}),
+            ) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     _validate_store_identity(
@@ -15340,7 +15869,7 @@ class SQLiteTMStore:
     def _append_prepared_batch(
         self,
         *,
-        lease: _SQLiteGenerationView,
+        lease: _SQLiteGenerationView | _SQLiteOperationLease,
         prepared_batch_id: str,
         prepared_kind: str,
         prepared_source_digest: str | None,
@@ -15414,6 +15943,8 @@ class SQLiteTMStore:
                     raise SQLiteStoreSchemaError(
                         "STORE.HEAD_REVISION_MISSING"
                     )
+                if type(lease) is _SQLiteOperationLease:
+                    lease.reprove()
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -15531,7 +16062,12 @@ class SQLiteTMStore:
         timestamp = datetime.now(UTC).isoformat()
 
         with self._coordinator._operation_lease() as lease:
-            with _open_leased_connection(lease) as connection:
+            with _open_leased_connection(
+                lease,
+                **({"purpose": "stage-append"}
+                   if isinstance(lease, _SQLiteStageView) and lease.stage_borrow is not None
+                   else {}),
+            ) as connection:
                 if immediate_seal:
                     _configure_immediate_seal_bulk_cache(connection)
                 if defer_secondary_indexes:
@@ -15755,7 +16291,7 @@ class SQLiteTMStore:
             return _candidate_recall_snapshot_body(lease, prepared)
 
     @contextmanager
-    def query_lease(self) -> Iterator[SQLiteTMQueryView]:
+    def query_lease(self, *, _borrow: _ResourceOperationBorrow | None = None) -> Iterator[SQLiteTMQueryView]:
         """Yield one read-only query view under exactly one operation lease.
 
         The view is an exact ``SQLiteTMQueryView`` bound to this exact
@@ -15766,7 +16302,7 @@ class SQLiteTMStore:
         update port.
         """
 
-        with self._coordinator._operation_lease() as lease:
+        with self._coordinator._operation_lease(borrow=_borrow) as lease:
             token = object()
             with self._coordinator._condition:
                 self._query_view_tokens.add(token)
@@ -15780,7 +16316,7 @@ class SQLiteTMStore:
                 with self._coordinator._condition:
                     self._query_view_tokens.discard(token)
 
-    def health(self) -> StoreHealth:
+    def health(self, *, _borrow: _ResourceOperationBorrow | None = None) -> StoreHealth:
         """Return one truthful physical-health observation under one lease.
 
         Revalidates canonical identity and derives schema/generation/
@@ -15790,7 +16326,7 @@ class SQLiteTMStore:
         divergence, never publishes Gate C, and never writes the DB.
         """
 
-        with self._coordinator._operation_lease() as lease:
+        with self._coordinator._operation_lease(borrow=_borrow) as lease:
             return _store_health_body(lease, coordinator=self._coordinator)
 
     def export_records(self) -> Iterator[TMRecord]:
@@ -15806,7 +16342,7 @@ class SQLiteTMStore:
     def _validate_identity(
         self,
         connection: sqlite3.Connection,
-        lease: _SQLiteGenerationView,
+        lease: _SQLiteGenerationView | _SQLiteOperationLease,
     ) -> None:
         _validate_lease_identity(connection, lease)
 
@@ -15889,7 +16425,7 @@ def _prepare_candidate_recall_inputs(
 
 
 def _candidate_recall_snapshot_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     prepared: _PreparedCandidateRecallInputs,
 ) -> SQLiteCandidateRecallSnapshot:
     with _open_leased_connection(lease) as connection:
@@ -15974,7 +16510,7 @@ def _bounded_seed_stages(
 
 
 def _candidate_proof_snapshot_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     folded_query: str,
     seed_limit: int,
@@ -16086,7 +16622,7 @@ def _candidate_proof_snapshot_body(
 
 
 def _candidate_proof_block_records_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     folded_query: str,
     block: SQLiteCandidateProofBlock,
@@ -16126,7 +16662,7 @@ def _candidate_proof_block_records_body(
 
 def _candidate_proof_dense_binding_digest(
     *,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     folded_query: str,
     blocks: tuple[SQLiteCandidateProofBlock, ...],
     head_revision: int,
@@ -16206,7 +16742,7 @@ def _validate_candidate_proof_dense_phase2_result(
 def _validate_candidate_proof_dense_binding(
     connection: sqlite3.Connection,
     *,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     folded_query: str,
     blocks: tuple[SQLiteCandidateProofBlock, ...],
     head_revision: int,
@@ -16236,7 +16772,7 @@ def _validate_candidate_proof_dense_binding(
 
 
 def _candidate_proof_dense_phase1_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     folded_query: str,
     blocks: tuple[SQLiteCandidateProofBlock, ...],
@@ -16315,7 +16851,7 @@ def _candidate_proof_dense_phase1_body(
 
 
 def _candidate_proof_dense_phase2_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     folded_query: str,
     blocks: tuple[SQLiteCandidateProofBlock, ...],
@@ -16401,7 +16937,7 @@ def _candidate_proof_dense_phase2_body(
 
 
 def _validate_candidate_proof_generation_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     head_revision: int,
     total_record_count: int,
@@ -16458,7 +16994,7 @@ def _validate_store_identity_meta(
 
 def _validate_lease_identity(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> None:
     identity = lease.stage.resource_identity
     _validate_store_identity(
@@ -16471,7 +17007,7 @@ def _validate_lease_identity(
 
 def _validate_lease_identity_meta(
     meta: dict[str, str],
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> None:
     identity = lease.stage.resource_identity
     _validate_store_identity_meta(
@@ -16488,7 +17024,7 @@ def _validate_exact_records_input(source_raw: object) -> None:
 
 
 def _exact_records_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     source_raw: str,
 ) -> tuple[TMRecord, ...]:
     with _open_leased_connection(lease) as connection:
@@ -16521,7 +17057,7 @@ def _validate_records_by_id_input(
 
 
 def _records_by_id_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     record_ids: tuple[int, ...],
     *,
     connection: sqlite3.Connection | None = None,
@@ -16549,7 +17085,7 @@ def _records_by_id_body(
 
 def _canonical_revision_from_connection(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> CanonicalRevisionSnapshot:
     owns_transaction = not connection.in_transaction
     if owns_transaction:
@@ -16567,7 +17103,7 @@ def _canonical_revision_from_connection(
 
 def _canonical_revision_from_transaction(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> CanonicalRevisionSnapshot:
     if not connection.in_transaction:
         raise SQLiteStoreSchemaError("STORE.READ_SNAPSHOT_MISSING")
@@ -17102,7 +17638,7 @@ def _validate_candidate_index_before_publication(
 
 def _suspend_streamed_stage_secondary_indexes(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> None:
     """Drop only rebuildable secondary indexes on one empty private stage."""
 
@@ -17155,7 +17691,7 @@ def _suspend_streamed_stage_secondary_indexes(
 
 def _restore_streamed_stage_secondary_indexes(
     connection: sqlite3.Connection,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     before_publication: bool = False,
 ) -> None:
@@ -17666,7 +18202,7 @@ def _source_binding_health_state(
 
 
 def _active_attestation_for_health(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> ActiveContentAttestation | PortableActiveContentAttestation | None:
     """Re-prove one immutable active byte set for semantic-health reuse.
 
@@ -17698,7 +18234,19 @@ def _active_attestation_for_health(
     ):
         raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
     try:
-        database = _capture_content_file(identity.canonical_sidecar_path)
+        if type(lease) is _SQLiteOperationLease:
+            lease.reprove()
+            family = lease.borrow._family
+            if not isinstance(family._backend, PosixBoundContentObservation):
+                raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
+            opened = family._backend.open_regular(family._root, PurePath(identity.canonical_sidecar_path.name))
+            try:
+                database = _capture_posix_bound_content(family._backend, opened)
+                lease.reprove()
+            finally:
+                opened.close()
+        else:
+            database = _capture_content_file(identity.canonical_sidecar_path)
     except ContentAttestationError as error:
         raise SQLiteStoreSchemaError(
             "STORE.ACTIVE_ATTESTATION_INVALID"
@@ -17717,7 +18265,7 @@ def _active_attestation_for_health(
 
 @contextmanager
 def _portable_health_database_window(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     coordinator: ResourceStoreCoordinator,
 ) -> Iterator[BoundContentFacts]:
     """Keep the current rooted DB alive through health and its terminal proof.
@@ -17789,7 +18337,7 @@ def _portable_health_database_window(
 
 def _current_index_validation_matches(
     coordinator: ResourceStoreCoordinator,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     database: BoundContentFacts,
 ) -> bool:
     with coordinator._condition:
@@ -17798,8 +18346,8 @@ def _current_index_validation_matches(
         if (
             type(prior) is not _CurrentCanonicalIndexValidation
             or prior.coordinator is not coordinator
-            or prior.view is not lease
-            or coordinator._view is not lease
+            or prior.view is not _generation_view(lease)
+            or coordinator._view is not _generation_view(lease)
         ):
             return False
     # Current rooted authority was proved independently. A stored FileId is
@@ -17811,7 +18359,7 @@ def _current_index_validation_matches(
 
 def _require_current_index_identity(
     coordinator: ResourceStoreCoordinator,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     database: BoundContentFacts,
 ) -> None:
     """Compare only after fresh rooted proof, with the coordinator lock held."""
@@ -17819,7 +18367,7 @@ def _require_current_index_identity(
     anchor = coordinator._current_index_identity
     if (
         anchor is not None
-        and anchor[0] is lease
+        and anchor[0] is _generation_view(lease)
         and anchor[1] != database.snapshot.identity
     ):
         raise SQLiteStoreSchemaError("STORE.ACTIVE_ATTESTATION_INVALID")
@@ -17827,21 +18375,21 @@ def _require_current_index_identity(
 
 def _remember_current_index_validation(
     coordinator: ResourceStoreCoordinator,
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     database: BoundContentFacts,
 ) -> None:
     with coordinator._condition:
-        if coordinator._view is not lease:
+        if coordinator._view is not _generation_view(lease):
             return
         _require_current_index_identity(coordinator, lease, database)
-        coordinator._current_index_identity = (lease, database.snapshot.identity)
+        coordinator._current_index_identity = (_generation_view(lease), database.snapshot.identity)
         coordinator._current_index_validation = _CurrentCanonicalIndexValidation(
-            coordinator, lease, database,
+            coordinator, _generation_view(lease), database,
         )
 
 
 def _store_health_body(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     coordinator: ResourceStoreCoordinator,
 ) -> StoreHealth:
@@ -17856,7 +18404,7 @@ def _store_health_body(
 
 
 def _store_health_snapshot(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     *,
     coordinator: ResourceStoreCoordinator,
 ) -> StoreHealth:
@@ -17997,13 +18545,13 @@ class SQLiteTMQueryView:
     def __init__(
         self,
         store: SQLiteTMStore,
-        lease: _SQLiteGenerationView,
+        lease: _SQLiteGenerationView | _SQLiteOperationLease,
         *,
         token: object,
     ) -> None:
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be exact SQLiteTMStore")
-        if type(lease) is not _SQLiteGenerationView:
+        if type(lease) not in {_SQLiteGenerationView, _SQLiteStageView, _SQLiteOperationLease}:
             raise TypeError("lease must be exact _SQLiteGenerationView")
         with store._coordinator._condition:
             if token not in store._query_view_tokens:
@@ -18018,13 +18566,18 @@ class SQLiteTMQueryView:
         ) = None
         self._connection: sqlite3.Connection | None = None
 
-    def _invalidate(self) -> None:
+    def _close_connection(self) -> None:
         manager = self._connection_manager
         self._connection = None
         self._connection_manager = None
         if manager is not None:
             manager.__exit__(None, None, None)
-        self._expired = True
+
+    def _invalidate(self) -> None:
+        try:
+            self._close_connection()
+        finally:
+            self._expired = True
 
     def _candidate_connection(self) -> sqlite3.Connection:
         self._check_lifetime()
@@ -18070,6 +18623,8 @@ class SQLiteTMQueryView:
             )
         if self._store._coordinator is not self._coordinator:
             raise SQLiteStoreSchemaError("STORE.QUERY_VIEW_FOREIGN")
+        if type(self._lease) is _SQLiteOperationLease:
+            self._lease.reprove()
         with self._coordinator._condition:
             if self._token not in self._store._query_view_tokens:
                 raise SQLiteStoreLifecycleError(
@@ -18078,7 +18633,7 @@ class SQLiteTMQueryView:
                     generation=generation,
                     retryable=False,
                 )
-            if self._coordinator._view is not self._lease:
+            if self._coordinator._view is not _generation_view(self._lease):
                 raise SQLiteStoreLifecycleError(
                     "STORE.GENERATION_CHANGED",
                     resource_id=resource_id,
@@ -18358,6 +18913,9 @@ class SQLiteTMQueryView:
         """Return the same truthful health snapshot on the captured lease."""
 
         self._check_lifetime()
+        if type(self._lease) is _SQLiteOperationLease:
+            self._close_connection()
+            self._lease.reprove()
         return _store_health_body(self._lease, coordinator=self._coordinator)
 
 
@@ -18454,27 +19012,39 @@ def _configure_immediate_seal_bulk_cache(
         raise SQLiteStoreSchemaError("STORE.BULK_CACHE_UNAVAILABLE")
 
 
+def _close_activation_receipt_connection(connection: sqlite3.Connection) -> None:
+    """Receipt close seam; the exact stdlib connection owns idempotent cleanup."""
+    connection.close()
+
+
 @contextmanager
 def _open_configured_connection(
     database_path: Path,
     *,
     expected_file: _ReservedStageFile | None = None,
     require_existing: bool = False,
+    _stage_borrow: _StageSQLBorrow | None = None,
+    purpose: str = "store",
+    _close_connection: Callable[[sqlite3.Connection], None] | None = None,
 ) -> Iterator[sqlite3.Connection]:
     """Open one short, thread-local connection under the fixed policy."""
 
     _require_absolute_path(database_path, "database_path")
     database, uri = _sqlite_connection_target(
         database_path,
-        require_existing=(expected_file is not None or require_existing),
+        require_existing=(expected_file is not None or require_existing or _stage_borrow is not None),
     )
-    connection = sqlite3.connect(
-        database,
-        timeout=BUSY_TIMEOUT_MS / 1000,
-        isolation_level=None,
-        uri=uri,
-    )
+    if _stage_borrow is not None:
+        _stage_borrow.enter_sql(database_path, purpose)
+    connection: sqlite3.Connection | None = None
+    operation_error: BaseException | None = None
     try:
+        connection = sqlite3.connect(
+            database, timeout=BUSY_TIMEOUT_MS / 1000,
+            isolation_level=None, uri=uri,
+        )
+        if _stage_borrow is not None:
+            _stage_borrow.reprove_sql(database_path, purpose)
         if expected_file is not None:
             _verify_reserved_stage_file(database_path, expected_file)
         connection.enable_load_extension(False)
@@ -18499,8 +19069,48 @@ def _open_configured_connection(
         if _pragma_int(connection, "busy_timeout") != BUSY_TIMEOUT_MS:
             raise SQLiteStoreSchemaError("STORE.BUSY_TIMEOUT_MISMATCH")
         yield connection
+    except BaseException as error:
+        operation_error = error
+        raise
     finally:
-        connection.close()
+        closing_error: BaseException | None = None
+        connection_closed = connection is None
+        try:
+            if connection is not None:
+                if _close_connection is None:
+                    connection.close()
+                    connection_closed = True
+                else:
+                    try:
+                        _close_connection(connection)
+                        connection_closed = True
+                    except BaseException:
+                        # The exact Connection owns safe, idempotent cleanup.
+                        # Never retry a raw descriptor on the guard/pending.
+                        connection.close()
+                        connection_closed = True
+                        raise
+        except BaseException as error:
+            closing_error = error
+        defer_connection = getattr(_stage_borrow, "defer_connection_close", None)
+        deferred_connection = closing_error is not None and not connection_closed and connection is not None and callable(defer_connection)
+        if deferred_connection:
+            assert callable(defer_connection)
+            _ = defer_connection(connection)
+        try:
+            if _stage_borrow is not None and not deferred_connection:
+                _stage_borrow.exit_sql(database_path, purpose)
+        except BaseException as error:
+            if closing_error is None:
+                closing_error = error
+            else:
+                closing_error = _with_owned_close_facts(closing_error, error, context="SQL guard close failed")
+        if closing_error is not None:
+            if operation_error is None:
+                raise closing_error
+            mapped = _with_owned_close_facts(operation_error, closing_error, context="SQL close failed")
+            if mapped is not operation_error:
+                raise mapped from operation_error
 
 
 def _sqlite_connection_target(
@@ -18608,15 +19218,37 @@ def _sqlite_path_is_symlink(database_path: Path) -> bool:
 
 @contextmanager
 def _open_leased_connection(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
+    *, purpose: str = "runtime",
 ) -> Iterator[sqlite3.Connection]:
     """Keep one generation lease around one thread-local connection."""
 
     try:
+        if type(lease) is _SQLiteOperationLease:
+            lease.reprove()
         with _open_configured_connection(
-            lease.stage.staged_db_path
+            lease.stage.staged_db_path,
+            require_existing=type(lease) is _SQLiteOperationLease,
+            _stage_borrow=lease.stage_borrow if isinstance(lease, _SQLiteStageView) else None,
+            purpose=purpose,
         ) as connection:
+            if type(lease) is _SQLiteOperationLease:
+                lease.reprove()
+                meta = _read_meta(connection)
+                _validate_lease_identity_meta(meta, lease)
+                if meta.get("activation_status") != "ACTIVE":
+                    raise SQLiteStoreSchemaError("STORE.CANONICAL_NOT_ACTIVE")
+                if (
+                    _meta_int(meta, "generation") != lease.generation
+                    or _meta_bool(meta, "fts5_available") != lease.fts5_available
+                ):
+                    raise SQLiteStoreLifecycleError(
+                        "STORE.GENERATION_CHANGED", resource_id=lease.coordinator.resource_id,
+                        generation=lease.generation, retryable=True,
+                    )
             yield connection
+        if type(lease) is _SQLiteOperationLease:
+            lease.reprove()
     except sqlite3.OperationalError as error:
         sqlite_code = getattr(error, "sqlite_errorcode", None)
         primary_code = (
@@ -18641,7 +19273,7 @@ def _open_leased_connection(
 
 @contextmanager
 def _open_health_connection(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
 ) -> Iterator[sqlite3.Connection]:
     """Open portable health read-only so rooted byte proof can share the file.
 
@@ -18711,7 +19343,7 @@ def _open_health_connection(
 
 @contextmanager
 def _leased_connection_scope(
-    lease: _SQLiteGenerationView,
+    lease: _SQLiteGenerationView | _SQLiteOperationLease,
     connection: sqlite3.Connection | None,
 ) -> Iterator[sqlite3.Connection]:
     """Reuse one idle query-view connection without spanning transactions."""
@@ -18730,6 +19362,7 @@ def initialize_stage_schema(
     *,
     canonical_store_id: str,
     _legacy_schema: bool = False,
+    _stage_borrow: _StageSQLBorrow | None = None,
     _caller_reservation: MutableFileReservation | None = None,
     _caller_parent: RootedDirectoryAuthority | None = None,
 ) -> SQLiteSchemaSnapshot:
@@ -18745,6 +19378,8 @@ def initialize_stage_schema(
     validated_stage = _require_stage(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
     path = validated_stage.staged_db_path
+    if _stage_borrow is not None:
+        _stage_borrow.reprove_sql(path, "stage-schema")
     runtime = detect_sqlite_runtime()
     if (_caller_reservation is None) != (_caller_parent is None):
         raise TypeError(
@@ -18777,6 +19412,8 @@ def initialize_stage_schema(
         with _open_configured_connection(
             path,
             expected_file=reservation,
+            _stage_borrow=_stage_borrow,
+            purpose="stage-schema",
             require_existing=_caller_reservation is not None,
         ) as connection:
             if _caller_reservation is not None:
@@ -18830,6 +19467,7 @@ def initialize_stage_schema(
             validated_stage,
             canonical_store_id=canonical_store_id,
             _allow_legacy_schema=_legacy_schema,
+            _stage_borrow=_stage_borrow,
         )
         if _caller_reservation is not None:
             _reprove_caller_stage_reservation(
@@ -18868,6 +19506,7 @@ def inspect_stage_schema(
     stage: _StoreRuntimeRef,
     *,
     canonical_store_id: str,
+    _stage_borrow: _StageSQLBorrow | None = None,
     _allow_diverged_runtime: bool = False,
     _allow_sealed: bool = False,
     _allow_active: bool = False,
@@ -18890,11 +19529,15 @@ def inspect_stage_schema(
         raise TypeError("_allow_legacy_schema must be a built-in bool")
     validated_stage = _require_inspectable_store_ref(stage)
     _require_identity(canonical_store_id, "canonical_store_id")
+    if _stage_borrow is not None:
+        _stage_borrow.reprove_sql(validated_stage.staged_db_path, "stage-inspect")
     if not _sqlite_path_is_regular_file(validated_stage.staged_db_path):
         raise SQLiteStoreSchemaError("STORE.DATABASE_MISSING")
     with _open_configured_connection(
         validated_stage.staged_db_path,
         require_existing=True,
+        _stage_borrow=_stage_borrow,
+        purpose="stage-inspect",
     ) as connection:
         meta = _read_meta(connection)
         schema_version = _meta_int(meta, "schema_version")
@@ -19673,10 +20316,28 @@ def _promote_pending_schema_upgrade_backup(
 def _finish_cold_schema_upgrade_pending(
     store_path: Path,
     *,
-    completed: bool,
+    completed: bool | None,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
-    """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
+    """None means observation only, never schema promotion or cancellation."""
 
+    if caller_borrow is not None:
+        caller_borrow.require_path(store_path)
+        if not isinstance(caller_borrow.backend, LockedRootDirectoryObservation):
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE", retryable=False)
+        observed = caller_borrow.backend.observe_root_children(
+            caller_borrow.root, caller_borrow.lease,
+            DirectoryObservationLimits(maximum_depth=0, maximum_entries=4096,
+                                       maximum_directory_handles=1),
+            DirectoryObservationCancellation(),
+        )
+        prefix = f".{store_path.name}.localcat-schema-upgrade."
+        if any(item.name.startswith(prefix) and item.name.endswith(".pending") for item in observed):
+            raise ActivationPreparationError("ACTIVATION.UPGRADE_PENDING_UNSAFE", retryable=False)
+        caller_borrow.reprove()
+        return
+    if completed is None:
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE", retryable=False)
     schema_upgrade_module._finish_cold_schema_upgrade_pending(
         store_path,
         completed=completed,
@@ -19708,7 +20369,7 @@ def _recovered_schema_upgrade_pending_root(
     prior_db_path: Path | None = None
     journal_path = _activation_journal_path(identity)
     try:
-        journal_identity = _lstat_activation_journal_identity(journal_path)
+        journal_identity = _lstat_activation_journal_identity(journal_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     except ActivationPreparationError:
         journal_identity = None
     if journal_identity is not None:
@@ -19726,7 +20387,7 @@ def _recovered_schema_upgrade_pending_root(
         terminal_path = _activation_terminal_path(identity)
         try:
             terminal_identity = _lstat_activation_terminal_identity(
-                terminal_path
+                terminal_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
             )
         except ActivationPreparationError:
             terminal_identity = None

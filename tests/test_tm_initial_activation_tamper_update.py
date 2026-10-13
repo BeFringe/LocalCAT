@@ -47,6 +47,45 @@ def _assert_no_partial_initial_authority(
     testcase.assertFalse(identity.snapshot_manifest_path.exists())
 
 
+def _assert_failed_posix_family_rejects_before_probe(testcase, identity, owner):
+    """R7.16: changed lock rejects before any new view, SQL or repair."""
+    root = identity.configured_jsonl_path.parent
+    def snapshot():
+        return tuple((p.name, p.lstat().st_ino, p.lstat().st_mtime_ns,
+                      p.lstat().st_size, p.read_bytes() if p.is_file() else b"")
+                     for p in sorted(root.iterdir()))
+    before = snapshot()
+    family = owner._family
+    testcase.assertIsNotNone(family)
+    real_reprove = family.reprove
+    hits = []
+    def observe_reproof():
+        hits.append(True)
+        return real_reprove()
+    with patch.object(family, "reprove", observe_reproof), patch.object(
+        tm_sqlite_store.sqlite3, "connect", wraps=tm_sqlite_store.sqlite3.connect
+    ) as sql, patch.object(
+        tm_sqlite_store, "_recover_activation_indexes", wraps=tm_sqlite_store._recover_activation_indexes
+    ) as repair, patch.object(
+        tm_sqlite_store, "_rehydrate_completed_initial_authority_only",
+        wraps=tm_sqlite_store._rehydrate_completed_initial_authority_only,
+    ) as probe:
+        with testcase.assertRaises(tm_sqlite_store.SQLiteStoreLifecycleError) as raised:
+            _coordinator(identity)
+        testcase.assertEqual(raised.exception.code, "STORE.RESOURCE_IDENTITY_STALE")
+        with testcase.assertRaisesRegex(ValueError, "TM.CANONICAL_UNHEALTHY"):
+            TMEngine(str(identity.configured_jsonl_path), update=False)
+    testcase.assertTrue(hits)
+    sql.assert_not_called()
+    repair.assert_not_called()
+    probe.assert_not_called()
+    testcase.assertEqual(snapshot(), before)
+    testcase.assertIs(owner._family, family)
+    testcase.assertEqual(family._state, "FAILED")
+    testcase.assertEqual(family._active_count, 0)
+    testcase.assertEqual(family._operation_tokens, {})
+
+
 class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
     def test_completion_only_append_proof_never_opens_writable_or_repair_seam(
         self,
@@ -98,6 +137,10 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                 )
 
             before = database_family_snapshot()
+            if sys.platform != "win32":
+                _assert_failed_posix_family_rejects_before_probe(self, identity, coordinator)
+                self.assertEqual(database_family_snapshot(), before)
+                return
             fresh = _coordinator(identity)
             real_open = tm_sqlite_store._open_configured_connection
             real_recover_indexes = (
@@ -249,6 +292,10 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                 return tuple(entries)
 
             before = exact_tree_snapshot()
+            if sys.platform != "win32":
+                _assert_failed_posix_family_rejects_before_probe(self, identity, coordinator)
+                self.assertEqual(exact_tree_snapshot(), before)
+                return
             fresh_coordinator = _coordinator(identity)
             fresh_service = _service(identity, fresh_coordinator)
             real_connect = tm_sqlite_store.sqlite3.connect
@@ -365,6 +412,21 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     injected_snapshot.append(exact_tree_snapshot())
                 return observed
 
+            if sys.platform != "win32":
+                # Lock drift is now rejected before either historical probe.
+                # Still leave a real hot journal and require zero SQL/effects.
+                crashed = subprocess.run(
+                    (sys.executable, "-c", crash_script, str(identity.canonical_sidecar_path)),
+                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+                )
+                self.assertEqual(crashed.returncode, 29)
+                self.assertEqual(crashed.stderr, "")
+                self.assertTrue(Path(f"{identity.canonical_sidecar_path}-journal").exists())
+                before = exact_tree_snapshot()
+                _assert_failed_posix_family_rejects_before_probe(self, identity, coordinator)
+                self.assertEqual(exact_tree_snapshot(), before)
+                self.assertEqual(probe_calls, 0)
+                return
             fresh_coordinator = _coordinator(identity)
             fresh_service = _service(identity, fresh_coordinator)
             real_connect = tm_sqlite_store.sqlite3.connect
@@ -498,6 +560,21 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     )
                 return result
 
+            if sys.platform != "win32":
+                # Lock drift is now rejected before either historical probe.
+                # Still leave a real hot journal and require zero SQL/effects.
+                crashed = subprocess.run(
+                    (sys.executable, "-c", crash_script, str(identity.canonical_sidecar_path)),
+                    cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+                )
+                self.assertEqual(crashed.returncode, 31)
+                self.assertEqual(crashed.stderr, "")
+                self.assertTrue(Path(f"{identity.canonical_sidecar_path}-journal").exists())
+                before = exact_tree_snapshot()
+                _assert_failed_posix_family_rejects_before_probe(self, identity, coordinator)
+                self.assertEqual(exact_tree_snapshot(), before)
+                self.assertEqual(probe_calls, 0)
+                return
             fresh_coordinator = _coordinator(identity)
             fresh_service = _service(identity, fresh_coordinator)
             with (
@@ -552,45 +629,32 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                 _service(identity, coordinator)
                 for coordinator in coordinators
             )
-            real_flock_module = __import__("fcntl")
-            real_flock = real_flock_module.flock
-            first_regular_waiting = threading.Event()
-            second_regular_locked = threading.Event()
-            regular_lock_guard = threading.Lock()
-            regular_lock_calls = 0
-            build_guard = threading.Lock()
+            family = coordinators[0]._family
+            backend_type = type(family._backend)
+            real_acquire = backend_type.acquire
+            acquired = threading.Event()
+            release = threading.Event()
+            peer_waiting = threading.Event()
+            acquisitions = []
+            real_wait = family._condition.wait
             build_calls = 0
-            real_builds = tuple(
-                service._build_stage for service in services
-            )
+            build_guard = threading.Lock()
+            real_builds = tuple(service._build_stage for service in services)
             outcomes: list[object | None] = [None, None]
 
-            def schedule_regular_resource_lock(
-                descriptor: int,
-                operation: int,
-            ) -> None:
-                nonlocal regular_lock_calls
-                observed = os.fstat(descriptor)
-                if (
-                    operation == real_flock_module.LOCK_EX
-                    and stat.S_ISREG(observed.st_mode)
-                ):
-                    with regular_lock_guard:
-                        regular_lock_calls += 1
-                        call_number = regular_lock_calls
-                    if call_number == 1:
-                        first_regular_waiting.set()
-                        if not second_regular_locked.wait(timeout=10.0):
-                            raise TimeoutError(
-                                "peer did not reach the resource lock"
-                            )
-                        real_flock(descriptor, operation)
-                        return
-                    if call_number == 2:
-                        real_flock(descriptor, operation)
-                        second_regular_locked.set()
-                        return
-                real_flock(descriptor, operation)
+            def acquire(backend, root, *args, **kwargs):
+                lease = real_acquire(backend, root, *args, **kwargs)
+                acquisitions.append(lease)
+                self.assertEqual((identity.configured_jsonl_path.parent / family._lock_name).read_bytes(), family._payload)
+                if len(acquisitions) == 1:
+                    acquired.set()
+                    if not release.wait(10):
+                        raise TimeoutError("owner was not released")
+                return lease
+
+            def family_wait(timeout=None):
+                peer_waiting.set()
+                return real_wait(timeout)
 
             def count_build(
                 service_index: int,
@@ -614,11 +678,8 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     outcomes[service_index] = error
 
             with (
-                patch.object(
-                    real_flock_module,
-                    "flock",
-                    side_effect=schedule_regular_resource_lock,
-                ),
+                patch.object(backend_type, "acquire", acquire),
+                patch.object(family._condition, "wait", family_wait),
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
                 patch.object(
                     services[0],
@@ -650,8 +711,12 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     daemon=True,
                 )
                 creator.start()
-                self.assertTrue(first_regular_waiting.wait(timeout=10.0))
+                self.assertTrue(acquired.wait(timeout=10.0))
                 peer.start()
+                self.assertTrue(peer_waiting.wait(timeout=10.0))
+                self.assertEqual(len(acquisitions), 1)
+                self.assertEqual(build_calls, 0)
+                release.set()
                 creator.join(timeout=20.0)
                 peer.join(timeout=20.0)
 
@@ -696,8 +761,8 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             build_calls = 0
             outcomes: list[object | None] = [None, None]
 
-            def publish_prepared_then_pause(preparation: Any):
-                handle = real_publish_prepared(preparation)
+            def publish_prepared_then_pause(preparation: Any, **kwargs: Any):
+                handle = real_publish_prepared(preparation, **kwargs)
                 prepared_durable.set()
                 if not resume_owner.wait(timeout=15.0):
                     raise TimeoutError("owner was not resumed")
@@ -805,8 +870,8 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             journal_path = tm_migration._activation_journal_path(identity)
             foreign_bytes = b"foreign lock while owner is PREPARED"
 
-            def publish_prepared_then_pause(preparation: Any):
-                handle = real_publish_prepared(preparation)
+            def publish_prepared_then_pause(preparation: Any, **kwargs: Any):
+                handle = real_publish_prepared(preparation, **kwargs)
                 prepared_durable.set()
                 if not resume_owner.wait(timeout=15.0):
                     raise TimeoutError("owner was not resumed")
@@ -872,70 +937,61 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             self.assertEqual(lock_path.read_bytes(), foreign_bytes)
             self.assertIs(type(owner_outcome[0]), MigrationFailure)
 
-    def test_empty_crash_lock_is_durable_fail_stop_not_bootstrapped(
-        self,
-    ) -> None:
+    def test_empty_crash_lock_completes_public_initialization_before_builder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity = _identity(root)
-            coordinator = _coordinator(identity)
-            service = _service(identity, coordinator)
-            lock_path = identity.canonical_sidecar_path.with_name(
-                f".{identity.canonical_sidecar_path.name}."
-                "localcat-initial-activation.lock"
-            )
-            child_script = "\n".join(
-                (
-                    "from pathlib import Path",
-                    "import os, sys",
-                    "from tm_contracts import CanonicalResourceIdentity",
-                    "import tm_migration",
-                    "source = Path(sys.argv[1]).resolve()",
-                    "identity = CanonicalResourceIdentity.from_configured_jsonl(sys.argv[2], source)",
-                    "def crash_before_payload(_descriptor, _payload):",
-                    "    print('EMPTY_LOCK_VISIBLE', flush=True)",
-                    "    os._exit(17)",
-                    "tm_migration._InitialActivationResourceReservation._write_new_payload = staticmethod(crash_before_payload)",
-                    "tm_migration._InitialActivationResourceReservation.acquire(identity)",
-                )
-            )
+            before = identity.configured_jsonl_path.read_bytes()
+            script = """
+import os, sys
+from pathlib import Path
+from tm_contracts import CanonicalResourceIdentity
+from tests.test_tm_initial_activation_contract import _coordinator, _service
+identity = CanonicalResourceIdentity.from_configured_jsonl(sys.argv[2], Path(sys.argv[1]))
+owner = _coordinator(identity)
+def fault(point):
+    if point == 'lock_after_lease':
+        print('PUBLIC_W1_EMPTY_LOCK', flush=True)
+        os._exit(17)
+owner._family._backend._fault_injector = fault
+_service(identity, owner).activate_initial(identity.configured_jsonl_path, identity.resource_id)
+"""
             crashed = subprocess.run(
-                (
-                    sys.executable,
-                    "-c",
-                    child_script,
-                    str(identity.configured_jsonl_path),
-                    identity.resource_id,
-                ),
-                cwd=Path(__file__).resolve().parents[1],
-                capture_output=True,
-                text=True,
-                check=False,
+                [sys.executable, "-B", "-c", script, str(identity.configured_jsonl_path), identity.resource_id],
+                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
             )
             self.assertEqual(crashed.returncode, 17)
-            self.assertEqual(crashed.stdout.strip(), "EMPTY_LOCK_VISIBLE")
+            self.assertEqual(crashed.stdout.strip(), "PUBLIC_W1_EMPTY_LOCK")
             self.assertEqual(crashed.stderr, "")
-            self.assertTrue(lock_path.exists())
+            coordinator = _coordinator(identity)
+            service = _service(identity, coordinator)
+            family = coordinator._family
+            lock_path = root / family._lock_name
             self.assertEqual(lock_path.read_bytes(), b"")
-
-            outcome = service.activate_initial(
-                identity.configured_jsonl_path,
-                identity.resource_id,
-            )
-
-            self.assertIs(type(outcome), MigrationFailure)
-            assert isinstance(outcome, MigrationFailure)
-            self.assertEqual(
-                outcome.error_code,
-                "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
-            )
-            self.assertTrue(outcome.canonical_authority_ambiguous)
-            self.assertEqual(lock_path.read_bytes(), b"")
-            _assert_no_partial_initial_authority(
-                self,
-                identity=identity,
-                coordinator=coordinator,
-            )
+            self.assertEqual({p.name for p in root.iterdir()}, {identity.configured_jsonl_path.name, lock_path.name})
+            inode = lock_path.stat().st_ino
+            builds = []
+            leases = []
+            acquire = type(family._backend).acquire
+            def acquired(backend, *args, **kwargs):
+                lease = acquire(backend, *args, **kwargs)
+                leases.append(lease)
+                return lease
+            real_build = service._build_stage
+            def build(*args, **kwargs):
+                self.assertEqual(len(leases), 1)
+                leases[0].reprove()
+                self.assertFalse(leases[0].closed)
+                self.assertEqual(lock_path.read_bytes(), family._payload)
+                builds.append(True)
+                return real_build(*args, **kwargs)
+            with patch.object(service, "_build_stage", side_effect=build), patch.object(type(family._backend), "acquire", acquired):
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
+            self.assertIs(type(outcome), MigrationReport)
+            self.assertEqual(builds, [True])
+            self.assertEqual(coordinator.current_generation, 0)
+            self.assertEqual(lock_path.stat().st_ino, inode)
+            self.assertEqual(identity.configured_jsonl_path.read_bytes(), before)
 
     def test_parent_bootstrap_unlock_programmer_error_closes_all_handles(
         self,
@@ -1153,7 +1209,9 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                         foreign.write_bytes(foreign_bytes)
                         lock_path.symlink_to(foreign.name)
 
-                    outcome = service.activate_initial(
+                    before = lock_path.lstat()
+                    with patch.object(service, "_build_stage", wraps=service._build_stage) as build, patch.object(tm_sqlite_store.sqlite3, "connect", wraps=tm_sqlite_store.sqlite3.connect) as sql:
+                        outcome = service.activate_initial(
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
@@ -1172,11 +1230,13 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                         self.assertEqual(lock_path.read_bytes(), foreign_bytes)
                     if artifact_kind != "regular":
                         self.assertEqual(foreign.read_bytes(), foreign_bytes)
-                    _assert_no_partial_initial_authority(
-                        self,
-                        identity=identity,
-                        coordinator=coordinator,
-                    )
+                    build.assert_not_called()
+                    sql.assert_not_called()
+                    self.assertEqual(lock_path.lstat().st_ino, before.st_ino)
+                    self.assertEqual(coordinator.state, "FAILED")
+                    self.assertIsNone(coordinator.current_generation)
+                    self.assertFalse(identity.canonical_sidecar_path.exists())
+                    self.assertFalse(identity.snapshot_manifest_path.exists())
 
     def test_resource_lock_programmer_error_crosses_public_seam(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1184,15 +1244,18 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             coordinator = _coordinator(identity)
             service = _service(identity, coordinator)
             with patch.object(
-                tm_migration._InitialActivationResourceReservation,
+                (tm_migration._InitialActivationResourceReservation
+                 if sys.platform == "win32" else type(coordinator._family._backend)),
                 "acquire",
                 side_effect=TypeError("programmer defect"),
-            ):
+            ) as hit:
                 with self.assertRaisesRegex(TypeError, "programmer defect"):
                     service.activate_initial(
                         identity.configured_jsonl_path,
                         identity.resource_id,
                     )
+
+            hit.assert_called_once()
 
     def test_real_resource_reservation_release_closes_every_descriptor(
         self,
@@ -1291,27 +1354,22 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     os.fstat(descriptor)
 
     def test_unsupported_lock_platform_fails_closed_before_stage(self) -> None:
+        from platform_fs_contracts import PlatformFileError, PlatformFileErrorCode
         with tempfile.TemporaryDirectory() as temporary:
             identity = _identity(Path(temporary))
             coordinator = _coordinator(identity)
             service = _service(identity, coordinator)
-            with patch.object(tm_migration.sys, "platform", "unsupported"):
-                outcome = service.activate_initial(
-                    identity.configured_jsonl_path,
-                    identity.resource_id,
-                )
+            with patch.object(type(coordinator._family._backend), "acquire", side_effect=PlatformFileError(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)) as fault, patch.object(service, "_build_stage", wraps=service._build_stage) as build:
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
+            fault.assert_called_once()
+            build.assert_not_called()
             self.assertIs(type(outcome), MigrationFailure)
-            assert isinstance(outcome, MigrationFailure)
-            self.assertEqual(
-                outcome.error_code,
-                "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
-            )
+            self.assertEqual(outcome.error_code, "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE")
             self.assertTrue(outcome.canonical_authority_ambiguous)
-            _assert_no_partial_initial_authority(
-                self,
-                identity=identity,
-                coordinator=coordinator,
-            )
+            self.assertEqual(coordinator.state, "FAILED")
+            self.assertIsNone(coordinator.current_generation)
+            self.assertFalse(identity.canonical_sidecar_path.exists())
+            self.assertFalse(identity.snapshot_manifest_path.exists())
 
     def test_published_probe_precedes_foreign_lock_without_runtime_handoff(
         self,
@@ -1336,6 +1394,10 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             foreign.write_bytes(foreign_bytes)
             os.replace(foreign, lock_path)
 
+            if sys.platform != "win32":
+                _assert_failed_posix_family_rejects_before_probe(self, identity, coordinator)
+                self.assertEqual(lock_path.read_bytes(), foreign_bytes)
+                return
             restarted_coordinator = _coordinator(identity)
             restarted = _service(identity, restarted_coordinator)
             with patch("tm_sqlite_store._probe_fts5", return_value=False):
@@ -1356,6 +1418,64 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
             self.assertIsNone(restarted_coordinator.current_generation)
             self.assertIsNone(restarted_coordinator.active_store_path)
             self.assertEqual(lock_path.read_bytes(), foreign_bytes)
+
+    def test_memory_generation_without_completed_owner_return_stays_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = _identity(root)
+            coordinator = _coordinator(identity)
+            service = _service(identity, coordinator)
+            real_publish = coordinator.publish_activation
+            lock_path = root / coordinator._family._lock_name
+            hits = []
+
+            def publish_without_return(*args: Any, **kwargs: Any) -> int:
+                real_publish(*args, **kwargs)
+                self.assertEqual(coordinator.current_generation, 0)
+                replacement = root / "foreign.lock"
+                replacement.write_bytes(b"lost before owner return")
+                os.replace(replacement, lock_path)
+                hits.append("view-without-return")
+                raise OSError("owner completion unavailable")
+
+            with patch.object(coordinator, "publish_activation", side_effect=publish_without_return):
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
+            self.assertEqual(hits, ["view-without-return"])
+            self.assertIs(type(outcome), MigrationFailure)
+            self.assertTrue(outcome.canonical_authority_ambiguous)
+            self.assertFalse(outcome.canonical_authority_published)
+            self.assertIsNone(outcome.active_generation)
+            self.assertEqual(coordinator.state, "FAILED")
+
+    def test_completed_recovery_outer_close_preserves_published_fact_and_stop(self) -> None:
+        from platform_fs_contracts import LockLease
+        with tempfile.TemporaryDirectory() as temporary:
+            identity = _identity(Path(temporary))
+            first = _coordinator(identity)
+            self.assertIs(type(_service(identity, first).activate_initial(identity.configured_jsonl_path, identity.resource_id)), MigrationReport)
+            owner = _coordinator(identity)
+            service = _service(identity, owner)
+            digest = hashlib.sha256(identity.configured_jsonl_path.read_bytes()).hexdigest()
+            owner._mark_initial_activation_authority_unavailable(digest)
+            root = owner._family._root
+            close = LockLease.close
+            hits = []
+            def close_then_fail(lease):
+                self.assertEqual(owner._initial_activation_failure_digest(), digest)
+                close(lease)
+                hits.append(lease)
+                raise OSError("outer W1 close failure")
+            with patch.object(LockLease, "close", close_then_fail), patch.object(type(owner._family._backend), "bind_root", side_effect=AssertionError("rebind")), patch.object(owner, "recover_durable_activation", wraps=owner.recover_durable_activation) as recover:
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(recover.call_count, 1)
+            self.assertIs(owner._family._root, root)
+            self.assertIs(type(outcome), MigrationFailure)
+            self.assertTrue(outcome.canonical_authority_published)
+            self.assertFalse(outcome.canonical_authority_ambiguous)
+            self.assertEqual(outcome.active_generation, 0)
+            self.assertEqual(owner._initial_activation_failure_digest(), digest)
+            self.assertEqual(owner.state, "FAILED")
 
     def test_lock_swap_after_publication_reports_unavailable_published_gen0(
         self,
@@ -2056,11 +2176,14 @@ class InitialActivationTamperAndConcurrencyTests(unittest.TestCase):
                     self.assertEqual(restarted_coordinator.current_generation, 0)
                     self.assertEqual(foreign_path.read_bytes(), foreign_bytes)
 
-                    same_process_retry = service.activate_initial(
-                        identity.configured_jsonl_path,
-                        identity.resource_id,
-                    )
+                    with patch.object(coordinator, "recover_durable_activation", wraps=coordinator.recover_durable_activation) as recover:
+                        same_process_retry = service.activate_initial(
+                            identity.configured_jsonl_path,
+                            identity.resource_id,
+                        )
                     self.assertIs(type(same_process_retry), MigrationReport)
+                    self.assertEqual(recover.call_count, 1)
+                    self.assertIsNone(coordinator._initial_activation_failure_digest())
 
                     # The residue family is bound to identity A.  An exact
                     # first activation for identity B in the same directory

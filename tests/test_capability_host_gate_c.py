@@ -208,12 +208,14 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
             *,
             path: Path,
             named_defaults: dict[str, object],
+            **kwargs: object,
         ) -> object:
             declaration_modules.append(path.stem)
             return source_declarations(
                 content,
                 path=path,
                 named_defaults=named_defaults,
+                **kwargs,
             )
 
         with patch.object(
@@ -246,6 +248,7 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
             ),
             (
                 "tm_retrieval_validation",
+                "tm_activation_journal",
                 "tm_candidate_index",
                 "tm_candidate_store_contracts",
                 "tm_contracts",
@@ -273,9 +276,9 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
         materialized_on: list[int | None] = []
         errors: list[BaseException] = []
 
-        def recorded_materialize(seed: object) -> object:
+        def recorded_materialize(seed: object, **kwargs: object) -> object:
             materialized_on.append(current_thread().ident)
-            return original_materialize(seed)
+            return original_materialize(seed, **kwargs)
 
         def capture_on_worker() -> None:
             try:
@@ -289,7 +292,7 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
             worker.join(10)
             self.assertFalse(worker.is_alive())
             self.assertEqual(errors, [])
-            self.assertEqual(len(materialized_on), 10)
+            self.assertEqual(len(materialized_on), 11)
             self.assertTrue(
                 all(identity == worker.ident for identity in materialized_on)
             )
@@ -298,7 +301,7 @@ class CapabilityHostGateCCompositionTests(unittest.TestCase):
             )
             self.assertIsNotNone(cached)
             execution._capture_binding()
-            self.assertEqual(len(materialized_on), 10)
+            self.assertEqual(len(materialized_on), 11)
             self.assertIs(
                 getattr(execution, "_RealGateCExecution__validation_binding"),
                 cached,
@@ -1104,6 +1107,7 @@ def recompute_retrieval_validation(
         self,
     ) -> None:
         required_paths = (
+            "tm_activation_journal.py",
             "tm_candidate_index.py",
             "tm_candidate_store_contracts.py",
             "tm_contracts.py",

@@ -10,8 +10,9 @@ import os
 from pathlib import Path, PurePath
 import sqlite3
 import stat
+import sys
 import threading
-from typing import Any, Iterator, Protocol, cast, runtime_checkable
+from typing import Any, Callable, Iterator, Protocol, cast, runtime_checkable
 import uuid
 
 import tm_contracts as contract_module
@@ -29,6 +30,7 @@ from platform_fs_contracts import (
     PlatformFileErrorCode,
     RootedDirectoryAuthority,
     RootedFileSystem,
+    PosixBoundContentObservation,
 )
 from tm_content_attestation import (
     ContentAttestationError,
@@ -43,6 +45,9 @@ from tm_content_attestation import (
     _create_portable_sealed_content_attestation,
     _create_sealed_content_attestation,
     _revalidate_content_file,
+    _capture_posix_bound_content,
+    _RecoveryProfile,
+    _select_recovery_profile,
 )
 from tm_contracts import (
     GENERATION_EXPECTATION_VERSION,
@@ -142,6 +147,11 @@ class _CallerHeldSealBorrow:
         "__stage",
         "__database_reservation",
         "__manifest_reservation",
+        "__thread",
+        "__sql_count",
+        "__sealed_database",
+        "__owner_reproof",
+        "__owner_failure",
     )
 
     def __init__(
@@ -157,6 +167,8 @@ class _CallerHeldSealBorrow:
         database_reservation: MutableFileReservation | None,
         manifest_reservation: MutableFileReservation | None,
         _factory_key: object,
+        owner_reproof: Callable[[], None] | None = None,
+        owner_failure: Callable[[], None] | None = None,
     ) -> None:
         if _factory_key is not _CALLER_HELD_SEAL_BORROW_FACTORY_KEY:
             raise TypeError("caller-held seal borrow is private")
@@ -172,6 +184,11 @@ class _CallerHeldSealBorrow:
             raise TypeError("lock name must be a non-empty exact string")
         if type(lock_payload) is not bytes or not lock_payload:
             raise TypeError("lock payload must be non-empty exact bytes")
+        expected_name = f".{identity.canonical_sidecar_path.name}.localcat-initial-activation.lock"
+        expected_payload = ("localcat-initial-activation-lock-v1\0"
+                            f"{identity.target_identity}\n").encode("ascii")
+        if lock_name != expected_name or lock_payload != expected_payload:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
         if (stage is None) != (database_reservation is None) or (
             stage is None
         ) != (manifest_reservation is None):
@@ -197,13 +214,18 @@ class _CallerHeldSealBorrow:
         self.__stage = stage
         self.__database_reservation = database_reservation
         self.__manifest_reservation = manifest_reservation
+        self.__owner_reproof = owner_reproof
+        self.__owner_failure = owner_failure
+        self.__thread = threading.get_ident()
+        self.__sql_count = 0
+        self.__sealed_database: ContentFileProof | None = None
 
     def _require_stage(
         self,
         platform: _StageSealerPlatform,
         stage: MutableStageRef,
     ) -> None:
-        if self.__released:
+        if self.__released or self.__thread != threading.get_ident():
             raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
         if platform is not self.__platform:
             raise StageSealError("SEALER.RESERVATION_MISMATCH")
@@ -225,7 +247,9 @@ class _CallerHeldSealBorrow:
     ) -> None:
         self._require_stage(platform, stage)
         try:
-            self.__root.reprove()
+            if self.__owner_reproof is not None:
+                self.__owner_reproof()
+            self.__root.reprove_location()
             if self.__stage is not None:
                 for name, reservation in (
                     (
@@ -249,7 +273,9 @@ class _CallerHeldSealBorrow:
                 self.__lock_payload,
             )
             self.__root.reprove()
-        except (PlatformFileError, OSError) as error:
+        except (PlatformFileError, OSError, SQLiteStoreSchemaError, StageSealError) as error:
+            if self.__owner_failure is not None:
+                self.__owner_failure()
             raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE") from error
 
     def open_existing_for_synchronization(
@@ -321,7 +347,73 @@ class _CallerHeldSealBorrow:
         return candidate
 
     def _release(self) -> None:
+        if self.__sql_count:
+            raise StageSealError("SEALER.SQL_STILL_LIVE")
         self.__released = True
+
+    def reprove_sql(self, path: Path, purpose: str) -> None:
+        stage = self.__stage
+        if stage is None or path != stage.staged_db_path or not purpose:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        self.reprove(self.__platform, stage)
+
+    def reprove_stage(self, stage: MutableStageRef) -> None:
+        """Reprove this borrow against the registry's exact original stage."""
+
+        self.reprove(self.__platform, stage)
+
+    def enter_sql(self, path: Path, purpose: str) -> None:
+        self.reprove_sql(path, purpose)
+        self.__sql_count += 1
+
+    def exit_sql(self, path: Path, purpose: str) -> None:
+        self.__sql_count -= 1
+        self.reprove_sql(path, purpose)
+
+    def stage_sql_borrow(self) -> _CallerHeldSealBorrow | None:
+        return self if self.__stage is not None else None
+
+    def _remember_sealed_content(self, proof: ContentFileProof) -> None:
+        self.__sealed_database = proof
+
+    def require_sealed_handoff(self, expected: ContentFileProof) -> None:
+        if self.__sql_count or self.__sealed_database != expected:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+
+    def capture_posix(self, path: Path, *, synchronize: bool = False) -> ContentFileProof:
+        stage = self.__stage
+        if stage is None or self.__sql_count:
+            raise StageSealError("SEALER.SQL_STILL_LIVE")
+        self.reprove(self.__platform, stage)
+        platform = self.__platform
+        if not isinstance(platform, PosixBoundContentObservation):
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        if path in (stage.staged_db_path, stage.manifest_temp_path):
+            opened = self.open_existing_for_synchronization(platform, stage, path.name)
+        elif path == stage.resource_identity.configured_jsonl_path:
+            opened = platform.open_existing_for_synchronization(self.__root, PurePath(path.name))
+        else:
+            raise StageSealError("SEALER.RESERVATION_MISMATCH")
+        try:
+            if synchronize:
+                opened.synchronize_content(opened.content_facts())
+            proof = _capture_posix_bound_content(platform, opened)
+            self.reprove(platform, stage)
+            return proof
+        finally:
+            opened.close()
+
+    def read_manifest_posix(self) -> bytes:
+        stage = self.__stage
+        if stage is None or self.__sql_count:
+            raise StageSealError("SEALER.SQL_STILL_LIVE")
+        opened = self.open_existing_for_synchronization(self.__platform, stage, stage.manifest_temp_path.name)
+        try:
+            result = b"".join(opened.iter_exact_chunks(opened.snapshot()))
+            self.reprove(self.__platform, stage)
+            return result
+        finally:
+            opened.close()
 
     def __reduce__(self) -> object:
         raise TypeError("caller-held seal borrow is non-serializable")
@@ -342,6 +434,8 @@ def _create_caller_held_seal_borrow(
     stage: MutableStageRef | None = None,
     database_reservation: MutableFileReservation | None = None,
     manifest_reservation: MutableFileReservation | None = None,
+    owner_reproof: Callable[[], None] | None = None,
+    owner_failure: Callable[[], None] | None = None,
 ) -> _CallerHeldSealBorrow:
     return _CallerHeldSealBorrow(
         identity=identity,
@@ -354,6 +448,8 @@ def _create_caller_held_seal_borrow(
         database_reservation=database_reservation,
         manifest_reservation=manifest_reservation,
         _factory_key=_CALLER_HELD_SEAL_BORROW_FACTORY_KEY,
+        owner_reproof=owner_reproof,
+        owner_failure=owner_failure,
     )
 
 
@@ -804,6 +900,8 @@ class _RegistryReservation:
     mutable: MutableStageRef
     database_identity: _ArtifactFileIdentity
     manifest_identity: _ArtifactFileIdentity
+    caller_borrow: _CallerHeldSealBorrow | None = None
+    caller_borrow_required: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -1019,6 +1117,8 @@ class _RegistryEntry:
     database_identity: _ArtifactFileIdentity
     manifest_identity: _ArtifactFileIdentity
     sealed_content_attestation: SealedContentAttestation
+    caller_borrow: _CallerHeldSealBorrow | None = None
+    caller_borrow_required: bool = False
     token: contract_module._ActivationToken | None = None
 
 
@@ -1055,6 +1155,8 @@ class _PhysicalReadinessSnapshot:
     database_identity: _ArtifactFileIdentity
     manifest_identity: _ArtifactFileIdentity
     sealed_content_attestation: SealedContentAttestation
+    caller_borrow: _CallerHeldSealBorrow | None = None
+    caller_borrow_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -1479,37 +1581,55 @@ def _source_provenance_json(row: dict[str, object]) -> str:
     return _provenance_json(row.get("provenance")) or '[["source","legacy-jsonl"]]'
 
 
-def _open_stage_read_connection(database_path: Path) -> sqlite3.Connection:
+def _open_stage_read_connection(database_path: Path, caller_borrow: _CallerHeldSealBorrow | None = None) -> sqlite3.Connection:
     database, uri = _sqlite_uri_connection_target(
         database_path,
         mode="ro",
     )
-    connection = sqlite3.connect(
-        database,
-        uri=uri,
-        timeout=5.0,
-        isolation_level=None,
-    )
+    if caller_borrow is not None:
+        caller_borrow.enter_sql(database_path, "seal")
     try:
+        connection = sqlite3.connect(
+            database,
+            uri=uri,
+            timeout=5.0,
+            isolation_level=None,
+        )
+    except BaseException:
+        if caller_borrow is not None:
+            caller_borrow.exit_sql(database_path, "seal")
+        raise
+    try:
+        if caller_borrow is not None:
+            caller_borrow.reprove_sql(database_path, "seal")
         connection.execute("PRAGMA query_only = ON")
         return connection
     except BaseException:
-        connection.close()
+        _close_stage_connection(connection, database_path, caller_borrow)
         raise
 
 
-def _open_stage_write_connection(database_path: Path) -> sqlite3.Connection:
+def _open_stage_write_connection(database_path: Path, caller_borrow: _CallerHeldSealBorrow | None = None) -> sqlite3.Connection:
     database, uri = _sqlite_uri_connection_target(
         database_path,
         mode="rw",
     )
-    connection = sqlite3.connect(
-        database,
-        uri=uri,
-        timeout=5.0,
-        isolation_level=None,
-    )
+    if caller_borrow is not None:
+        caller_borrow.enter_sql(database_path, "seal")
     try:
+        connection = sqlite3.connect(
+            database,
+            uri=uri,
+            timeout=5.0,
+            isolation_level=None,
+        )
+    except BaseException:
+        if caller_borrow is not None:
+            caller_borrow.exit_sql(database_path, "seal")
+        raise
+    try:
+        if caller_borrow is not None:
+            caller_borrow.reprove_sql(database_path, "seal")
         connection.enable_load_extension(False)
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
@@ -1517,8 +1637,17 @@ def _open_stage_write_connection(database_path: Path) -> sqlite3.Connection:
         connection.execute("PRAGMA busy_timeout=5000")
         return connection
     except BaseException:
-        connection.close()
+        _close_stage_connection(connection, database_path, caller_borrow)
         raise
+
+
+def _close_stage_connection(connection: sqlite3.Connection, path: Path,
+                            caller_borrow: _CallerHeldSealBorrow | None) -> None:
+    try:
+        connection.close()
+    finally:
+        if caller_borrow is not None:
+            caller_borrow.exit_sql(path, "seal")
 
 
 def _text_row(value: object, field_name: str) -> str:
@@ -1616,6 +1745,10 @@ def _stage_closure_row_frame(row: tuple[object, ...]) -> bytes:
     return bytes(framed)
 
 
+def _close_stage_closure_cursor(cursor: sqlite3.Cursor) -> None:
+    cursor.close()
+
+
 def _stage_closure_digests(
     connection: sqlite3.Connection,
     *,
@@ -1680,42 +1813,55 @@ def _stage_closure_digests(
 
     def frame_table(table: str, query: str) -> None:
         frame_table_header(table)
+        # A framing failure retains this frame in its traceback. Finalize
+        # the native statement before its connection and any raw guard close.
         cursor = connection.execute(query)
-        while True:
-            rows = cursor.fetchmany(_STAGE_CLOSURE_FETCH_ROWS)
-            if not rows:
-                break
-            active_framed = bytearray()
-            pre_activation_framed = (
-                bytearray() if pre_activation_digest is not None else None
-            )
-            for row in rows:
-                if pre_activation_framed is not None:
-                    reconstructed = pre_activation_row(table, row)
-                else:
-                    reconstructed = None
-                if (
-                    pre_activation_framed is not None
-                    and reconstructed == row
-                ):
-                    encoded_row = _stage_closure_row_frame(row)
-                    active_framed.extend(encoded_row)
-                    pre_activation_framed.extend(encoded_row)
-                else:
-                    active_framed.extend(_stage_closure_row_frame(row))
+        try:
+            while True:
+                rows = cursor.fetchmany(_STAGE_CLOSURE_FETCH_ROWS)
+                if not rows:
+                    break
+                active_framed = bytearray()
+                pre_activation_framed = (
+                    bytearray() if pre_activation_digest is not None else None
+                )
+                for row in rows:
+                    if pre_activation_framed is not None:
+                        reconstructed = pre_activation_row(table, row)
+                    else:
+                        reconstructed = None
                     if (
                         pre_activation_framed is not None
-                        and reconstructed is not None
+                        and reconstructed == row
                     ):
-                        pre_activation_framed.extend(
-                            _stage_closure_row_frame(reconstructed)
-                        )
-            active_digest.update(active_framed)
-            if (
-                pre_activation_digest is not None
-                and pre_activation_framed is not None
-            ):
-                pre_activation_digest.update(pre_activation_framed)
+                        encoded_row = _stage_closure_row_frame(row)
+                        active_framed.extend(encoded_row)
+                        pre_activation_framed.extend(encoded_row)
+                    else:
+                        active_framed.extend(_stage_closure_row_frame(row))
+                        if (
+                            pre_activation_framed is not None
+                            and reconstructed is not None
+                        ):
+                            pre_activation_framed.extend(
+                                _stage_closure_row_frame(reconstructed)
+                            )
+                active_digest.update(active_framed)
+                if (
+                    pre_activation_digest is not None
+                    and pre_activation_framed is not None
+                ):
+                    pre_activation_digest.update(pre_activation_framed)
+        finally:
+            primary = sys.exception()
+            try:
+                _close_stage_closure_cursor(cursor)
+            except BaseException:
+                # The seam may fail before or after native close. This exact
+                # cursor still owns safe, idempotent SQLite cleanup.
+                cursor.close()
+                if primary is None:
+                    raise
 
     def has_table(table: str) -> bool:
         row = connection.execute(
@@ -1852,6 +1998,7 @@ def _import_batch_token(batch_id: str) -> str:
 def _validate_stage_facts(
     stage: MutableStageRef,
     *,
+    caller_borrow: _CallerHeldSealBorrow | None = None,
     canonical_store_id: str,
     allow_sealed: bool = False,
     schema_upgrade: bool | None = None,
@@ -1880,9 +2027,9 @@ def _validate_stage_facts(
     identity = stage.resource_identity
     try:
         connection = (
-            _open_stage_write_connection(stage.staged_db_path)
+            _open_stage_write_connection(stage.staged_db_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
             if seal_stage
-            else _open_stage_read_connection(stage.staged_db_path)
+            else _open_stage_read_connection(stage.staged_db_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
         )
         try:
             connection.execute("BEGIN IMMEDIATE" if seal_stage else "BEGIN")
@@ -1891,6 +2038,7 @@ def _validate_stage_facts(
                     stage,
                     canonical_store_id=canonical_store_id,
                     _allow_sealed=allow_sealed,
+                    _stage_borrow=caller_borrow,
                 )
                 if type(schema.activation_status) is not str:
                     raise StageSealError("SEALER.STAGE_INVALID")
@@ -2186,7 +2334,7 @@ def _validate_stage_facts(
                 connection.rollback()
                 raise
         finally:
-            connection.close()
+            _close_stage_connection(connection, stage.staged_db_path, caller_borrow)
     except StageSealError:
         raise
     except (
@@ -2816,6 +2964,7 @@ def _mark_stage_sealed(
 def _restore_stage_unpublished(
     path: Path,
     expected: _ArtifactFileIdentity,
+    caller_borrow: _CallerHeldSealBorrow | None = None,
 ) -> None:
     """Durably roll the SEALED marker back to UNPUBLISHED after a failed seal.
 
@@ -2825,21 +2974,17 @@ def _restore_stage_unpublished(
     exactly like the marker write, so a swapped path is never rewritten.
     """
 
+    if caller_borrow is not None:
+        caller_borrow.reprove_sql(path, "restore-unpublished")
     _require_identity_unchanged(
         path,
         expected,
         unsafe_code="SEALER.STAGE_DATABASE_UNSAFE",
     )
     try:
-        database, uri = _sqlite_uri_connection_target(
-            path,
-            mode="rw",
-        )
-        connection = sqlite3.connect(
-            database,
-            uri=uri,
-            timeout=5.0,
-            isolation_level=None,
+        connection = (
+            _open_stage_write_connection(path, caller_borrow=caller_borrow)
+            if caller_borrow is not None else _open_stage_write_connection(path)
         )
     except sqlite3.DatabaseError as error:
         raise StageSealError("SEALER.STAGE_INVALID") from error
@@ -2873,9 +3018,12 @@ def _restore_stage_unpublished(
     except sqlite3.DatabaseError as error:
         raise StageSealError("SEALER.STAGE_INVALID") from error
     finally:
-        connection.close()
-    _fsync_file(path, expected)
-    _fsync_directory(path.parent)
+        _close_stage_connection(connection, path, caller_borrow)
+    if caller_borrow is not None:
+        caller_borrow.capture_posix(path, synchronize=True)
+    else:
+        _fsync_file(path, expected)
+        _fsync_directory(path.parent)
 
 
 def _fsync_file(path: Path, expected: _ArtifactFileIdentity) -> None:
@@ -3047,6 +3195,7 @@ def _verify_manifest_at_digest(
 def _verify_sealed_stage_semantics(
     stage: MutableStageRef,
     *,
+    caller_borrow: _CallerHeldSealBorrow | None = None,
     record_count: int,
     origin_batch_count: int,
     receipt_count: int,
@@ -3054,7 +3203,7 @@ def _verify_sealed_stage_semantics(
     expected_candidate_projection_digest: str,
     expected_closure_digest: str,
 ) -> None:
-    connection = _open_stage_read_connection(stage.staged_db_path)
+    connection = _open_stage_read_connection(stage.staged_db_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
     try:
         connection.execute("BEGIN")
         try:
@@ -3114,7 +3263,7 @@ def _verify_sealed_stage_semantics(
             connection.rollback()
             raise
     finally:
-        connection.close()
+        _close_stage_connection(connection, stage.staged_db_path, caller_borrow)
 
 
 def _verify_sealed_stage(
@@ -3267,23 +3416,32 @@ def _require_linearization_closure(
         or type(attestation) is not SealedContentAttestation
     ):
         raise StageSealError("SEALER.ATTESTATION_INVALID")
+    caller_borrow = snapshot.caller_borrow
+    if snapshot.caller_borrow_required or caller_borrow is not None:
+        if type(caller_borrow) is not _CallerHeldSealBorrow:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        caller_borrow.reprove_stage(snapshot.mutable_stage)
+    capture = (
+        _capture_content_file
+        if caller_borrow is None else caller_borrow.capture_posix
+    )
     try:
-        observed_database = _capture_content_file(
+        observed_database = capture(
             snapshot.mutable_stage.staged_db_path
         )
-    except ContentAttestationError as error:
+    except (ContentAttestationError, PlatformFileError, OSError) as error:
         raise StageSealError("SEALER.STAGE_DATABASE_UNSAFE") from error
     try:
-        observed_manifest = _capture_content_file(
+        observed_manifest = capture(
             snapshot.mutable_stage.manifest_temp_path
         )
-    except ContentAttestationError as error:
+    except (ContentAttestationError, PlatformFileError, OSError) as error:
         raise StageSealError("SEALER.STAGE_MANIFEST_UNSAFE") from error
     try:
-        observed_source = _capture_content_file(
+        observed_source = capture(
             snapshot.mutable_stage.resource_identity.configured_jsonl_path
         )
-    except ContentAttestationError as error:
+    except (ContentAttestationError, PlatformFileError, OSError) as error:
         raise StageSealError("SEALER.SOURCE_DIGEST_MISMATCH") from error
     if (
         observed_database.device,
@@ -3503,6 +3661,7 @@ class _SealedArtifactRegistry:
         *,
         database_identity: _ArtifactFileIdentity,
         manifest_identity: _ArtifactFileIdentity,
+        caller_borrow: _CallerHeldSealBorrow | None = None,
     ) -> _RegistryReservation:
         """Reserve one stage before any irreversible transition.
 
@@ -3521,6 +3680,8 @@ class _SealedArtifactRegistry:
                 or type(manifest_identity) is not _ArtifactFileIdentity
             ):
                 raise StageSealError("SEALER.TYPE_INVALID")
+            if caller_borrow is not None:
+                caller_borrow.reprove_sql(stage.staged_db_path, "registry-reserve")
             self._reject_second_seal(stage)
             key = (str(stage.staged_db_path), str(stage.manifest_temp_path))
             if key in self._reservations:
@@ -3550,6 +3711,8 @@ class _SealedArtifactRegistry:
                 mutable=stage,
                 database_identity=database_identity,
                 manifest_identity=manifest_identity,
+                caller_borrow=caller_borrow,
+                caller_borrow_required=caller_borrow is not None,
             )
             self._reservations[reservation.key] = reservation
             return reservation
@@ -3732,6 +3895,10 @@ class _SealedArtifactRegistry:
             if type(attestation) is not SealedContentAttestation:
                 raise StageSealError("SEALER.TYPE_INVALID")
             stage = reservation.mutable
+            if reservation.caller_borrow_required:
+                if type(reservation.caller_borrow) is not _CallerHeldSealBorrow:
+                    raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+                reservation.caller_borrow.reprove_stage(stage)
             try:
                 contract_module._validate_stage_validation_evidence(claim)
                 identity = stage.resource_identity
@@ -3755,17 +3922,17 @@ class _SealedArtifactRegistry:
                     reservation.manifest_identity,
                     unsafe_code="SEALER.STAGE_MANIFEST_UNSAFE",
                 )
-                _require_stage_sealed_marker(stage.staged_db_path)
-                observed_database = _revalidate_content_file(
-                    stage.staged_db_path,
+                _require_stage_sealed_marker(stage.staged_db_path, reservation.caller_borrow)
+                observed_database = _revalidate_sealed_file(
+                    reservation.caller_borrow, stage.staged_db_path,
                     attestation.database,
                 )
-                observed_manifest = _revalidate_content_file(
-                    stage.manifest_temp_path,
+                observed_manifest = _revalidate_sealed_file(
+                    reservation.caller_borrow, stage.manifest_temp_path,
                     attestation.manifest,
                 )
-                observed_source = _revalidate_content_file(
-                    stage.resource_identity.configured_jsonl_path,
+                observed_source = _revalidate_sealed_file(
+                    reservation.caller_borrow, stage.resource_identity.configured_jsonl_path,
                     attestation.source,
                 )
                 semantic = attestation.semantic_facts
@@ -3823,6 +3990,8 @@ class _SealedArtifactRegistry:
                 database_identity=reservation.database_identity,
                 manifest_identity=reservation.manifest_identity,
                 sealed_content_attestation=attestation,
+                caller_borrow=reservation.caller_borrow,
+                caller_borrow_required=reservation.caller_borrow_required,
             )
             self._sealed_paths[reservation.key] = artifact_id
             del self._reservations[reservation.key]
@@ -4015,6 +4184,8 @@ class _SealedArtifactRegistry:
                 database_identity=entry.database_identity,
                 manifest_identity=entry.manifest_identity,
                 sealed_content_attestation=entry.sealed_content_attestation,
+                caller_borrow=entry.caller_borrow,
+                caller_borrow_required=entry.caller_borrow_required,
             )
 
     def contains(self, stage: SealedStage) -> bool:
@@ -4226,10 +4397,10 @@ class _SealedArtifactRegistry:
             )
 
 
-def _require_stage_sealed_marker(path: Path) -> None:
+def _require_stage_sealed_marker(path: Path, caller_borrow: _CallerHeldSealBorrow | None = None) -> None:
     """Confirm the on-disk seal marker that only the sealer can set."""
 
-    connection = _open_stage_read_connection(path)
+    connection = _open_stage_read_connection(path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
     try:
         rows = connection.execute(
             "SELECT value FROM tm_meta WHERE key = 'activation_status'"
@@ -4237,7 +4408,17 @@ def _require_stage_sealed_marker(path: Path) -> None:
         if rows != [("SEALED",)]:
             raise StageSealError("SEALER.STAGE_NOT_SEALED")
     finally:
-        connection.close()
+        _close_stage_connection(connection, path, caller_borrow)
+
+
+def _revalidate_sealed_file(borrow: _CallerHeldSealBorrow | None, path: Path,
+                            expected: ContentFileProof) -> ContentFileProof:
+    if borrow is None:
+        return _revalidate_content_file(path, expected)
+    observed = borrow.capture_posix(path)
+    if observed != expected:
+        raise StageSealError("SEALER.STAGE_MUTATED_AFTER_VALIDATION")
+    return observed
 
 
 class StageSealer:
@@ -4253,6 +4434,7 @@ class StageSealer:
         registry: _SealedArtifactRegistry,
         canonical_store_id: str,
         platform: _StageSealerPlatform | None = None,
+        recovery_profile: _RecoveryProfile | None = None,
     ) -> None:
         if type(registry) is not _SealedArtifactRegistry:
             raise StageSealError("SEALER.TYPE_INVALID")
@@ -4271,6 +4453,9 @@ class StageSealer:
         self._registry = registry
         self._canonical_store_id = canonical_store_id
         self._platform = platform
+        if recovery_profile is not None and type(recovery_profile) is not _RecoveryProfile:
+            raise TypeError("recovery_profile must be exact _RecoveryProfile or None")
+        self._recovery_profile = _select_recovery_profile() if recovery_profile is None else recovery_profile
 
     @property
     def registry(self) -> contract_module._SealedArtifactRegistryPort:
@@ -4309,6 +4494,7 @@ class StageSealer:
                 canonical_store_id=self._canonical_store_id,
                 schema_upgrade=schema_upgrade,
                 seal_stage=True,
+                caller_borrow=caller_borrow.stage_sql_borrow(),
             )
             live_authority = _open_portable_stage_live_authority(
                 platform,
@@ -4342,6 +4528,7 @@ class StageSealer:
                     facts.candidate_projection_digest
                 ),
                 expected_closure_digest=facts.closure_digest,
+                caller_borrow=caller_borrow.stage_sql_borrow(),
             )
             live_authority.reprove()
             binding = _build_binding(
@@ -4398,6 +4585,70 @@ class StageSealer:
                 pass
             raise
 
+    def _seal_posix(
+        self, stage: MutableStageRef, *, expected_prior_generation: int | None,
+        schema_upgrade: bool, caller_borrow: _CallerHeldSealBorrow,
+    ) -> SealedStage:
+        platform = self._platform
+        if platform is None:
+            raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+        caller_borrow.reprove(platform, stage)
+        database = caller_borrow.capture_posix(stage.staged_db_path)
+        manifest = caller_borrow.capture_posix(stage.manifest_temp_path)
+        database_identity = _ArtifactFileIdentity(database.device, database.inode)
+        manifest_identity = _ArtifactFileIdentity(manifest.device, manifest.inode)
+        reservation = self._registry._reserve(
+            stage, database_identity=database_identity,
+            manifest_identity=manifest_identity, caller_borrow=caller_borrow,
+        )
+        marker_written = False
+        try:
+            facts = _validate_stage_facts(
+                stage, canonical_store_id=self._canonical_store_id,
+                schema_upgrade=schema_upgrade, seal_stage=True,
+                caller_borrow=caller_borrow,
+            )
+            marker_written = True
+            database = caller_borrow.capture_posix(stage.staged_db_path, synchronize=True)
+            manifest = caller_borrow.capture_posix(stage.manifest_temp_path, synchronize=True)
+            source = caller_borrow.capture_posix(stage.resource_identity.configured_jsonl_path)
+            _verify_sealed_stage_semantics(
+                stage, record_count=facts.record_count,
+                origin_batch_count=facts.origin_batch_count, receipt_count=1,
+                fts5_available=facts.fts5_available,
+                expected_candidate_projection_digest=facts.candidate_projection_digest,
+                expected_closure_digest=facts.closure_digest, caller_borrow=caller_borrow,
+            )
+            _revalidate_sealed_file(caller_borrow, stage.staged_db_path, database)
+            manifest_digest, decoded = _decode_verified_manifest(
+                caller_borrow.read_manifest_posix(), facts.receipt,
+                upgrade_manifest=facts.schema_upgrade,
+            )
+            if manifest_digest != manifest.sha256 or source.sha256 != facts.receipt.jsonl_digest:
+                raise StageSealError("SEALER.STAGE_MUTATED_AFTER_VALIDATION")
+            binding = _build_binding(stage.resource_identity, facts.receipt, decoded)
+            evidence = _build_evidence(facts, binding, stage_file_digest=database.sha256,
+                                       manifest_temp_digest=manifest_digest)
+            generation = _build_generation(facts, canonical_store_id=self._canonical_store_id,
+                                           expected_prior_generation=expected_prior_generation)
+            attestation = _build_sealed_content_attestation(
+                stage, facts, evidence, generation, database_proof=database,
+                manifest_proof=manifest, source_proof=source,
+            )
+            capability = _create_verified_seal_commit_capability(
+                self._registry, reservation, evidence, generation, attestation,
+            )
+            sealed = self._registry._commit_verified(capability)
+            caller_borrow._remember_sealed_content(database)
+            return sealed
+        except BaseException:
+            try:
+                if marker_written:
+                    _restore_stage_unpublished(stage.staged_db_path, database_identity, caller_borrow)
+            finally:
+                self._registry._release(reservation)
+            raise
+
     def seal(
         self,
         mutable_stage: MutableStageRef,
@@ -4435,7 +4686,12 @@ class StageSealer:
             if expected_prior_generation < 0:
                 raise StageSealError("SEALER.GENERATION_INVALID")
         stage = _snapshot_stage(mutable_stage)
-        if self._platform is not None:
+        if self._platform is not None and self._recovery_profile is _RecoveryProfile.POSIX_V2:
+            if type(caller_borrow) is not _CallerHeldSealBorrow:
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
+            return self._seal_posix(stage, expected_prior_generation=expected_prior_generation,
+                                    schema_upgrade=schema_upgrade, caller_borrow=caller_borrow)
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             if type(caller_borrow) is not _CallerHeldSealBorrow:
                 raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE")
             return self._seal_portable(

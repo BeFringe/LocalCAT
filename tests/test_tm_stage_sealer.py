@@ -707,6 +707,7 @@ class StageSealerHappyPathTests(unittest.TestCase):
             "closure-origin-batch-only",
             910014,
         )
+        closed_cursors = []
 
         class Cursor:
             def __init__(self, rows: list[tuple[object, ...]]) -> None:
@@ -718,6 +719,10 @@ class StageSealerHappyPathTests(unittest.TestCase):
 
             def fetchone(self) -> tuple[object, ...] | None:
                 return self._rows.pop(0) if self._rows else None
+
+            def close(self) -> None:
+                self._rows = []
+                closed_cursors.append(self)
 
         class Connection:
             def execute(
@@ -750,6 +755,8 @@ class StageSealerHappyPathTests(unittest.TestCase):
 
         self.assertEqual(active, pre_activation)
         self.assertEqual(record_frame_count, 1)
+        self.assertEqual(len(closed_cursors), 6)
+        self.assertEqual(len({id(cursor) for cursor in closed_cursors}), 6)
 
     def test_stage_closure_row_frame_is_exact_and_rejects_non_cells(self) -> None:
         row = (None, "", "é", -12, 0)

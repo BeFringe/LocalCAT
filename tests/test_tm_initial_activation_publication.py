@@ -74,8 +74,8 @@ class InitialActivationPublicationTests(unittest.TestCase):
                 f"{rebound_jsonl.name}.localcat-snapshot.json"
             )
 
-            def publish_then_rebind(*args: Any) -> int:
-                generation = real_publish(*args)
+            def publish_then_rebind(*args: Any, **kwargs: Any) -> int:
+                generation = real_publish(*args, **kwargs)
                 active_store_path = coordinator.active_store_path
                 assert active_store_path is not None
                 with closing(
@@ -118,9 +118,9 @@ class InitialActivationPublicationTests(unittest.TestCase):
                 outcome.error_code,
                 "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
             )
-            self.assertFalse(outcome.canonical_authority_published)
-            self.assertTrue(outcome.canonical_authority_ambiguous)
-            self.assertIsNone(outcome.active_generation)
+            self.assertTrue(outcome.canonical_authority_published)
+            self.assertFalse(outcome.canonical_authority_ambiguous)
+            self.assertEqual(outcome.active_generation, 0)
             self.assertFalse(outcome.retryable)
             self.assertEqual(outcome.recovery_locators, ())
             self.assertEqual(coordinator.current_generation, 0)
@@ -284,8 +284,8 @@ class InitialActivationPublicationTests(unittest.TestCase):
             identity, coordinator, service = _fixture(Path(temporary))
             real_publish = coordinator.publish_activation
 
-            def publish_with_false_return(*args: Any) -> int:
-                real_publish(*args)
+            def publish_with_false_return(*args: Any, **kwargs: Any) -> int:
+                real_publish(*args, **kwargs)
                 return 1
 
             with (

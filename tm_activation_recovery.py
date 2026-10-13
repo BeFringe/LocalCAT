@@ -12,18 +12,22 @@ has no dependency on the store module.  The coordinator in
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import sqlite3
 import stat
 import sys
 import threading
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from pathlib import Path, PurePath
-from typing import Any, Protocol, cast
+from typing import Any, Iterator, Protocol, cast
 
 import tm_contracts as contract_module
 from tm_content_attestation import (
+    ContentFileProof,
+    _capture_posix_bound_content,
     ActiveContentAttestation,
     ContentAttestationError,
     ContentSemanticFacts,
@@ -50,6 +54,7 @@ from tm_contracts import (
     snapshot_receipt_digest,
 )
 from tm_activation_journal import (
+    _CallerHeldPosixActivationBorrow,
     ActivationPreparationError,
     ActivationRecoveryReport,
     _ACTIVATION_JOURNAL_VERSION,
@@ -102,6 +107,7 @@ from tm_activation_journal import (
     _activation_terminal_coexistence_valid,
     _activation_terminal_path,
     _activation_terminal_temp_path,
+    _append_owned_close_facts,
     _capture_activation_file,
     _ensure_activation_lineage_marker,
     _fsync_activation_directory,
@@ -124,6 +130,7 @@ from tm_activation_journal import (
     _replace_activation_file,
     _replay_activation_journal,
     _retire_cancelled_candidate_assets,
+    _posix_cancelled_rollback_closure,
     _require_first_activation_absence,
     _rollback_terminal_prior_closes,
     _write_recovery_backup,
@@ -140,6 +147,8 @@ from platform_fs_contracts import (
     CandidateContentFacts,
     CandidateFile,
     EntrySnapshot,
+    ExistingFileMutationGuard,
+    PosixStageHandoff,
     ExistingFileRetirement,
     LedgerEntryObservation,
     LedgerEnumerationLimits,
@@ -149,6 +158,7 @@ from platform_fs_contracts import (
     LockedDescendantNamespaceInspection,
     OpaqueAuthority,
     PendingPublication,
+    PosixBoundContentObservation,
     PrivateProofContext,
     PrivateProofObjectRole,
     PersistentPrivateProof,
@@ -159,6 +169,7 @@ from platform_fs_contracts import (
     RootedDirectoryAuthority,
     VerifiedPrivateProof,
 )
+
 
 _SCHEMA_UPGRADE_META_KEY = "schema_upgrade_origin"
 _SCHEMA_UPGRADE_META_VALUE = "schema-upgrade-v1"
@@ -441,6 +452,9 @@ class _RetainedPortableReplacementInspection(OpaqueAuthority):
 
 class _StoreValidationPort(Protocol):
     """Narrow store-side surface consumed by the recovery functions."""
+
+    posix_activation_borrow: _CallerHeldPosixActivationBorrow | None
+    receipt_handoff: _PosixReceiptHandoff | None
 
     @property
     def resource_identity(self) -> CanonicalResourceIdentity: ...
@@ -3584,21 +3598,25 @@ def _capture_prior_assets(
         _capture_activation_file(
             view.stage.staged_db_path,
             asset_kind="DATABASE",
+            **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
         ),
     ]
     if not replacement or _lstat_any_entry(
-        identity.snapshot_manifest_path
+        identity.snapshot_manifest_path,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     ):
         captures.append(
             _capture_activation_file(
                 identity.snapshot_manifest_path,
                 asset_kind="MANIFEST",
+                **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
             )
         )
     captures.append(
         _capture_activation_file(
             identity.configured_jsonl_path,
             asset_kind="SOURCE",
+            **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
         )
     )
     database = captures[0]
@@ -3617,7 +3635,7 @@ def _capture_prior_assets(
             retryable=False,
         )
     if manifest is not None and not replacement:
-        manifest_payload = _read_activation_file_bytes(manifest)
+        manifest_payload = _read_activation_file_bytes(manifest, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
         if manifest_payload != contract_to_json(
             binding.manifest
         ).encode("utf-8"):
@@ -3663,6 +3681,7 @@ def _validate_activation_publication_authority(
     registry: Any,
     identity: CanonicalResourceIdentity,
     canonical_store_id: str,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Validate token/registry/source/backup facts after candidate movement."""
 
@@ -3753,7 +3772,7 @@ def _validate_activation_publication_authority(
             "ACTIVATION.JOURNAL_CLOSURE_INVALID",
             retryable=False,
         )
-    source = _capture_journal_closure_file(identity.configured_jsonl_path)
+    source = _capture_journal_closure_file(identity.configured_jsonl_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
     if (
         (source[0].device, source[0].inode) != record.source_jsonl_identity
         or source[1] != record.source_jsonl_digest
@@ -3798,7 +3817,7 @@ def _validate_activation_publication_authority(
                     "ACTIVATION.JOURNAL_CLOSURE_INVALID",
                     retryable=False,
                 )
-            capture = _capture_journal_closure_file(path)
+            capture = _capture_journal_closure_file(path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
             asset = backups[kind]
             if (
                 (capture[0].device, capture[0].inode) != expected_identity
@@ -3818,13 +3837,166 @@ def _validate_activation_publication_authority(
         )
 
 
+class _PosixReceiptHandoff:
+    """DB naming authority handed to one retained guard before any receipt SQL."""
+
+    def __init__(self, borrow: _CallerHeldPosixActivationBorrow, pending: PendingPublication | None) -> None:
+        self.borrow = borrow
+        self.pending: PendingPublication | None = pending
+        self.guard: BoundExistingFileMutationGuard | None = None
+        self._sql_count = 0
+        self.final_content: ContentFileProof | None = None
+
+    def begin_receipt(self) -> None:
+        borrow = self.borrow
+        borrow.reprove()
+        pending = self.pending
+        if pending is None or self.guard is not None:
+            raise ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_INVALID", retryable=False)
+        if not isinstance(borrow.backend, ExistingFileMutationGuard):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        self.guard = borrow.backend.guard_existing_for_mutation(
+            borrow.root, PurePath(borrow.identity.canonical_sidecar_path.name),
+        )
+        if pending.retained_destination().identity() != self.guard.reprove():
+            raise ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_INVALID", retryable=False)
+        pending.terminal_reproof()
+        self.pending = None
+        close_error = borrow.close_owned(pending)
+        if close_error is not None:
+            raise close_error
+        self.reprove_sql(borrow.identity.canonical_sidecar_path, "activation-receipt")
+
+    def reprove_sql(self, path: Path, purpose: str) -> None:
+        if path != self.borrow.identity.canonical_sidecar_path or purpose not in {"activation-receipt", "stage-inspect"} or self.pending is not None or self.guard is None:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        self.borrow.reprove()
+        try:
+            self.guard.reprove()
+        except (PlatformFileError, OSError):
+            self.borrow.fail()
+            raise
+
+    def enter_sql(self, path: Path, purpose: str) -> None:
+        self.reprove_sql(path, purpose)
+        self._sql_count += 1
+
+    def exit_sql(self, path: Path, purpose: str) -> None:
+        self._sql_count -= 1
+        self.reprove_sql(path, purpose)
+
+    def capture(self, *, synchronize: bool = False) -> ContentFileProof:
+        if self._sql_count or self.guard is None or self.pending is not None:
+            raise ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_INVALID", retryable=False)
+        borrow = self.borrow
+        path = borrow.identity.canonical_sidecar_path
+        self.reprove_sql(path, "activation-receipt")
+        if not isinstance(borrow.backend, PosixBoundContentObservation):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        opened = borrow.backend.open_existing_for_synchronization(borrow.root, PurePath(path.name))
+        operation_error = None
+        try:
+            if opened.identity() != self.guard.reprove():
+                raise ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_INVALID", retryable=False)
+            if synchronize:
+                opened.synchronize_content(opened.content_facts())
+            proof = _capture_posix_bound_content(borrow.backend, opened)
+            if opened.identity() != self.guard.reprove():
+                raise ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_INVALID", retryable=False)
+            borrow.reprove()
+            return proof
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = borrow.close_owned(opened, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
+
+    def defer_connection_close(self, connection: sqlite3.Connection) -> None:
+        self.borrow.io_incomplete = True
+        def retry_close() -> BaseException | None:
+            try:
+                connection.close()
+            except BaseException as error:
+                return error
+            self._sql_count -= 1
+            return None
+        self.borrow.defer_close(retry_close)
+
+    def close(self, *, primary: BaseException | None = None) -> None:
+        if self._sql_count:
+            # SQL's exact failed connection is queued first. Never release its
+            # guard while native statements/connection may still be alive.
+            self.borrow.io_incomplete = True
+            def retry_close() -> BaseException | None:
+                if self._sql_count:
+                    return ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
+                try:
+                    self.close()
+                except BaseException as error:
+                    return error
+                return None
+            self.borrow.defer_close(retry_close)
+            return
+        owned = (self.pending, self.guard)
+        self.pending = None
+        self.guard = None
+        close_error = self.borrow.close_owned(*owned, primary=primary)
+        if primary is None and close_error is not None:
+            raise close_error
+
+
+def _replace_posix_activation_database(
+    record: _ActivationJournalRecord, *, identity: CanonicalResourceIdentity,
+    caller_borrow: _CallerHeldPosixActivationBorrow,
+) -> _PosixReceiptHandoff:
+    borrow = caller_borrow
+    borrow.reprove()
+    if borrow.identity != identity or record.resource_id != identity.resource_id or record.target_identity != identity.target_identity:
+        raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+    canonical = identity.canonical_sidecar_path
+    if record.had_prior_canonical and record.prior_db_path == canonical:
+        prior = borrow.capture(canonical)
+        if (prior.device, prior.inode) != record.prior_db_identity or prior.sha256 != record.prior_db_digest:
+            raise ActivationPreparationError("ACTIVATION.PRIOR_ASSET_INVALID", retryable=False)
+    elif borrow.root.inspect_entry(canonical.name) is not None:
+        raise ActivationPreparationError("ACTIVATION.CANONICAL_TARGET_OCCUPIED", retryable=False)
+    candidate = borrow.handoff_stage(record.sealed_content_attestation.database)
+    pending: PendingPublication | None = None
+    operation_error = None
+    try:
+        borrow.reprove()
+        borrow.publication_incomplete = True
+        pending = borrow.root.begin_publish(candidate, canonical.name,
+            mode=PublishMode.REPLACE_UNDER_LOCK, lease=borrow.lease)
+        handoff = _PosixReceiptHandoff(borrow, pending)
+        if not isinstance(borrow.backend, PosixBoundContentObservation):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        if _capture_posix_bound_content(borrow.backend, pending.retained_destination()) != record.sealed_content_attestation.database:
+            raise ActivationPreparationError("ACTIVATION.DB_REPLACE_UNPROVEN", retryable=False)
+        borrow.reprove()
+        pending = None
+        return handoff
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        close_error = borrow.close_owned(pending, candidate, primary=operation_error)
+        if operation_error is None and close_error is not None:
+            raise close_error
+
+
 def _replace_activation_database(
     record: _ActivationJournalRecord,
     *,
     identity: CanonicalResourceIdentity,
-) -> None:
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
+) -> _PosixReceiptHandoff | None:
     """Atomically move the sealed candidate into the canonical sidecar."""
 
+    if caller_borrow is not None:
+        return _replace_posix_activation_database(record, identity=identity, caller_borrow=caller_borrow)
     candidate = _capture_journal_closure_file(record.candidate_stage_db_path)
     if (
         (candidate[0].device, candidate[0].inode)
@@ -3888,6 +4060,14 @@ def _validate_replaced_activation_database(
     """Rehash the post-integrity sealed bytes, then reopen their schema."""
 
     sealed = record.sealed_content_attestation
+    borrow = port.posix_activation_borrow
+    if borrow is not None:
+        if (borrow.capture(identity.canonical_sidecar_path) != sealed.database
+                or borrow.capture(record.candidate_manifest_temp_path) != sealed.manifest
+                or borrow.capture(identity.configured_jsonl_path) != sealed.source
+                or borrow.root.inspect_entry(record.candidate_stage_db_path.name) is not None):
+            raise ActivationPreparationError("ACTIVATION.DB_REOPEN_INVALID", retryable=False)
+        return None
     try:
         canonical = _capture_content_file(identity.canonical_sidecar_path)
         manifest = _capture_content_file(record.candidate_manifest_temp_path)
@@ -3952,6 +4132,34 @@ def _activation_publication_digest(
     ).hexdigest()
 
 
+def _close_activation_receipt_cursor(cursor: sqlite3.Cursor) -> None:
+    cursor.close()
+
+
+@contextmanager
+def _activation_receipt_cursor(cursor: sqlite3.Cursor) -> Iterator[sqlite3.Cursor]:
+    """Finalize every owned statement before the connection, preserving cause."""
+    try:
+        yield cursor
+    finally:
+        primary = sys.exception()
+        try:
+            _close_activation_receipt_cursor(cursor)
+        except BaseException:
+            # Native cursor cleanup is idempotent and remains owned by SQLite.
+            cursor.close()
+            if primary is None:
+                raise
+
+
+def _commit_activation_receipt(connection: sqlite3.Connection) -> None:
+    connection.commit()
+
+
+def _rollback_activation_receipt(connection: sqlite3.Connection) -> None:
+    connection.rollback()
+
+
 def _publish_activation_receipt(
     port: _StoreValidationPort,
     record: _ActivationJournalRecord,
@@ -3967,24 +4175,36 @@ def _publish_activation_receipt(
     evidence = preparation._sealed_stage.evidence
     binding = evidence.source_binding
     receipt = binding.receipt
-    canonical_capture = _capture_journal_closure_file(
-        identity.canonical_sidecar_path
-    )
-    if (
-        (canonical_capture[0].device, canonical_capture[0].inode)
-        != record.candidate_stage_db_identity
-        or canonical_capture[1] != record.stage_db_digest
-    ):
-        raise ActivationPreparationError(
-            "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
-            retryable=False,
-        )
+    handoff = port.receipt_handoff
+    canonical_capture = None
+    if handoff is not None:
+        handoff.borrow.publication_incomplete = True
+        if handoff.capture() != record.sealed_content_attestation.database:
+            raise ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_INVALID", retryable=False)
+    else:
+        canonical_capture = _capture_journal_closure_file(identity.canonical_sidecar_path)
+        if ((canonical_capture[0].device, canonical_capture[0].inode) != record.candidate_stage_db_identity
+                or canonical_capture[1] != record.stage_db_digest):
+            raise ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_INVALID", retryable=False)
     try:
+        if handoff is not None:
+            # The immutable sealed proof authorized DB_REPLACED without SQL
+            # under pending. Reopen/schema validation now borrows the guard,
+            # after pending terminal/close, before the receipt transaction.
+            snapshot = port.inspect_stage_schema(
+                _canonical_activation_ref(identity, journal_id=record.journal_id),
+                canonical_store_id=canonical_store_id, _allow_sealed=True,
+            )
+            if snapshot.activation_status != "SEALED":
+                raise ActivationPreparationError("ACTIVATION.DB_REOPEN_INVALID", retryable=False)
         with port.open_configured_connection(
             identity.canonical_sidecar_path,
             require_existing=True,
-        ) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        ) as connection, ExitStack() as statements:
+            def execute(sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+                return statements.enter_context(_activation_receipt_cursor(connection.execute(sql, parameters)))
+
+            execute("BEGIN IMMEDIATE")
             try:
                 meta = port.read_meta(connection)
                 if (
@@ -3998,7 +4218,7 @@ def _publish_activation_receipt(
                     raise port.store_schema_error(
                         "STORE.ACTIVATION_STATE_INVALID"
                     )
-                rows = connection.execute(
+                rows = execute(
                     "SELECT snapshot_id, resource_id, canonical_store_id, "
                     "exported_revision, jsonl_digest, record_count, "
                     "format_version, destination_jsonl_path, "
@@ -4019,32 +4239,35 @@ def _publish_activation_receipt(
                 )
                 if rows != [expected_row]:
                     raise port.store_schema_error("STORE.RECEIPT_INVALID")
-                if connection.execute(
+                if execute(
                     "SELECT COUNT(*) FROM tm_snapshot_binding"
                 ).fetchone() != (0,):
                     raise port.store_schema_error("STORE.BINDING_INVALID")
-                try:
-                    locked_database = _capture_content_file(
-                        identity.canonical_sidecar_path
-                    )
-                except ContentAttestationError as error:
-                    raise ActivationPreparationError(
-                        "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
-                        retryable=False,
-                    ) from error
-                if locked_database != record.sealed_content_attestation.database:
-                    raise ActivationPreparationError(
-                        "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
-                        retryable=False,
-                    )
-                updated = connection.execute(
+                if handoff is not None:
+                    handoff.reprove_sql(identity.canonical_sidecar_path, "activation-receipt")
+                else:
+                    try:
+                        locked_database = _capture_content_file(
+                            identity.canonical_sidecar_path
+                        )
+                    except ContentAttestationError as error:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
+                            retryable=False,
+                        ) from error
+                    if locked_database != record.sealed_content_attestation.database:
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECEIPT_PUBLICATION_INVALID",
+                            retryable=False,
+                        )
+                updated = execute(
                     "UPDATE tm_snapshot_receipt SET status = 'completed' "
                     "WHERE snapshot_id = ? AND status = 'issued'",
                     (receipt.snapshot_id,),
                 )
                 if updated.rowcount != 1:
                     raise port.store_schema_error("STORE.RECEIPT_INVALID")
-                connection.execute(
+                execute(
                     "INSERT INTO tm_snapshot_binding("
                     "binding_id, configured_jsonl_path, manifest_path, "
                     "snapshot_kind, snapshot_id, binding_version) "
@@ -4057,16 +4280,16 @@ def _publish_activation_receipt(
                         binding.binding_version,
                     ),
                 )
-                status = connection.execute(
+                status = execute(
                     "UPDATE tm_meta SET value = 'ACTIVE' "
                     "WHERE key = 'activation_status' AND value = 'SEALED'"
                 )
-                generation = connection.execute(
+                generation = execute(
                     "UPDATE tm_meta SET value = ? "
                     "WHERE key = 'generation' AND value = '0'",
                     (str(next_generation),),
                 )
-                connection.execute(
+                execute(
                     "INSERT INTO tm_meta(key, value) VALUES "
                     "('activation_digest', ?)",
                     (activation_digest,),
@@ -4078,14 +4301,26 @@ def _publish_activation_receipt(
                 expected_logical_closure_digest = (
                     port.stage_closure_digest(connection)
                 )
-                connection.commit()
+                if handoff is not None:
+                    handoff.reprove_sql(identity.canonical_sidecar_path, "activation-receipt")
+                _commit_activation_receipt(connection)
             except BaseException:
-                connection.rollback()
+                if handoff is None:
+                    connection.rollback()
+                else:
+                    try:
+                        _rollback_activation_receipt(connection)
+                    except BaseException:
+                        pass
                 raise
-        after = _activation_file_identity(identity.canonical_sidecar_path)
-        if after != canonical_capture[0]:
-            raise OSError("canonical identity changed")
-        _fsync_activation_file(identity.canonical_sidecar_path, after)
+        if handoff is not None:
+            handoff.final_content = handoff.capture(synchronize=True)
+        else:
+            assert canonical_capture is not None
+            after = _activation_file_identity(identity.canonical_sidecar_path)
+            if after != canonical_capture[0]:
+                raise OSError("canonical identity changed")
+            _fsync_activation_file(identity.canonical_sidecar_path, after)
     except Exception as error:
         if isinstance(error, ActivationPreparationError):
             raise
@@ -4101,9 +4336,46 @@ def _publish_activation_manifest(
     *,
     preparation: _ActivationPreparation,
     identity: CanonicalResourceIdentity,
-) -> None:
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
+) -> PendingPublication | None:
     """Atomically publish and fsync the new adjacent manifest."""
 
+    if caller_borrow is not None:
+        borrow = caller_borrow
+        borrow.publication_incomplete = True
+        expected = record.sealed_content_attestation.manifest
+        if borrow.capture(record.candidate_manifest_temp_path) != expected:
+            raise ActivationPreparationError("ACTIVATION.MANIFEST_CANDIDATE_INVALID", retryable=False)
+        final = identity.snapshot_manifest_path
+        if record.had_prior_canonical and not record.prior_manifest_absent:
+            prior = borrow.capture(final)
+            if (prior.device, prior.inode) != record.prior_manifest_identity or prior.sha256 != record.prior_manifest_digest:
+                raise ActivationPreparationError("ACTIVATION.PRIOR_ASSET_INVALID", retryable=False)
+        elif borrow.exists(final):
+            raise ActivationPreparationError("ACTIVATION.MANIFEST_TARGET_OCCUPIED", retryable=False)
+        candidate = borrow.handoff_manifest(expected)
+        pending: PendingPublication | None = None
+        operation_error = None
+        try:
+            borrow.reprove()
+            pending = borrow.root.begin_publish(candidate, final.name,
+                mode=PublishMode.REPLACE_UNDER_LOCK if record.had_prior_canonical and not record.prior_manifest_absent else PublishMode.CREATE_IF_ABSENT,
+                lease=borrow.lease if record.had_prior_canonical and not record.prior_manifest_absent else None)
+            proof = borrow.capture(final)
+            if proof != expected or borrow.exists(record.candidate_manifest_temp_path):
+                raise ActivationPreparationError("ACTIVATION.MANIFEST_PUBLICATION_UNPROVEN", retryable=False)
+            payload, _ = borrow.read_journal(final, _ActivationFileIdentity(proof.device, proof.inode))
+            if contract_from_json(payload.decode("utf-8")) != preparation._sealed_stage.evidence.source_binding.manifest:
+                raise ActivationPreparationError("ACTIVATION.MANIFEST_PUBLICATION_INVALID", retryable=False)
+            result, pending = pending, None
+            return result
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = borrow.close_owned(pending, candidate, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
     manifest_temp = _capture_journal_closure_file(
         record.candidate_manifest_temp_path
     )
@@ -4210,10 +4482,18 @@ def _activation_winners_parity_digest(
             (boundary,),
         )
     winners: dict[str, str] = {}
-    for source_raw, target_raw in rows:
-        if type(source_raw) is not str or type(target_raw) is not str:
-            raise port.store_schema_error("STORE.RECORD_INVALID")
-        winners[source_raw] = target_raw
+    try:
+        for source_raw, target_raw in rows:
+            if type(source_raw) is not str or type(target_raw) is not str:
+                raise port.store_schema_error("STORE.RECORD_INVALID")
+            winners[source_raw] = target_raw
+    finally:
+        primary = sys.exception()
+        try:
+            rows.close()
+        except BaseException:
+            if primary is None:
+                raise
     digest = hashlib.sha256()
     for source_raw in sorted(winners):
         for value in (source_raw, winners[source_raw]):
@@ -4303,6 +4583,11 @@ def _validate_activation_indexes(
     return actual_count_rows, actual_fts_count
 
 
+def _capture_publication_content(port: _StoreValidationPort, path: Path) -> ContentFileProof:
+    borrow = port.posix_activation_borrow
+    return _capture_content_file(path) if borrow is None else borrow.capture(path)
+
+
 def _validate_published_activation_set(
     port: _StoreValidationPort,
     record: _ActivationJournalRecord,
@@ -4329,16 +4614,16 @@ def _validate_published_activation_set(
             retryable=False,
         )
 
-    database = _capture_journal_closure_file(identity.canonical_sidecar_path)
-    manifest = _capture_journal_closure_file(identity.snapshot_manifest_path)
+    database = _capture_journal_closure_file(identity.canonical_sidecar_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+    manifest = _capture_journal_closure_file(identity.snapshot_manifest_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     if (
         (database[0].device, database[0].inode)
         != record.candidate_stage_db_identity
         or (manifest[0].device, manifest[0].inode)
         != record.candidate_manifest_temp_identity
         or manifest[1] != record.new_manifest_digest
-        or _lstat_any_entry(record.candidate_stage_db_path)
-        or _lstat_any_entry(record.candidate_manifest_temp_path)
+        or _lstat_any_entry(record.candidate_stage_db_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+        or _lstat_any_entry(record.candidate_manifest_temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     ):
         raise ActivationPreparationError(
             "ACTIVATION.ACTIVE_SET_INVALID",
@@ -4440,9 +4725,9 @@ def _validate_published_activation_set(
             retryable=False,
         ) from error
     try:
-        database_proof = _capture_content_file(identity.canonical_sidecar_path)
-        manifest_proof = _capture_content_file(identity.snapshot_manifest_path)
-        source_proof = _capture_content_file(identity.configured_jsonl_path)
+        database_proof = _capture_publication_content(port, identity.canonical_sidecar_path)
+        manifest_proof = _capture_publication_content(port, identity.snapshot_manifest_path)
+        source_proof = _capture_publication_content(port, identity.configured_jsonl_path)
     except ContentAttestationError as error:
         raise ActivationPreparationError(
             "ACTIVATION.ACTIVE_SET_INVALID",
@@ -4568,8 +4853,10 @@ def _revalidate_active_content_attestation(
         activation_digest=activation_digest,
         attestation=attestation,
     )
+    if port.posix_activation_borrow is not None and not port.posix_activation_borrow.exists(identity.canonical_sidecar_path):
+        raise ActivationPreparationError("ACTIVATION.ACTIVE_ATTESTATION_ASSET_MISSING", retryable=False)
     try:
-        database = _capture_content_file(identity.canonical_sidecar_path)
+        database = _capture_publication_content(port, identity.canonical_sidecar_path)
     except ContentAttestationError as error:
         code = (
             "ACTIVATION.ACTIVE_ATTESTATION_ASSET_MISSING"
@@ -4590,8 +4877,8 @@ def _revalidate_active_content_attestation(
         )
     if (
         database != active.database
-        or _lstat_any_entry(record.candidate_stage_db_path)
-        or _lstat_any_entry(record.candidate_manifest_temp_path)
+        or _lstat_any_entry(record.candidate_stage_db_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+        or _lstat_any_entry(record.candidate_manifest_temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     ):
         raise ActivationPreparationError(
             "ACTIVATION.ACTIVE_ATTESTATION_INVALID",
@@ -4599,7 +4886,7 @@ def _revalidate_active_content_attestation(
         )
     if require_configured_pair:
         try:
-            manifest = _capture_content_file(identity.snapshot_manifest_path)
+            manifest = _capture_publication_content(port, identity.snapshot_manifest_path)
         except ContentAttestationError as error:
             code = (
                 "ACTIVATION.ACTIVE_ATTESTATION_ASSET_MISSING"
@@ -4611,7 +4898,7 @@ def _revalidate_active_content_attestation(
                 retryable=False,
             ) from error
         try:
-            source = _capture_content_file(identity.configured_jsonl_path)
+            source = _capture_publication_content(port, identity.configured_jsonl_path)
         except ContentAttestationError as error:
             raise ActivationPreparationError(
                 "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID",
@@ -4666,6 +4953,7 @@ def _restore_activation_file(
     backup_path: Path,
     expected_digest: str,
     destination: Path,
+    *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _ActivationFileIdentity:
     """Restore one journal-owned backup to its authority path (Task 5.9).
 
@@ -4681,6 +4969,61 @@ def _restore_activation_file(
     temp_path = destination.parent / (
         f"{destination.name}.localcat-rollback.{record.journal_id}.tmp"
     )
+    if caller_borrow is not None:
+        borrow = caller_borrow
+        if not isinstance(borrow.backend, PosixBoundContentObservation):
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_BACKUP_INVALID", retryable=False)
+        borrow.require_path(backup_path)
+        borrow.require_path(destination)
+        proof = borrow.capture(backup_path)
+        if proof.sha256 != expected_digest:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_BACKUP_INVALID", retryable=False)
+        # Quarantine has removed only the authenticated failed object. A
+        # surviving prior is accepted by its full closure before this call.
+        if borrow.exists(destination):
+            current = borrow.capture(destination)
+            # A prior member restored before a crash is permitted by Task
+            # 5.9's authenticated backup relation. The full pair is still
+            # withheld until schema/binding/source/generation revalidation.
+            if current.sha256 == expected_digest and current.size == proof.size:
+                return _ActivationFileIdentity(current.device, current.inode)
+            raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+        if borrow.exists(temp_path):
+            temporary = borrow.capture(temp_path)
+            if temporary.sha256 != expected_digest or temporary.size != proof.size:
+                raise ActivationPreparationError("ACTIVATION.ROLLBACK_RESTORE_FAILED", retryable=False)
+            borrow.remove(temp_path, _ActivationFileIdentity(temporary.device, temporary.inode), temporary.sha256)
+        candidate = borrow.root.create_candidate(temp_path.name, private=False)
+        opened = None
+        pending = None
+        operation_error = None
+        try:
+            opened = borrow.backend.open_regular(borrow.root, PurePath(backup_path.name))
+            if _capture_posix_bound_content(borrow.backend, opened) != proof:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_BACKUP_INVALID", retryable=False)
+            content = candidate.write_chunks(opened.iter_exact_chunks(opened.snapshot()), maximum_bytes=proof.size)
+            candidate.flush_content()
+            if content != CandidateContentFacts(proof.size, bytes.fromhex(expected_digest)):
+                raise ActivationPreparationError("ACTIVATION.ROLLBACK_RESTORE_FAILED", retryable=False)
+            borrow.reprove()
+            pending = borrow.root.begin_publish(candidate, destination.name, mode=PublishMode.CREATE_IF_ABSENT, lease=None)
+            candidate = None
+            final = borrow.capture(destination)
+            if final.sha256 != expected_digest or final.size != proof.size:
+                raise ActivationPreparationError("ACTIVATION.ROLLBACK_RESTORE_FAILED", retryable=False)
+            _ = pending.terminal_reproof()
+            borrow.reprove()
+            return _ActivationFileIdentity(final.device, final.inode)
+        except (PlatformFileError, OSError) as error:
+            operation_error = ActivationPreparationError("ACTIVATION.ROLLBACK_RESTORE_FAILED", retryable=True)
+            raise operation_error from error
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = borrow.close_owned(pending, candidate, opened, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
     _remove_orphaned_rollback_temp(temp_path)
     source_descriptor = -1
     temp_descriptor = -1
@@ -4742,6 +5085,7 @@ def _restore_activation_file(
 
 def _require_rollback_backups(
     record: _ActivationJournalRecord,
+    *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[tuple[Path, str], tuple[Path, str] | None]:
     """Verify the journal-owned prior backups are present and intact.
 
@@ -4779,6 +5123,15 @@ def _require_rollback_backups(
                 "ACTIVATION.RECOVERY_BACKUP_INVALID",
                 retryable=False,
             )
+        if caller_borrow is not None:
+            try:
+                proof = caller_borrow.capture(path)
+            except (PlatformFileError, ContentAttestationError) as error:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_BACKUP_INVALID", retryable=False) from error
+            if (proof.device, proof.inode) != identity_value or proof.sha256 != digest_value:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_BACKUP_INVALID", retryable=False)
+            owned.append((path, digest_value))
+            continue
         try:
             observed = os.lstat(path)
         except FileNotFoundError as error:
@@ -4937,7 +5290,8 @@ def _recovery_jsonl_winners_digest(
         raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
     winners: dict[str, str] = {}
-    with path.open("rb") as stream:
+    with (path.open("rb") if port.posix_activation_borrow is None else
+          io.BytesIO(port.posix_activation_borrow.read_journal(path, None)[0])) as stream:
         for raw_line in stream:
             try:
                 decoded_line = raw_line.decode("utf-8")
@@ -5078,6 +5432,7 @@ def _preflight_recovered_manifest(
     record: _ActivationJournalRecord,
     *,
     identity: CanonicalResourceIdentity,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Prove the DB_REPLACED manifest window before any receipt mutation.
 
@@ -5088,9 +5443,9 @@ def _preflight_recovered_manifest(
     """
 
     try:
-        if _lstat_any_entry(record.candidate_manifest_temp_path):
+        if _lstat_any_entry(record.candidate_manifest_temp_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
             temporary = _capture_journal_closure_file(
-                record.candidate_manifest_temp_path
+                record.candidate_manifest_temp_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})
             )
             if (
                 (temporary[0].device, temporary[0].inode)
@@ -5103,10 +5458,13 @@ def _preflight_recovered_manifest(
                 )
             return
         published = _capture_journal_closure_file(
-            identity.snapshot_manifest_path
+            identity.snapshot_manifest_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})
         )
     except ActivationPreparationError as error:
-        raise _recovery_mismatch(error) from error
+        mapped = _recovery_mismatch(error)
+        if mapped is error:
+            raise
+        raise mapped from error
     if (
         (published[0].device, published[0].inode)
         != record.candidate_manifest_temp_identity
@@ -5174,13 +5532,17 @@ def _recovery_mismatch(
 
 def _recovery_capture_journal_file(
     path: Path,
+    *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[_ActivationFileIdentity, str]:
     """Capture one journal-closure file with a Task 5.8 fail-stop code."""
 
     try:
-        return _capture_journal_closure_file(path)
+        return _capture_journal_closure_file(path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
     except ActivationPreparationError as error:
-        raise _recovery_mismatch(error) from error
+        mapped = _recovery_mismatch(error)
+        if mapped is error:
+            raise
+        raise mapped from error
 
 
 def _revalidate_recovered_prior_set(
@@ -5223,6 +5585,8 @@ def _revalidate_recovered_prior_set(
             "ACTIVATION.RECOVERY_MISMATCH",
             retryable=False,
         )
+    if port.posix_activation_borrow is not None and not port.posix_activation_borrow.exists(record.prior_db_path):
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_PRIOR_SET_INVALID", retryable=False)
     prior_db_path = record.prior_db_path
     prior_manifest_path = (
         identity.snapshot_manifest_path
@@ -5300,8 +5664,11 @@ def _revalidate_recovered_prior_set(
             )
             fts5_available = port.meta_bool(meta, "fts5_available")
     except ActivationPreparationError as error:
-        raise _recovery_mismatch(error) from error
-    except (OSError, sqlite3.Error, port.store_schema_error) as error:
+        mapped = _recovery_mismatch(error)
+        if mapped is error:
+            raise
+        raise mapped from error
+    except (PlatformFileError, OSError, sqlite3.Error, port.store_schema_error) as error:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_PRIOR_SET_INVALID",
             retryable=False,
@@ -5359,15 +5726,15 @@ def _revalidate_recovered_sealed_database(
     """Cold rehash sealed bytes and reopen schema/integrity/FK."""
 
     sealed = record.sealed_content_attestation
-    if not _lstat_any_entry(database_path):
+    if not _lstat_any_entry(database_path, caller_borrow=port.posix_activation_borrow):
         raise ActivationPreparationError(
             "ACTIVATION.JOURNAL_ASSET_MUTATED",
             retryable=False,
         )
     try:
-        database = _capture_content_file(database_path)
-        manifest = _capture_content_file(record.candidate_manifest_temp_path)
-        source = _capture_content_file(identity.configured_jsonl_path)
+        database = _capture_publication_content(port, database_path)
+        manifest = _capture_publication_content(port, record.candidate_manifest_temp_path)
+        source = _capture_publication_content(port, identity.configured_jsonl_path)
     except ContentAttestationError as error:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID",
@@ -5885,6 +6252,78 @@ def _revalidate_discovered_active_set(
     return generation, snapshot.fts5_available
 
 
+@contextmanager
+def _cold_receipt_handoff(
+    port: _StoreValidationPort, record: _ActivationJournalRecord,
+    *, next_generation: int, activation_digest: str,
+) -> Iterator[None]:
+    """Authenticate the cold closure before acquiring this process's SQL guard."""
+    borrow = port.posix_activation_borrow
+    if borrow is None:
+        yield
+        return
+    identity = port.resource_identity
+    path = identity.canonical_sidecar_path
+    before = borrow.capture(path)
+    with port.open_configured_connection(path, require_existing=True) as connection:
+        status = port.read_meta(connection).get("activation_status")
+    if status not in {"SEALED", "ACTIVE"}:
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_COMPLETION_INVALID", retryable=False)
+    port.inspect_stage_schema(
+        _canonical_activation_ref(identity, journal_id=record.journal_id),
+        canonical_store_id=record.canonical_store_id,
+        _allow_sealed=status == "SEALED", _allow_active=status == "ACTIVE",
+        _allow_diverged_runtime=True,
+        _expected_active_generation=next_generation if status == "ACTIVE" else None,
+        _expected_activation_digest=activation_digest if status == "ACTIVE" else None,
+    )
+    with port.open_configured_connection(path, require_existing=True) as connection, ExitStack() as statements:
+        def execute(sql: str) -> sqlite3.Cursor:
+            return statements.enter_context(_activation_receipt_cursor(connection.execute(sql)))
+        execute("BEGIN")
+        try:
+            if execute("PRAGMA integrity_check").fetchall() != [("ok",)] or execute("PRAGMA foreign_key_check").fetchall():
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_SEAL_EVIDENCE_INVALID", retryable=False)
+            _active_closure, closure = port.active_transition_closure_digests(connection)
+            if closure != record.sealed_content_attestation.semantic_facts.logical_closure_digest:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+        finally:
+            connection.rollback()
+    after = borrow.capture(path)
+    if after != before or (status == "SEALED" and after != record.sealed_content_attestation.database):
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+    if not isinstance(borrow.backend, ExistingFileMutationGuard) or not isinstance(borrow.backend, PosixBoundContentObservation):
+        raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+    handoff = _PosixReceiptHandoff(borrow, None)
+    handoff_error = None
+    try:
+        # The historical proof is never the guard authority: compare two live
+        # handles on this process's original root after complete validation.
+        opened = borrow.backend.open_existing_for_synchronization(borrow.root, PurePath(path.name))
+        reader_error = None
+        try:
+            if _capture_posix_bound_content(borrow.backend, opened) != after:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+            handoff.guard = borrow.backend.guard_existing_for_mutation(borrow.root, PurePath(path.name))
+            if opened.identity() != handoff.guard.reprove():
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+        except BaseException as error:
+            reader_error = error
+            raise
+        finally:
+            close_error = borrow.close_owned(opened, primary=reader_error)
+            if reader_error is None and close_error is not None:
+                raise close_error
+        port.receipt_handoff = handoff
+        yield
+    except BaseException as error:
+        handoff_error = error
+        raise
+    finally:
+        port.receipt_handoff = None
+        handoff.close(primary=handoff_error)
+
+
 def _complete_recovered_receipt(
     port: _StoreValidationPort,
     record: _ActivationJournalRecord,
@@ -5906,8 +6345,9 @@ def _complete_recovered_receipt(
     and database-identity revalidation.
     """
 
+    handoff = port.receipt_handoff
     canonical_capture = _capture_journal_closure_file(
-        identity.canonical_sidecar_path
+        identity.canonical_sidecar_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
     )
     if (
         (canonical_capture[0].device, canonical_capture[0].inode)
@@ -5921,8 +6361,10 @@ def _complete_recovered_receipt(
         with port.open_configured_connection(
             identity.canonical_sidecar_path,
             require_existing=True,
-        ) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        ) as connection, ExitStack() as statements:
+            def execute(sql: str, parameters: tuple[object, ...] = ()) -> sqlite3.Cursor:
+                return statements.enter_context(_activation_receipt_cursor(connection.execute(sql, parameters)))
+            execute("BEGIN IMMEDIATE")
             try:
                 meta = port.read_meta(connection)
                 status = meta.get("activation_status")
@@ -5947,7 +6389,7 @@ def _complete_recovered_receipt(
                         or receipt.canonical_store_id != canonical_store_id
                     ):
                         raise port.store_schema_error("STORE.RECEIPT_INVALID")
-                    if connection.execute(
+                    if execute(
                         "SELECT COUNT(*) FROM tm_snapshot_binding"
                     ).fetchone() != (0,):
                         raise port.store_schema_error("STORE.BINDING_INVALID")
@@ -5959,8 +6401,10 @@ def _complete_recovered_receipt(
                             "STORE.ACTIVATION_STATE_INVALID"
                         )
                     try:
-                        locked_database = _capture_content_file(
-                            identity.canonical_sidecar_path
+                        locked_database = (
+                            record.sealed_content_attestation.database
+                            if handoff is not None
+                            else _capture_content_file(identity.canonical_sidecar_path)
                         )
                     except ContentAttestationError as error:
                         raise ActivationPreparationError(
@@ -5975,7 +6419,22 @@ def _complete_recovered_receipt(
                             "ACTIVATION.RECOVERY_ASSET_MUTATED",
                             retryable=False,
                         )
-                    updated = connection.execute(
+                    # The pre-SQL bytes capture cannot cover a later mutation.
+                    # Reconstruct the full closure in this write transaction;
+                    # POSIX must not open/close another raw DB FD while it lives.
+                    _, pre_activation_closure_digest = (
+                        port.active_transition_closure_digests(connection)
+                    )
+                    if (
+                        pre_activation_closure_digest
+                        != record.sealed_content_attestation.semantic_facts
+                        .logical_closure_digest
+                    ):
+                        raise ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_ASSET_MUTATED",
+                            retryable=False,
+                        )
+                    updated = execute(
                         "UPDATE tm_snapshot_receipt SET status = "
                         "'completed' WHERE snapshot_id = ? "
                         "AND status = 'issued'",
@@ -5985,7 +6444,7 @@ def _complete_recovered_receipt(
                         raise port.store_schema_error(
                             "STORE.RECEIPT_INVALID"
                         )
-                    connection.execute(
+                    execute(
                         "INSERT INTO tm_snapshot_binding("
                         "binding_id, configured_jsonl_path, "
                         "manifest_path, snapshot_kind, snapshot_id, "
@@ -5998,17 +6457,17 @@ def _complete_recovered_receipt(
                             contract_module.SNAPSHOT_BINDING_VERSION,
                         ),
                     )
-                    active_status = connection.execute(
+                    active_status = execute(
                         "UPDATE tm_meta SET value = 'ACTIVE' "
                         "WHERE key = 'activation_status' "
                         "AND value = 'SEALED'"
                     )
-                    generation = connection.execute(
+                    generation = execute(
                         "UPDATE tm_meta SET value = ? "
                         "WHERE key = 'generation' AND value = '0'",
                         (str(next_generation),),
                     )
-                    connection.execute(
+                    execute(
                         "INSERT INTO tm_meta(key, value) VALUES "
                         "('activation_digest', ?)",
                         (activation_digest,),
@@ -6040,7 +6499,7 @@ def _complete_recovered_receipt(
                         or meta.get("activation_digest") != activation_digest
                         or receipt_status != "completed"
                         or receipt != binding.receipt
-                        or connection.execute(
+                        or execute(
                             "SELECT COUNT(*) FROM tm_snapshot_binding"
                         ).fetchone()
                         != (1,)
@@ -6069,10 +6528,13 @@ def _complete_recovered_receipt(
             except BaseException:
                 connection.rollback()
                 raise
-        after = _activation_file_identity(identity.canonical_sidecar_path)
+        if handoff is not None:
+            handoff.final_content = handoff.capture(synchronize=True)
+            return expected_logical_closure_digest
+        after = _activation_file_identity(identity.canonical_sidecar_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
         if after != canonical_capture[0]:
             raise OSError("canonical identity changed")
-        _fsync_activation_file(identity.canonical_sidecar_path, after)
+        _fsync_activation_file(identity.canonical_sidecar_path, after, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     except Exception as error:
         if isinstance(error, ActivationPreparationError):
             raise
@@ -6089,7 +6551,7 @@ def _complete_recovered_manifest(
     *,
     identity: CanonicalResourceIdentity,
     canonical_store_id: str,
-) -> None:
+) -> PendingPublication | None:
     """Idempotently finish the adjacent manifest publication.
 
     The candidate temporary manifest must match the journal exactly and its
@@ -6125,13 +6587,13 @@ def _complete_recovered_manifest(
             connection.rollback()
     expected_bytes = _recovery_expected_manifest_bytes(receipt)
     final_path = identity.snapshot_manifest_path
-    if not _lstat_any_entry(record.candidate_manifest_temp_path):
+    if not _lstat_any_entry(record.candidate_manifest_temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})):
         try:
             final_capture = _capture_activation_file(
                 final_path,
-                asset_kind="MANIFEST",
+                asset_kind="MANIFEST", **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
             )
-            final_bytes = _read_activation_file_bytes(final_capture)
+            final_bytes = _read_activation_file_bytes(final_capture, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
         except ActivationPreparationError as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_COMPLETION_INVALID",
@@ -6150,11 +6612,11 @@ def _complete_recovered_manifest(
                 "ACTIVATION.RECOVERY_COMPLETION_INVALID",
                 retryable=False,
             )
-        _fsync_activation_file(final_path, final_capture.identity)
+        _fsync_activation_file(final_path, final_capture.identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
         return
     manifest_temp = _capture_activation_file(
         record.candidate_manifest_temp_path,
-        asset_kind="MANIFEST",
+        asset_kind="MANIFEST", **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
     )
     if (
         (
@@ -6168,16 +6630,16 @@ def _complete_recovered_manifest(
             "ACTIVATION.RECOVERY_COMPLETION_INVALID",
             retryable=False,
         )
-    temp_bytes = _read_activation_file_bytes(manifest_temp)
+    temp_bytes = _read_activation_file_bytes(manifest_temp, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     if temp_bytes != expected_bytes:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_COMPLETION_INVALID",
             retryable=False,
         )
-    if _lstat_any_entry(final_path):
+    if _lstat_any_entry(final_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})):
         final_capture = _capture_activation_file(
             final_path,
-            asset_kind="MANIFEST",
+            asset_kind="MANIFEST", **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
         )
         published = (
             (
@@ -6188,12 +6650,12 @@ def _complete_recovered_manifest(
             and final_capture.digest == record.new_manifest_digest
         )
         if published:
-            if _read_activation_file_bytes(final_capture) != expected_bytes:
+            if _read_activation_file_bytes(final_capture, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})) != expected_bytes:
                 raise ActivationPreparationError(
                     "ACTIVATION.RECOVERY_COMPLETION_INVALID",
                     retryable=False,
                 )
-            _fsync_activation_file(final_path, final_capture.identity)
+            _fsync_activation_file(final_path, final_capture.identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
             return
         if record.had_prior_canonical and not record.prior_manifest_absent:
             if (
@@ -6218,6 +6680,43 @@ def _complete_recovered_manifest(
             "ACTIVATION.RECOVERY_COMPLETION_INVALID",
             retryable=False,
         )
+    borrow = port.posix_activation_borrow
+    if borrow is not None:
+        borrow.require_path(record.candidate_manifest_temp_path)
+        if not isinstance(borrow.backend, PosixStageHandoff):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        proof = borrow.capture(record.candidate_manifest_temp_path)
+        if proof != record.sealed_content_attestation.manifest:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+        content = CandidateContentFacts(proof.size, bytes.fromhex(proof.sha256))
+        existing = borrow.backend.open_existing_stage(
+            borrow.root, record.candidate_manifest_temp_path.name,
+            owner_lease=borrow.lease, expected_content=content,
+        )
+        candidate = None
+        pending = None
+        operation_error = None
+        try:
+            borrow.reprove()
+            candidate = borrow.backend.handoff_stage(existing, owner_lease=borrow.lease, expected_content=content)
+            replacing = borrow.exists(final_path)
+            pending = borrow.root.begin_publish(candidate, final_path.name,
+                mode=PublishMode.REPLACE_UNDER_LOCK if replacing else PublishMode.CREATE_IF_ABSENT,
+                lease=borrow.lease if replacing else None)
+            if borrow.capture(final_path) != proof or borrow.exists(record.candidate_manifest_temp_path):
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_COMPLETION_INVALID", retryable=False)
+            payload, _ = borrow.read_journal(final_path, manifest_temp.identity)
+            if payload != expected_bytes:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_COMPLETION_INVALID", retryable=False)
+            result, pending = pending, None
+            return result
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = borrow.close_owned(pending, candidate, existing, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
     try:
         _replace_activation_file(record.candidate_manifest_temp_path, final_path)
         _fsync_activation_directory(final_path.parent)
@@ -6228,18 +6727,18 @@ def _complete_recovered_manifest(
         ) from error
     final_capture = _capture_activation_file(
         final_path,
-        asset_kind="MANIFEST",
+        asset_kind="MANIFEST", **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
     )
     if (
         final_capture.identity != manifest_temp.identity
         or final_capture.digest != record.new_manifest_digest
-        or _lstat_any_entry(record.candidate_manifest_temp_path)
+        or _lstat_any_entry(record.candidate_manifest_temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     ):
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_COMPLETION_INVALID",
             retryable=False,
         )
-    if _read_activation_file_bytes(final_capture) != expected_bytes:
+    if _read_activation_file_bytes(final_capture, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})) != expected_bytes:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_COMPLETION_INVALID",
             retryable=False,
@@ -6248,7 +6747,11 @@ def _complete_recovered_manifest(
 
 def _capture_journal_closure_file(
     path: Path,
+    *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[_ActivationFileIdentity, str]:
+    if caller_borrow is not None:
+        proof = caller_borrow.capture(path)
+        return _ActivationFileIdentity(proof.device, proof.inode), proof.sha256
     try:
         capture = _capture_activation_file(path, asset_kind="JOURNAL_CLOSURE")
     except ActivationPreparationError as error:
@@ -6284,9 +6787,18 @@ def _rollback_inconsistent_activation(
     """
 
     identity = port.resource_identity
-    canonical_store_id = port.canonical_store_id
+    canonical_store_id = (record.prior_canonical_store_id or port.canonical_store_id)
+    borrow = port.posix_activation_borrow
+    if borrow is not None and borrow.io_incomplete:
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
+    if borrow is not None and not record.had_prior_canonical:
+        # A legacy terminal cannot coexist with a durable first-publication
+        # lineage fact. Refuse before moving any canonical or candidate asset.
+        _require_cancelled_lineage_consistency(
+            identity, had_prior_canonical=False, caller_borrow=borrow,
+        )
     source = _recovery_capture_journal_file(
-        identity.configured_jsonl_path
+        identity.configured_jsonl_path, caller_borrow=borrow
     )
     if (
         (source[0].device, source[0].inode)
@@ -6297,15 +6809,51 @@ def _rollback_inconsistent_activation(
             "ACTIVATION.RECOVERY_ASSET_MUTATED",
             retryable=False,
         )
+    if borrow is not None:
+        terminal_path = _activation_terminal_path(identity)
+        terminal_identity = _lstat_activation_terminal_identity(terminal_path, caller_borrow=borrow)
+        if terminal_identity is not None:
+            terminal = _load_recovery_terminal(port, terminal_path, terminal_identity)
+            if _rollback_terminal_prior_closes(terminal, record):
+                _ = _replay_cancelled_terminal_recovery(port, terminal)
+                _remove_owned_activation_journal_final(_activation_journal_path(identity), journal_identity, caller_borrow=borrow)
+                return ActivationRecoveryReport(phase=record.phase.value, action="ROLLED_BACK", generation=record.prior_generation)
+        if record.had_prior_canonical:
+            _ = _require_rollback_backups(record, caller_borrow=borrow)
+            try:
+                _ = _revalidate_recovered_prior_set(
+                    port, record, identity=identity,
+                    canonical_store_id=canonical_store_id,
+                    allow_restored_identities=True,
+                )
+            except ActivationPreparationError:
+                pass
+            else:
+                # Task 5.9 authorizes a restored prior from authenticated
+                # backups and the complete prior closure. This current proof
+                # only excludes that prior from failed-candidate retirement;
+                # it never reissues SEALED identity or rewrites the journal.
+                assert record.prior_db_path is not None
+                prior_db = borrow.capture(record.prior_db_path)
+                prior_manifest = (None if record.prior_manifest_path is None
+                                  else borrow.capture(record.prior_manifest_path))
+                record = replace(
+                    record, prior_db_identity=(prior_db.device, prior_db.inode),
+                    prior_manifest_identity=(None if prior_manifest is None
+                        else (prior_manifest.device, prior_manifest.inode)),
+                )
     _quarantine_failed_activation_artifacts(
         record,
-        identity=identity,
+        identity=identity, caller_borrow=borrow,
     )
     if not record.had_prior_canonical:
         try:
-            _require_first_activation_absence(identity)
+            _require_first_activation_absence(identity, caller_borrow=borrow)
         except ActivationPreparationError as error:
-            raise _recovery_mismatch(error) from error
+            mapped = _recovery_mismatch(error)
+            if mapped is error:
+                raise
+            raise mapped from error
         fts5_available = False
         prior_generation = None
         terminal_record = replace(
@@ -6330,39 +6878,44 @@ def _rollback_inconsistent_activation(
                 record,
                 identity=identity,
                 canonical_store_id=canonical_store_id,
-                allow_restored_identities=True,
+                allow_restored_identities=borrow is None,
             )
         except ActivationPreparationError:
-            db_backup, manifest_backup = _require_rollback_backups(record)
-            _restore_activation_file(
+            db_backup, manifest_backup = _require_rollback_backups(record, caller_borrow=borrow)
+            restored_db = _restore_activation_file(
                 record,
                 db_backup[0],
                 db_backup[1],
-                record.prior_db_path,
+                record.prior_db_path, caller_borrow=borrow,
             )
+            restored_manifest = None
             if manifest_backup is not None:
                 assert record.prior_manifest_path is not None
-                _restore_activation_file(
+                restored_manifest = _restore_activation_file(
                     record,
                     manifest_backup[0],
                     manifest_backup[1],
-                    record.prior_manifest_path,
+                    record.prior_manifest_path, caller_borrow=borrow,
                 )
+            restored_record = replace(
+                record, prior_db_identity=(restored_db.device, restored_db.inode),
+                prior_manifest_identity=(None if restored_manifest is None else (restored_manifest.device, restored_manifest.inode)),
+            )
             fts5_available = _revalidate_recovered_prior_set(port,
-                record,
+                restored_record,
                 identity=identity,
                 canonical_store_id=canonical_store_id,
-                allow_restored_identities=True,
+                allow_restored_identities=False,
             )
         db_identity = _recovery_capture_journal_file(
-            record.prior_db_path
+            record.prior_db_path, caller_borrow=borrow
         )[0]
         if record.prior_manifest_absent:
             manifest_identity = None
         else:
             assert record.prior_manifest_path is not None
             manifest_identity = _recovery_capture_journal_file(
-                record.prior_manifest_path
+                record.prior_manifest_path, caller_borrow=borrow
             )[0]
         terminal_record = replace(
             record,
@@ -6380,9 +6933,9 @@ def _rollback_inconsistent_activation(
     _ = port.write_terminal(terminal_record)
     _remove_owned_activation_journal_final(
         _activation_journal_path(identity),
-        journal_identity,
+        journal_identity, caller_borrow=borrow,
     )
-    _remove_journal_proven_backups(record)
+    _remove_journal_proven_backups(record, caller_borrow=borrow)
     if record.had_prior_canonical:
         port.view = _rollback_restored_prior_view(
             record,
@@ -6403,6 +6956,7 @@ def _require_cancelled_lineage_consistency(
     identity: CanonicalResourceIdentity,
     *,
     had_prior_canonical: bool,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Validate the write-once lineage fact before a PREPARED cancellation.
 
@@ -6421,7 +6975,7 @@ def _require_cancelled_lineage_consistency(
     marker_path = _activation_lineage_marker_path(identity)
     if had_prior_canonical:
         marker_identity = (
-            _activation_lineage_marker_state_complete(identity)
+            _activation_lineage_marker_state_complete(identity, caller_borrow=caller_borrow)
         )
         if marker_identity is None:
             raise ActivationPreparationError(
@@ -6429,13 +6983,13 @@ def _require_cancelled_lineage_consistency(
                 retryable=False,
             )
         return
-    if _lstat_any_entry(marker_path):
+    if _lstat_any_entry(marker_path, caller_borrow=caller_borrow):
         raise ActivationPreparationError(
             "ACTIVATION.LINEAGE_MARKER_INVALID",
             retryable=False,
         )
     if _lstat_any_entry(
-        _activation_lineage_marker_temp_path(marker_path)
+        _activation_lineage_marker_temp_path(marker_path), caller_borrow=caller_borrow
     ):
         raise ActivationPreparationError(
             "ACTIVATION.LINEAGE_MARKER_INVALID",
@@ -6471,12 +7025,12 @@ def _discover_active_canonical(
     marker_path = _activation_lineage_marker_path(identity)
     temp_path = _activation_lineage_marker_temp_path(marker_path)
     if (
-        not _lstat_any_entry(identity.canonical_sidecar_path)
-        and not _lstat_any_entry(identity.snapshot_manifest_path)
+        not _lstat_any_entry(identity.canonical_sidecar_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+        and not _lstat_any_entry(identity.snapshot_manifest_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     ):
         try:
             marker_identity = _lstat_activation_lineage_marker_identity(
-                marker_path
+                marker_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
             )
         except ActivationPreparationError as error:
             raise ActivationPreparationError(
@@ -6484,7 +7038,7 @@ def _discover_active_canonical(
                 retryable=False,
                 reason_code=error.code,
             ) from error
-        if marker_identity is not None or _lstat_any_entry(temp_path):
+        if marker_identity is not None or _lstat_any_entry(temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})):
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
                 retryable=False,
@@ -6495,9 +7049,19 @@ def _discover_active_canonical(
                 retryable=False,
             )
         return None
+    discovered_set: tuple[int, bool] | None = None
+    if port.posix_activation_borrow is not None:
+        try:
+            has_temporary = port.posix_activation_borrow.exists(temp_path)
+        except (PlatformFileError, ContentAttestationError, OSError) as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False,
+            ) from error
+        if has_temporary:
+            discovered_set = _revalidate_discovered_active_set(port, identity, canonical_store_id=port.canonical_store_id)
     try:
         marker_identity = _activation_lineage_marker_state_complete(
-            identity
+            identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
         )
     except ActivationPreparationError as error:
         raise ActivationPreparationError(
@@ -6511,7 +7075,7 @@ def _discover_active_canonical(
             retryable=False,
         )
     try:
-        generation, fts5_available = _revalidate_discovered_active_set(port,
+        generation, fts5_available = discovered_set if discovered_set is not None else _revalidate_discovered_active_set(port,
             identity,
             canonical_store_id=port.canonical_store_id,
         )
@@ -6550,7 +7114,7 @@ def _load_recovery_journal(
     try:
         disk_bytes, disk_identity = _read_activation_journal_file(
             journal_path,
-            journal_identity,
+            journal_identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
         )
         disk_record = _parse_activation_journal_bytes(
             disk_bytes,
@@ -6563,7 +7127,9 @@ def _load_recovery_journal(
             reason_code=error.code,
         ) from error
     try:
-        _fsync_activation_directory(journal_path.parent)
+        (_fsync_activation_directory(journal_path.parent)
+         if port.posix_activation_borrow is None
+         else port.posix_activation_borrow.capture(journal_path, synchronize=True))
     except OSError as error:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_JOURNAL_INVALID",
@@ -6572,7 +7138,7 @@ def _load_recovery_journal(
     try:
         fsynced_bytes, fsynced_identity = _read_activation_journal_file(
             journal_path,
-            disk_identity,
+            disk_identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
         )
         fsynced_record = _parse_activation_journal_bytes(
             fsynced_bytes,
@@ -6640,7 +7206,8 @@ def _coexisting_terminal(
     terminal_path = _activation_terminal_path(port.resource_identity)
     try:
         terminal_identity = _lstat_activation_terminal_identity(
-            terminal_path
+            terminal_path,
+            **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
         )
     except ActivationPreparationError as error:
         raise ActivationPreparationError(
@@ -6687,6 +7254,7 @@ def _retire_coexisting_terminal(
     _remove_owned_activation_terminal_final(
         _activation_terminal_path(port.resource_identity),
         terminal_identity,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
 
 
@@ -6872,7 +7440,7 @@ def _complete_prepared_cancellation(
 
     identity = port.resource_identity
     source = _recovery_capture_journal_file(
-        identity.configured_jsonl_path
+        identity.configured_jsonl_path, caller_borrow=port.posix_activation_borrow
     )
     if (
         (source[0].device, source[0].inode)
@@ -6898,7 +7466,10 @@ def _complete_prepared_cancellation(
             canonical_store_id=record.canonical_store_id,
         )
     except ActivationPreparationError as error:
-        raise _recovery_mismatch(error) from error
+        mapped = _recovery_mismatch(error)
+        if mapped is error:
+            raise
+        raise mapped from error
     if record.had_prior_canonical:
         fts5_available = _revalidate_recovered_prior_set(port,
             record,
@@ -6907,7 +7478,7 @@ def _complete_prepared_cancellation(
         )
         if (
             record.prior_db_path != identity.canonical_sidecar_path
-            and _lstat_any_entry(identity.canonical_sidecar_path)
+            and _lstat_any_entry(identity.canonical_sidecar_path, caller_borrow=port.posix_activation_borrow)
         ):
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_MISMATCH",
@@ -6915,20 +7486,24 @@ def _complete_prepared_cancellation(
             )
     else:
         try:
-            _require_first_activation_absence(identity)
+            _require_first_activation_absence(identity, caller_borrow=port.posix_activation_borrow)
         except ActivationPreparationError as error:
-            raise _recovery_mismatch(error) from error
+            mapped = _recovery_mismatch(error)
+            if mapped is error:
+                raise
+            raise mapped from error
         fts5_available = False
     _require_cancelled_lineage_consistency(
         identity,
         had_prior_canonical=record.had_prior_canonical,
+        caller_borrow=port.posix_activation_borrow,
     )
-    _remove_journal_proven_backups(record)
+    _remove_journal_proven_backups(record, caller_borrow=port.posix_activation_borrow)
     _retire_coexisting_terminal(port, record)
     _ = port.write_terminal(record)
     _remove_owned_activation_journal_final(
         _activation_journal_path(identity),
-        journal_identity,
+        journal_identity, caller_borrow=port.posix_activation_borrow,
     )
     # The CANCELLED terminal and retired journal are durable, so the
     # journal-proven candidate DB/manifest pair may now be quarantined:
@@ -6936,7 +7511,7 @@ def _complete_prepared_cancellation(
     # resume, and a fresh deterministic migration retry no longer hits
     # MIGRATION.STAGE_SEALED.  Mutated/symlinked/hardlinked/foreign
     # candidates fail closed and are never removed.
-    _retire_cancelled_candidate_assets(record, identity=identity)
+    _retire_cancelled_candidate_assets(record, identity=identity, caller_borrow=port.posix_activation_borrow)
     if record.had_prior_canonical:
         prior_db_path = record.prior_db_path
         assert prior_db_path is not None
@@ -6996,23 +7571,26 @@ def _recover_manifest_publication(
 
     identity = port.resource_identity
     canonical = _recovery_capture_journal_file(
-        identity.canonical_sidecar_path
+        identity.canonical_sidecar_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
     )
     if (
         (canonical[0].device, canonical[0].inode)
         != record.candidate_stage_db_identity
-        or _lstat_any_entry(record.candidate_stage_db_path)
+        or _lstat_any_entry(record.candidate_stage_db_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     ):
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
             retryable=False,
         )
     try:
-        _preflight_recovered_manifest(record, identity=identity)
+        _preflight_recovered_manifest(record, identity=identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     except ActivationPreparationError as error:
-        raise _recovery_mismatch(error) from error
+        mapped = _recovery_mismatch(error)
+        if mapped is error:
+            raise
+        raise mapped from error
     source = _recovery_capture_journal_file(
-        identity.configured_jsonl_path
+        identity.configured_jsonl_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
     )
     if (
         (source[0].device, source[0].inode)
@@ -7032,42 +7610,68 @@ def _recover_manifest_publication(
         record,
         next_generation=next_generation,
     )
-    expected_logical_closure_digest = _complete_recovered_receipt(port,
-        record,
-        identity=identity,
-        canonical_store_id=record.canonical_store_id,
-        next_generation=next_generation,
-        activation_digest=activation_digest,
-    )
-    _complete_recovered_manifest(port,
-        record,
-        identity=identity,
-        canonical_store_id=record.canonical_store_id,
-    )
-    _active_ref, _snapshot, active_attestation = (
-        _validate_published_activation_set(port,
-        record,
-        preparation=None,
-        identity=identity,
-        canonical_store_id=record.canonical_store_id,
-        next_generation=next_generation,
-        activation_digest=activation_digest,
-        expected_logical_closure_digest=(
-            expected_logical_closure_digest
-        ),
+    with _cold_receipt_handoff(port, record, next_generation=next_generation, activation_digest=activation_digest):
+        expected_logical_closure_digest = _complete_recovered_receipt(port,
+            record,
+            identity=identity,
+            canonical_store_id=record.canonical_store_id,
+            next_generation=next_generation,
+            activation_digest=activation_digest,
         )
-    )
-    journal_path = _activation_journal_path(identity)
-    manifest_record = replace(
-        record,
-        phase=_ActivationJournalPhase.MANIFEST_PUBLISHED,
-        active_content_attestation=active_attestation,
-    )
-    journal_identity = port.write_journal(
-        manifest_record,
-        journal_path,
-        expected_final_identity=journal_identity,
-    ).file_identity
+    try:
+        manifest_pending = _complete_recovered_manifest(port,
+            record,
+            identity=identity,
+            canonical_store_id=record.canonical_store_id,
+        )
+    except (PlatformFileError, OSError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_MANIFEST_FAILED", retryable=True,
+        ) from error
+    manifest_error = None
+    try:
+        _active_ref, _snapshot, active_attestation = (
+            _validate_published_activation_set(port,
+            record,
+            preparation=None,
+            identity=identity,
+            canonical_store_id=record.canonical_store_id,
+            next_generation=next_generation,
+            activation_digest=activation_digest,
+            expected_logical_closure_digest=(
+                expected_logical_closure_digest
+            ),
+            )
+        )
+        journal_path = _activation_journal_path(identity)
+        manifest_record = replace(
+            record,
+            phase=_ActivationJournalPhase.MANIFEST_PUBLISHED,
+            active_content_attestation=active_attestation,
+        )
+        journal_identity = port.write_journal(
+            manifest_record,
+            journal_path,
+            expected_final_identity=journal_identity,
+        ).file_identity
+        if manifest_pending is not None:
+            manifest_pending.terminal_reproof()
+    except BaseException as error:
+        manifest_error = error
+        raise
+    finally:
+        if manifest_pending is not None:
+            borrow = port.posix_activation_borrow
+            if borrow is not None:
+                close_error = borrow.close_owned(manifest_pending, primary=manifest_error)
+                if manifest_error is None and close_error is not None:
+                    raise close_error
+            else:
+                try:
+                    manifest_pending.close()
+                except BaseException:
+                    if manifest_error is None:
+                        raise
     return _recover_generation_publication(port,
         manifest_record,
         journal_identity,
@@ -7150,12 +7754,17 @@ def _recover_generation_publication(
     # marker may be ensured.  A marker failure keeps the completed journal
     # as the cold-recovery authority and the view is withheld under
     # ACTIVATING for a fresh recovery to resume.
-    _ensure_activation_lineage_marker(identity)
+    try:
+        _ensure_activation_lineage_marker(identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+    except (PlatformFileError, OSError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID", retryable=True,
+        ) from error
     # The GENERATION_PUBLISHED journal, the re-proven active set, and the
     # write-once marker are durable: coordinator authority switches to the
     # candidate store id so later operations observe the new generation.
     port._activate_candidate_store_id(record.canonical_store_id)
-    _remove_journal_proven_backups(record)
+    _remove_journal_proven_backups(record, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     return ActivationRecoveryReport(
         phase=report_phase.value,
         action="COMPLETED",
@@ -7207,9 +7816,14 @@ def _replay_terminal_recovery(
         fts5_available=snapshot.fts5_available,
         active_content_attestation=record.active_content_attestation,
     )
-    _ensure_activation_lineage_marker(identity)
+    try:
+        _ensure_activation_lineage_marker(identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+    except (PlatformFileError, OSError) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.LINEAGE_MARKER_INVALID", retryable=True,
+        ) from error
     port._activate_candidate_store_id(record.canonical_store_id)
-    _remove_journal_proven_backups(record)
+    _remove_journal_proven_backups(record, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     return ActivationRecoveryReport(
         phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
         action="COMPLETED",
@@ -7238,43 +7852,59 @@ def _replay_cancelled_terminal_recovery(
             "ACTIVATION.RECOVERY_TERMINAL_INVALID",
             retryable=False,
         )
-    _require_cancelled_lineage_consistency(
-        identity,
-        had_prior_canonical=record.had_prior_canonical,
-    )
+    preserved_rollback = False
+    if port.posix_activation_borrow is not None:
+        source = port.posix_activation_borrow.capture(identity.configured_jsonl_path)
+        if (source.device, source.inode) != record.source_jsonl_identity or source.sha256 != record.source_jsonl_digest:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+        preserved_rollback = _posix_cancelled_rollback_closure(record, identity, port.posix_activation_borrow)
     if not record.had_prior_canonical:
         try:
-            _require_first_activation_absence(identity)
+            _require_first_activation_absence(identity, caller_borrow=port.posix_activation_borrow)
         except ActivationPreparationError as error:
-            raise _recovery_mismatch(error) from error
-        _remove_journal_proven_backups(record)
-        _retire_cancelled_candidate_assets(record, identity=identity)
+            mapped = _recovery_mismatch(error)
+            if mapped is error:
+                raise
+            raise mapped from error
+        _require_cancelled_lineage_consistency(identity, had_prior_canonical=False, caller_borrow=port.posix_activation_borrow)
+        if not preserved_rollback:
+            _retire_cancelled_candidate_assets(record, identity=identity, caller_borrow=port.posix_activation_borrow)
+        _remove_journal_proven_backups(record, caller_borrow=port.posix_activation_borrow)
         return None
     try:
         fts5_available = _revalidate_recovered_prior_set(port,
             record,
             identity=identity,
             canonical_store_id=port.canonical_store_id,
-            allow_restored_identities=True,
+            allow_restored_identities=port.posix_activation_borrow is None,
         )
     except ActivationPreparationError as error:
-        raise _recovery_mismatch(error) from error
+        mapped = _recovery_mismatch(error)
+        if mapped is error:
+            raise
+        raise mapped from error
+    _require_cancelled_lineage_consistency(
+        identity,
+        had_prior_canonical=record.had_prior_canonical,
+        caller_borrow=port.posix_activation_borrow,
+    )
     # A Task 5.9 rollback removes the journal-owned backups only after
     # the restored authority and terminal are durable; a crash in that
     # window leaves terminal-only state with backups still present, so
     # the terminal replay cleans them idempotently.  A normal Task 5.8
     # cancellation already removed every backup before the terminal, so
     # this is a no-op for the unchanged-prior path.
-    _remove_journal_proven_backups(record)
+    _remove_journal_proven_backups(record, caller_borrow=port.posix_activation_borrow)
     # A PREPARED cancellation retires the journal-proven candidate
     # DB/manifest pair only after the CANCELLED terminal; a crash in that
     # window leaves terminal-only state with the candidates still present,
     # so the terminal replay finishes the retirement idempotently before
     # reporting the prior/legacy state.
-    _retire_cancelled_candidate_assets(record, identity=identity)
+    if not preserved_rollback:
+        _retire_cancelled_candidate_assets(record, identity=identity, caller_borrow=port.posix_activation_borrow)
     if (
         record.prior_db_path != identity.canonical_sidecar_path
-        and _lstat_any_entry(identity.canonical_sidecar_path)
+        and _lstat_any_entry(identity.canonical_sidecar_path, caller_borrow=port.posix_activation_borrow)
     ):
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_MISMATCH",
@@ -7350,6 +7980,7 @@ def _load_activation_transition_record(
         disk_bytes, _disk_identity = _read_activation_journal_file(
             handle.journal_path,
             handle.file_identity,
+            **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
         )
         disk_record = _parse_activation_journal_bytes(
             disk_bytes,
@@ -7454,7 +8085,7 @@ def _publish_activation_journal(
     journal_path = _activation_journal_path(port.resource_identity)
     terminal_path = _activation_terminal_path(port.resource_identity)
     record = _build_activation_journal_record(port, preparation)
-    existing = _lstat_activation_journal_identity(journal_path)
+    existing = _lstat_activation_journal_identity(journal_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     if existing is None:
         coexisting = _coexisting_terminal(port, record)
         handle = port.write_journal(
@@ -7466,12 +8097,14 @@ def _publish_activation_journal(
             _remove_owned_activation_terminal_final(
                 terminal_path,
                 coexisting[0],
+                **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
             )
         return handle
     try:
         disk_bytes, _disk_identity = _read_activation_journal_file(
             journal_path,
             existing,
+            **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
         )
         disk_record = _parse_activation_journal_bytes(
             disk_bytes,
@@ -7485,16 +8118,21 @@ def _publish_activation_journal(
         ) from error
     if disk_record.phase is _ActivationJournalPhase.PREPARED:
         coexisting = _coexisting_terminal(port, record)
-        handle = _replay_activation_journal(
-            preparation,
-            record,
-            journal_path,
-            existing,
-        )
+        if port.posix_activation_borrow is not None:
+            if disk_record != record:
+                raise ActivationPreparationError("ACTIVATION.JOURNAL_REPLAY_MISMATCH", retryable=False)
+            # Re-publish the authenticated bytes through the original root's
+            # publisher; the legacy replay helper synchronizes a pathname.
+            handle = port.write_journal(record, journal_path, expected_final_identity=existing)
+        else:
+            handle = _replay_activation_journal(
+                preparation, record, journal_path, existing,
+            )
         if coexisting is not None:
             _remove_owned_activation_terminal_final(
                 terminal_path,
                 coexisting[0],
+                **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
             )
         return handle
     identity = port.resource_identity
@@ -7524,8 +8162,8 @@ def _publish_activation_journal(
     # journal is retired; a crash at every boundary leaves a main or
     # terminal record able to resume the cleanup and no backup becomes
     # ownerless.
-    _remove_journal_proven_backups(disk_record)
-    _remove_owned_activation_journal_final(journal_path, existing)
+    _remove_journal_proven_backups(disk_record, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
+    _remove_owned_activation_journal_final(journal_path, existing, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     handle = port.write_journal(
         record,
         journal_path,
@@ -7534,6 +8172,7 @@ def _publish_activation_journal(
     _remove_owned_activation_terminal_final(
         terminal_path,
         terminal_identity,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     return handle
 
@@ -7597,7 +8236,8 @@ def _build_activation_journal_record(
             retryable=False,
         )
     db_capture = _capture_journal_closure_file(
-        physical.mutable_stage.staged_db_path
+        physical.mutable_stage.staged_db_path,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     if (
         (db_capture[0].device, db_capture[0].inode)
@@ -7609,7 +8249,8 @@ def _build_activation_journal_record(
             retryable=False,
         )
     manifest_capture = _capture_journal_closure_file(
-        physical.mutable_stage.manifest_temp_path
+        physical.mutable_stage.manifest_temp_path,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     if (
         (manifest_capture[0].device, manifest_capture[0].inode)
@@ -7624,7 +8265,8 @@ def _build_activation_journal_record(
             retryable=False,
         )
     source_capture = _capture_journal_closure_file(
-        identity.configured_jsonl_path
+        identity.configured_jsonl_path,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     sealed_attestation = physical.sealed_content_attestation
     if (
@@ -7726,7 +8368,8 @@ def _build_activation_journal_record(
                 retryable=False,
             )
         prior_db_backup_capture = _capture_journal_closure_file(
-            prior_db_asset.backup_path
+            prior_db_asset.backup_path,
+            **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
         )
         if (
             prior_db_backup_capture
@@ -7752,7 +8395,8 @@ def _build_activation_journal_record(
                     retryable=False,
                 )
             prior_manifest_backup_capture = _capture_journal_closure_file(
-                prior_manifest_asset.backup_path
+                prior_manifest_asset.backup_path,
+                **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
             )
             if (
                 prior_manifest_backup_capture
@@ -7824,7 +8468,7 @@ def _build_activation_journal_record(
                 retryable=False,
             )
         try:
-            _require_first_activation_absence(identity)
+            _require_first_activation_absence(identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
         except ActivationPreparationError as error:
             raise ActivationPreparationError(
                 "ACTIVATION.JOURNAL_CLOSURE_INVALID",
@@ -8020,7 +8664,8 @@ def _revalidate_activation_journal_closure(
             retryable=False,
         )
     db_capture = _capture_journal_closure_file(
-        physical.mutable_stage.staged_db_path
+        physical.mutable_stage.staged_db_path,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     if (
         (db_capture[0].device, db_capture[0].inode)
@@ -8032,7 +8677,8 @@ def _revalidate_activation_journal_closure(
             retryable=False,
         )
     manifest_capture = _capture_journal_closure_file(
-        physical.mutable_stage.manifest_temp_path
+        physical.mutable_stage.manifest_temp_path,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     if (
         (manifest_capture[0].device, manifest_capture[0].inode)
@@ -8044,7 +8690,8 @@ def _revalidate_activation_journal_closure(
             retryable=False,
         )
     source_capture = _capture_journal_closure_file(
-        identity.configured_jsonl_path
+        identity.configured_jsonl_path,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     if (
         (source_capture[0].device, source_capture[0].inode)
@@ -8071,9 +8718,10 @@ def _revalidate_activation_journal_closure(
             database = _capture_activation_file(
                 view.stage.staged_db_path,
                 asset_kind="DATABASE",
+                **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
             )
             if record.prior_manifest_absent:
-                if _lstat_any_entry(identity.snapshot_manifest_path):
+                if _lstat_any_entry(identity.snapshot_manifest_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})):
                     raise ActivationPreparationError(
                         "ACTIVATION.JOURNAL_ASSET_MUTATED",
                         retryable=False,
@@ -8083,6 +8731,7 @@ def _revalidate_activation_journal_closure(
                 manifest = _capture_activation_file(
                     identity.snapshot_manifest_path,
                     asset_kind="MANIFEST",
+                    **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
                 )
             with port.open_configured_connection(
                 view.stage.staged_db_path,
@@ -8154,7 +8803,7 @@ def _revalidate_activation_journal_closure(
                 retryable=False,
             )
         if manifest is not None and not replacement:
-            manifest_payload = _read_activation_file_bytes(manifest)
+            manifest_payload = _read_activation_file_bytes(manifest, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
             if manifest_payload != contract_to_json(
                 binding.manifest
             ).encode("utf-8"):
@@ -8176,7 +8825,8 @@ def _revalidate_activation_journal_closure(
             )
         prior_db_asset = backups_by_kind["DATABASE"]
         db_backup_capture = _capture_journal_closure_file(
-            prior_db_asset.backup_path
+            prior_db_asset.backup_path,
+            **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
         )
         if (
             (
@@ -8199,7 +8849,8 @@ def _revalidate_activation_journal_closure(
         if not record.prior_manifest_absent:
             prior_manifest_asset = backups_by_kind["MANIFEST"]
             manifest_backup_capture = _capture_journal_closure_file(
-                prior_manifest_asset.backup_path
+                prior_manifest_asset.backup_path,
+                **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
             )
             if (
                 (
@@ -8228,7 +8879,7 @@ def _revalidate_activation_journal_closure(
                 retryable=False,
             )
         try:
-            _require_first_activation_absence(identity)
+            _require_first_activation_absence(identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
         except ActivationPreparationError as error:
             raise ActivationPreparationError(
                 "ACTIVATION.JOURNAL_CLOSURE_INVALID",
@@ -8293,6 +8944,7 @@ def _revalidate_activation_effect_closure(
         registry=cast(Any, port.sealed_registry),
         identity=port.resource_identity,
         canonical_store_id=record.canonical_store_id,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
     if next_phase is _ActivationJournalPhase.DB_REPLACED:
         if (
@@ -8391,9 +9043,13 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
     state without relying on bare absence or caller memory.
     """
 
+    live_preparation = port.preparation
     if (
         port.state not in {"READY", "ACTIVATING"}
-        or port.preparation is not None
+        or (live_preparation is not None and (
+            port.posix_activation_borrow is None
+            or getattr(port, "_posix_live_cancellation_preparation", None) is not live_preparation
+        ))
         or port.cleanup_reservation is not None
     ):
         raise ActivationPreparationError(
@@ -8416,9 +9072,9 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
     try:
         try:
             journal_identity = _lstat_activation_journal_identity(
-                journal_path
+                journal_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
             )
-        except ActivationPreparationError as error:
+        except (ActivationPreparationError, PlatformFileError) as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_JOURNAL_INVALID",
                 retryable=False,
@@ -8426,9 +9082,9 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
             ) from error
         try:
             terminal_identity = _lstat_activation_terminal_identity(
-                terminal_path
+                terminal_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})
             )
-        except ActivationPreparationError as error:
+        except (ActivationPreparationError, PlatformFileError) as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_TERMINAL_INVALID",
                 retryable=False,
@@ -8440,9 +9096,10 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
         terminal_temp_path = _activation_terminal_temp_path(
             terminal_path
         )
-        if _lstat_any_entry(journal_temp_path):
+        if _lstat_any_entry(journal_temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})):
             if (
-                journal_identity is not None
+                port.posix_activation_borrow is not None
+                or journal_identity is not None
                 or terminal_identity is None
             ):
                 raise ActivationPreparationError(
@@ -8450,9 +9107,10 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
                     retryable=False,
                 )
             _remove_orphaned_activation_temp(journal_temp_path)
-        if _lstat_any_entry(terminal_temp_path):
+        if _lstat_any_entry(terminal_temp_path, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {})):
             if (
-                terminal_identity is not None
+                port.posix_activation_borrow is not None
+                or terminal_identity is not None
                 or journal_identity is None
             ):
                 raise ActivationPreparationError(
@@ -8462,6 +9120,8 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
             _remove_orphaned_activation_temp(terminal_temp_path)
         if journal_identity is None:
             if terminal_identity is None:
+                if live_preparation is not None:
+                    raise ActivationPreparationError("ACTIVATION.RECOVERY_STATE_INVALID", retryable=True)
                 # A live in-memory view never bypasses the cold discovery:
                 # the marker and the active canonical pair are re-proven
                 # from disk (or fail closed), so a deleted/tampered
@@ -8475,6 +9135,11 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
                 _revalidate_recovery_authority(port,
                     terminal_record
                 )
+                if live_preparation is not None and (
+                    terminal_record.phase is not _ActivationJournalPhase.PREPARED
+                    or terminal_record.preparation_id != live_preparation.preparation_id
+                ):
+                    raise ActivationPreparationError("ACTIVATION.RECOVERY_STATE_INVALID", retryable=True)
                 if (
                     terminal_record.phase
                     is _ActivationJournalPhase.GENERATION_PUBLISHED
@@ -8507,6 +9172,11 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
             journal_identity,
         )
         _revalidate_recovery_authority(port, record)
+        if live_preparation is not None and (
+            record.phase is not _ActivationJournalPhase.PREPARED
+            or record.preparation_id != live_preparation.preparation_id
+        ):
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_STATE_INVALID", retryable=True)
         rollback_terminal_coexists = False
         if terminal_identity is not None:
             terminal_record = _load_recovery_terminal(port,
@@ -8581,8 +9251,30 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
                     journal_identity,
                 )
         except ActivationPreparationError as error:
+            if (port.posix_activation_borrow is not None
+                    and record.phase is _ActivationJournalPhase.GENERATION_PUBLISHED):
+                # This authenticated completed journal is recovery authority,
+                # even if a later active-set proof fails. Keep its exact error,
+                # pair, lineage and any reliably published view for recovery.
+                raise
             if not _activation_rollback_eligible(error):
                 raise
+            if port.posix_activation_borrow is not None:
+                if port.posix_activation_borrow.io_incomplete:
+                    raise
+                # Recovery may have durably advanced the journal before its
+                # later proof failed. Only the same original journal object
+                # and record authorize this rollback; never use the stale
+                # entry phase or reacquire authority at a replacement name.
+                rollback_record_proven = False
+                try:
+                    current_record = _load_recovery_journal(port, journal_path, journal_identity)
+                except (ActivationPreparationError, PlatformFileError, OSError) as reproof_error:
+                    _append_owned_close_facts(error, reproof_error, context="Rollback journal reproof failed")
+                else:
+                    rollback_record_proven = current_record == record
+                if not rollback_record_proven:
+                    raise
             # Task 5.9: completion cannot be proven, so restore one
             # complete prior authority (or the legacy first-activation
             # state) instead of leaving the resource fail-stopped.
@@ -8641,9 +9333,9 @@ def rollback_durable_activation(
     try:
         try:
             journal_identity = _lstat_activation_journal_identity(
-                journal_path
+                journal_path, caller_borrow=port.posix_activation_borrow
             )
-        except ActivationPreparationError as error:
+        except (ActivationPreparationError, PlatformFileError) as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_JOURNAL_INVALID",
                 retryable=False,
@@ -8651,9 +9343,9 @@ def rollback_durable_activation(
             ) from error
         try:
             terminal_identity = _lstat_activation_terminal_identity(
-                terminal_path
+                terminal_path, caller_borrow=port.posix_activation_borrow
             )
-        except ActivationPreparationError as error:
+        except (ActivationPreparationError, PlatformFileError) as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_TERMINAL_INVALID",
                 retryable=False,
@@ -8665,9 +9357,10 @@ def rollback_durable_activation(
         terminal_temp_path = _activation_terminal_temp_path(
             terminal_path
         )
-        if _lstat_any_entry(journal_temp_path):
+        if _lstat_any_entry(journal_temp_path, caller_borrow=port.posix_activation_borrow):
             if (
-                journal_identity is not None
+                port.posix_activation_borrow is not None
+                or journal_identity is not None
                 or terminal_identity is None
             ):
                 raise ActivationPreparationError(
@@ -8675,9 +9368,10 @@ def rollback_durable_activation(
                     retryable=False,
                 )
             _remove_orphaned_activation_temp(journal_temp_path)
-        if _lstat_any_entry(terminal_temp_path):
+        if _lstat_any_entry(terminal_temp_path, caller_borrow=port.posix_activation_borrow):
             if (
-                terminal_identity is not None
+                port.posix_activation_borrow is not None
+                or terminal_identity is not None
                 or journal_identity is None
             ):
                 raise ActivationPreparationError(
@@ -8852,59 +9546,107 @@ def publish_activation(
         prepared_record,
     )
 
-    _replace_activation_database(
+    handoff = _replace_activation_database(
         prepared_record,
         identity=port.resource_identity,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
-    handle = port.advance_after_effect(
-        preparation,
-        handle,
-        _ActivationJournalPhase.DB_REPLACED,
-    )
-
-    next_generation = (
-        0
-        if prepared_record.expected_prior_generation is None
-        else prepared_record.expected_prior_generation + 1
-    )
-    activation_digest = _activation_publication_digest(
-        prepared_record,
-        next_generation=next_generation,
-    )
-    expected_logical_closure_digest = _publish_activation_receipt(port,
-        prepared_record,
-        preparation=preparation,
-        identity=port.resource_identity,
-        canonical_store_id=prepared_record.canonical_store_id,
-        next_generation=next_generation,
-        activation_digest=activation_digest,
-    )
-    _publish_activation_manifest(
-        prepared_record,
-        preparation=preparation,
-        identity=port.resource_identity,
-    )
-    active_ref, active_snapshot, active_attestation = (
-        _validate_published_activation_set(port,
-        prepared_record,
-        preparation=preparation,
-        identity=port.resource_identity,
-        canonical_store_id=prepared_record.canonical_store_id,
-        next_generation=next_generation,
-        activation_digest=activation_digest,
-        expected_logical_closure_digest=(
-            expected_logical_closure_digest
-        ),
+    handoff_error = None
+    try:
+        handle = port.advance_after_effect(
+            preparation,
+            handle,
+            _ActivationJournalPhase.DB_REPLACED,
         )
+
+        if handoff is not None:
+            handoff.begin_receipt()
+            handoff.borrow.publication_incomplete = False
+            port.receipt_handoff = handoff
+
+        next_generation = (
+            0
+            if prepared_record.expected_prior_generation is None
+            else prepared_record.expected_prior_generation + 1
+        )
+        activation_digest = _activation_publication_digest(
+            prepared_record,
+            next_generation=next_generation,
+        )
+        expected_logical_closure_digest = _publish_activation_receipt(port,
+            prepared_record,
+            preparation=preparation,
+            identity=port.resource_identity,
+            canonical_store_id=prepared_record.canonical_store_id,
+            next_generation=next_generation,
+            activation_digest=activation_digest,
+        )
+    except (PlatformFileError, OSError) as error:
+        if handoff is None:
+            raise
+        handoff_error = ActivationPreparationError("ACTIVATION.RECEIPT_PUBLICATION_FAILED", retryable=True)
+        raise handoff_error from error
+    except BaseException as error:
+        handoff_error = error
+        raise
+    finally:
+        port.receipt_handoff = None
+        if handoff is not None:
+            handoff.close(primary=handoff_error)
+    if handoff is not None:
+        # Only normal control flow after SQL and guard close can certify the
+        # receipt owner completed. An exception must leave this fact pending.
+        handoff.borrow.publication_incomplete = False
+    manifest_pending = _publish_activation_manifest(
+        prepared_record,
+        preparation=preparation,
+        identity=port.resource_identity,
+        **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
-    handle = port.advance_after_effect(
-        preparation,
-        handle,
-        _ActivationJournalPhase.MANIFEST_PUBLISHED,
-        next_generation=next_generation,
-        activation_digest=activation_digest,
-        active_content_attestation=active_attestation,
-    )
+    manifest_error = None
+    try:
+        active_ref, active_snapshot, active_attestation = (
+            _validate_published_activation_set(port,
+            prepared_record,
+            preparation=preparation,
+            identity=port.resource_identity,
+            canonical_store_id=prepared_record.canonical_store_id,
+            next_generation=next_generation,
+            activation_digest=activation_digest,
+            expected_logical_closure_digest=(
+                expected_logical_closure_digest
+            ),
+            )
+        )
+        handle = port.advance_after_effect(
+            preparation,
+            handle,
+            _ActivationJournalPhase.MANIFEST_PUBLISHED,
+            next_generation=next_generation,
+            activation_digest=activation_digest,
+            active_content_attestation=active_attestation,
+        )
+        if manifest_pending is not None:
+            manifest_pending.terminal_reproof()
+    except BaseException as error:
+        manifest_error = error
+        raise
+    finally:
+        if manifest_pending is not None:
+            borrow = port.posix_activation_borrow
+            if borrow is not None:
+                close_error = borrow.close_owned(manifest_pending, primary=manifest_error)
+                if manifest_error is None and close_error is not None:
+                    raise close_error
+            else:
+                try:
+                    manifest_pending.close()
+                except BaseException:
+                    if manifest_error is None:
+                        raise
+    if port.posix_activation_borrow is not None:
+        # The manifest's phase, terminal reproof and every owned close returned.
+        port.posix_activation_borrow.publication_incomplete = False
     active_record = handle._record
 
     # Rehash and reopen the attested active set immediately before the
@@ -8970,7 +9712,7 @@ def publish_activation(
     # stays withheld under ACTIVATING) and a fresh recovery resumes the
     # publication; the marker is never cleared by rollback or cancellation
     # and survives every later generation/import/upgrade.
-    _ensure_activation_lineage_marker(port.resource_identity)
+    _ensure_activation_lineage_marker(port.resource_identity, **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}))
     # The completed activation is durable (GENERATION_PUBLISHED journal,
     # final revalidation, consumed token, marker): coordinator authority
     # switches to the candidate store id before READY so the replacement

@@ -11,7 +11,8 @@ import stat
 import sys
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
-from pathlib import Path
+from pathlib import Path, PurePath
+from platform_fs_contracts import PlatformFileError
 
 from tm_activation_journal import (
     ActivationPreparationError,
@@ -20,6 +21,10 @@ from tm_activation_journal import (
     _lstat_activation_journal_identity,
     _parse_activation_journal_bytes,
     _read_activation_journal_file,
+    _CallerHeldPosixActivationBorrow,
+    _parse_activation_lineage_marker_bytes,
+    _activation_journal_temp_path,
+    _activation_terminal_temp_path,
 )
 from tm_contracts import CanonicalResourceIdentity, TMRecordDraft
 from tm_sqlite_store import (
@@ -28,6 +33,8 @@ from tm_sqlite_store import (
     SQLiteStoreSchemaError,
     SQLiteTMStore,
     _check_resource_family_path,
+    _known_resource_family_identity,
+    _ResourceOperationBorrow,
 )
 
 
@@ -110,13 +117,26 @@ def _canonical_artifact_paths(
     return sidecar, manifest, journal, terminal, marker
 
 
-def _sidecar_activation_facts(sidecar: Path) -> tuple[str, str]:
+def _sidecar_activation_facts(sidecar: Path, *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None) -> tuple[str, str]:
     """Bootstrap ``(resource_id, canonical_store_id)`` from sidecar meta.
 
     This is a read-only identity bootstrap only: recovery re-proves every
     fact before any generation view is trusted.
     """
 
+    if caller_borrow is not None:
+        from tm_sqlite_store import _open_configured_connection
+        with _open_configured_connection(sidecar, require_existing=True,
+                _stage_borrow=caller_borrow, purpose="activation-validation") as connection:
+            cursor = connection.execute("SELECT key, value FROM tm_meta WHERE key IN ('resource_id', 'canonical_store_id')")
+            try:
+                meta = dict(cursor.fetchall())
+            finally:
+                cursor.close()
+        resource_id, store_id = meta.get("resource_id"), meta.get("canonical_store_id")
+        if not resource_id or not store_id:
+            raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+        return resource_id, store_id
     try:
         initial = os.lstat(sidecar)
         if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
@@ -187,7 +207,7 @@ def _journal_activation_facts(
     return record.resource_id, canonical_store_id
 
 
-def _activation_facts(configured_jsonl: Path) -> tuple[str, str] | None:
+def _activation_facts(configured_jsonl: Path, *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None) -> tuple[str, str] | None:
     """Return durable ``(resource_id, canonical_store_id)`` or ``None``.
 
     ``None`` means the resource carries no activation artifacts at all and
@@ -200,12 +220,12 @@ def _activation_facts(configured_jsonl: Path) -> tuple[str, str] | None:
         _canonical_artifact_paths(configured_jsonl)
     )
     if not any(
-        _lstat_any_entry(path)
+        _lstat_any_entry(path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
         for path in (sidecar, _manifest, journal, terminal, marker)
     ):
         return None
-    if _lstat_any_entry(sidecar):
-        return _sidecar_activation_facts(sidecar)
+    if _lstat_any_entry(sidecar, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
+        return _sidecar_activation_facts(sidecar, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
     if _lstat_any_entry(journal):
         return _journal_activation_facts(
             journal,
@@ -268,11 +288,113 @@ def _rehydrate_canonical_runtime_authority(
     ).rehydrate_completed_portable_activation()
 
 
+def _posix_cold_resource_locator(path: Path, backend: Any, root: Any) -> str | None:
+    """Read untrusted non-SQL hints; the original root is retained for recovery."""
+    sidecar, manifest, journal, terminal, marker = _canonical_artifact_paths(path)
+    # An interrupted unpublished attempt may have no authenticated main record.
+    # Its deterministic temporary is a refusal barrier, never a legacy hint.
+    for temporary in (_activation_journal_temp_path(journal), _activation_terminal_temp_path(terminal)):
+        if root.inspect_entry(temporary.name) is not None:
+            raise ValueError(_CANONICAL_RECOVERY_FAILED_CODE)
+    for candidate in (journal, terminal, marker):
+        root.reprove_location()
+        if root.inspect_entry(candidate.name) is None:
+            continue
+        opened = backend.open_regular(root, PurePath(candidate.name))
+        try:
+            payload = b"".join(opened.iter_exact_chunks(opened.snapshot()))
+        finally:
+            primary = sys.exception()
+            try:
+                opened.close()
+            except BaseException:
+                if primary is None:
+                    raise
+        root.reprove_location()
+        if candidate == marker:
+            resource_id = json.loads(payload).get("resource_id")
+            if type(resource_id) is not str or not resource_id.strip():
+                raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+            identity = CanonicalResourceIdentity.from_configured_jsonl(resource_id, path)
+            _parse_activation_lineage_marker_bytes(payload, identity=identity)
+            return resource_id
+        return _parse_activation_journal_bytes(payload, expected_journal_path=journal).resource_id
+    if any(root.inspect_entry(candidate.name) is not None for candidate in (sidecar, manifest)):
+        # Active canonical discovery already requires a durable lineage marker.
+        raise ValueError(_CANONICAL_IDENTITY_MISSING_CODE)
+    return None
+
+
 def open_canonical_tm_store(
     configured_jsonl: Path,
     *,
     expected_resource_id: str | None = None,
     drain_timeout_seconds: float = 5.0,
+) -> SQLiteTMStore | None:
+    """Reserve the original family before the first cold database pathname read."""
+    path = _configured_jsonl_path(configured_jsonl)
+    if sys.platform == "win32":
+        return _open_canonical_tm_store_reserved(path, expected_resource_id=expected_resource_id,
+            drain_timeout_seconds=drain_timeout_seconds)
+    identity = _known_resource_family_identity(path)
+    retained = None
+    coordinator = None
+    store = None
+    try:
+        if identity is None:
+            if expected_resource_id is None:
+                from platform_fs import compose_platform_file_backend
+                backend = compose_platform_file_backend(path.parent)
+                root = backend.bind_root(path.parent)
+                retained = (backend, root)
+                resource_id = _posix_cold_resource_locator(path, backend, root)
+                if resource_id is None:
+                    return None
+            else:
+                resource_id = expected_resource_id
+            identity = CanonicalResourceIdentity.from_configured_jsonl(resource_id, path)
+        coordinator = ResourceStoreCoordinator(
+            resource_identity=identity, canonical_store_id="runtime.bootstrap",
+            drain_timeout_seconds=drain_timeout_seconds, _family_root=retained,
+        )
+        if retained is not None and coordinator._family is not None and coordinator._family._root is retained[1]:
+            retained = None  # The single family owner now closes this exact root.
+        with coordinator._family_transition(recovery=True) as borrow:
+            store = _open_canonical_tm_store_reserved(path,
+                expected_resource_id=expected_resource_id,
+                drain_timeout_seconds=drain_timeout_seconds,
+                _coordinator=coordinator, _borrow=borrow)
+        return store
+    except (SQLiteStoreSchemaError, SQLiteStoreLifecycleError,
+            sqlite3.DatabaseError, OSError, PlatformFileError) as error:
+        # Locator and family admission now precede reserved recovery. Preserve
+        # the public factory's body-safe failure surface across that boundary.
+        raise ValueError(_CANONICAL_UNHEALTHY_CODE) from error
+    finally:
+        primary = sys.exception()
+        close_error = None
+        if store is None and coordinator is not None:
+            try:
+                coordinator.close_family_session()
+            except BaseException as error:
+                close_error = error
+        if retained is not None and not retained[1].closed:
+            try:
+                retained[1].close()
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+        if primary is None and close_error is not None:
+            raise close_error
+
+
+def _open_canonical_tm_store_reserved(
+    configured_jsonl: Path,
+    *,
+    expected_resource_id: str | None = None,
+    drain_timeout_seconds: float = 5.0,
+    _coordinator: ResourceStoreCoordinator | None = None,
+    _borrow: _ResourceOperationBorrow | None = None,
 ) -> SQLiteTMStore | None:
     """Open one activated resource's canonical store, or ``None`` for legacy.
 
@@ -314,26 +436,64 @@ def open_canonical_tm_store(
         )
     else:
         try:
-            facts = _activation_facts(path)
+            if _coordinator is not None and _borrow is not None:
+                with _coordinator._posix_recovery_port(borrow=_borrow) as port:
+                    facts = _activation_facts(path, caller_borrow=port.posix_activation_borrow)
+            else:
+                facts = _activation_facts(path)
         except ActivationPreparationError as error:
             raise ValueError(
                 f"{_CANONICAL_RECOVERY_FAILED_CODE}:{error.code}"
             ) from error
+        except (SQLiteStoreSchemaError, sqlite3.DatabaseError) as error:
+            # These reads locate activation authority before runtime health.
+            # Preserve that public failure stage without exposing DB details.
+            raise ValueError(_CANONICAL_RECOVERY_FAILED_CODE) from error
         if facts is None:
-            return None
+            if _coordinator is None or _borrow is None:
+                return None
+            # A known family may still have schema pending or a latched failed
+            # recovery even when the canonical locator has no current facts.
+            # Only full recovery under this same borrow can accept legacy.
+            report = _coordinator.rehydrate_runtime_authority(_borrow=_borrow)
+            if report is None or (report.action == "CANCELLED" and report.generation is None):
+                return None
+            facts = (_coordinator.resource_id, _coordinator.canonical_store_id)
         resource_id, canonical_store_id = facts
 
-    coordinator: ResourceStoreCoordinator | None = None
+    coordinator: ResourceStoreCoordinator | None = _coordinator
     try:
         identity = CanonicalResourceIdentity.from_configured_jsonl(
             resource_id,
             path,
         )
-        coordinator = ResourceStoreCoordinator(
-            resource_identity=identity,
-            canonical_store_id=canonical_store_id,
-            drain_timeout_seconds=drain_timeout_seconds,
-        )
+        if coordinator is None:
+            coordinator = ResourceStoreCoordinator(
+                resource_identity=identity,
+                canonical_store_id=canonical_store_id,
+                drain_timeout_seconds=drain_timeout_seconds,
+            )
+            if coordinator._family is not None:
+                # The first locator is untrusted and may predate registration
+                # by another opener. Repeat it under W1 before raw recovery
+                # reads can overlap any newly admitted local SQL owner.
+                opened: SQLiteTMStore | None = None
+                try:
+                    with coordinator._family_transition(recovery=True) as issued:
+                        opened = _open_canonical_tm_store_reserved(
+                            path, expected_resource_id=expected_resource_id,
+                            drain_timeout_seconds=drain_timeout_seconds,
+                            _coordinator=coordinator, _borrow=issued,
+                        )
+                    return opened
+                finally:
+                    if opened is None:
+                        coordinator.close_family_session()
+        else:
+            if coordinator._resource_identity != identity or _borrow is None:
+                raise SQLiteStoreSchemaError("STORE.IDENTITY_MISMATCH")
+            _borrow.reprove(coordinator)
+            coordinator._canonical_store_id = canonical_store_id
         opened_windows_store: SQLiteTMStore | None = None
         windows_recovery = None
         if sys.platform == "win32":
@@ -349,10 +509,11 @@ def open_canonical_tm_store(
                 coordinator=coordinator,
             ).open_completed_portable_runtime()
         else:
-            report = _rehydrate_canonical_runtime_authority(
-                coordinator,
-                identity,
-            )
+            try:
+                report = (coordinator.rehydrate_runtime_authority(_borrow=_borrow)
+                          if _borrow is not None else _rehydrate_canonical_runtime_authority(coordinator, identity))
+            except (SQLiteStoreSchemaError, sqlite3.DatabaseError) as error:
+                raise ValueError(_CANONICAL_RECOVERY_FAILED_CODE) from error
         if sys.platform == "win32" and report is None:
             facts = _activation_facts(path)
             if facts is None:
@@ -400,7 +561,7 @@ def open_canonical_tm_store(
                     f"{recovery.error_code or 'RECOVERY.BLOCKED'}"
                 )
         if opened_windows_store is None:
-            _ = store.canonical_revision()
+            _ = store.canonical_revision(_borrow=_borrow)
     except (
         ActivationPreparationError,
         SQLiteStoreSchemaError,

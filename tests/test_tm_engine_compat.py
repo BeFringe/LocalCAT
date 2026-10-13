@@ -365,8 +365,12 @@ class CanonicalFailStopTests(unittest.TestCase):
             tm_path = _activate_resource(root)
             sidecar = _identity(root).canonical_sidecar_path
             same_bytes = sidecar.read_bytes()
-            sidecar.unlink()
+            original_inode = sidecar.stat().st_ino
+            retained_original = sidecar.with_name("retained-original.sqlite3")
+            sidecar.rename(retained_original)
             sidecar.write_bytes(same_bytes)
+            self.assertNotEqual(sidecar.stat().st_ino, original_inode)
+            self.assertEqual(retained_original.stat().st_ino, original_inode)
 
             with self.assertRaises(ValueError) as raised:
                 TMEngine(str(tm_path))

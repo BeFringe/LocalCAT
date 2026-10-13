@@ -22,6 +22,7 @@ retained, and the pending journal is retired idempotently.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
 import json
@@ -88,6 +89,37 @@ PREPARED = _ActivationJournalPhase.PREPARED
 DB_REPLACED = _ActivationJournalPhase.DB_REPLACED
 MANIFEST_PUBLISHED = _ActivationJournalPhase.MANIFEST_PUBLISHED
 GENERATION_PUBLISHED = _ActivationJournalPhase.GENERATION_PUBLISHED
+
+
+@contextmanager
+def _rooted_backup_cleanup_fault(owner, backup_paths, *, window='unlink', fail_at=1):
+    """Inject at the consumed rooted unlink or its actual directory fsync."""
+    root = owner._family._root
+    actual_unlink = type(root).unlink_owned
+    actual_sync = os.fsync
+    names = {path.name for path in backup_paths}
+    calls, hits, active = [], [], []
+    def unlink(current, name, expected):
+        selected = current is root and name in names
+        if selected:
+            calls.append(name)
+            if window == 'unlink' and len(calls) == fail_at:
+                hits.append(name)
+                raise OSError('injected backup unlink')
+            active.append(name)
+        try:
+            return actual_unlink(current, name, expected)
+        finally:
+            if selected:
+                active.pop()
+    def sync(descriptor):
+        if window == 'fsync' and active and len(calls) == fail_at and not hits:
+            hits.append(active[-1])
+            raise OSError('injected cleanup fsync')
+        return actual_sync(descriptor)
+    with patch.object(type(root), 'unlink_owned', unlink), patch('platform_fs_posix.os.fsync', sync):
+        yield hits
+    assert len(hits) == 1, 'the real backup cleanup boundary was not reached'
 
 
 def _fresh(identity: contract_module.CanonicalResourceIdentity):
@@ -304,125 +336,43 @@ class ActivationRecoveryCancelTests(unittest.TestCase):
                     self.assertEqual(second_fresh.state, "READY")
                     self.assertIsNone(second_fresh.current_generation)
 
-    def test_existing_canonical_prepared_cancel_restores_prior_generation(
-        self,
-    ) -> None:
+    def test_existing_canonical_prepared_cancel_restores_prior_generation(self) -> None:
+        from tests.test_tm_initial_activation_contract import _identity as public_identity, _coordinator, _service
+        from tm_contracts import MigrationFailure, MigrationReport
+        from tm_engine import open_canonical_tm_store
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (
-                identity,
-                store,
-                coordinator,
-                _stage,
-                sealed,
-            ) = _existing_fixture(root, fts5_available=True)
-            prepared = coordinator.activate(sealed)
-            journal = coordinator.publish_prepared_activation(prepared)
-            journal_path = journal.journal_path
-            prior_db_path = journal._record.prior_db_path
-            self.assertIsNotNone(prior_db_path)
-            assert prior_db_path is not None
-            backup_paths = tuple(
-                asset.backup_path for asset in prepared._backup_assets
-            )
-            prior_bytes = prior_db_path.read_bytes()
-            prior_manifest_bytes = identity.snapshot_manifest_path.read_bytes()
+            identity = public_identity(Path(temporary))
+            owner = _coordinator(identity)
+            service = _service(identity, owner)
+            self.assertIs(type(service.activate_initial(identity.configured_jsonl_path, identity.resource_id)), MigrationReport)
+            prior = tuple(path.read_bytes() for path in (identity.configured_jsonl_path, identity.canonical_sidecar_path, identity.snapshot_manifest_path))
+            peer = open_canonical_tm_store(identity.configured_jsonl_path)
+            self.assertIsNotNone(peer)
+            real_cancel = owner.cancel_prepared_activation
+            hits = []
+            def cancel(preparation, **kwargs):
+                hits.append(preparation)
+                self.assertEqual(owner.durable_activation_phase, 'PREPARED')
+                with self.assertRaises(SQLiteStoreLifecycleError):
+                    peer.exact_records('same')
+                return real_cancel(preparation, **kwargs)
+            with patch.object(owner, 'publish_activation', side_effect=OSError('PREPARED publication fault')), patch.object(owner, 'cancel_prepared_activation', cancel):
+                result = service.import_snapshot(identity.configured_jsonl_path, identity.resource_id)
+            self.assertIs(type(result), MigrationFailure)
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(owner.current_generation, 0)
+            self.assertFalse(owner._family._recovery_required)
+            self.assertEqual(tuple(path.read_bytes() for path in (identity.configured_jsonl_path, identity.canonical_sidecar_path, identity.snapshot_manifest_path)), prior)
+            self.assertEqual(peer.exact_records('same')[0].target_raw, 'winner')
+            peer.coordinator.close_family_session()
+            for _ in range(2):
+                reopened = open_canonical_tm_store(identity.configured_jsonl_path)
+                self.assertIsNotNone(reopened)
+                self.assertEqual(reopened.coordinator.active_store_path, identity.canonical_sidecar_path)
+                self.assertEqual(reopened.coordinator.current_generation, 0)
+                self.assertEqual(reopened.exact_records('same')[0].target_raw, 'winner')
+                reopened.coordinator.close_family_session()
 
-            recovered = _fresh(identity)
-            with self.assertRaises(ActivationPreparationError) as raised:
-                recovered.activate(sealed)
-            self.assertEqual(
-                raised.exception.code,
-                "ACTIVATION.RECOVERY_PENDING",
-            )
-            self.assertFalse(raised.exception.retryable)
-
-            report = recovered.recover_durable_activation()
-            self.assertEqual(
-                report,
-                ActivationRecoveryReport(
-                    phase="PREPARED",
-                    action="CANCELLED",
-                    generation=0,
-                ),
-            )
-            self.assertEqual(recovered.state, "READY")
-            self.assertEqual(recovered.current_generation, 0)
-            self.assertFalse(journal_path.exists())
-            self.assertFalse(identity.canonical_sidecar_path.exists())
-            self.assertEqual(prior_db_path.read_bytes(), prior_bytes)
-            self.assertEqual(
-                identity.snapshot_manifest_path.read_bytes(),
-                prior_manifest_bytes,
-            )
-            with recovered._operation_lease() as lease:
-                self.assertEqual(lease.stage.staged_db_path, prior_db_path)
-                self.assertEqual(lease.generation, 0)
-            connection = sqlite3.connect(prior_db_path)
-            try:
-                rows = connection.execute(
-                    "SELECT source_raw, target_raw FROM tm_record "
-                    "ORDER BY record_id"
-                ).fetchall()
-            finally:
-                connection.close()
-            self.assertEqual(rows, [("prior", "canonical")])
-            for backup_path in backup_paths:
-                self.assertFalse(backup_path.exists())
-            terminal_path = store_module._activation_terminal_path(identity)
-            self.assertTrue(terminal_path.is_file())
-            terminal_bytes = terminal_path.read_bytes()
-            self.assertEqual(
-                recovered.recover_durable_activation(),
-                ActivationRecoveryReport(
-                    phase="PREPARED",
-                    action="CANCELLED",
-                    generation=0,
-                ),
-            )
-            self.assertEqual(recovered.current_generation, 0)
-            second_fresh = _fresh(identity)
-            self.assertEqual(
-                second_fresh.recover_durable_activation(),
-                ActivationRecoveryReport(
-                    phase="PREPARED",
-                    action="CANCELLED",
-                    generation=0,
-                ),
-            )
-            self.assertEqual(second_fresh.state, "READY")
-            self.assertEqual(second_fresh.current_generation, 0)
-            with second_fresh._operation_lease() as lease:
-                self.assertEqual(lease.stage.staged_db_path, prior_db_path)
-                self.assertEqual(lease.generation, 0)
-            connection = sqlite3.connect(prior_db_path)
-            try:
-                rows = connection.execute(
-                    "SELECT source_raw, target_raw FROM tm_record "
-                    "ORDER BY record_id"
-                ).fetchall()
-            finally:
-                connection.close()
-            self.assertEqual(rows, [("prior", "canonical")])
-            self.assertEqual(prior_db_path.read_bytes(), prior_bytes)
-            third_fresh = _fresh(identity)
-            self.assertEqual(
-                third_fresh.recover_durable_activation(),
-                ActivationRecoveryReport(
-                    phase="PREPARED",
-                    action="CANCELLED",
-                    generation=0,
-                ),
-            )
-            self.assertEqual(third_fresh.current_generation, 0)
-            self.assertEqual(terminal_path.read_bytes(), terminal_bytes)
-            self.assertFalse(journal_path.exists())
-            # the terminal replay never resumed or consumed the token
-            self.assertIs(
-                _registry(coordinator)._token_entry(prepared._token).state,
-                contract_module.ActivationCapabilityState.TOKEN_ISSUED,
-            )
-            self.assertEqual(store.coordinator.current_generation, 0)
 
 
 class ActivationRecoveryCompletionTests(unittest.TestCase):
@@ -454,10 +404,10 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
                 **kwargs: Any,
             ) -> str:
                 def capture_then_mutate(
-                    path: Path,
+                    path: Path, **capture_kwargs: Any,
                 ) -> tuple[Any, str]:
                     nonlocal captured_identity, mutation_injected
-                    capture = real_capture(path)
+                    capture = real_capture(path, **capture_kwargs)
                     self.assertEqual(path, identity.canonical_sidecar_path)
                     captured_identity = (
                         capture[0].device,
@@ -1119,8 +1069,16 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
                 _registry(coordinator)._token_entry(prepared._token).state,
                 contract_module.ActivationCapabilityState.CONSUMED,
             )
-            with self.assertRaises(ActivationPreparationError) as raised:
-                recovered.activate(sealed)
+            before_replay = identity.canonical_sidecar_path.read_bytes()
+            with patch.object(
+                recovered._sealed_registry, "retire_unissued_portable",
+                wraps=recovered._sealed_registry.retire_unissued_portable,
+            ) as retirement:
+                with self.assertRaises(ActivationPreparationError) as raised:
+                    recovered.activate(sealed)
+            retirement.assert_not_called()
+            self.assertEqual(identity.canonical_sidecar_path.read_bytes(), before_replay)
+            self.assertEqual(recovered.current_generation, 0)
             self.assertEqual(
                 raised.exception.code,
                 "ACTIVATION.GATE_B_DENIED",
@@ -1185,6 +1143,58 @@ class ActivationRecoveryCompletionTests(unittest.TestCase):
             self.assertIn(("other", "value"), rows)
 
 
+@contextmanager
+def _posix_phase_fault(owner, kind, phase=None):
+    """在真实 rooted publication/同步点注入，记录必须命中的 phase。"""
+    from platform_fs_contracts import CandidateFile
+    root = owner._family._root
+    journal_path = _activation_journal_path(owner._resource_identity)
+    write, begin, fsync = CandidateFile.write_all, type(root).begin_publish, os.fsync
+    capture = recovery_module._PosixReceiptHandoff.capture
+    hits, publishing = [], []
+    def write_fault(candidate, payload):
+        selected = False
+        if kind == 'write':
+            try:
+                selected = _parse_activation_journal_bytes(payload, expected_journal_path=journal_path).phase is phase
+            except ActivationPreparationError:
+                pass
+        if selected:
+            hits.append(kind)
+            raise OSError('rooted journal write')
+        return write(candidate, payload)
+    def publish(current, candidate, destination, **kwargs):
+        selected = current is root and destination == (owner._resource_identity.snapshot_manifest_path.name if kind == 'manifest' else journal_path.name)
+        if selected and kind in {'manifest', 'replace'}:
+            hits.append(kind)
+            raise OSError('rooted publication')
+        if selected:
+            publishing.append(True)
+        try:
+            return begin(current, candidate, destination, **kwargs)
+        finally:
+            if selected:
+                publishing.pop()
+    def sync(descriptor):
+        if kind == 'sync' and publishing and _lstat_journal_phase(journal_path) is phase and not hits:
+            hits.append(kind)
+            raise OSError('rooted directory fsync')
+        return fsync(descriptor)
+    def receipt_capture(handoff, *, synchronize=False):
+        if kind == 'receipt' and synchronize:
+            from platform_fs_contracts import BoundSynchronizedRegularFile
+            def failed_sync(*args, **kwargs):
+                hits.append(kind)
+                raise OSError('receipt content fsync')
+            with patch.object(BoundSynchronizedRegularFile, 'synchronize_content', failed_sync):
+                return capture(handoff, synchronize=synchronize)
+        return capture(handoff, synchronize=synchronize)
+    with patch.object(CandidateFile, 'write_all', write_fault), patch.object(type(root), 'begin_publish', publish), patch('platform_fs_posix.os.fsync', sync), patch.object(recovery_module._PosixReceiptHandoff, 'capture', receipt_capture):
+        yield hits
+    if not hits:
+        raise AssertionError('real recovery fault seam did not execute')
+
+
 class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
     def test_advance_failure_before_manifest_journal_keeps_db_replaced(
         self,
@@ -1205,17 +1215,14 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             journal_bytes = journal_path.read_bytes()
 
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._write_activation_journal_bytes",
-                side_effect=OSError("injected journal write"),
-            ):
+            with _posix_phase_fault(first, 'write', MANIFEST_PUBLISHED):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
                 raised.exception.code,
-                "ACTIVATION.JOURNAL_WRITE_FAILED",
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
             )
-            self.assertTrue(raised.exception.retryable)
+            self.assertFalse(raised.exception.retryable)
             self.assertEqual(first.state, "ACTIVATING")
             self.assertIsNone(first.current_generation)
             self.assertIs(_phase(journal_path), DB_REPLACED)
@@ -1267,40 +1274,15 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     coordinator.publish_activation(prepared, journal)
             self.assertIs(_phase(journal_path), DB_REPLACED)
-            real_write = store_module._write_activation_journal_bytes
-            calls = {"count": 0}
-
-            def fail_generation_journal_write(
-                descriptor: int,
-                payload: bytes,
-            ) -> None:
-                calls["count"] += 1
-                try:
-                    parsed = _parse_activation_journal_bytes(
-                        payload,
-                        expected_journal_path=journal_path,
-                    )
-                except Exception:
-                    parsed = None
-                if (
-                    parsed is not None
-                    and parsed.phase is GENERATION_PUBLISHED
-                ):
-                    raise OSError("injected generation journal write")
-                real_write(descriptor, payload)
-
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._write_activation_journal_bytes",
-                side_effect=fail_generation_journal_write,
-            ):
+            with _posix_phase_fault(first, 'write', GENERATION_PUBLISHED):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
                 raised.exception.code,
-                "ACTIVATION.JOURNAL_WRITE_FAILED",
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
             )
-            self.assertTrue(raised.exception.retryable)
+            self.assertFalse(raised.exception.retryable)
             self.assertEqual(first.state, "ACTIVATING")
             self.assertIsNone(first.current_generation)
             self.assertIs(_phase(journal_path), MANIFEST_PUBLISHED)
@@ -1341,10 +1323,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             journal_bytes = journal_path.read_bytes()
 
             first = _fresh(identity)
-            with patch(
-                "tm_activation_recovery._replace_activation_file",
-                side_effect=OSError("injected manifest replace"),
-            ):
+            with _posix_phase_fault(first, 'manifest'):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
@@ -1387,10 +1366,7 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             self.assertIs(_phase(journal_path), DB_REPLACED)
 
             first = _fresh(identity)
-            with patch(
-                "tm_activation_recovery._fsync_activation_file",
-                side_effect=OSError("injected receipt fsync"),
-            ):
+            with _posix_phase_fault(first, 'receipt'):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
@@ -1429,17 +1405,14 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
             self.assertTrue(identity.snapshot_manifest_path.is_file())
 
             first = _fresh(identity)
-            with patch(
-                "tm_sqlite_store.os.replace",
-                side_effect=OSError("injected journal replace"),
-            ):
+            with _posix_phase_fault(first, 'replace'):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
                 raised.exception.code,
-                "ACTIVATION.JOURNAL_WRITE_FAILED",
+                "ACTIVATION.JOURNAL_DURABILITY_UNPROVEN",
             )
-            self.assertTrue(raised.exception.retryable)
+            self.assertFalse(raised.exception.retryable)
             self.assertEqual(first.state, "ACTIVATING")
             self.assertIs(_phase(journal_path), DB_REPLACED)
             self.assertFalse(
@@ -1468,15 +1441,8 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
                     coordinator.publish_activation(prepared, journal)
             self.assertIs(_phase(journal_path), DB_REPLACED)
 
-            def fail_manifest_fsync(path: Path) -> None:
-                if _lstat_journal_phase(journal_path) is MANIFEST_PUBLISHED:
-                    raise OSError("injected manifest journal fsync")
-
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._fsync_activation_directory",
-                side_effect=fail_manifest_fsync,
-            ):
+            with _posix_phase_fault(first, 'sync', MANIFEST_PUBLISHED):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
@@ -1514,15 +1480,8 @@ class ActivationRecoveryPhaseTruthfulnessTests(unittest.TestCase):
                     coordinator.publish_activation(prepared, journal)
             self.assertIs(_phase(journal_path), DB_REPLACED)
 
-            def fail_terminal_fsync(path: Path) -> None:
-                if _lstat_journal_phase(journal_path) is GENERATION_PUBLISHED:
-                    raise OSError("injected terminal journal fsync")
-
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._fsync_activation_directory",
-                side_effect=fail_terminal_fsync,
-            ):
+            with _posix_phase_fault(first, 'sync', GENERATION_PUBLISHED):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
@@ -1625,10 +1584,9 @@ class ActivationRecoveryTerminalProtocolTests(unittest.TestCase):
                 raised.exception.code,
                 "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
             )
-            self.assertEqual(
-                raised.exception.reason_code,
-                "STORE.ACTIVE_COUNT_MISMATCH",
-            )
+            # The current byte/closure proof rejects before a count-only scan.
+            self.assertIsNone(raised.exception.reason_code)
+            self.assertEqual(identity.configured_jsonl_path.read_bytes(), b'{"source":"external","target":"changed"}\n')
             self.assertEqual(discovered.state, "ACTIVATING")
             self.assertIsNone(discovered.current_generation)
 
@@ -2341,20 +2299,8 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
                 asset.backup_path for asset in prepared._backup_assets
             )
             self.assertEqual(len(backup_paths), 2)
-            real_unlink = store_module._unlink_recovery_backup
-            calls = {"count": 0}
-
-            def fail_second_backup_unlink(path: Path) -> None:
-                calls["count"] += 1
-                if calls["count"] == 2:
-                    raise OSError("injected backup unlink")
-                real_unlink(path)
-
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._unlink_recovery_backup",
-                side_effect=fail_second_backup_unlink,
-            ):
+            with _rooted_backup_cleanup_fault(first, backup_paths, fail_at=2):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
@@ -2417,10 +2363,7 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
             self.assertIs(_phase(journal_path), DB_REPLACED)
 
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._unlink_recovery_backup",
-                side_effect=OSError("injected backup unlink"),
-            ):
+            with _rooted_backup_cleanup_fault(first, backup_paths):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
@@ -2476,10 +2419,7 @@ class ActivationRecoveryBackupLifecycleTests(unittest.TestCase):
                     coordinator.publish_activation(prepared, journal)
 
             first = _fresh(identity)
-            with patch(
-                "tm_activation_journal._fsync_recovery_deletion_directory",
-                side_effect=OSError("injected cleanup fsync"),
-            ):
+            with _rooted_backup_cleanup_fault(first, backup_paths, window='fsync'):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     first.recover_durable_activation()
             self.assertEqual(
@@ -2608,7 +2548,26 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
                         )
 
                     recovered = _fresh(identity)
-                    if mutation == "same_inode_bytes":
+                    if mutation == "same_inode_bytes" and os.name != 'nt':
+                        root = Path(temporary)
+                        def files():
+                            return {str(path.relative_to(root)): path.read_bytes()
+                                    for path in root.rglob('*') if path.is_file() and not path.name.endswith('.lock')}
+                        before = files()
+                        try:
+                            for _ in range(2):
+                                with self.assertRaises(ActivationPreparationError) as raised:
+                                    recovered.recover_durable_activation()
+                                self.assertEqual(raised.exception.code, 'ACTIVATION.RECOVERY_ACTIVE_SET_INVALID')
+                                self.assertEqual(recovered.state, 'ACTIVATING')
+                                self.assertTrue(recovered._family._recovery_required)
+                                self.assertIsNone(recovered.current_generation)
+                                self.assertEqual(coordinator.current_generation, 0)
+                                self.assertIs(_phase(journal.journal_path), GENERATION_PUBLISHED)
+                                self.assertEqual(files(), before)
+                        finally:
+                            recovered.close_family_session()
+                    elif mutation == "same_inode_bytes":
                         report = _recovered_report(recovered)
                         self.assertEqual(report.action, "ROLLED_BACK")
                         self.assertIsNone(recovered.current_generation)
@@ -2694,6 +2653,15 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     coordinator.publish_activation(prepared, journal)
             record.candidate_manifest_temp_path.write_bytes(b"tampered")
+            if os.name != 'nt':
+                from tests.test_tm_activation_rollback import _assert_unprovable_preservation_stops
+                _assert_unprovable_preservation_stops(self, identity, record, journal_path, 'ACTIVATION.QUARANTINE_FOREIGN')
+                connection = sqlite3.connect(identity.canonical_sidecar_path)
+                try:
+                    self.assertEqual(connection.execute('SELECT status FROM tm_snapshot_receipt').fetchall(), [('issued',)])
+                finally:
+                    connection.close()
+                return
             source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
             self.assertEqual(
@@ -2782,6 +2750,10 @@ class ActivationRecoveryFailStopTests(unittest.TestCase):
             self.assertIs(_phase(journal_path), DB_REPLACED)
             candidate_path = record.candidate_stage_db_path
             candidate_path.write_bytes(b"reappeared candidate")
+            if os.name != 'nt':
+                from tests.test_tm_activation_rollback import _assert_unprovable_preservation_stops
+                _assert_unprovable_preservation_stops(self, identity, record, journal_path, 'ACTIVATION.QUARANTINE_FOREIGN')
+                return
             source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
             self.assertEqual(

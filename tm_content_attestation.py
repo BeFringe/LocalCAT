@@ -9,12 +9,14 @@ freeze, encode, decode, and re-prove the exact files.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import json
 import os
 from pathlib import Path, PurePath
 import re
 import stat
+import sys
 from typing import Mapping, TypedDict
 
 from platform_fs_contracts import (
@@ -24,6 +26,7 @@ from platform_fs_contracts import (
     OpaqueAuthority,
     PlatformFileError,
     PlatformFileErrorCode,
+    PosixBoundContentObservation,
     RootedDirectoryAuthority,
     RootedFileSystem,
 )
@@ -119,6 +122,31 @@ class ContentFileProof:
 # Semantic name for the v2 POSIX dev/inode proof.  ContentFileProof remains the
 # compatibility spelling consumed by existing v2 owners.
 LegacyPosixContentFileProof = ContentFileProof
+
+
+class _RecoveryProfile(Enum):
+    POSIX_V2 = "POSIX_V2"
+    WINDOWS_V3 = "WINDOWS_V3"
+
+
+def _select_recovery_profile() -> _RecoveryProfile:
+    return (_RecoveryProfile.WINDOWS_V3 if sys.platform == "win32"
+            else _RecoveryProfile.POSIX_V2)
+
+
+def _capture_posix_bound_content(
+    platform: PosixBoundContentObservation,
+    source: BoundRegularFile,
+) -> ContentFileProof:
+    """Freeze v2 observations from the caller's original live file."""
+    if not isinstance(platform, PosixBoundContentObservation):
+        raise ContentAttestationError("ATTESTATION.CAPABILITY_UNAVAILABLE")
+    try:
+        facts = platform.observe_bound_content(source)
+        return ContentFileProof(facts.device, facts.inode, facts.byte_count,
+                                facts.content_sha256.hex())
+    except PlatformFileError as error:
+        raise ContentAttestationError("ATTESTATION.FILE_CHANGED") from error
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import tm_migration
+import tm_activation_recovery as activation_recovery
 from tm_activation_journal import ActivationPreparationError
 from tm_contracts import (
     AssetPreservationState,
@@ -169,103 +170,77 @@ class InitialActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity, coordinator, service = _fixture(root)
-            original_move = tm_migration._exclusive_initial_quarantine_move
-            moved_owned: list[Path] = []
-            quarantined_foreign: list[Path] = []
+            real_cleanup = tm_migration._cleanup_platform_initial_unpublished_stage
+            moved_owned = []
+            preserved_foreign = []
+            quarantine_targets = []
             foreign_payload = b"foreign replacement must survive"
 
-            def substitute_before_quarantine(
-                source_parent: Any,
-                source_name: str,
-                target_parent: Any,
-                target_name: str,
-            ) -> None:
-                source = root / source_name
-                target = target_parent.destination.parent / target_name
-                moved = root / f"owned-away-{source.name}"
-                source.rename(moved)
-                source.write_bytes(foreign_payload)
-                moved_owned.append(moved)
-                quarantined_foreign.append(target)
-                original_move(
-                    source_parent,
-                    source_name,
-                    target_parent,
-                    target_name,
-                )
+            def cleanup_with_substitution(attempt):
+                backend = attempt.platform_backend
+                real_retire = backend.retire_owned_exclusive
 
-            with (
-                patch.object(
-                    coordinator,
-                    "_seal_stage",
-                    side_effect=StageSealError("SEALER.STAGE_INVALID"),
-                ),
-                patch.object(
-                    tm_migration,
-                    "_exclusive_initial_quarantine_move",
-                    side_effect=substitute_before_quarantine,
-                ),
+                def substitute(source_parent, source_name, reservation, target_parent, target_name):
+                    self.assertIs(source_parent, attempt.platform_parent)
+                    self.assertIs(reservation, attempt.stage_reservation)
+                    source = root / source_name
+                    target = attempt.quarantine_dir / target_name
+                    moved = root / f"owned-away-{source_name}"
+                    source.rename(moved)
+                    source.write_bytes(foreign_payload)
+                    moved_owned.append(moved)
+                    preserved_foreign.append(source)
+                    quarantine_targets.append(target)
+                    return real_retire(source_parent, source_name, reservation, target_parent, target_name)
+
+                with patch.object(backend, "retire_owned_exclusive", substitute):
+                    return real_cleanup(attempt)
+
+            with patch.object(coordinator, "_seal_stage", side_effect=StageSealError("SEALER.STAGE_INVALID")), patch.object(
+                tm_migration, "_cleanup_platform_initial_unpublished_stage", cleanup_with_substitution
             ):
-                outcome = service.activate_initial(
-                    identity.configured_jsonl_path,
-                    identity.resource_id,
-                )
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
 
-            self.assertTrue(moved_owned)
-            self.assertTrue(all(path.exists() for path in moved_owned))
-            self.assertTrue(quarantined_foreign)
-            self.assertEqual(quarantined_foreign[0].read_bytes(), foreign_payload)
+            self.assertEqual(len(moved_owned), 1)
+            self.assertTrue(moved_owned[0].exists())
+            self.assertEqual(preserved_foreign[0].read_bytes(), foreign_payload)
+            self.assertFalse(quarantine_targets[0].exists())
             _assert_authority_unavailable(self, outcome)
-            self.assertEqual(
-                identity.configured_jsonl_path.read_bytes(),
-                SOURCE_BYTES,
-            )
+            self.assertEqual(identity.configured_jsonl_path.read_bytes(), SOURCE_BYTES)
 
-    def test_quarantine_target_race_preserves_foreign_and_fails_closed(
-        self,
-    ) -> None:
+    def test_quarantine_target_race_preserves_foreign_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             identity, coordinator, service = _fixture(Path(temporary))
-            original_move = tm_migration._exclusive_initial_quarantine_move
-            raced_targets: list[Path] = []
+            real_cleanup = tm_migration._cleanup_platform_initial_unpublished_stage
+            raced_targets = []
+            preserved_sources = []
             foreign_payload = b"foreign quarantine target must survive"
 
-            def occupy_target_before_move(
-                source_parent: Any,
-                source_name: str,
-                target_parent: Any,
-                target_name: str,
-            ) -> None:
-                target = target_parent.destination.parent / target_name
-                target.write_bytes(foreign_payload)
-                raced_targets.append(target)
-                original_move(
-                    source_parent,
-                    source_name,
-                    target_parent,
-                    target_name,
-                )
+            def cleanup_with_race(attempt):
+                backend = attempt.platform_backend
+                real_retire = backend.retire_owned_exclusive
 
-            with (
-                patch.object(
-                    coordinator,
-                    "_seal_stage",
-                    side_effect=StageSealError("SEALER.STAGE_INVALID"),
-                ),
-                patch.object(
-                    tm_migration,
-                    "_exclusive_initial_quarantine_move",
-                    side_effect=occupy_target_before_move,
-                ),
+                def occupy(source_parent, source_name, reservation, target_parent, target_name):
+                    self.assertIs(source_parent, attempt.platform_parent)
+                    target = attempt.quarantine_dir / target_name
+                    target.write_bytes(foreign_payload)
+                    raced_targets.append(target)
+                    source = identity.configured_jsonl_path.parent / source_name
+                    preserved_sources.append((source, source.read_bytes()))
+                    return real_retire(source_parent, source_name, reservation, target_parent, target_name)
+
+                with patch.object(backend, "retire_owned_exclusive", occupy):
+                    return real_cleanup(attempt)
+
+            with patch.object(coordinator, "_seal_stage", side_effect=StageSealError("SEALER.STAGE_INVALID")), patch.object(
+                tm_migration, "_cleanup_platform_initial_unpublished_stage", cleanup_with_race
             ):
-                outcome = service.activate_initial(
-                    identity.configured_jsonl_path,
-                    identity.resource_id,
-                )
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
 
             _assert_authority_unavailable(self, outcome)
-            self.assertTrue(raced_targets)
+            self.assertEqual(len(raced_targets), 1)
             self.assertEqual(raced_targets[0].read_bytes(), foreign_payload)
+            self.assertEqual(preserved_sources[0][0].read_bytes(), preserved_sources[0][1])
             self.assertEqual(identity.configured_jsonl_path.read_bytes(), SOURCE_BYTES)
 
     def test_builder_residue_before_return_never_reports_legacy_safe(
@@ -274,12 +249,13 @@ class InitialActivationRollbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             identity, _coordinator, service = _fixture(Path(temporary))
             residue: list[Path] = []
+            real_build = service._build_stage
 
             def leave_attempt_asset(
                 source: Path,
                 **kwargs: Any,
             ) -> Any:
-                del source
+                real_build(source, **kwargs)
                 preflight = kwargs["preflight"]
                 stage = tm_migration._deterministic_stage_ref(
                     identity,
@@ -287,6 +263,7 @@ class InitialActivationRollbackTests(unittest.TestCase):
                     stage_prefix=kwargs["stage_prefix"],
                     path_salt=kwargs["path_salt"],
                 )
+                stage.staged_db_path.rename(stage.staged_db_path.with_suffix(".owned-away"))
                 stage.staged_db_path.write_bytes(b"foreign attempt residue")
                 residue.append(stage.staged_db_path)
                 raise OSError("sensitive builder payload")
@@ -349,93 +326,51 @@ class InitialActivationRollbackTests(unittest.TestCase):
             self.assertTrue(outcome.retryable)
             self.assertNotIn("sensitive", repr(outcome))
 
-    def test_tampered_rollback_terminal_fails_cold_recovery_proof(self) -> None:
+    def test_tampered_cancel_terminal_fails_cold_recovery_proof(self) -> None:
+        import tm_activation_journal as journal
         with tempfile.TemporaryDirectory() as temporary:
             identity, coordinator, service = _fixture(Path(temporary))
-            real_rollback = coordinator.rollback_durable_activation
-            terminal = identity.canonical_sidecar_path.with_name(
-                f".{identity.canonical_sidecar_path.name}.localcat-activation-terminal.json"
-            )
-
-            def rollback_then_tamper() -> Any:
-                report = real_rollback()
-                terminal.write_bytes(b"tampered terminal")
-                return report
-
-            with (
-                patch.object(
-                    coordinator,
-                    "publish_activation",
-                    side_effect=OSError("sensitive publication payload"),
-                ),
-                patch.object(
-                    coordinator,
-                    "rollback_durable_activation",
-                    side_effect=rollback_then_tamper,
-                ),
-            ):
-                outcome = service.activate_initial(
-                    identity.configured_jsonl_path,
-                    identity.resource_id,
-                )
-
+            terminal = journal._activation_terminal_path(identity)
+            real_read = journal._CallerHeldPosixActivationBorrow.read_journal
+            hits = []
+            def tamper_then_read(borrow, path, *args, **kwargs):
+                if path == terminal and terminal.exists() and not hits:
+                    terminal.write_bytes(b"tampered terminal")
+                    hits.append(path)
+                return real_read(borrow, path, *args, **kwargs)
+            with patch.object(coordinator, "publish_activation", side_effect=OSError("publication fault")), patch.object(journal._CallerHeldPosixActivationBorrow, "read_journal", tamper_then_read), patch.object(coordinator, "cancel_prepared_activation", wraps=coordinator.cancel_prepared_activation) as cancel:
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
+            cancel.assert_called_once()
+            self.assertEqual(hits, [terminal])
             _assert_authority_unavailable(self, outcome)
             self.assertEqual(terminal.read_bytes(), b"tampered terminal")
-            with self.assertRaisesRegex(
-                ValueError,
-                "TM.CANONICAL_ACTIVATION_AMBIGUOUS",
-            ):
+            with self.assertRaisesRegex(ValueError, "^TM.CANONICAL_UNHEALTHY$"):
                 TMEngine(str(identity.configured_jsonl_path), update=False)
 
-    def test_tampered_rollback_quarantine_fails_cold_recovery_proof(self) -> None:
+    def test_tampered_cancel_quarantine_fails_cold_recovery_proof(self) -> None:
+        from platform_fs_contracts import RetainedRetirement
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             identity, coordinator, service = _fixture(root)
-            real_rollback = coordinator.rollback_durable_activation
-            tampered: list[Path] = []
-            displaced: list[Path] = []
-
-            def rollback_then_tamper() -> Any:
-                report = real_rollback()
-                candidates = sorted(
-                    path
-                    for path in root.rglob("*")
-                    if path.is_file()
-                    and ".localcat-activation-quarantine-v1" in path.parts
-                )
-                self.assertTrue(candidates)
-                moved = root / f"displaced-{candidates[0].name}"
-                candidates[0].rename(moved)
-                candidates[0].write_bytes(b"tampered quarantine payload")
-                tampered.append(candidates[0])
-                displaced.append(moved)
-                return report
-
-            with (
-                patch.object(
-                    coordinator,
-                    "publish_activation",
-                    side_effect=OSError("sensitive publication payload"),
-                ),
-                patch.object(
-                    coordinator,
-                    "rollback_durable_activation",
-                    side_effect=rollback_then_tamper,
-                ),
-            ):
-                outcome = service.activate_initial(
-                    identity.configured_jsonl_path,
-                    identity.resource_id,
-                )
-
+            real_reprove = RetainedRetirement.reprove
+            tampered, displaced = [], []
+            def tamper_then_reprove(retained):
+                candidates = sorted(path for path in root.rglob("*") if path.is_file() and ".localcat-activation-quarantine-v1" in path.parts)
+                if candidates and not tampered:
+                    moved = root / ("displaced-" + candidates[0].name)
+                    candidates[0].rename(moved)
+                    candidates[0].write_bytes(b"tampered quarantine payload")
+                    tampered.append(candidates[0])
+                    displaced.append(moved)
+                return real_reprove(retained)
+            with patch.object(coordinator, "publish_activation", side_effect=OSError("publication fault")), patch.object(RetainedRetirement, "reprove", tamper_then_reprove), patch.object(coordinator, "cancel_prepared_activation", wraps=coordinator.cancel_prepared_activation) as cancel:
+                outcome = service.activate_initial(identity.configured_jsonl_path, identity.resource_id)
+            cancel.assert_called_once()
             _assert_authority_unavailable(self, outcome)
             self.assertEqual(len(tampered), 1)
             self.assertEqual(len(displaced), 1)
             self.assertTrue(displaced[0].is_file())
-            self.assertEqual(
-                tampered[0].read_bytes(),
-                b"tampered quarantine payload",
-            )
+            self.assertEqual(tampered[0].read_bytes(), b"tampered quarantine payload")
 
     def test_fully_rolled_back_plain_io_failure_is_stably_retryable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -653,25 +588,20 @@ class InitialActivationRollbackTests(unittest.TestCase):
     def test_unprovable_durable_rollback_never_returns_legacy_safe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             identity, coordinator, service = _fixture(Path(temporary))
-            with (
-                patch.object(
-                    coordinator,
-                    "publish_activation",
-                    side_effect=OSError("sensitive publication payload"),
-                ),
-                patch.object(
-                    coordinator,
-                    "rollback_durable_activation",
-                    side_effect=ActivationPreparationError(
-                        "ACTIVATION.ROLLBACK_RESTORE_FAILED",
-                        retryable=True,
-                    ),
-                ),
-            ):
+            actual_replace = activation_recovery._replace_activation_database
+            hits = []
+            def named_then_failed(*args, **kwargs):
+                actual_replace(*args, **kwargs)
+                self.assertTrue(identity.canonical_sidecar_path.is_file())
+                hits.append(True)
+                raise OSError("sensitive publication payload")
+            with patch.object(activation_recovery, '_replace_activation_database', named_then_failed):
                 outcome = service.activate_initial(
                     identity.configured_jsonl_path,
                     identity.resource_id,
                 )
+            self.assertEqual(hits, [True])
+            self.assertTrue(coordinator._family._recovery_required)
             failure = _assert_authority_unavailable(self, outcome)
             self.assertNotIn("sensitive", repr(failure))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 import ctypes
 import errno
 import hashlib
@@ -17,12 +18,16 @@ import sys
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 import uuid
 
 from tm_activation_journal import (
+    _append_owned_close_facts,
+    _CallerHeldPosixActivationBorrow,
     ActivationRecoveryReport,
     _ActivationPreparation,
+    _ActivationJournalPhase,
+    _parse_activation_journal_bytes,
     _PortablePublicationPhaseRecord,
     _PortableReplacementRecord,
     _WindowsPortableFreshRecoveryOwner,
@@ -88,6 +93,7 @@ from tm_snapshot_recovery import (
     RefreshRecoveryState,
 )
 from tm_sqlite_store import (
+    _ResourceOperationBorrow,
     ReceiptCompletionProbe,
     TM_LEGACY_SCHEMA_VERSION,
     TM_SCHEMA_VERSION,
@@ -119,7 +125,8 @@ from tm_stage_sealer import (
     _create_caller_held_seal_borrow,
     StageSealError,
 )
-from tm_content_attestation import PortableContentFileProof
+from tm_content_attestation import (PortableContentFileProof, ContentFileProof,
+                                    _RecoveryProfile, _select_recovery_profile)
 import tm_schema_upgrade as schema_upgrade_module
 import tm_snapshot_artifacts as snapshot_artifacts_module
 from platform_fs import (
@@ -146,6 +153,7 @@ from platform_fs_contracts import (
     LockPolicy,
     LockWait,
     MutableFileReservation,
+    PosixStageHandoff,
     PlatformFileBackend,
     PlatformFileError,
     PlatformFileErrorCode,
@@ -305,6 +313,8 @@ class _InitialStageAttempt:
     manifest_identity: _CreatedFileIdentity | None = None
     primary_error: Exception | None = None
     platform_backend: PlatformFileBackend | None = None
+    stage_borrow: _CallerHeldSealBorrow | None = None
+    recovery_profile: _RecoveryProfile = _RecoveryProfile.POSIX_V2
     platform_parent: RootedDirectoryAuthority | None = None
     stage_reservation: MutableFileReservation | None = None
     manifest_reservation: MutableFileReservation | None = None
@@ -514,6 +524,18 @@ class _InitialActivationReservationError(RuntimeError):
             raise TypeError("initial resource lock error code is invalid")
         self.error_code = error_code
         super().__init__(error_code)
+
+
+def _is_stage_admission_operational_error(error: SQLiteStoreLifecycleError) -> bool:
+    """Exclude invalid borrow/reentry and other caller errors from projection."""
+
+    return error.code in {
+        "STORE.FAMILY_BUSY",
+        "STORE.RESOURCE_DRAINING",
+        "STORE.OPERATION_CANCELLED",
+        "STORE.RESOURCE_IDENTITY_STALE",
+        "STORE.FAMILY_CONFLICT",
+    }
 
 
 def _is_initial_activation_operational_error(error: Exception) -> bool:
@@ -923,17 +945,19 @@ def _copy_bound_export_prior(
     parent: BoundDirectoryAuthority,
     source_name: str,
     recovery_name: str,
-    prior: _BoundExportPrior,
-) -> tuple[
+    prior: _BoundExportPrior, *, candidate_name: str | None = None) -> tuple[
     FileObjectIdentity | None,
     PendingPublication | None,
     BaseException | None,
 ]:
+    candidate_name = recovery_name if candidate_name is None else candidate_name
     if prior.snapshot is None:
         return None, None, None
     if parent.inspect_entry(recovery_name) is not None:
         raise ExportPreflightError("EXPORT.RECOVERY_CONFLICT")
     source = backend.open_regular(root, PurePath(source_name))
+    candidate: CandidateFile | None = None
+    candidate_identity: FileObjectIdentity | None = None
     pending: PendingPublication | None = None
     published_identity: FileObjectIdentity | None = None
     try:
@@ -946,7 +970,7 @@ def _copy_bound_export_prior(
             raise ExportPreflightError("EXPORT.DESTINATION_STALE")
         candidate, copied, candidate_identity = _bound_candidate_from_opened(
             parent,
-            recovery_name,
+            candidate_name,
             source,
             prior.snapshot,
         )
@@ -957,7 +981,7 @@ def _copy_bound_export_prior(
             mismatch = ExportPreflightError("EXPORT.RECOVERY_COPY_FAILED")
             cleanup_error = _cleanup_failed_bound_candidate(
                 parent,
-                recovery_name,
+                candidate_name,
                 candidate,
                 candidate_identity,
             )
@@ -980,8 +1004,12 @@ def _copy_bound_export_prior(
         ):
             raise ExportPreflightError("EXPORT.RECOVERY_COPY_FAILED")
         published_identity = published.destination_identity
-    except BaseException:
+    except BaseException as error:
         _close_bound_export_authorities(pending, source)
+        if candidate_name != recovery_name and candidate_identity is not None:
+            cleanup_error = _cleanup_failed_bound_candidate(parent, candidate_name, candidate, candidate_identity)
+            if cleanup_error is not None:
+                raise cleanup_error from error
         raise
     close_error = _close_bound_export_authorities(source)
     return published_identity, pending, close_error
@@ -2605,6 +2633,7 @@ class TMMigrationService:
         self._canonical_store_id = canonical_store_id
         self._coordinator = coordinator
         self._platform_backend = platform_backend
+        self._recovery_profile = _select_recovery_profile()
         # The apply seam exposes a caller-held owner projection only during
         # its callback window.  It is deliberately instance-local: callers
         # create one service per operation, and no second W1 may be minted.
@@ -2643,10 +2672,10 @@ class TMMigrationService:
             raise MigrationPreflightError(
                 "MIGRATION.COORDINATOR_IDENTITY_MISMATCH"
             )
-        if sys.platform != "win32":
+        if self._recovery_profile is not _RecoveryProfile.WINDOWS_V3:
             return None
         try:
-            reservation = self._acquire_initial_reservation()
+            reservation = self._acquire_initial_reservation(completed_runtime=True)
         except _InitialActivationReservationError as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
@@ -2696,10 +2725,10 @@ class TMMigrationService:
             raise MigrationPreflightError(
                 "MIGRATION.COORDINATOR_IDENTITY_MISMATCH"
             )
-        if sys.platform != "win32":
+        if self._recovery_profile is not _RecoveryProfile.WINDOWS_V3:
             return None, None, None
         try:
-            reservation = self._acquire_initial_reservation()
+            reservation = self._acquire_initial_reservation(completed_runtime=True)
         except _InitialActivationReservationError as error:
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_REQUIRED",
@@ -2753,8 +2782,24 @@ class TMMigrationService:
                 retryable=True,
             ) from error
 
+    @contextmanager
+    def _initial_stage_reservation(self) -> Iterator[_InitialActivationResourceReservation]:
+        coordinator = self._coordinator
+        if self._recovery_profile is _RecoveryProfile.POSIX_V2:
+            if coordinator is None:
+                raise MigrationPreflightError("MIGRATION.COORDINATOR_UNAVAILABLE")
+            with coordinator._family_transition(wait_for_transition=True) as borrow:
+                with self._acquire_initial_reservation(borrow=borrow) as reservation:
+                    yield reservation
+        else:
+            with self._acquire_initial_reservation() as reservation:
+                yield reservation
+
     def _acquire_initial_reservation(
         self,
+        *,
+        borrow: _ResourceOperationBorrow | None = None,
+        completed_runtime: bool = False,
     ) -> _InitialActivationResourceReservation:
         """Acquire the shared platform reservation when the backend is available.
 
@@ -2764,13 +2809,40 @@ class TMMigrationService:
         and retains its rooted authority for the reservation lifetime.
         """
 
+        if borrow is not None:
+            coordinator = self._coordinator
+            if coordinator is None:
+                raise MigrationPreflightError("IMPORT.COORDINATOR_UNAVAILABLE")
+            return _InitialActivationResourceReservation.borrow_existing(coordinator, borrow, recovery_profile=self._recovery_profile)
+
         backend = self._platform_backend
-        if backend is None and sys.platform == "win32":
+        if backend is None and self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             try:
                 backend = compose_platform_file_backend(
                     self._resource_identity.canonical_sidecar_path.parent
                 )
             except PlatformFileError as error:
+                raise _InitialActivationReservationError(
+                    "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
+                ) from error
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
+            try:
+                if backend is None:
+                    raise PlatformFileError(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+                narrow_windows_persistent_private_proof(
+                    backend, self._resource_identity.canonical_sidecar_path.parent,
+                )
+                narrow_windows_locked_descendant_namespace_inspection(
+                    backend, self._resource_identity.canonical_sidecar_path.parent,
+                )
+            except PlatformFileError as error:
+                # Only the W2 narrowing seam changes projection for cold open.
+                # Compose/root/W1 failures retain the reservation contract.
+                if completed_runtime:
+                    raise ActivationPreparationError(
+                        "ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE",
+                        retryable=False,
+                    ) from error
                 raise _InitialActivationReservationError(
                     "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
                 ) from error
@@ -2781,6 +2853,7 @@ class TMMigrationService:
         return _InitialActivationResourceReservation.acquire_with_backend(
             self._resource_identity,
             backend,
+            recovery_profile=self._recovery_profile,
         )
 
     def _acquire_existing_initial_reservation(
@@ -2796,6 +2869,7 @@ class TMMigrationService:
         return _InitialActivationResourceReservation.acquire_existing_with_backend(
             self._resource_identity,
             backend,
+            recovery_profile=self._recovery_profile,
         )
 
     def preflight(self, source: Path) -> MigrationPreflight:
@@ -2820,7 +2894,7 @@ class TMMigrationService:
         preflight = _scan_jsonl(source)
         coordinator = self._coordinator
         if (
-            sys.platform != "win32"
+            self._recovery_profile is not _RecoveryProfile.WINDOWS_V3
             or coordinator is None
             or coordinator._resource_identity != self._resource_identity
             or coordinator.resource_id != self._resource_identity.resource_id
@@ -2928,41 +3002,102 @@ class TMMigrationService:
             or coordinator.active_store_path is not None
         ):
             raise MigrationPreflightError("MIGRATION.ALREADY_ACTIVE")
+        # A stopped attempt already owns the only trustworthy before-digest.
+        # Project its failure before READY/admission checks without reopening
+        # an invalidated source path or weakening caller identity validation.
+        stopped_source_digest = coordinator._initial_activation_failure_digest()
+        recovered_family = False
+        family = coordinator._family
+        if stopped_source_digest is not None and family is not None:
+            with family._condition:
+                recovered_family = (
+                    family._state == "READY"
+                    and not family._recovery_required
+                    and not family._recovery_preparations
+                    and not family._pending_activation_closes
+                )
+        if stopped_source_digest is not None and coordinator.state != "FAILED":
+            if type(source) is not _NATIVE_PATH_TYPE:
+                raise TypeError("source must be an exact native Path")
+            if source != self._resource_identity.configured_jsonl_path:
+                raise MigrationPreflightError("MIGRATION.RESOURCE_IDENTITY_MISMATCH")
+            if not recovered_family:
+                return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator, source_before=stopped_source_digest,
+                    preflight=None, published_generation=None, observe_source=False,
+                )
         if coordinator.state != "READY":
-            raise MigrationPreflightError("MIGRATION.ACTIVATION_NOT_READY")
+            family = coordinator._family
+            if family is None:
+                raise MigrationPreflightError("MIGRATION.ACTIVATION_NOT_READY")
+            with family._condition:
+                pending_peer = family._state in {"DRAINING", "ACTIVATING"}
+            if not pending_peer or coordinator.state != "ACTIVATING":
+                raise MigrationPreflightError("MIGRATION.ACTIVATION_NOT_READY")
 
         # The public outcome needs a before-digest even when the build fails
         # before it can return its preflight value.  Invalid caller identity
         # remains the Task 2.1 zero-mutation exception surface; only a valid
         # configured source enters the failure-outcome transaction below.
-        self._validate_source_preconditions(source)
-        source_before = _try_file_digest(source)
+        if stopped_source_digest is None:
+            self._validate_source_preconditions(source)
+        source_before = stopped_source_digest or _try_file_digest(source)
         if source_before is None:
             raise MigrationPreflightError("MIGRATION.SOURCE_UNREADABLE")
 
-        # Separate application facades may own distinct in-memory
-        # coordinators for the same physical resource.  The persistent
-        # Core-private reservation serializes those coordinators/processes.
-        # All recovery capable of advancing or cancelling durable facts runs
-        # only after acquiring it, then the same descriptor-bound lock spans
-        # durable-authority proof and the whole
-        # build -> seal -> publish -> reconcile transaction.
+        # Admission/drain precedes the one W1 acquisition in the POSIX candidate.
+        reservation_entered = False
+        operation_returned = False
+        reservation: _InitialActivationResourceReservation | None = None
         try:
-            reservation = self._acquire_initial_reservation()
-        except _InitialActivationReservationError:
-            return self._initial_resource_reservation_failure(
-                coordinator=coordinator,
-                source_before=source_before,
-            )
-        try:
-            with reservation:
-                return self._activate_initial_with_resource_reservation(
-                    coordinator=coordinator,
-                    source=source,
-                    source_before=source_before,
-                    reservation=reservation,
+            with self._initial_stage_reservation() as reservation:
+                reservation_entered = True
+                outcome = self._activate_initial_with_resource_reservation(
+                    coordinator=coordinator, source=source,
+                    source_before=source_before, reservation=reservation,
                 )
+                operation_returned = True
+            # The recovery report is authority only after all owned and outer
+            # root/W1 terminal checks have succeeded.
+            coordinator._clear_initial_activation_fail_stop_after_recovery(
+                reservation._completed_initial_recovery,
+            )
+            return outcome
+        except SQLiteStoreLifecycleError as error:
+            if reservation_entered and error.code == "STORE.RESOURCE_IDENTITY_STALE":
+                # Final W1/root reproof can invalidate an otherwise returned
+                # outcome. Preserve the fail-stop and do not reopen the lost
+                # location to manufacture published or unchanged evidence.
+                return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator, source_before=source_before,
+                    preflight=None,
+                    published_generation=None if reservation is None else reservation._published_initial_generation,
+                    observe_source=False,
+                )
+            if reservation_entered or not _is_stage_admission_operational_error(error):
+                raise
+            return self._initial_stage_admission_failure(
+                error, coordinator=coordinator, source_before=source_before,
+            )
+        except (PlatformFileError, OSError):
+            # Preserve errors from the body and its owned-authority cleanup.
+            # Only a result withdrawn by outer root/W1 close is projected here.
+            if not operation_returned:
+                raise
+            return self._initial_authority_unavailable_failure(
+                coordinator=coordinator, source_before=source_before,
+                preflight=None,
+                published_generation=None if reservation is None else reservation._published_initial_generation,
+                observe_source=False,
+            )
         except _InitialActivationReservationError:
+            if reservation_entered:
+                return self._initial_authority_unavailable_failure(
+                    coordinator=coordinator, source_before=source_before,
+                    preflight=None,
+                    published_generation=None if reservation is None else reservation._published_initial_generation,
+                    observe_source=False,
+                )
             return self._initial_resource_reservation_failure(
                 coordinator=coordinator,
                 source_before=source_before,
@@ -2976,6 +3111,90 @@ class TMMigrationService:
                 preflight=None,
                 published_generation=None,
             )
+
+    def _initial_stage_admission_failure(
+        self,
+        error: SQLiteStoreLifecycleError,
+        *,
+        coordinator: ResourceStoreCoordinator,
+        source_before: str,
+    ) -> MigrationFailure:
+        """Project admission failure without recovery, DB opens, or a new owner.
+
+        No stage was entered. Only an unchanged rooted source with absent
+        durable activation facts can retain the ordinary busy/cancel result.
+        Existing facts require W1 to classify, so leave them unavailable.
+        """
+
+        source_evidence = _unverified_preservation(
+            AssetKind.ORIGINAL_SOURCE, source_before,
+        )
+        family = coordinator._family
+        legacy_proven = False
+        if family is not None and error.code in {
+            "STORE.FAMILY_BUSY", "STORE.RESOURCE_DRAINING", "STORE.OPERATION_CANCELLED",
+        }:
+            identity = self._resource_identity
+            journal = _activation_journal_path(identity)
+            marker = _activation_lineage_marker_path(identity)
+            terminal = _activation_terminal_path(identity)
+            prohibited = (
+                identity.canonical_sidecar_path, identity.snapshot_manifest_path,
+                journal, _activation_journal_temp_path(journal),
+                marker, _activation_lineage_marker_temp_path(marker),
+                terminal, _activation_terminal_temp_path(terminal),
+            )
+            try:
+                family.reprove()
+                if (
+                    coordinator.current_generation is None
+                    and not coordinator._initial_activation_authority_is_unavailable()
+                    and all(family._root.inspect_entry(path.name) is None for path in prohibited)
+                ):
+                    source = family._backend.open_regular(
+                        family._root, PurePath(identity.configured_jsonl_path.name),
+                    )
+                    try:
+                        observed = source.content_facts().content_sha256.hex()
+                    finally:
+                        source.close()
+                    family.reprove()
+                    source_evidence = (
+                        _unchanged_preservation(AssetKind.ORIGINAL_SOURCE, source_before)
+                        if observed == source_before else
+                        _changed_preservation(AssetKind.ORIGINAL_SOURCE, source_before, observed)
+                    )
+                    legacy_proven = (
+                        observed == source_before
+                        and coordinator.current_generation is None
+                        and all(family._root.inspect_entry(path.name) is None for path in prohibited)
+                    )
+                    family.reprove()
+            except (PlatformFileError, OSError, SQLiteStoreLifecycleError):
+                # A failed original binding must remain failed even if the
+                # caller later restores the pathname. Do not inspect a clone.
+                family.fail()
+                source_evidence = _unverified_preservation(
+                    AssetKind.ORIGINAL_SOURCE, source_before,
+                )
+                legacy_proven = False
+        if not legacy_proven:
+            coordinator._mark_initial_activation_authority_unavailable(source_before)
+        return MigrationFailure(
+            stage="BUILD" if legacy_proven else "RECOVERY",
+            error_code=error.code if legacy_proven else "MIGRATION.INITIAL_AUTHORITY_UNAVAILABLE",
+            retryable=error.retryable if legacy_proven else False,
+            diagnostics=(),
+            active_generation=None,
+            original_source_preservation=source_evidence,
+            active_store_preservation=AssetPreservationEvidence(
+                asset_kind=AssetKind.ACTIVE_STORE,
+                state=AssetPreservationState.NOT_APPLICABLE,
+                before_digest=None, observed_digest=None,
+            ),
+            recovery_locators=(),
+            canonical_authority_ambiguous=not legacy_proven,
+        )
 
     def reattest_completed_authority(
         self,
@@ -3146,12 +3365,22 @@ class TMMigrationService:
                 raise MigrationPreflightError(
                     "MIGRATION.ACTIVATION_NOT_READY"
                 )
-            return self._activate_initial_authority_transaction(
-                coordinator=coordinator,
-                source=source,
-                source_before=source_before,
-                reservation=reservation,
-            )
+            if reservation._family_borrow is None:
+                return self._activate_initial_authority_transaction(
+                    coordinator=coordinator,
+                    source=source,
+                    source_before=source_before,
+                    reservation=reservation,
+                )
+        # The POSIX family transition already owns admission and W1. Holding
+        # the coordinator condition across I/O hides the in-flight operation
+        # from peers and defeats their bounded wait before family admission.
+        return self._activate_initial_authority_transaction(
+            coordinator=coordinator,
+            source=source,
+            source_before=source_before,
+            reservation=reservation,
+        )
 
     def _activate_initial_authority_transaction(
         self,
@@ -3169,205 +3398,283 @@ class TMMigrationService:
         attempt: _InitialStageAttempt | None = None
         sealed: SealedStage | None = None
         prepared: _ActivationPreparation | None = None
+        rooted_source: _PortableRootedRead | None = None
         activation_attempted = False
+        posix_inputs: _PosixActivationInputs = {}
         stage_label = "BUILD"
+        primary_error: BaseException | None = None
+        propagating_error: BaseException | None = None
         try:
-            reservation.reprove()
-            # A first-activation attempt gets its own unpublished namespace.
-            # Cancelled/sealed registry entries are intentionally immutable;
-            # reusing their deterministic path would make a later safe retry
-            # collide with an old cancelled capability.  The migration batch
-            # and receipt identities remain source-digest deterministic.
-            preflight = self.preflight(source)
-            path_salt = f"initial-{uuid.uuid4().hex}"
-            attempt_stage = _deterministic_stage_ref(
-                self._resource_identity,
-                source_digest=preflight.source_digest,
-                stage_prefix="migration",
-                path_salt=path_salt,
-            )
-            attempt = _freeze_initial_stage_attempt(
-                attempt_stage,
-                path_salt=path_salt,
-                resource_reservation=reservation,
-            )
-            initial_stage, _stage_identity, _manifest_identity = (
-                self._build_stage(
-                    source,
-                    preflight=preflight,
-                    canonical_store_id=self._canonical_store_id,
-                    immediate_seal=True,
-                    batch_kind="migration",
-                    batch_prefix="migration",
-                    snapshot_prefix="snapshot.migration",
+            try:
+                reservation.reprove()
+                # A first-activation attempt gets its own unpublished namespace.
+                # Cancelled/sealed registry entries are intentionally immutable;
+                # reusing their deterministic path would make a later safe retry
+                # collide with an old cancelled capability.  The migration batch
+                # and receipt identities remain source-digest deterministic.
+                if reservation._family_borrow is not None:
+                    rooted_source = reservation.open_portable_rooted_read(source, unavailable_code="MIGRATION.SOURCE_UNREADABLE")
+                    preflight = _scan_portable_jsonl(rooted_source)
+                else:
+                    preflight = self.preflight(source)
+                path_salt = f"initial-{uuid.uuid4().hex}"
+                attempt_stage = _deterministic_stage_ref(
+                    self._resource_identity,
+                    source_digest=preflight.source_digest,
                     stage_prefix="migration",
                     path_salt=path_salt,
-                    initial_attempt=attempt,
                 )
-            )
-            reservation.reprove()
-            if initial_stage != attempt.stage:
-                raise MigrationPreflightError(
-                    "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                attempt = _freeze_initial_stage_attempt(
+                    attempt_stage,
+                    path_salt=path_salt,
+                    resource_reservation=reservation,
                 )
-            build = MigrationStageBuild(
-                preflight=preflight,
-                mutable_stage=initial_stage,
-                reused_completed_revision=None,
-            )
-            if build.preflight.source_digest != source_before:
-                raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
-            mutable_stage = build.mutable_stage
-            if mutable_stage is None:
-                raise MigrationPreflightError(
-                    "MIGRATION.INITIAL_STAGE_UNAVAILABLE"
-                )
-            _reprove_initial_stage_ownership(attempt)
-            stage_label = "SEAL"
-            reservation.reprove()
-            sealed = coordinator._seal_stage(
-                mutable_stage,
-                canonical_store_id=self._canonical_store_id,
-                expected_prior_generation=None,
-                **reservation.stage_seal_inputs(attempt),
-            )
-            stage_label = "PREPARE"
-            reservation.reprove()
-            activation_attempted = True
-            prepared = coordinator.activate(sealed)
-            stage_label = "JOURNAL"
-            reservation.reprove()
-            if attempt.platform_backend is None:
-                handle = coordinator.publish_prepared_activation(prepared)
-                portable_inputs: dict[str, object] | None = None
-            else:
-                portable_inputs = reservation.portable_journal_inputs()
-                handle = coordinator.publish_portable_prepared_activation(
-                    prepared,
-                    **portable_inputs,
-                )
-            stage_label = "PUBLISH"
-            reservation.reprove()
-            if attempt.platform_backend is None:
-                generation = coordinator.publish_activation(prepared, handle)
-            else:
-                assert portable_inputs is not None
-                generation = coordinator.publish_portable_activation(
-                    prepared,
-                    handle,
-                    platform=cast(
-                        PlatformFileBackend,
-                        portable_inputs["platform"],
-                    ),
-                    persistent_private=cast(
-                        Any,
-                        portable_inputs["persistent_private"],
-                    ),
-                    caller_borrow=cast(
-                        Any,
-                        portable_inputs["caller_borrow"],
-                    ),
-                    retire_unpublished_stage=lambda: (
-                        _cleanup_initial_unpublished_stage(attempt)
-                    ),
-                )
-            stage_label = "VERIFY"
-            reservation.reprove()
-            self._verify_initial_activation_runtime(
-                coordinator=coordinator,
-                preflight=build.preflight,
-                sealed=sealed,
-                generation=generation,
-                require_legacy_journal_phase=(
-                    attempt.platform_backend is None
-                ),
-            )
-            reservation.reprove()
-            return self._success_report(
-                preflight=build.preflight,
-                sealed=sealed,
-                canonical_store_id=self._canonical_store_id,
-                generation=generation,
-            )
-        except Exception as error:
-            if (
-                prepared is not None
-                and attempt is not None
-                and attempt.platform_backend is not None
-            ):
-                try:
-                    coordinator._sealed_registry.release_portable_live_authority_for_recovery(
-                        prepared._token
+                initial_stage, _stage_identity, _manifest_identity = (
+                    self._build_stage(
+                        source,
+                        preflight=preflight,
+                        canonical_store_id=self._canonical_store_id,
+                        immediate_seal=True,
+                        batch_kind="migration",
+                        batch_prefix="migration",
+                        snapshot_prefix="snapshot.migration",
+                        stage_prefix="migration",
+                        path_salt=path_salt,
+                        initial_attempt=attempt,
+                        portable_source=rooted_source,
                     )
-                except BaseException:
-                    if type(error) not in (
-                        TypeError,
-                        AssertionError,
-                        AttributeError,
-                    ):
-                        raise
-            if not (
-                _is_initial_activation_operational_error(error)
-                or isinstance(error, _InitialActivationReservationError)
-            ):
-                raise
-            if attempt is None:
-                attempt = reservation._initial_attempt
-            try:
-                failure = self._reconcile_initial_activation_failure(
-                    error,
-                    stage_label=stage_label,
-                    source_before=source_before,
-                    preflight=preflight,
-                    attempt=attempt,
-                    sealed=sealed,
-                    prepared=prepared,
-                    activation_attempted=activation_attempted,
-                    coordinator=coordinator,
                 )
-            except Exception as reconciliation_error:
-                if not _is_initial_activation_operational_error(
-                    reconciliation_error
+                reservation.reprove()
+                if initial_stage != attempt.stage:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
+                    )
+                build = MigrationStageBuild(
+                    preflight=preflight,
+                    mutable_stage=initial_stage,
+                    reused_completed_revision=None,
+                )
+                if build.preflight.source_digest != source_before:
+                    raise MigrationPreflightError("MIGRATION.SOURCE_CHANGED")
+                mutable_stage = build.mutable_stage
+                if mutable_stage is None:
+                    raise MigrationPreflightError(
+                        "MIGRATION.INITIAL_STAGE_UNAVAILABLE"
+                    )
+                _reprove_initial_stage_ownership(attempt)
+                stage_label = "SEAL"
+                reservation.reprove()
+                sealed = coordinator._seal_stage(
+                    mutable_stage,
+                    canonical_store_id=self._canonical_store_id,
+                    expected_prior_generation=None,
+                    **reservation.stage_seal_inputs(attempt),
+                )
+                stage_label = "PREPARE"
+                reservation.reprove()
+                activation_attempted = True
+                posix_inputs = reservation.posix_activation_inputs(attempt)
+                prepared = coordinator.activate(sealed, **posix_inputs)
+                stage_label = "JOURNAL"
+                reservation.reprove()
+                if reservation._recovery_profile is _RecoveryProfile.POSIX_V2:
+                    handle = coordinator.publish_prepared_activation(prepared, **posix_inputs)
+                    portable_inputs: dict[str, object] | None = None
+                else:
+                    portable_inputs = reservation.portable_journal_inputs()
+                    handle = coordinator.publish_portable_prepared_activation(
+                        prepared,
+                        **portable_inputs,
+                    )
+                stage_label = "PUBLISH"
+                reservation.reprove()
+                if reservation._recovery_profile is _RecoveryProfile.POSIX_V2:
+                    generation = coordinator.publish_activation(
+                        prepared, handle, **posix_inputs
+                    )
+                else:
+                    assert portable_inputs is not None
+                    generation = coordinator.publish_portable_activation(
+                        prepared,
+                        handle,
+                        platform=cast(
+                            PlatformFileBackend,
+                            portable_inputs["platform"],
+                        ),
+                        persistent_private=cast(
+                            Any,
+                            portable_inputs["persistent_private"],
+                        ),
+                        caller_borrow=cast(
+                            Any,
+                            portable_inputs["caller_borrow"],
+                        ),
+                        retire_unpublished_stage=lambda: (
+                            _cleanup_initial_unpublished_stage(attempt)
+                        ),
+                    )
+                reservation._published_initial_generation = generation
+                stage_label = "VERIFY"
+                reservation.reprove()
+                self._verify_initial_activation_runtime(
+                    coordinator=coordinator,
+                    preflight=build.preflight,
+                    sealed=sealed,
+                    generation=generation,
+                    require_legacy_journal_phase=(
+                        reservation._recovery_profile is _RecoveryProfile.POSIX_V2
+                    ),
+                    _borrow=reservation._family_borrow,
+                    _activation_borrow=posix_inputs.get("_posix_borrow"),
+                )
+                reservation.reprove()
+                return self._success_report(
+                    preflight=build.preflight,
+                    sealed=sealed,
+                    canonical_store_id=self._canonical_store_id,
+                    generation=generation,
+                )
+            except Exception as error:
+                primary_error = error
+                if (
+                    prepared is not None
+                    and attempt is not None
+                    and attempt.recovery_profile is _RecoveryProfile.WINDOWS_V3
+                ):
+                    try:
+                        coordinator._sealed_registry.release_portable_live_authority_for_recovery(
+                            prepared._token
+                        )
+                    except BaseException:
+                        if type(error) not in (
+                            TypeError,
+                            AssertionError,
+                            AttributeError,
+                        ):
+                            raise
+                if not (
+                    _is_initial_activation_operational_error(error)
+                    or isinstance(error, _InitialActivationReservationError)
                 ):
                     raise
-                unavailable = self._initial_authority_unavailable_failure(
+                if (prepared is not None
+                        and reservation._family_borrow is not None):
+                    coordinator._stop_posix_recovery_admission()
+                    try:
+                        inputs = reservation.posix_recovery_inputs()
+                        borrow = inputs["_posix_borrow"]
+                        journal_path = _activation_journal_path(self._resource_identity)
+                        durable_record = None
+                        if borrow.exists(journal_path):
+                            durable_record = _parse_activation_journal_bytes(
+                                borrow.read_journal(journal_path, None)[0], expected_journal_path=journal_path,
+                            )
+                        if durable_record is not None and durable_record.phase is _ActivationJournalPhase.GENERATION_PUBLISHED:
+                            return self._recover_published_initial_tail(
+                                coordinator=coordinator, source_before=source_before,
+                                preflight=preflight, sealed=sealed, _reservation=reservation,
+                            )
+                        if (durable_record is not None
+                                and durable_record.phase is _ActivationJournalPhase.PREPARED
+                                and borrow.exists(self._resource_identity.canonical_sidecar_path)):
+                            raise MigrationPreflightError("MIGRATION.INITIAL_RECOVERY_REQUIRED")
+                        if durable_record is not None and durable_record.phase is not _ActivationJournalPhase.PREPARED:
+                            original_borrow = posix_inputs.get("_posix_borrow")
+                            if original_borrow is None or original_borrow.publication_incomplete:
+                                # A durable phase does not prove receipt COMMIT or
+                                # completion of the publication handshake. Keep the
+                                # original facts for explicit owner recovery.
+                                raise MigrationPreflightError("MIGRATION.INITIAL_RECOVERY_REQUIRED")
+                            _ = coordinator.rollback_durable_activation(**inputs)
+                        else:
+                            coordinator.cancel_prepared_activation(prepared, **inputs)
+                        borrow.reprove()
+                        if borrow.capture(source).sha256 != source_before:
+                            raise MigrationPreflightError("MIGRATION.INITIAL_ROLLBACK_UNPROVEN")
+                        reservation._family_borrow._recovery_completed = True
+                    except Exception as reconciliation_error:
+                        if not _is_initial_activation_operational_error(reconciliation_error):
+                            raise
+                        _append_owned_close_facts(error, reconciliation_error, context="Cancellation failed")
+                        return self._initial_authority_unavailable_failure(
+                            coordinator=coordinator, source_before=source_before,
+                            preflight=preflight, published_generation=None,
+                            observe_source=False,
+                        )
+                    return MigrationFailure(
+                        stage=stage_label, error_code=_initial_activation_error_code(error),
+                        retryable=_initial_activation_retryable(error),
+                        diagnostics=() if preflight is None else preflight.diagnostics,
+                        active_generation=None,
+                        original_source_preservation=_unchanged_preservation(AssetKind.ORIGINAL_SOURCE, source_before),
+                        active_store_preservation=AssetPreservationEvidence(
+                            asset_kind=AssetKind.ACTIVE_STORE, state=AssetPreservationState.NOT_APPLICABLE,
+                            before_digest=None, observed_digest=None), recovery_locators=(),
+                    )
+                if attempt is None:
+                    attempt = reservation._initial_attempt
+                try:
+                    failure = self._reconcile_initial_activation_failure(
+                        error,
+                        stage_label=stage_label,
+                        source_before=source_before,
+                        preflight=preflight,
+                        attempt=attempt,
+                        sealed=sealed,
+                        prepared=prepared,
+                        activation_attempted=activation_attempted,
+                        coordinator=coordinator,
+                    )
+                except Exception as reconciliation_error:
+                    if not _is_initial_activation_operational_error(
+                        reconciliation_error
+                    ):
+                        raise
+                    unavailable = self._initial_authority_unavailable_failure(
+                        coordinator=coordinator,
+                        source_before=source_before,
+                        preflight=preflight,
+                        published_generation=None,
+                    )
+                    reservation.reprove()
+                    return unavailable
+                if failure is not None:
+                    reservation.reprove()
+                    return failure
+                outcome = self._recover_published_initial_tail(
                     coordinator=coordinator,
                     source_before=source_before,
                     preflight=preflight,
-                    published_generation=None,
+                    sealed=sealed,
                 )
                 reservation.reprove()
-                return unavailable
-            if failure is not None:
-                reservation.reprove()
-                return failure
-            outcome = self._recover_published_initial_tail(
-                coordinator=coordinator,
-                source_before=source_before,
-                preflight=preflight,
-                sealed=sealed,
-            )
-            reservation.reprove()
-            return outcome
+                return outcome
+        except BaseException as error:
+            # Include reconciliation failures, but never a caller's handled error.
+            propagating_error = error
+            raise
         finally:
-            active_error = sys.exception()
             terminal_attempt = (
                 attempt
                 if attempt is not None
                 else reservation._initial_attempt
             )
             try:
-                if terminal_attempt is not None:
-                    try:
-                        _close_initial_stage_attempt_authorities(terminal_attempt)
-                    except MigrationPreflightError as close_error:
-                        if not (
-                            close_error.error_code
-                            == "MIGRATION.INITIAL_RECOVERY_REQUIRED"
-                            and type(active_error)
-                            in (TypeError, AssertionError, AttributeError)
-                        ):
-                            raise
+                close_error = _close_initial_activation_authorities(
+                    rooted_source, terminal_attempt,
+                    primary=propagating_error if propagating_error is not None else primary_error,
+                )
+                if close_error is not None:
+                    if reservation is not None and reservation._family_borrow is not None:
+                        reservation._family_borrow._recovery_completed = False
+                        coordinator._stop_posix_recovery_admission(
+                            pending_close=lambda: _close_initial_activation_authorities(
+                                rooted_source, terminal_attempt, primary=None,
+                            ),
+                        )
+                    # A reconciled operational primary is already a result;
+                    # only an exception still unwinding outranks owned close.
+                    raise propagating_error if propagating_error is not None else close_error
             finally:
                 reservation._initial_attempt = None
 
@@ -3388,7 +3695,7 @@ class TMMigrationService:
         failure and never falls through to JSONL activation/query behavior.
         """
 
-        if reservation._backend is not None:
+        if reservation._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             return self._recover_existing_portable_initial_activation(
                 coordinator=coordinator,
                 source=source,
@@ -3396,11 +3703,11 @@ class TMMigrationService:
                 reservation=reservation,
             )
         try:
-            recovery_probe = ResourceStoreCoordinator(
-                canonical_store_id=self._canonical_store_id,
-                resource_identity=self._resource_identity,
+            recovery_probe = coordinator
+            recovery_inputs = reservation.posix_recovery_inputs()
+            recovered = coordinator.recover_durable_activation(
+                **recovery_inputs, _defer_initial_fail_stop_clear=True,
             )
-            recovered = recovery_probe.recover_durable_activation()
         except Exception as error:
             if not _is_initial_activation_operational_error(error):
                 raise
@@ -3412,8 +3719,18 @@ class TMMigrationService:
             )
         if recovered is None:
             return None
+        reservation._completed_initial_recovery = recovered
+        if recovered.action == "COMPLETED":
+            reservation._published_initial_generation = recovered.generation
         try:
-            preflight = _scan_jsonl(source)
+            if reservation._family_borrow is None:
+                preflight = _scan_jsonl(source)
+            else:
+                source_read = reservation.open_portable_rooted_read(source, unavailable_code="MIGRATION.SOURCE_UNREADABLE")
+                try:
+                    preflight = _scan_portable_jsonl(source_read)
+                finally:
+                    source_read.close()
         except Exception as error:
             if not _is_initial_activation_operational_error(error):
                 raise
@@ -3443,30 +3760,11 @@ class TMMigrationService:
             if generation != 0:
                 raise MigrationPreflightError("MIGRATION.ALREADY_ACTIVE")
             try:
-                probed_report = self._recovered_initial_success_report(
-                    coordinator=recovery_probe,
-                    preflight=preflight,
-                    generation=generation,
+                return self._recovered_initial_success_report(
+                    coordinator=coordinator, preflight=preflight,
+                    generation=generation, _reservation=reservation,
+                    _activation_borrow=recovery_inputs.get("_posix_borrow"),
                 )
-                live_recovered = coordinator.recover_durable_activation()
-                if (
-                    live_recovered is None
-                    or live_recovered.action != "COMPLETED"
-                    or live_recovered.generation != generation
-                ):
-                    raise MigrationPreflightError(
-                        "MIGRATION.INITIAL_RUNTIME_INVALID"
-                    )
-                live_report = self._recovered_initial_success_report(
-                    coordinator=coordinator,
-                    preflight=preflight,
-                    generation=generation,
-                )
-                if live_report != probed_report:
-                    raise MigrationPreflightError(
-                        "MIGRATION.INITIAL_RUNTIME_INVALID"
-                    )
-                return live_report
             except Exception as error:
                 if not _is_initial_activation_operational_error(error):
                     raise
@@ -3628,30 +3926,47 @@ class TMMigrationService:
         source_before: str,
         preflight: MigrationPreflight | None,
         sealed: SealedStage | None,
+        _reservation: _InitialActivationResourceReservation | None = None,
     ) -> MigrationOutcome:
-        """Cold-recover one published tail and adopt exactly generation 0."""
+        """Re-prove a published tail and adopt exactly generation zero."""
 
+        published_generation = (
+            None if _reservation is None else _reservation._published_initial_generation
+        )
         if preflight is None or sealed is None:
             return self._initial_authority_unavailable_failure(
                 coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
-                published_generation=None,
+                published_generation=published_generation,
+                observe_source=_reservation is None,
             )
+        recovery_inputs: _PosixActivationInputs = {}
+        if _reservation is not None:
+            coordinator._stop_posix_recovery_admission()
+            assert _reservation._family_borrow is not None
+            _reservation._family_borrow._recovery_completed = False
         try:
-            recovered_coordinator = ResourceStoreCoordinator(
-                canonical_store_id=self._canonical_store_id,
-                resource_identity=self._resource_identity,
-            )
-            recovered = recovered_coordinator.recover_durable_activation()
+            if _reservation is None:
+                recovered_coordinator = ResourceStoreCoordinator(
+                    canonical_store_id=self._canonical_store_id,
+                    resource_identity=self._resource_identity,
+                )
+            else:
+                recovered_coordinator = coordinator
+                recovery_inputs = _reservation.posix_recovery_inputs()
+            recovered = recovered_coordinator.recover_durable_activation(**recovery_inputs)
         except Exception as error:
             if not _is_initial_activation_operational_error(error):
                 raise
+            if _reservation is not None:
+                coordinator._stop_posix_recovery_admission()
             return self._initial_authority_unavailable_failure(
                 coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
-                published_generation=None,
+                published_generation=published_generation,
+                observe_source=_reservation is None,
             )
         if (
             recovered is None
@@ -3662,16 +3977,29 @@ class TMMigrationService:
                 coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
-                published_generation=None,
+                published_generation=published_generation,
+                observe_source=_reservation is None,
             )
         generation = recovered.generation
+        if _reservation is not None:
+            _reservation._published_initial_generation = generation
         try:
             self._verify_initial_activation_runtime(
                 coordinator=recovered_coordinator,
                 preflight=preflight,
                 sealed=sealed,
                 generation=generation,
+                _borrow=None if _reservation is None else _reservation._family_borrow,
+                _activation_borrow=recovery_inputs.get("_posix_borrow"),
             )
+            if _reservation is not None:
+                _reservation.reprove()
+                assert _reservation._family_borrow is not None
+                _reservation._family_borrow._recovery_completed = True
+                return self._success_report(
+                    preflight=preflight, sealed=sealed,
+                    canonical_store_id=self._canonical_store_id, generation=generation,
+                )
             if coordinator.state == "ACTIVATING":
                 coordinator.adopt_recovered_authority(
                     recovered_coordinator
@@ -3694,11 +4022,14 @@ class TMMigrationService:
         except Exception as error:
             if not _is_initial_activation_operational_error(error):
                 raise
+            if _reservation is not None:
+                coordinator._stop_posix_recovery_admission()
             return self._initial_authority_unavailable_failure(
                 coordinator=coordinator,
                 source_before=source_before,
                 preflight=preflight,
                 published_generation=generation,
+                observe_source=_reservation is None,
             )
         return self._success_report(
             preflight=preflight,
@@ -3714,12 +4045,16 @@ class TMMigrationService:
         preflight: MigrationPreflight,
         generation: int,
         require_legacy_journal_phase: bool = True,
+        _reservation: _InitialActivationResourceReservation | None = None,
+        _activation_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> MigrationReport:
         """Project a cold-recovered binding without rebuilding a stage."""
 
         try:
-            manifest_payload = self._resource_identity.snapshot_manifest_path.read_text(
-                encoding="utf-8"
+            manifest_payload = (
+                self._resource_identity.snapshot_manifest_path.read_text(encoding="utf-8")
+                if _activation_borrow is None else _activation_borrow.read_journal(
+                    self._resource_identity.snapshot_manifest_path, None)[0].decode("utf-8")
             )
         except Exception as error:
             if not _is_initial_activation_operational_error(error):
@@ -3770,6 +4105,8 @@ class TMMigrationService:
             expected_binding_digest=_sealed_source_binding_digest(binding),
             generation=generation,
             require_legacy_journal_phase=require_legacy_journal_phase,
+            _borrow=None if _reservation is None else _reservation._family_borrow,
+            _activation_borrow=_activation_borrow,
         )
         return MigrationReport(
             resource_id=self._resource_identity.resource_id,
@@ -3956,8 +4293,8 @@ class TMMigrationService:
             )
         try:
             store = SQLiteTMStore.from_coordinator(coordinator)
-            health = store.health()
-            revision = store.canonical_revision()
+            health = store.health(**({"_borrow": reservation._family_borrow} if reservation._family_borrow is not None else {}))
+            revision = store.canonical_revision(**({"_borrow": reservation._family_borrow} if reservation._family_borrow is not None else {}))
             if not health.healthy:
                 raise ActivationPreparationError(
                     "ACTIVATION.OWNER_PROJECTION_UNAVAILABLE",
@@ -4012,15 +4349,15 @@ class TMMigrationService:
         source_before: str,
         preflight: MigrationPreflight | None,
         published_generation: int | None,
+        observe_source: bool = True,
     ) -> MigrationFailure:
         """Build one code-only outcome that explicitly forbids legacy use."""
 
         if published_generation is None:
-            coordinator._mark_initial_activation_authority_unavailable()
+            coordinator._mark_initial_activation_authority_unavailable(source_before)
 
-        observed = _try_file_digest(
-            self._resource_identity.configured_jsonl_path
-        )
+        observed = (_try_file_digest(self._resource_identity.configured_jsonl_path)
+                    if observe_source else None)
         if observed is None:
             source_evidence = AssetPreservationEvidence(
                 asset_kind=AssetKind.ORIGINAL_SOURCE,
@@ -4088,7 +4425,7 @@ class TMMigrationService:
         if (
             prepared is not None
             and attempt is not None
-            and attempt.platform_backend is not None
+            and attempt.recovery_profile is _RecoveryProfile.WINDOWS_V3
         ):
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_RECOVERY_REQUIRED"
@@ -4115,7 +4452,7 @@ class TMMigrationService:
                 sealed is not None
                 and prepared is None
                 and attempt is not None
-                and attempt.platform_backend is not None
+                and attempt.recovery_profile is _RecoveryProfile.WINDOWS_V3
             ):
                 try:
                     retired = coordinator._sealed_registry.retire_unissued_portable(
@@ -4272,6 +4609,8 @@ class TMMigrationService:
         sealed: SealedStage,
         generation: int,
         require_legacy_journal_phase: bool = True,
+        _borrow: _ResourceOperationBorrow | None = None,
+        _activation_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> None:
         """Require one complete generation-zero runtime before success.
 
@@ -4292,6 +4631,8 @@ class TMMigrationService:
             expected_binding_digest=expected_binding_digest,
             generation=generation,
             require_legacy_journal_phase=require_legacy_journal_phase,
+            _borrow=_borrow,
+            _activation_borrow=_activation_borrow,
         )
 
     def _verify_initial_runtime_binding(
@@ -4303,6 +4644,8 @@ class TMMigrationService:
         expected_binding_digest: str,
         generation: int,
         require_legacy_journal_phase: bool = True,
+        _borrow: _ResourceOperationBorrow | None = None,
+        _activation_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> None:
         """Re-prove one generation-zero runtime against one frozen binding."""
 
@@ -4325,15 +4668,15 @@ class TMMigrationService:
             )
         try:
             if require_legacy_journal_phase and (
-                coordinator.durable_activation_phase != "GENERATION_PUBLISHED"
+                (coordinator.durable_activation_phase if _activation_borrow is None else coordinator._read_durable_activation_phase(caller_borrow=_activation_borrow)) != "GENERATION_PUBLISHED"
             ):
                 raise MigrationPreflightError(
                     "MIGRATION.INITIAL_RUNTIME_INVALID"
                 )
             store = SQLiteTMStore.from_coordinator(coordinator)
-            health = store.health()
-            revision = store.canonical_revision()
-            with store.query_lease() as query_view:
+            health = store.health(**({"_borrow": _borrow} if _borrow is not None else {}))
+            revision = store.canonical_revision(**({"_borrow": _borrow} if _borrow is not None else {}))
+            with store.query_lease(**({"_borrow": _borrow} if _borrow is not None else {})) as query_view:
                 query_health = query_view.health()
         except MigrationPreflightError:
             raise
@@ -4423,7 +4766,7 @@ class TMMigrationService:
 
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be exact SQLiteTMStore")
-        if sys.platform == "win32":
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             return self._run_bound_configured_refresh(store)
         identity = self._resource_identity
         paths = _export_artifact_paths(identity.configured_jsonl_path)
@@ -5099,7 +5442,7 @@ class TMMigrationService:
 
         if type(store) is not SQLiteTMStore:
             raise TypeError("store must be exact SQLiteTMStore")
-        if sys.platform == "win32":
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             active_open_reservation = self._active_open_reservation
             if active_open_reservation is not None:
                 try:
@@ -6100,7 +6443,7 @@ class TMMigrationService:
         destination: Path,
     ) -> ExportOutcome:
         backend = self._platform_backend
-        if sys.platform == "win32":
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             if backend is None:
                 try:
                     backend = compose_platform_file_backend(destination.parent)
@@ -6980,12 +7323,6 @@ class TMMigrationService:
         if coordinator is None:
             raise MigrationPreflightError("IMPORT.COORDINATOR_UNAVAILABLE")
 
-        try:
-            reservation = self._acquire_initial_reservation()
-        except _InitialActivationReservationError as error:
-            raise MigrationPreflightError(
-                "IMPORT.RESOURCE_LOCK_UNAVAILABLE"
-            ) from error
         source_publication: _BoundExportPublication | None = None
         source_recovery_pending: PendingPublication | None = None
         source_recovery_identity: FileObjectIdentity | None = None
@@ -6998,242 +7335,262 @@ class TMMigrationService:
         payload_root: RootedDirectoryAuthority | None = None
         payload_authority: BoundRegularFile | None = None
         owner_started = False
+        reservation_entered = False
+        reservation_stack = ExitStack()
         try:
-            with reservation:
-                self._active_owner_reservation = reservation
-                backend, source_root, lease, _lock_name, _lock_payload = (
-                    reservation.bound_family_inputs()
-                )
-                source_parent = source_root
-                payload_root = backend.bind_root(payload.parent)
-                payload_authority = backend.open_regular(
-                    payload_root,
-                    PurePath(payload.name),
-                )
-                payload_facts = payload_authority.content_facts()
-                if (
-                    payload_facts.snapshot.identity.kind != "regular"
-                    or payload_facts.snapshot.identity.link_count != 1
-                    or not payload_facts.snapshot.reparse_free
-                    or payload_facts.content_sha256.hex() != expected_digest
-                ):
-                    raise MigrationPreflightError("IMPORT.SOURCE_STALE")
+            reservation = reservation_stack.enter_context(self._initial_stage_reservation())
+            reservation_entered = True
+            self._active_owner_reservation = reservation
+            backend, source_root, lease, _lock_name, _lock_payload = (
+                reservation.bound_family_inputs()
+            )
+            source_parent = source_root
+            payload_root = backend.bind_root(payload.parent)
+            payload_authority = backend.open_regular(
+                payload_root,
+                PurePath(payload.name),
+            )
+            payload_facts = payload_authority.content_facts()
+            if (
+                payload_facts.snapshot.identity.kind != "regular"
+                or payload_facts.snapshot.identity.link_count != 1
+                or not payload_facts.snapshot.reparse_free
+                or payload_facts.content_sha256.hex() != expected_digest
+            ):
+                raise MigrationPreflightError("IMPORT.SOURCE_STALE")
 
-                destination_name = self._resource_identity.configured_jsonl_path.name
-                prior = _capture_bound_export_prior(
+            destination_name = self._resource_identity.configured_jsonl_path.name
+            prior = _capture_bound_export_prior(
+                backend,
+                source_root,
+                source_parent,
+                destination_name,
+                unsafe_code="IMPORT.DESTINATION_UNSAFE",
+            )
+            if initial and prior.snapshot is not None:
+                raise MigrationPreflightError("IMPORT.DESTINATION_STALE")
+            if not initial and prior.snapshot is None:
+                raise MigrationPreflightError("IMPORT.DESTINATION_STALE")
+
+            if prior.snapshot is not None:
+                (
+                    source_recovery_identity,
+                    source_recovery_pending,
+                    recovery_close_error,
+                ) = _copy_bound_export_prior(
                     backend,
                     source_root,
                     source_parent,
                     destination_name,
-                    unsafe_code="IMPORT.DESTINATION_UNSAFE",
+                    source_recovery_name,
+                    prior,
+                    **({"candidate_name": source_recovery_name + ".tmp"}
+                       if reservation._family_borrow is not None else {}),
                 )
-                if initial and prior.snapshot is not None:
-                    raise MigrationPreflightError("IMPORT.DESTINATION_STALE")
-                if not initial and prior.snapshot is None:
-                    raise MigrationPreflightError("IMPORT.DESTINATION_STALE")
+                if recovery_close_error is not None:
+                    raise recovery_close_error
 
-                if prior.snapshot is not None:
-                    (
-                        source_recovery_identity,
+            candidate_name = (
+                f".{destination_name}.localcat-import-{uuid.uuid4().hex}.tmp"
+            )
+            candidate, content, candidate_identity = _bound_candidate_from_opened(
+                source_parent,
+                candidate_name,
+                payload_authority,
+                payload_facts.snapshot,
+            )
+            mode = (
+                PublishMode.CREATE_IF_ABSENT
+                if prior.snapshot is None
+                else PublishMode.REPLACE_UNDER_LOCK
+            )
+            try:
+                pending = source_parent.begin_publish(
+                    candidate,
+                    destination_name,
+                    mode=mode,
+                    lease=lease if mode is PublishMode.REPLACE_UNDER_LOCK else None,
+                )
+            finally:
+                candidate = None
+            source_publication = _BoundExportPublication(
+                name=destination_name,
+                candidate_name=candidate_name,
+                content=content,
+                candidate_identity=candidate_identity,
+                candidate=None,
+                pending=pending,
+            )
+            if content.content_sha256.hex() != expected_digest:
+                raise MigrationPreflightError("IMPORT.SOURCE_STALE")
+            reservation.reprove()
+
+            owner_started = True
+            outcome = (
+                self._activate_initial_with_resource_reservation(
+                    coordinator=coordinator,
+                    source=self._resource_identity.configured_jsonl_path,
+                    source_before=expected_digest,
+                    reservation=reservation,
+                )
+                if initial
+                else self._posix_explicit_disambiguation_reserved(
+                    self._resource_identity.configured_jsonl_path, resource_id,
+                    reservation=reservation,
+                )
+                if self._recovery_profile is _RecoveryProfile.POSIX_V2
+                else self._portable_explicit_disambiguation_reserved(
+                    source=self._resource_identity.configured_jsonl_path,
+                    resource_id=resource_id,
+                    coordinator=coordinator,
+                    reservation=reservation,
+                )
+            )
+            if type(outcome) is MigrationReport:
+                if (
+                    outcome.source_digest != expected_digest
+                    or outcome.migrated_count != expected_record_count
+                    or outcome.skipped_count
+                ):
+                    raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+                owner_commit_error: BaseException | None = None
+                if owner_commit is not None:
+                    try:
+                        owner_commit(outcome)
+                    except BaseException as error:
+                        # The owner callback may have advanced its durable
+                        # receipt before failing.  Preserve that exact
+                        # exception, but first finish the configured-source
+                        # terminal proof and retire the private prior copy
+                        # while this operation still holds W1/root.
+                        owner_commit_error = error
+                if source_publication.pending is None:
+                    raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+                if (
+                    source_publication.pending.terminal_reproof()
+                    != source_publication.pending.preliminary_facts()
+                ):
+                    raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+                publication_close_error = _close_bound_export_authorities(
+                    source_publication.pending,
+                )
+                source_publication.pending = None
+                if publication_close_error is not None:
+                    raise MigrationPreflightError(
+                        "IMPORT.RECOVERY_REQUIRED"
+                    ) from publication_close_error
+                if source_recovery_pending is not None:
+                    recovery_close_error = _close_bound_export_authorities(
                         source_recovery_pending,
-                        recovery_close_error,
-                    ) = _copy_bound_export_prior(
+                    )
+                    source_recovery_pending = None
+                    if recovery_close_error is not None:
+                        raise MigrationPreflightError(
+                            "IMPORT.RECOVERY_REQUIRED"
+                        ) from recovery_close_error
+                    _cleanup_bound_export_artifacts(
+                        source_parent,
+                        ((source_recovery_name, source_recovery_identity),),
+                    )
+                if owner_commit_error is not None:
+                    raise owner_commit_error
+                return outcome
+
+            if type(outcome) is MigrationFailure:
+                if (
+                    outcome.canonical_authority_published
+                    or outcome.canonical_authority_ambiguous
+                ):
+                    # The canonical owner has either published or lost the
+                    # proof of publication, so this adapter must not guess a
+                    # configured-source rollback.  Its private prior copy is
+                    # not a durable recovery locator, however; retire that
+                    # exact owned artifact instead of leaking an anonymous
+                    # file beside the user's resource.
+                    deferred_error = _close_bound_export_authorities(
+                        source_publication.pending,
+                    )
+                    source_publication.pending = None
+                    if source_recovery_pending is not None:
+                        recovery_close_error = _close_bound_export_authorities(
+                            source_recovery_pending,
+                        )
+                        source_recovery_pending = None
+                        if deferred_error is None:
+                            deferred_error = recovery_close_error
+                        try:
+                            _cleanup_bound_export_artifacts(
+                                source_parent,
+                                ((
+                                    source_recovery_name,
+                                    source_recovery_identity,
+                                ),),
+                            )
+                        except (ExportPreflightError, PlatformFileError) as error:
+                            if deferred_error is None:
+                                deferred_error = error
+                    if deferred_error is not None:
+                        raise MigrationPreflightError(
+                            "IMPORT.RECOVERY_REQUIRED"
+                        ) from deferred_error
+                    return outcome
+                if source_publication.pending is None:
+                    raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+                close_error = _close_bound_export_authorities(
+                    source_publication.pending,
+                )
+                source_publication.pending = None
+                if close_error is not None:
+                    raise MigrationPreflightError(
+                        "IMPORT.RECOVERY_REQUIRED"
+                    ) from close_error
+                if source_recovery_pending is not None:
+                    recovery_close_error = _close_bound_export_authorities(
+                        source_recovery_pending,
+                    )
+                    source_recovery_pending = None
+                    if recovery_close_error is not None:
+                        raise MigrationPreflightError(
+                            "IMPORT.RECOVERY_REQUIRED"
+                        ) from recovery_close_error
+                try:
+                    rollback = _restore_bound_export_member(
                         backend,
                         source_root,
                         source_parent,
-                        destination_name,
-                        source_recovery_name,
+                        source_publication,
                         prior,
+                        source_recovery_name,
                     )
-                    if recovery_close_error is not None:
-                        raise recovery_close_error
-
-                candidate_name = (
-                    f".{destination_name}.localcat-import-{uuid.uuid4().hex}.tmp"
-                )
-                candidate, content, candidate_identity = _bound_candidate_from_opened(
-                    source_parent,
-                    candidate_name,
-                    payload_authority,
-                    payload_facts.snapshot,
-                )
-                mode = (
-                    PublishMode.CREATE_IF_ABSENT
-                    if prior.snapshot is None
-                    else PublishMode.REPLACE_UNDER_LOCK
-                )
-                try:
-                    pending = source_parent.begin_publish(
-                        candidate,
-                        destination_name,
-                        mode=mode,
-                        lease=lease if mode is PublishMode.REPLACE_UNDER_LOCK else None,
+                except (ExportPreflightError, PlatformFileError) as error:
+                    raise MigrationPreflightError(
+                        "IMPORT.RECOVERY_REQUIRED"
+                    ) from error
+                if rollback is not None:
+                    rollback_close_error = _close_bound_export_authorities(
+                        rollback,
                     )
-                finally:
-                    candidate = None
-                source_publication = _BoundExportPublication(
-                    name=destination_name,
-                    candidate_name=candidate_name,
-                    content=content,
-                    candidate_identity=candidate_identity,
-                    candidate=None,
-                    pending=pending,
-                )
-                if content.content_sha256.hex() != expected_digest:
-                    raise MigrationPreflightError("IMPORT.SOURCE_STALE")
-                reservation.reprove()
-
-                owner_started = True
-                outcome = (
-                    self._activate_initial_with_resource_reservation(
-                        coordinator=coordinator,
-                        source=self._resource_identity.configured_jsonl_path,
-                        source_before=expected_digest,
-                        reservation=reservation,
-                    )
-                    if initial
-                    else self._portable_explicit_disambiguation_reserved(
-                        source=self._resource_identity.configured_jsonl_path,
-                        resource_id=resource_id,
-                        coordinator=coordinator,
-                        reservation=reservation,
-                    )
-                )
-                if type(outcome) is MigrationReport:
-                    if (
-                        outcome.source_digest != expected_digest
-                        or outcome.migrated_count != expected_record_count
-                        or outcome.skipped_count
-                    ):
-                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
-                    owner_commit_error: BaseException | None = None
-                    if owner_commit is not None:
-                        try:
-                            owner_commit(outcome)
-                        except BaseException as error:
-                            # The owner callback may have advanced its durable
-                            # receipt before failing.  Preserve that exact
-                            # exception, but first finish the configured-source
-                            # terminal proof and retire the private prior copy
-                            # while this operation still holds W1/root.
-                            owner_commit_error = error
-                    if source_publication.pending is None:
-                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
-                    if (
-                        source_publication.pending.terminal_reproof()
-                        != source_publication.pending.preliminary_facts()
-                    ):
-                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
-                    publication_close_error = _close_bound_export_authorities(
-                        source_publication.pending,
-                    )
-                    source_publication.pending = None
-                    if publication_close_error is not None:
+                    if rollback_close_error is not None:
                         raise MigrationPreflightError(
                             "IMPORT.RECOVERY_REQUIRED"
-                        ) from publication_close_error
-                    if source_recovery_pending is not None:
-                        recovery_close_error = _close_bound_export_authorities(
-                            source_recovery_pending,
-                        )
-                        source_recovery_pending = None
-                        if recovery_close_error is not None:
-                            raise MigrationPreflightError(
-                                "IMPORT.RECOVERY_REQUIRED"
-                            ) from recovery_close_error
-                        _cleanup_bound_export_artifacts(
-                            source_parent,
-                            ((source_recovery_name, source_recovery_identity),),
-                        )
-                    if owner_commit_error is not None:
-                        raise owner_commit_error
-                    return outcome
-
-                if type(outcome) is MigrationFailure:
-                    if (
-                        outcome.canonical_authority_published
-                        or outcome.canonical_authority_ambiguous
-                    ):
-                        # The canonical owner has either published or lost the
-                        # proof of publication, so this adapter must not guess a
-                        # configured-source rollback.  Its private prior copy is
-                        # not a durable recovery locator, however; retire that
-                        # exact owned artifact instead of leaking an anonymous
-                        # file beside the user's resource.
-                        deferred_error = _close_bound_export_authorities(
-                            source_publication.pending,
-                        )
-                        source_publication.pending = None
-                        if source_recovery_pending is not None:
-                            recovery_close_error = _close_bound_export_authorities(
-                                source_recovery_pending,
-                            )
-                            source_recovery_pending = None
-                            if deferred_error is None:
-                                deferred_error = recovery_close_error
-                            try:
-                                _cleanup_bound_export_artifacts(
-                                    source_parent,
-                                    ((
-                                        source_recovery_name,
-                                        source_recovery_identity,
-                                    ),),
-                                )
-                            except (ExportPreflightError, PlatformFileError) as error:
-                                if deferred_error is None:
-                                    deferred_error = error
-                        if deferred_error is not None:
-                            raise MigrationPreflightError(
-                                "IMPORT.RECOVERY_REQUIRED"
-                            ) from deferred_error
-                        return outcome
-                    if source_publication.pending is None:
-                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
-                    close_error = _close_bound_export_authorities(
-                        source_publication.pending,
+                        ) from rollback_close_error
+                if prior.snapshot is not None:
+                    _cleanup_bound_export_artifacts(
+                        source_parent,
+                        ((source_recovery_name, source_recovery_identity),),
                     )
-                    source_publication.pending = None
-                    if close_error is not None:
-                        raise MigrationPreflightError(
-                            "IMPORT.RECOVERY_REQUIRED"
-                        ) from close_error
-                    if source_recovery_pending is not None:
-                        recovery_close_error = _close_bound_export_authorities(
-                            source_recovery_pending,
-                        )
-                        source_recovery_pending = None
-                        if recovery_close_error is not None:
-                            raise MigrationPreflightError(
-                                "IMPORT.RECOVERY_REQUIRED"
-                            ) from recovery_close_error
-                    try:
-                        rollback = _restore_bound_export_member(
-                            backend,
-                            source_root,
-                            source_parent,
-                            source_publication,
-                            prior,
-                            source_recovery_name,
-                        )
-                    except (ExportPreflightError, PlatformFileError) as error:
-                        raise MigrationPreflightError(
-                            "IMPORT.RECOVERY_REQUIRED"
-                        ) from error
-                    if rollback is not None:
-                        rollback_close_error = _close_bound_export_authorities(
-                            rollback,
-                        )
-                        if rollback_close_error is not None:
-                            raise MigrationPreflightError(
-                                "IMPORT.RECOVERY_REQUIRED"
-                            ) from rollback_close_error
-                    if prior.snapshot is not None:
-                        _cleanup_bound_export_artifacts(
-                            source_parent,
-                            ((source_recovery_name, source_recovery_identity),),
-                        )
-                    return outcome
-                raise TypeError("TM import returned an unknown outcome")
+                return outcome
+            raise TypeError("TM import returned an unknown outcome")
+        except SQLiteStoreLifecycleError as error:
+            if reservation_entered or not _is_stage_admission_operational_error(error):
+                raise
+            raise MigrationPreflightError(
+                "IMPORT.RESOURCE_LOCK_UNAVAILABLE"
+                if error.code in {"STORE.FAMILY_BUSY", "STORE.RESOURCE_DRAINING", "STORE.OPERATION_CANCELLED"}
+                else "IMPORT.RECOVERY_REQUIRED"
+            ) from error
+        except _InitialActivationReservationError as error:
+            raise MigrationPreflightError("IMPORT.RESOURCE_LOCK_UNAVAILABLE") from error
         except (MigrationPreflightError, PlatformFileError, OSError) as error:
             # Before Core owns the activation attempt, the configured source
             # publication is the only changed asset.  Restore its exact prior
@@ -7306,13 +7663,23 @@ class TMMigrationService:
                     ) from restore_error
             raise
         finally:
-            self._active_owner_reservation = None
-            _close_bound_export_authorities(
-                source_publication.pending if source_publication is not None else None,
-                source_recovery_pending,
-                payload_authority,
-                payload_root,
-            )
+            primary = sys.exception()
+            try:
+                close_error = _close_bound_export_authorities(
+                    source_publication.pending if source_publication is not None else None,
+                    source_recovery_pending,
+                    payload_authority,
+                    payload_root,
+                )
+                if primary is None and close_error is not None:
+                    raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED") from close_error
+            finally:
+                self._active_owner_reservation = None
+                try:
+                    reservation_stack.close()
+                except BaseException:
+                    if primary is None:
+                        raise
 
     def rebuild_from_snapshot(
         self,
@@ -7350,7 +7717,7 @@ class TMMigrationService:
         reported as digest-backed restoration evidence.
         """
 
-        if sys.platform == "win32":
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             return self._portable_upgrade_schema(store_path)
 
         coordinator = self._coordinator
@@ -8122,9 +8489,28 @@ class TMMigrationService:
         source: Path,
         resource_id: str,
     ) -> MigrationOutcome:
-        if sys.platform == "win32":
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
             return self._portable_explicit_disambiguation(source, resource_id)
 
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise MigrationPreflightError("IMPORT.COORDINATOR_UNAVAILABLE")
+        if coordinator._family is None:
+            return self._posix_explicit_disambiguation_reserved(source, resource_id)
+        with coordinator._family_transition() as borrow:
+            with self._acquire_initial_reservation(borrow=borrow) as reservation:
+                with coordinator._operation_lease(borrow=borrow):
+                    pass
+                outcome = self._posix_explicit_disambiguation_reserved(source, resource_id, reservation=reservation)
+                reservation.reprove()
+                return outcome
+
+    def _posix_explicit_disambiguation_reserved(
+        self,
+        source: Path,
+        resource_id: str,
+        *, reservation: _InitialActivationResourceReservation | None = None,
+    ) -> MigrationOutcome:
         coordinator = self._coordinator
         stage_label = "PREFLIGHT"
         preflight: MigrationPreflight | None = None
@@ -8143,103 +8529,176 @@ class TMMigrationService:
         )
         if store_before is None:
             raise MigrationPreflightError("IMPORT.ACTIVE_STORE_UNREADABLE")
+        rooted_source: _PortableRootedRead | None = None
+        attempt: _InitialStageAttempt | None = None
         prepared = None
         new_store_id: str | None = None
         sealed: SealedStage | None = None
         stage: MutableStageRef | None = None
         stage_identity: _CreatedFileIdentity | None = None
         manifest_identity: _CreatedFileIdentity | None = None
+        primary_error: BaseException | None = None
+        propagating_error: BaseException | None = None
         try:
-            if (
-                type(resource_id) is not str
-                or not resource_id.strip()
-            ):
-                raise MigrationPreflightError("IMPORT.RESOURCE_ID_INVALID")
-            if resource_id != self._resource_identity.resource_id:
-                raise MigrationPreflightError(
-                    "MIGRATION.RESOURCE_IDENTITY_MISMATCH"
-                )
-            if coordinator.canonical_store_id != self._canonical_store_id:
-                raise MigrationPreflightError("IMPORT.COORDINATOR_MISMATCH")
-            prior_generation = coordinator.current_generation
-            if prior_generation is None:
-                raise MigrationPreflightError(
-                    "IMPORT.ACTIVE_RESOURCE_REQUIRED"
-                )
-            self._validate_source_preconditions(source)
-            preflight = _scan_jsonl(source)
-            origin_token = uuid.uuid4().hex
-            new_store_id = f"store.import.{origin_token}"
-            stage, stage_identity, manifest_identity = self._build_stage(
-                source,
-                preflight=preflight,
-                canonical_store_id=new_store_id,
-                immediate_seal=True,
-                batch_kind="import",
-                batch_prefix="import",
-                snapshot_prefix="snapshot.import",
-                stage_prefix="import",
-                path_salt=uuid.uuid4().hex,
-                batch_id=f"import.{origin_token}",
-            )
-            stage_label = "ACTIVATION"
-            sealed = coordinator._seal_stage(
-                stage,
-                canonical_store_id=new_store_id,
-                expected_prior_generation=prior_generation,
-            )
-            prepared = coordinator.activate_replacement(sealed)
-            handle = coordinator.publish_prepared_activation(prepared)
-            generation = coordinator.publish_activation(prepared, handle)
-            report = self._success_report(
-                preflight=preflight,
-                sealed=sealed,
-                canonical_store_id=new_store_id,
-                generation=generation,
-            )
-            # The publication is durably READY: the same service instance
-            # adopts the fresh canonical store id so a second explicit
-            # import/rebuild of the identical bytes succeeds as the next
-            # generation without a caller-side service renewal.
-            self._canonical_store_id = new_store_id
-            return report
-        except Exception as error:
-            if (
-                stage is not None
-                and stage_identity is not None
-                and sealed is None
-            ):
-                if manifest_identity is not None:
-                    _remove_created_file(
-                        stage.manifest_temp_path,
-                        manifest_identity,
+            try:
+                if (
+                    type(resource_id) is not str
+                    or not resource_id.strip()
+                ):
+                    raise MigrationPreflightError("IMPORT.RESOURCE_ID_INVALID")
+                if resource_id != self._resource_identity.resource_id:
+                    raise MigrationPreflightError(
+                        "MIGRATION.RESOURCE_IDENTITY_MISMATCH"
                     )
-                _remove_created_file(
-                    stage.staged_db_path,
-                    stage_identity,
+                if coordinator.canonical_store_id != self._canonical_store_id:
+                    raise MigrationPreflightError("IMPORT.COORDINATOR_MISMATCH")
+                prior_generation = coordinator.current_generation
+                if prior_generation is None:
+                    raise MigrationPreflightError(
+                        "IMPORT.ACTIVE_RESOURCE_REQUIRED"
+                    )
+                self._validate_source_preconditions(source)
+                if reservation is not None:
+                    rooted_source = reservation.open_portable_rooted_read(source, unavailable_code="MIGRATION.SOURCE_UNREADABLE")
+                    preflight = _scan_portable_jsonl(rooted_source)
+                else:
+                    preflight = _scan_jsonl(source)
+                origin_token = uuid.uuid4().hex
+                new_store_id = f"store.import.{origin_token}"
+                path_salt = uuid.uuid4().hex
+                if reservation is not None:
+                    reservation.reprove()
+                    path_salt = f"initial-import-{origin_token}"
+                    attempt = _freeze_initial_stage_attempt(
+                        _deterministic_stage_ref(self._resource_identity,
+                            source_digest=preflight.source_digest, stage_prefix="import", path_salt=path_salt),
+                        path_salt=path_salt, resource_reservation=reservation,
+                    )
+                stage, stage_identity, manifest_identity = self._build_stage(
+                    source,
+                    preflight=preflight,
+                    canonical_store_id=new_store_id,
+                    immediate_seal=True,
+                    batch_kind="import",
+                    batch_prefix="import",
+                    snapshot_prefix="snapshot.import",
+                    stage_prefix="import",
+                    path_salt=path_salt,
+                    initial_attempt=attempt,
+                    portable_source=rooted_source,
+                    batch_id=f"import.{origin_token}",
                 )
-            if prepared is not None:
-                return self._reconcile_failed_activation(
-                    error,
-                    prepared=prepared,
+                stage_label = "ACTIVATION"
+                sealed = coordinator._seal_stage(
+                    stage,
+                    canonical_store_id=new_store_id,
+                    expected_prior_generation=prior_generation,
+                    **({} if reservation is None else reservation.stage_seal_inputs(attempt)),
+                )
+                posix_inputs: _PosixActivationInputs = reservation.posix_activation_inputs(attempt) if reservation is not None and attempt is not None else {}
+                prepared = coordinator.activate_replacement(sealed, **posix_inputs)
+                handle = coordinator.publish_prepared_activation(prepared, **posix_inputs)
+                generation = coordinator.publish_activation(
+                    prepared, handle,
+                    **posix_inputs,
+                )
+                report = self._success_report(
+                    preflight=preflight,
                     sealed=sealed,
+                    canonical_store_id=new_store_id,
+                    generation=generation,
+                )
+                # The publication is durably READY: the same service instance
+                # adopts the fresh canonical store id so a second explicit
+                # import/rebuild of the identical bytes succeeds as the next
+                # generation without a caller-side service renewal.
+                self._canonical_store_id = new_store_id
+                return report
+            except Exception as error:
+                primary_error = error
+                if reservation is not None and not _is_initial_activation_operational_error(error):
+                    raise
+                if prepared is not None and reservation is not None:
+                    coordinator._stop_posix_recovery_admission()
+                    try:
+                        inputs = reservation.posix_recovery_inputs()
+                        coordinator.cancel_prepared_activation(prepared, **inputs)
+                        borrow = inputs["_posix_borrow"]
+                        if (borrow.capture(self._resource_identity.configured_jsonl_path).sha256 != source_before
+                                or borrow.capture(store_path).sha256 != store_before):
+                            raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+                        borrow.reprove()
+                        reservation._family_borrow._recovery_completed = True
+                    except Exception as cleanup_error:
+                        _append_owned_close_facts(error, cleanup_error, context="Cancellation failed")
+                        raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE") from error
+                    return MigrationFailure(
+                        stage=stage_label, error_code=_disambiguation_error_code(error),
+                        retryable=_disambiguation_retryable(error),
+                        diagnostics=() if preflight is None else preflight.diagnostics,
+                        active_generation=coordinator.current_generation,
+                        original_source_preservation=_unchanged_preservation(AssetKind.ORIGINAL_SOURCE, source_before),
+                        active_store_preservation=_unchanged_preservation(AssetKind.ACTIVE_STORE, store_before),
+                        recovery_locators=(),
+                    )
+                if (
+                    stage is not None
+                    and stage_identity is not None
+                    and sealed is None
+                ):
+                    if manifest_identity is not None:
+                        _remove_created_file(
+                            stage.manifest_temp_path,
+                            manifest_identity,
+                        )
+                    _remove_created_file(
+                        stage.staged_db_path,
+                        stage_identity,
+                    )
+                if prepared is not None:
+                    return self._reconcile_failed_activation(
+                        error,
+                        prepared=prepared,
+                        sealed=sealed,
+                        preflight=preflight,
+                        stage_label=stage_label,
+                        coordinator=coordinator,
+                        source_before=source_before,
+                        store_before=store_before,
+                        store_path=store_path,
+                        new_store_id=new_store_id,
+                    )
+                return self._disambiguation_failure(
+                    error,
                     preflight=preflight,
                     stage_label=stage_label,
                     coordinator=coordinator,
                     source_before=source_before,
                     store_before=store_before,
                     store_path=store_path,
-                    new_store_id=new_store_id,
                 )
-            return self._disambiguation_failure(
-                error,
-                preflight=preflight,
-                stage_label=stage_label,
-                coordinator=coordinator,
-                source_before=source_before,
-                store_before=store_before,
-                store_path=store_path,
-            )
+        except BaseException as error:
+            # Include reconciliation failures, but never a caller's handled error.
+            propagating_error = error
+            raise
+        finally:
+            try:
+                close_error = _close_initial_activation_authorities(
+                    rooted_source, attempt,
+                    primary=propagating_error if propagating_error is not None else primary_error,
+                )
+                if close_error is not None:
+                    if reservation is not None and reservation._family_borrow is not None:
+                        reservation._family_borrow._recovery_completed = False
+                        coordinator._stop_posix_recovery_admission(
+                            pending_close=lambda: _close_initial_activation_authorities(
+                                rooted_source, attempt, primary=None,
+                            ),
+                        )
+                    raise propagating_error if propagating_error is not None else close_error
+            finally:
+                if reservation is not None:
+                    reservation._initial_attempt = None
 
     def _portable_explicit_disambiguation(
         self,
@@ -9617,6 +10076,9 @@ class TMMigrationService:
             raise MigrationPreflightError(
                 "MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH"
             )
+        stage_borrow = None if initial_attempt is None else initial_attempt.stage_borrow
+        if stage_borrow is not None:
+            stage_borrow.reprove_sql(stage.staged_db_path, "builder")
         platform_initial = (
             initial_attempt is not None
             and initial_attempt.platform_backend is not None
@@ -9642,6 +10104,7 @@ class TMMigrationService:
         initialize_stage_schema(
             stage,
             canonical_store_id=canonical_store_id,
+            _stage_borrow=stage_borrow,
             _caller_reservation=(
                 initial_attempt.stage_reservation
                 if platform_initial and initial_attempt is not None
@@ -9665,6 +10128,7 @@ class TMMigrationService:
             store = SQLiteTMStore(
                 stage,
                 canonical_store_id=canonical_store_id,
+                _stage_borrow=stage_borrow,
             )
             observation = _StreamingBuildObservation()
             drafts = (
@@ -10118,6 +10582,16 @@ def _deterministic_stage_ref(
     )
 
 
+class _StageSealInputs(TypedDict):
+    platform: PlatformFileBackend | None
+    caller_borrow: _CallerHeldSealBorrow | None
+    recovery_profile: _RecoveryProfile
+
+
+class _PosixActivationInputs(TypedDict, total=False):
+    _posix_borrow: _CallerHeldPosixActivationBorrow
+
+
 class _InitialActivationResourceReservation:
     """Persistent per-sidecar advisory lock held across initial activation.
 
@@ -10130,6 +10604,10 @@ class _InitialActivationResourceReservation:
     """
 
     __slots__ = (
+        "_family_borrow",
+        "_activation_borrows",
+        "_recovery_profile",
+        "_family_coordinator",
         "_descriptor",
         "_backend",
         "_fcntl",
@@ -10144,6 +10622,8 @@ class _InitialActivationResourceReservation:
         "_recovery_borrow_minted",
         "_initial_attempt",
         "_last_reproved_base_generation",
+        "_published_initial_generation",
+        "_completed_initial_recovery",
     )
 
     def __init__(
@@ -10157,7 +10637,14 @@ class _InitialActivationResourceReservation:
         backend: PlatformFileBackend | None = None,
         root: RootedDirectoryAuthority | None = None,
         lease: LockLease | None = None,
+        recovery_profile: _RecoveryProfile | None = None,
     ) -> None:
+        if recovery_profile is not None and type(recovery_profile) is not _RecoveryProfile:
+            raise TypeError("recovery_profile must be exact _RecoveryProfile or None")
+        self._recovery_profile = _select_recovery_profile() if recovery_profile is None else recovery_profile
+        self._family_borrow: _ResourceOperationBorrow | None = None
+        self._activation_borrows: list[_CallerHeldPosixActivationBorrow] = []
+        self._family_coordinator: ResourceStoreCoordinator | None = None
         self._identity = identity
         self._parent = parent
         self._descriptor = descriptor
@@ -10171,21 +10658,50 @@ class _InitialActivationResourceReservation:
         self._journal_borrow_minted = False
         self._recovery_borrow_minted = False
         self._initial_attempt: _InitialStageAttempt | None = None
+        self._published_initial_generation: int | None = None
+        self._completed_initial_recovery: ActivationRecoveryReport | None = None
         self._last_reproved_base_generation: (
             _PortablePublicationPhaseRecord | None
         ) = None
+
+    @classmethod
+    def borrow_existing(
+        cls,
+        coordinator: ResourceStoreCoordinator,
+        borrow: _ResourceOperationBorrow,
+        *, recovery_profile: _RecoveryProfile | None = None,
+    ) -> _InitialActivationResourceReservation:
+        """Consume an outer transition's authority without reacquiring W1."""
+        if type(borrow) is not _ResourceOperationBorrow:
+            raise TypeError("borrow must be exact resource operation borrow")
+        borrow.reprove(coordinator)
+        family = coordinator._family
+        if family is None or family._state != "ACTIVATING":
+            raise _InitialActivationReservationError("MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE")
+        reservation = cls(
+            identity=coordinator._resource_identity, parent=None, descriptor=-1,
+            lock_name=family._lock_name, fcntl_module=None,
+            backend=family._backend, root=family._root, lease=borrow._lease,
+            recovery_profile=recovery_profile,
+        )
+        reservation._family_borrow = borrow
+        reservation._family_coordinator = coordinator
+        reservation.reprove()
+        return reservation
 
     @classmethod
     def acquire_with_backend(
         cls,
         identity: CanonicalResourceIdentity,
         backend: PlatformFileBackend,
+        *, recovery_profile: _RecoveryProfile | None = None,
     ) -> _InitialActivationResourceReservation:
         """Acquire one reservation through the shared rooted/lock ports."""
 
         return cls._acquire_with_backend(
             identity,
             backend,
+            recovery_profile=recovery_profile,
             existing_only=False,
         )
 
@@ -10194,12 +10710,14 @@ class _InitialActivationResourceReservation:
         cls,
         identity: CanonicalResourceIdentity,
         backend: PlatformFileBackend,
+        *, recovery_profile: _RecoveryProfile | None = None,
     ) -> _InitialActivationResourceReservation:
         """Acquire one exact existing W1 without creating or upgrading it."""
 
         return cls._acquire_with_backend(
             identity,
             backend,
+            recovery_profile=recovery_profile,
             existing_only=True,
         )
 
@@ -10210,6 +10728,7 @@ class _InitialActivationResourceReservation:
         backend: PlatformFileBackend,
         *,
         existing_only: bool,
+        recovery_profile: _RecoveryProfile | None = None,
     ) -> _InitialActivationResourceReservation:
         if type(existing_only) is not bool:
             raise TypeError("existing_only must be exact bool")
@@ -10255,6 +10774,7 @@ class _InitialActivationResourceReservation:
                 backend=backend,
                 root=root,
                 lease=lease,
+                recovery_profile=recovery_profile,
             )
             reservation.reprove()
             root = None
@@ -10490,6 +11010,14 @@ class _InitialActivationResourceReservation:
             raise _InitialActivationReservationError(
                 "MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE"
             )
+        if self._family_borrow is not None:
+            coordinator = self._family_coordinator
+            if coordinator is None:
+                raise _InitialActivationReservationError("MIGRATION.INITIAL_RESOURCE_LOCK_UNAVAILABLE")
+            self._family_borrow.reprove(coordinator)
+            assert self._root is not None and self._lease is not None
+            self._lease.reprove_binding(self._root, self._lock_name, self._payload(self._identity))
+            return
         if self._backend is not None:
             try:
                 if self._root is None or self._lease is None:
@@ -10679,11 +11207,14 @@ class _InitialActivationResourceReservation:
     def stage_seal_inputs(
         self,
         attempt: _InitialStageAttempt | None = None,
-    ) -> dict[str, object]:
+    ) -> _StageSealInputs:
         """Mint one non-closing portable seal borrow from the held reservation."""
 
         if self._backend is None:
-            return {"platform": None, "caller_borrow": None}
+            return {"platform": None, "caller_borrow": None, "recovery_profile": self._recovery_profile}
+        if attempt is not None and attempt is self._initial_attempt and attempt.stage_borrow is not None:
+            attempt.stage_borrow.reprove(self._backend, attempt.stage)
+            return {"platform": self._backend, "caller_borrow": attempt.stage_borrow, "recovery_profile": self._recovery_profile}
         if (
             self._released
             or self._root is None
@@ -10707,9 +11238,20 @@ class _InitialActivationResourceReservation:
                 raise _InitialActivationReservationError(
                     "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
                 )
+
+        def reprove_owner() -> None:
+            try:
+                self.reprove()
+            except _InitialActivationReservationError as error:
+                if type(error) is not _InitialActivationReservationError:
+                    raise
+                raise StageSealError("SEALER.ATTESTATION_UNAVAILABLE") from error
+
         try:
             borrow: _CallerHeldSealBorrow = _create_caller_held_seal_borrow(
                 identity=self._identity,
+                owner_reproof=reprove_owner,
+                owner_failure=(self._family_borrow._family.fail if self._family_borrow is not None else None),
                 platform=self._backend,
                 root=self._root,
                 lease=self._lease,
@@ -10728,7 +11270,93 @@ class _InitialActivationResourceReservation:
                 "MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN"
             ) from error
         self._stage_borrow_minted = True
-        return {"platform": self._backend, "caller_borrow": borrow}
+        if attempt is not None:
+            attempt.stage_borrow = borrow
+        return {"platform": self._backend, "caller_borrow": borrow, "recovery_profile": self._recovery_profile}
+
+    def _defer_posix_owned_close(self, close: Callable[[], BaseException | None]) -> None:
+        coordinator = self._family_coordinator
+        if coordinator is None:
+            raise MigrationPreflightError("MIGRATION.INITIAL_RECOVERY_REQUIRED")
+        coordinator._stop_posix_recovery_admission(pending_close=close)
+
+    def posix_recovery_inputs(self) -> _PosixActivationInputs:
+        if self._family_borrow is None:
+            return {}
+        self.reprove()
+        if self._recovery_profile is not _RecoveryProfile.POSIX_V2 or self._backend is None or self._root is None or self._lease is None:
+            raise MigrationPreflightError("MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN")
+        def no_fresh_stage(expected: ContentFileProof) -> CandidateFile:
+            raise MigrationPreflightError("MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN")
+        borrow = _CallerHeldPosixActivationBorrow(
+            identity=self._identity, backend=self._backend, root=self._root,
+            lease=self._lease, owner_reproof=self.reprove,
+            owner_failure=self._family_borrow._family.fail,
+            defer_close=self._defer_posix_owned_close,
+            handoff_stage=no_fresh_stage,
+        )
+        self._activation_borrows.append(borrow)
+        return {"_posix_borrow": borrow}
+
+    def posix_activation_inputs(
+        self, attempt: _InitialStageAttempt,
+    ) -> _PosixActivationInputs:
+        if self._family_borrow is None:
+            return {}
+        self.reprove()
+        if (self._recovery_profile is not _RecoveryProfile.POSIX_V2
+                or attempt is not self._initial_attempt
+                or attempt.stage.resource_identity != self._identity
+                or self._backend is None or self._root is None or self._lease is None):
+            raise MigrationPreflightError("MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN")
+        activation_borrow = _CallerHeldPosixActivationBorrow(
+            identity=self._identity, backend=self._backend,
+            root=self._root, lease=self._lease, owner_reproof=self.reprove,
+            owner_failure=self._family_borrow._family.fail,
+            defer_close=self._defer_posix_owned_close,
+            handoff_stage=lambda expected: self.handoff_stage_candidate(attempt, expected),
+            handoff_manifest=lambda expected: self.handoff_manifest_candidate(attempt, expected),
+        )
+        self._activation_borrows.append(activation_borrow)
+        return {"_posix_borrow": activation_borrow}
+
+    def handoff_stage_candidate(
+        self, attempt: _InitialStageAttempt, expected: ContentFileProof,
+    ) -> CandidateFile:
+        self.reprove()
+        if (self._recovery_profile is not _RecoveryProfile.POSIX_V2
+                or attempt is not self._initial_attempt
+                or attempt.stage.resource_identity != self._identity
+                or attempt.platform_parent is not self._root
+                or attempt.platform_backend is not self._backend
+                or attempt.stage_borrow is None
+                or attempt.stage_reservation is None
+                or self._lease is None or self._root is None
+                or not isinstance(self._backend, PosixStageHandoff)):
+            raise MigrationPreflightError("MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN")
+        attempt.stage_borrow.reprove(self._backend, attempt.stage)
+        attempt.stage_borrow.require_sealed_handoff(expected)
+        if attempt.stage_borrow.capture_posix(attempt.stage.staged_db_path) != expected:
+            raise MigrationPreflightError("MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH")
+        self._lease.reprove_binding(self._root, self._lock_name, self._payload(self._identity))
+        candidate = self._backend.handoff_stage(
+            attempt.stage_reservation, owner_lease=self._lease,
+            expected_content=CandidateContentFacts(expected.size, bytes.fromhex(expected.sha256)),
+        )
+        attempt.stage_reservation = None
+        attempt.stage_borrow._release()
+        return candidate
+
+    def handoff_manifest_candidate(self, attempt: _InitialStageAttempt, expected: ContentFileProof) -> CandidateFile:
+        self.reprove()
+        if (attempt is not self._initial_attempt or attempt.manifest_reservation is None
+                or self._lease is None or self._root is None
+                or not isinstance(self._backend, PosixStageHandoff)):
+            raise MigrationPreflightError("MIGRATION.INITIAL_STAGE_IDENTITY_UNPROVEN")
+        candidate = self._backend.handoff_stage(attempt.manifest_reservation, owner_lease=self._lease,
+            expected_content=CandidateContentFacts(expected.size, bytes.fromhex(expected.sha256)))
+        attempt.manifest_reservation = None
+        return candidate
 
     def portable_journal_inputs(self) -> dict[str, object]:
         """Mint one non-closing v3 journal borrow from the held W1 owner."""
@@ -10991,6 +11619,16 @@ class _InitialActivationResourceReservation:
         """Release advisory ownership; never unlink the persistent file."""
 
         if self._released:
+            return
+        for borrow in self._activation_borrows:
+            borrow.release()
+        self._activation_borrows.clear()
+        if self._family_borrow is not None:
+            try:
+                self.reprove()
+            finally:
+                self._released = True
+                self._last_reproved_base_generation = None
             return
         self._released = True
         self._last_reproved_base_generation = None
@@ -11490,10 +12128,49 @@ def _reprove_initial_stage_ownership(attempt: _InitialStageAttempt) -> None:
         ) from error
 
 
+def _close_initial_activation_authorities(
+    source: _PortableRootedRead | None,
+    attempt: _InitialStageAttempt | None,
+    *,
+    primary: BaseException | None,
+) -> BaseException | None:
+    """Report all owned close failures to the exact operation's outer owner."""
+
+    # The reader close seam can fail before its authority is closed. The
+    # authority owns idempotent close; never retry a raw descriptor close.
+    failures: list[BaseException] = []
+    for authority in (source, None if source is None else source.authority):
+        if authority is not None:
+            try:
+                authority.close()
+            except BaseException as error:
+                failures.append(error)
+    try:
+        if attempt is not None:
+            _close_initial_stage_attempt_authorities(attempt)
+    except BaseException as error:
+        failures.append(error)
+    first_error = failures[0] if failures else None
+    if isinstance(first_error, PlatformFileError):
+        # Platform errors are body-free. Keep the exact platform cause while
+        # the migration carrier retains secondary closes and operation facts.
+        carrier = MigrationPreflightError("MIGRATION.INITIAL_RECOVERY_REQUIRED")
+        carrier.__cause__ = first_error
+        first_error = carrier
+    if first_error is not None:
+        for error in failures[1:]:
+            _append_owned_close_facts(first_error, error, context="Additional activation close failed")
+    if first_error is not None and primary is not None:
+        _append_owned_close_facts(first_error, primary, context="Activation operation failed")
+        if not isinstance(primary, PlatformFileError):
+            _append_owned_close_facts(primary, first_error, context="Activation authority close failed")
+    return first_error
+
+
 def _close_initial_stage_attempt_authorities(
     attempt: _InitialStageAttempt,
 ) -> None:
-    """Close every live build/retirement authority exactly once."""
+    """Close every live build/retirement authority, preserving failed attempts."""
 
     first_error: BaseException | None = None
     for retirement_name, reservation_name in (
@@ -11508,22 +12185,30 @@ def _close_initial_stage_attempt_authorities(
             MutableFileReservation | None,
             getattr(attempt, reservation_name),
         )
+        authority = retirement if retirement is not None else reservation
         try:
-            if retirement is not None:
-                retirement.close()
-            elif reservation is not None:
-                reservation.close()
+            if authority is not None:
+                authority.close()
         except BaseException as error:
             if first_error is None:
                 first_error = error
+                if isinstance(error, (PlatformFileError, OSError)):
+                    first_error = MigrationPreflightError("MIGRATION.INITIAL_RECOVERY_REQUIRED")
+                    first_error.__cause__ = error
+            else:
+                first_error.add_note(f"Additional stage close failed: {type(error).__name__}: {error}")
+            # A wrapper can fail before reaching the idempotent authority.
+            # Retry only while it remains open, never a raw descriptor close.
+            if authority is not None and not authority.closed:
+                try:
+                    authority.close()
+                except BaseException as retry_error:
+                    first_error.add_note(f"Stage authority close remained incomplete: {type(retry_error).__name__}: {retry_error}")
         finally:
-            setattr(attempt, retirement_name, None)
-            setattr(attempt, reservation_name, None)
+            if authority is None or authority.closed:
+                setattr(attempt, retirement_name, None)
+                setattr(attempt, reservation_name, None)
     if first_error is not None:
-        if isinstance(first_error, (PlatformFileError, OSError)):
-            raise MigrationPreflightError(
-                "MIGRATION.INITIAL_RECOVERY_REQUIRED"
-            ) from first_error
         raise first_error
 
 
@@ -11555,6 +12240,9 @@ def _freeze_initial_stage_attempt(
             raise TypeError(
                 "resource_reservation must be exact initial reservation or None"
             )
+        if stage.resource_identity != resource_reservation._identity:
+            raise MigrationPreflightError("MIGRATION.INITIAL_STAGE_IDENTITY_MISMATCH")
+        resource_reservation.reprove()
         backend = resource_reservation._backend
         root = resource_reservation._root
         if backend is not None:
@@ -11572,6 +12260,7 @@ def _freeze_initial_stage_attempt(
                 ),
                 platform_backend=backend,
                 platform_parent=root,
+                recovery_profile=resource_reservation._recovery_profile,
             )
             resource_reservation._initial_attempt = attempt
             try:
@@ -11596,6 +12285,7 @@ def _freeze_initial_stage_attempt(
                 )
                 attempt.manifest_reservation.identity()
                 resource_reservation.reprove()
+                resource_reservation.stage_seal_inputs(attempt)
                 return attempt
             except BaseException as error:
                 try:

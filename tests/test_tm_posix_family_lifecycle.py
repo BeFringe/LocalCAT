@@ -352,9 +352,17 @@ class PosixFamilyLifecycleTests(unittest.TestCase):
 
         configured = _activate_resource(self.root)
         gc.collect()
-        with patch("tm_engine._rehydrate_canonical_runtime_authority", side_effect=OSError("failure")):
+        calls = []
+        def failed_rehydrate(coordinator, *, _borrow=None):
+            self.assertIsNotNone(_borrow)
+            _borrow.reprove(coordinator)
+            calls.append(coordinator)
+            raise OSError("failure")
+        with patch.object(ResourceStoreCoordinator, "rehydrate_runtime_authority", failed_rehydrate):
             with self.assertRaises(ValueError):
                 TMEngine(str(configured))
+        self.assertEqual(len(calls), 1)
+        calls.clear()
         gc.collect()
         self.assertNotIn(configured, tm_sqlite_store._FAMILY_SESSIONS)
 

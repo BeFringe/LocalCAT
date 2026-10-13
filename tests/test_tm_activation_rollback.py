@@ -21,6 +21,7 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import sqlite3
+from platform_fs_contracts import CandidateFile
 import tempfile
 from typing import Any
 import unittest
@@ -167,6 +168,33 @@ def _assert_first_activation_rolled_back(
     )
 
 
+def _assert_unprovable_preservation_stops(test, identity, record, journal_path, code):
+    """Keep the first failure and every retry inside the original journal."""
+    paths = {journal_path, _activation_terminal_path(identity), identity.configured_jsonl_path,
+             identity.canonical_sidecar_path, identity.snapshot_manifest_path,
+             record.candidate_stage_db_path, record.candidate_manifest_temp_path}
+    paths.update(path for path in (record.prior_db_path, record.prior_manifest_path,
+                 record.prior_db_backup_path, record.prior_manifest_backup_path) if path is not None)
+    def snapshot():
+        quarantine = _activation_quarantine_directory(identity, record)
+        result = {str(path): path.read_bytes() if path.exists() else None for path in paths}
+        result.update({str(path): path.read_bytes() for path in quarantine.rglob('*') if path.is_file()})
+        return result
+    before = snapshot()
+    for _ in range(2):
+        fresh = _fresh(identity)
+        try:
+            with test.assertRaises(ActivationPreparationError) as raised:
+                fresh.recover_durable_activation()
+            test.assertEqual(raised.exception.code, code)
+            test.assertFalse(raised.exception.retryable)
+            test.assertEqual(fresh.state, 'ACTIVATING')
+            test.assertTrue(fresh._family._recovery_required)
+            test.assertEqual(snapshot(), before)
+        finally:
+            fresh.close_family_session()
+
+
 class RollbackFirstActivationTests(unittest.TestCase):
     def test_prepared_phase_rolls_back_to_legacy_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -223,6 +251,9 @@ class RollbackFirstActivationTests(unittest.TestCase):
             _db_replaced_window(coordinator, prepared, journal)
             self.assertIs(_phase(journal_path), DB_REPLACED)
             record.candidate_manifest_temp_path.write_bytes(b"tampered")
+            if os.name != 'nt':
+                _assert_unprovable_preservation_stops(self, identity, record, journal_path, 'ACTIVATION.QUARANTINE_FOREIGN')
+                return
             source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
             self.assertEqual(
@@ -276,6 +307,9 @@ class RollbackFirstActivationTests(unittest.TestCase):
             self.assertTrue(identity.canonical_sidecar_path.is_file())
             self.assertTrue(identity.snapshot_manifest_path.is_file())
             identity.canonical_sidecar_path.unlink()
+            if os.name != 'nt':
+                _assert_unprovable_preservation_stops(self, identity, record, journal_path, 'ACTIVATION.QUARANTINE_MISSING')
+                return
             source_bytes = identity.configured_jsonl_path.read_bytes()
             recovered = _fresh(identity)
             self.assertEqual(
@@ -437,6 +471,9 @@ class RollbackFirstActivationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             identity.canonical_sidecar_path.unlink()
+            if os.name != 'nt':
+                _assert_unprovable_preservation_stops(self, identity, generation_record, journal_path, 'ACTIVATION.RECOVERY_ACTIVE_SET_INVALID')
+                return
             source_bytes = identity.configured_jsonl_path.read_bytes()
 
             recovered = _fresh(identity)
@@ -580,6 +617,9 @@ class RollbackExistingCanonicalTests(unittest.TestCase):
             _db_replaced_window(coordinator, prepared, journal)
             self.assertIs(_phase(journal_path), DB_REPLACED)
             record.candidate_manifest_temp_path.write_bytes(b"tampered")
+            if os.name != 'nt':
+                _assert_unprovable_preservation_stops(self, identity, record, journal_path, 'ACTIVATION.QUARANTINE_FOREIGN')
+                return
             recovered = self._assert_prior_restored(
                 identity,
                 record,
@@ -619,6 +659,9 @@ class RollbackExistingCanonicalTests(unittest.TestCase):
             _manifest_published_window(coordinator, prepared, journal)
             self.assertIs(_phase(journal_path), MANIFEST_PUBLISHED)
             identity.canonical_sidecar_path.unlink()
+            if os.name != 'nt':
+                _assert_unprovable_preservation_stops(self, identity, record, journal_path, 'ACTIVATION.QUARANTINE_MISSING')
+                return
             self._assert_prior_restored(
                 identity,
                 record,
@@ -888,16 +931,22 @@ class RollbackCrashResumeTests(unittest.TestCase):
             )
             recovered = _fresh(identity)
 
-            def fail_quarantine_fsync(path: Path) -> None:
+            hits = []
+            real_fsync = os.fsync
+            def fail_quarantine_fsync(descriptor: int) -> None:
+                if quarantine_dir.parent.exists() and os.fstat(descriptor).st_ino == quarantine_dir.parent.stat().st_ino:
+                    hits.append(True)
+                    raise OSError("injected quarantine fsync")
+                real_fsync(descriptor)
+
+            def fail_legacy_quarantine_fsync(path):
                 if path == quarantine_dir.parent:
                     raise OSError("injected quarantine fsync")
-
-            with patch(
-                "tm_activation_journal._fsync_activation_directory",
-                side_effect=fail_quarantine_fsync,
-            ):
+            with (patch("platform_fs_posix.os.fsync", side_effect=fail_quarantine_fsync) if os.name != "nt" else patch("tm_activation_journal._fsync_activation_directory", side_effect=fail_legacy_quarantine_fsync)):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     recovered.recover_durable_activation()
+            if os.name != "nt":
+                self.assertTrue(hits)
             self.assertEqual(
                 raised.exception.code,
                 "ACTIVATION.QUARANTINE_FAILED",
@@ -935,12 +984,10 @@ class RollbackCrashResumeTests(unittest.TestCase):
                 prior_db_bytes,
             ) = self._existing_prior_missing_base(root)
             recovered = _fresh(identity)
-            with patch(
-                "tm_activation_recovery._fsync_recovery_backup",
-                side_effect=OSError("injected"),
-            ):
+            with (patch.object(CandidateFile, "flush_content", side_effect=OSError("injected")) if os.name != "nt" else patch("tm_activation_recovery._fsync_recovery_backup", side_effect=OSError("injected"))) as failed_flush:
                 with self.assertRaises(ActivationPreparationError) as raised:
                     recovered.recover_durable_activation()
+            failed_flush.assert_called_once()
             self.assertEqual(
                 raised.exception.code,
                 "ACTIVATION.ROLLBACK_RESTORE_FAILED",
@@ -1052,12 +1099,19 @@ class RollbackCrashResumeTests(unittest.TestCase):
                 prior_db_bytes,
             ) = self._existing_prior_missing_base(root)
             recovered = _fresh(identity)
-            with patch(
-                "tm_activation_journal._unlink_recovery_backup",
-                side_effect=OSError("injected"),
-            ):
+            root_type = type(recovered._family._root) if os.name != "nt" else None
+            original_unlink = root_type.unlink_owned if root_type is not None else None
+            hits = []
+            def fail_backup_unlink(root, name, expected):
+                if str(name) in {record.prior_db_backup_path.name, record.prior_manifest_backup_path.name}:
+                    hits.append(str(name))
+                    raise OSError("injected")
+                return original_unlink(root, name, expected)
+            with (patch.object(root_type, "unlink_owned", fail_backup_unlink) if root_type is not None else patch("tm_activation_journal._unlink_recovery_backup", side_effect=OSError("injected"))):
                 with self.assertRaises(ActivationPreparationError) as raised:
                     recovered.recover_durable_activation()
+            if os.name != "nt":
+                self.assertEqual(hits, [record.prior_db_backup_path.name])
             self.assertEqual(
                 raised.exception.code,
                 "ACTIVATION.RECOVERY_CLEANUP_FAILED",
@@ -1203,14 +1257,20 @@ class RollbackEntryPointTests(unittest.TestCase):
     def test_operations_gated_until_rollback_completes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (
-                identity,
-                store,
-                coordinator,
-                _stage,
-                sealed,
-            ) = _existing_fixture(root, fts5_available=True)
-            prepared = coordinator.activate(sealed)
+            from tests.test_tm_initial_activation_rollback import _fixture
+            from tm_contracts import MigrationReport
+            from tm_migration import _scan_jsonl
+            identity, coordinator, service = _fixture(root)
+            self.assertIs(type(service.activate_initial(identity.configured_jsonl_path, identity.resource_id)), MigrationReport)
+            preflight = _scan_jsonl(identity.configured_jsonl_path)
+            stage, _, _ = service._build_stage(
+                identity.configured_jsonl_path, preflight=preflight,
+                canonical_store_id="store.replacement", immediate_seal=False,
+                batch_kind="import", batch_prefix="import", snapshot_prefix="snapshot.import",
+                stage_prefix="import", path_salt="rollback-test", batch_id="import." + "a" * 32,
+            )
+            sealed = coordinator._seal_stage(stage, canonical_store_id="store.replacement", expected_prior_generation=0)
+            prepared = coordinator.activate_replacement(sealed)
             journal = coordinator.publish_prepared_activation(prepared)
             record = journal._record
             prior_db_path = record.prior_db_path
@@ -1240,6 +1300,16 @@ class RollbackEntryPointTests(unittest.TestCase):
                 prior_db_path.read_bytes(),
                 prior_db_bytes,
             )
+            recovered.close_family_session()
+            coordinator.close_family_session()
+            fresh = _fresh(identity)
+            try:
+                self.assertEqual(fresh.recover_durable_activation().generation, 0)
+                self.assertEqual(prior_db_path.read_bytes(), prior_db_bytes)
+                with fresh._operation_lease():
+                    pass
+            finally:
+                fresh.close_family_session()
 
 
 class RollbackReportTests(unittest.TestCase):

@@ -632,35 +632,35 @@
   - _Depends: windows-platform-enablement 11.1_
   - _Requirements: 2.10, 4.7, 7.15, 7.16, 7.17_
 
-- [ ] 10.2a 验证家族生命周期的有限机制
+- [x] 10.2a 验证家族生命周期的有限机制
   - 在隔离候选中用少量合成记录验证真实已激活store的query/append、lazy view、嵌套health、replacement reservation与已登记家族的并发factory；同家族W1不递归、不自等drain，等待后旧generation不得写新DB，raw close不得破坏活SQL锁，等待有界且count/句柄闭合。
   - 完成时，双coordinator/双进程及timeout/cancel得到真实机制证据；该结果只允许进入10.3–10.6，不启用日常公开入口，不代表首次激活或全部cold入口完成。正常场景出现超出后续明确前置的缺口时停止并报告，不以mock提前抛错替代continuation。
   - _Boundary: Core store/query view/health 与 reservation 的有限机制验证_
   - _Depends: 10.1_
   - _Requirements: 2.10, 4.7, 7.5, 7.15, 7.16_
 
-- [ ] 10.3 接入POSIX分派、builder与v2 seal
+- [x] 10.3 接入POSIX分派、builder与v2 seal
   - initial reservation 在首次stage动作前由原家族transition停止准入并drain，取得一次W1，向builder/schema/stage SQL/sealer显式借用；不得先持raw W1再drain。通用backend保留，POSIX_V2与WINDOWS_V3一次选择并覆盖真实消费者；Windows专用capability失败不得fallback。全部stage SQL/statement/backup关闭后才raw capture，不copy冒充POSIX seal。
   - 完成时，正确profile覆盖真实builder/schema初始化、阶段写入和seal；原reservation同对象交接，格式不变，SQL结束后才raw观察；Windows仍使用真实private capability。
   - _Boundary: Core migration/sealer/content 集成_
   - _Depends: 10.2a, windows-platform-enablement 11.2, windows-platform-enablement 11.3_
   - _Requirements: 2.4, 2.9, 2.12, 7.14, 7.15_
 
-- [ ] 10.4 接通DB命名与receipt SQL交接
+- [x] 10.4 接通DB命名与receipt SQL交接
   - DB pending 原 readback 仍 live 时取得 guard 并比较双方 live identity；pending terminal 与 close 全部成功后才能 receipt SQL。SQL/statement/backup 关闭后 final capture 与 guard 同时 live 比较，随后关闭 guard；保留原 root/W1，不改 preliminary 或新增 phase。
   - 完成时，真实DB_REPLACED journal持久复证→live guard交接→pending terminal/close→SQL→final capture；命名terminal不报activation成功；交接失败保留真实phase。
   - _Boundary: activation recovery 的 DB I/O/receipt 端口_
   - _Depends: 10.3, windows-platform-enablement 11.4_
   - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.14, 7.15, 7.16_
 
-- [ ] 10.5 接通正常activation其余应用发布
+- [x] 10.5 接通正常activation其余应用发布
   - 仅接fresh create/replace必经的既有owner端口与直接调用者，前移source mutation至家族排空后；source pending与registry/receipt callback闭合条件保留。terminal health/revision/query lease、nested health与callback显式借原root/W1，内部不得重取W1或持condition等待OS锁；不复制activation状态机。
   - 完成时，fresh create及已有generation replace必经的source/manifest/journal/lineage/backup/terminal都借原root；完整正常Core调用能走到底；排空前不改source，失败不裸路径清理。
   - _Boundary: activation journal/recovery 正常发布 I/O 端口_
   - _Depends: 10.4_
   - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.13, 7.14, 7.16_
 
-- [ ] 10.6 接入DB_REPLACED恢复并验证v2窄旅程
+- [x] 10.6 接入DB_REPLACED恢复并验证v2窄旅程
   - 以平台 11.2–11.4a 和 Core 10.3–10.6 的真实切片完成 v2 同对象门；原 root/W1 连续且 clone 不被接管。proof/交接/正常恢复缺口触发停止，不靠后置消费者、mock 提前抛错或旧 pathname 路线通过。
   - 完成时，receipt前、commit后/manifest前两个窗口经真实cold recovery闭合；普通父目录中的无关目录/链接不阻断恢复，重复恢复不多增generation；create/replace→receipt→cold query完成设计中的v2门。
   - 借原root/W1完整观察schema pending名字，仅无匹配时跳过schema收尾；匹配项（包括目录、链接或畸形token）及不完整观察均保留并明确拒绝。实际pending恢复继续由10.8接入。
@@ -668,7 +668,7 @@
   - _Depends: 10.5, windows-platform-enablement 11.4a_
   - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.14, 7.15, 7.16_
 
-- [ ] 10.6a 接通DB命名前的取消与家族终态
+- [x] 10.6a 接通DB命名前的取消与家族终态
   - 初次激活与替换借原root/W1接通既有取消owner；正式journal未发布或为PREPARED时，先复证完整prior/legacy authority与DB尚未命名，不能由phase或缺失handle直接推定可取消。
   - source/prior按既有内容分歧合同复证，本attempt的journal temp、backup、candidate、terminal按原owner收尾，取消记录支持重复恢复；不得退休未知对象、重新绑定同路径或绕过Windows专用能力。初次激活取消使用正确POSIX legacy复证。
   - 未完成取消/恢复的attempt停止整个资源家族新操作；durable terminal、owned收尾、prior/legacy及外层root/W1收尾均成功才恢复准入。失败保留primary与恢复事实，DB命名/commit不明保持完整恢复或recovery-only。
@@ -677,7 +677,7 @@
   - _Depends: 10.6, windows-platform-enablement 11.4b, windows-platform-enablement 11.4c, windows-platform-enablement 11.4d_
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.5, 7.13, 7.14, 7.15, 7.16_
 
-- [ ] 10.2b 启用公开生命周期并复核兼容
+- [x] 10.2b 启用公开生命周期并复核兼容
   - 在10.3–10.6a已完成initial reservation、builder/seal、同对象发布、receipt/recovery、未命名取消及terminal health/revision/query lease借用的基础上统一启用公开生命周期；本任务不提供v2门所需的前置接线。
   - 完成时，真实首次激活、替换、失败后last-known-good与既有公开查询/写回回归通过；复跑10.2a及v2门，删除隔离候选的临时测试门控后才启用公开入口。缺口不得以跳过health、放宽断言或伪造borrow处理。
   - _Boundary: Core initial reservation、runtime terminal与公开生命周期启用_
@@ -728,6 +728,28 @@
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.13, 7.14, 7.15, 7.16, 7.17, 7.18_
 
 ## Implementation Notes
+
+- Task 10.9／10.10：恢复期间持久 journal 可能已推进，自动回滚须复证原对象与当前记录，不能沿用入口阶段；已完成首次发布的 lineage 不能转成无 prior 的 legacy 终态。隔离资产仍按 stage／canonical receipt 角色核验，搬入隔离目录不改变其内容证明规则。
+
+- Task 10.2b／10.9：外层 root/W1 收尾失败会晚于真实发布或恢复完成；结果须连续保留这些可靠事实，不能由内存 generation 推断，也不能因关闭报错抹去已发布状态。cold SEALED 的 SQL 前字节检查与事务内语义闭包检查各有作用，不能用前者代替后者或在活 SQL 中恢复 raw FD 检查。
+
+- Task 10.6a／10.9：取消内部 reader、pending 与隔离目录的关闭失败也会遗留活对象；仅保留磁盘事实不足以恢复家族，须保留确切引用并先收尾。恢复异常映射可能返回原对象，再次以其自身作 cause 会抹掉真实关闭原因；后续已命名恢复和实际 rollback 的同形包装仍须核对。
+
+- Task 10.6a／10.9：合法 lineage pair 可沿原 root 读取，但不能用 single-link unlink 或 retirement 完成；原 ancestor W1 也不能代替 descendant ledger 的 exact-parent 锁。原 root 下读到预知名称不足以证明隔离目录无额外条目。
+
+- Task 10.6a：共同 PREPARED 终态也承载已完成 rollback；其隔离 DB 可已写入 receipt，terminal 不保留 active 摘要。已隔离失败资产只作保全，不能套用尚待退休 SEALED 候选的正文规则，也不成为活权威。最后关闭消费者须显式区分本次错误与调用者外层异常，不能靠 `sys.exception()`推定收尾已失败。
+
+- Task 10.6a／10.9：live creator-owned退休不能代替fresh process的既有文件退休；同父stage发布也不能完成原子跨目录隔离。取消候选的部分退休与已命名失败资产的隔离共用这一平台接缝；Core仍须分别证明完整业务记录、对象及内容关系，不能凭通用backend或持久inode假造创建者授权。
+
+- Task 10.2b：单个coordinator的ACTIVATING不能停止同家族peer写入；未发布正式journal也可能留下本attempt的owned temp。取消须覆盖这些临时件、prior/legacy复证与整个家族准入，PREPARED名称本身不能证明DB尚未命名。
+
+- Task 10.6：普通TM父目录可含无关子目录；严格ledger枚举会在筛选schema pending前拒绝，不能代替一般metadata观察。未发现本轮schema marker不证明历史pending不存在；目录观察须保留原root/W1，存在匹配项时由schema owner继续核验，不能跳过探测或重新绑定路径。
+
+- Task 10.5：新增rooted source reader的关闭失败不能截断stage与manifest reservation收尾，全部借用收尾后才能释放外层W1。备份候选从创建起就须登记清理身份；发布前可证失败清理自建temp，命名结果不明则保留文件与cleanup owner并停止新操作，不因prior/source未损坏而回到READY。
+
+- Task 10.4：批量 closure 扫描的异常 traceback 可保留未耗尽 cursor；`Connection.close()` 返回不等于 native statement 已结束。须由扫描 owner 确定关闭 cursor，再关闭 connection 和 POSIX guard；清理失败保留原业务错误。
+
+- Task 10.3：家族 admission/drain 的操作性失败发生在 reservation 正文之前，公开入口须沿各自原失败合同映射；进入正文后的错误不能被误报为准入失败。其他 SQL 使用者尚存活时，失败保全只核验原 root 的必要事实，不冷重绑或额外 raw 打开数据库。
 
 - Task 9.6b：合法非legacy provenance经导出后仍须按实际source逐项保真核对，不能硬编码为legacy来源。SQLite流式游标须在成功和异常路径都关闭，否则异常引用持有的游标会阻止Windows清理。
 

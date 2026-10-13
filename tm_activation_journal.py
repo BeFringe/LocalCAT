@@ -14,14 +14,20 @@ from collections.abc import Callable
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import sys
+import threading
+from typing import NoReturn
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path, PurePath
 
 import tm_contracts as contract_module
 from tm_content_attestation import (
+    ContentFileProof,
+    ContentAttestationError,
+    _capture_posix_bound_content,
     ActiveContentAttestation,
     PortableActiveContentAttestation,
     PortableContentFileProof,
@@ -47,11 +53,18 @@ from platform_fs_contracts import (
     BoundDirectoryAuthority,
     CandidateContentFacts,
     CandidateFile,
+    FileObjectIdentity,
     ExistingFileRetirement,
+    ExistingLinkPairCompletion,
+    ExistingFileMutationGuard,
+    BoundExistingFileMutationGuard,
     LedgerEnumerationLimits,
     LockLease,
     LockedDescendantNamespaceInspection,
     PendingPublication,
+    OpaqueAuthority,
+    PosixBoundContentObservation,
+    PosixStageHandoff,
     PersistentPrivateProof,
     PlatformFileBackend,
     PlatformFileError,
@@ -296,7 +309,8 @@ class _RecoveryBackupAsset:
 
 class _OwnedRecoveryPath:
     path: Path = field(repr=False, compare=False)
-    identity: _ActivationFileIdentity = field(repr=False, compare=False)
+    identity: _ActivationFileIdentity | None = field(repr=False, compare=False)
+    live_identity: FileObjectIdentity | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -807,6 +821,8 @@ def _activation_terminal_temp_path(terminal_path: Path) -> Path:
 
 def _lstat_activation_terminal_identity(
     path: Path,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _ActivationFileIdentity | None:
     """Regular-file terminal identity, None when absent, fail-closed otherwise.
 
@@ -815,6 +831,8 @@ def _lstat_activation_terminal_identity(
     never followed, used, or overwritten.
     """
 
+    if caller_borrow is not None:
+        return caller_borrow.file_identity(path)
     try:
         return _lstat_activation_journal_identity(path)
     except ActivationPreparationError as error:
@@ -858,6 +876,8 @@ def _activation_lineage_marker_temp_path(marker_path: Path) -> Path:
 
 def _lstat_activation_lineage_marker_identity(
     path: Path,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _ActivationFileIdentity | None:
     """Regular single-link marker identity, None when absent, fail-closed.
 
@@ -866,6 +886,11 @@ def _lstat_activation_lineage_marker_identity(
     followed, used, or overwritten.
     """
 
+    if caller_borrow is not None:
+        try:
+            return caller_borrow.file_identity(path)
+        except (PlatformFileError, OSError, ContentAttestationError) as error:
+            raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False) from error
     try:
         observed = os.lstat(path)
     except FileNotFoundError:
@@ -1438,6 +1463,8 @@ def _write_activation_lineage_marker_temp(
 
 def _activation_lineage_marker_state_complete(
     identity: CanonicalResourceIdentity,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _ActivationFileIdentity | None:
     """Strictly validate that one final/temp lineage-marker state is complete.
 
@@ -1454,6 +1481,38 @@ def _activation_lineage_marker_state_complete(
     fails closed.
     """
 
+    if caller_borrow is not None:
+        path = _activation_lineage_marker_path(identity)
+        temporary = _activation_lineage_marker_temp_path(path)
+        expected = _activation_lineage_marker_payload(identity)
+        try:
+            if caller_borrow.identity != identity:
+                raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+            caller_borrow.require_path(path)
+            caller_borrow.require_path(temporary)
+            has_temporary = caller_borrow.exists(temporary)
+            if not caller_borrow.exists(path):
+                if has_temporary:
+                    raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+                return None
+            if has_temporary:
+                backend = caller_borrow.backend
+                if not isinstance(backend, ExistingLinkPairCompletion):
+                    raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+                # Reprove the exact resource lock name/payload, not merely its
+                # shared parent, before the platform completes the old pair.
+                caller_borrow.reprove()
+                backend.complete_existing_link_pair(
+                    caller_borrow.root, caller_borrow.lease, path.name, temporary.name,
+                    CandidateContentFacts(len(expected), hashlib.sha256(expected).digest()),
+                )
+            payload, observed = caller_borrow.read_journal(path, None)
+            if payload != expected or caller_borrow.exists(temporary):
+                raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+            caller_borrow.reprove()
+            return observed
+        except (PlatformFileError, OSError, ContentAttestationError) as error:
+            raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False) from error
     marker_path = _activation_lineage_marker_path(identity)
     temp_path = _activation_lineage_marker_temp_path(marker_path)
     expected_bytes = _activation_lineage_marker_payload(identity)
@@ -1525,6 +1584,8 @@ def _activation_lineage_marker_state_complete(
 
 def _ensure_activation_lineage_marker(
     identity: CanonicalResourceIdentity,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Durably publish (or revalidate) the write-once activated-lineage marker.
 
@@ -1545,6 +1606,46 @@ def _ensure_activation_lineage_marker(
     never removed or overwritten.
     """
 
+    if caller_borrow is not None:
+        path = _activation_lineage_marker_path(identity)
+        temporary = _activation_lineage_marker_temp_path(path)
+        expected = _activation_lineage_marker_payload(identity)
+        if not caller_borrow.exists(path) and caller_borrow.exists(temporary):
+            borrow = caller_borrow
+            backend = borrow.backend
+            if not isinstance(backend, PosixStageHandoff):
+                raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+            try:
+                payload, original = borrow.read_journal(temporary, None)
+            except (PlatformFileError, ContentAttestationError) as error:
+                raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False) from error
+            if payload != expected:
+                raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+            content = CandidateContentFacts(len(expected), hashlib.sha256(expected).digest())
+            existing = backend.open_existing_stage(borrow.root, temporary.name, owner_lease=borrow.lease, expected_content=content)
+            candidate = pending = None
+            operation_error = None
+            try:
+                candidate = backend.handoff_stage(existing, owner_lease=borrow.lease, expected_content=content)
+                borrow.reprove()
+                pending = borrow.root.begin_publish(candidate, path.name, mode=PublishMode.CREATE_IF_ABSENT, lease=None)
+                candidate = None
+                if borrow.read_journal(path, original)[0] != expected:
+                    raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+                _ = pending.terminal_reproof()
+                borrow.reprove()
+            except BaseException as error:
+                operation_error = error
+                raise
+            finally:
+                close_error = borrow.close_owned(pending, candidate, existing, primary=operation_error)
+                if operation_error is None and close_error is not None:
+                    raise close_error
+        observed = _activation_lineage_marker_state_complete(identity, caller_borrow=caller_borrow)
+        if observed is None:
+            path = _activation_lineage_marker_path(identity)
+            caller_borrow.publish_bytes(path, _activation_lineage_marker_temp_path(path), _activation_lineage_marker_payload(identity))
+        return
     marker_path = _activation_lineage_marker_path(identity)
     temp_path = _activation_lineage_marker_temp_path(marker_path)
     expected_bytes = _activation_lineage_marker_payload(identity)
@@ -1608,7 +1709,9 @@ def _ensure_activation_lineage_marker(
 
 
 
-def _lstat_any_entry(path: Path) -> bool:
+def _lstat_any_entry(path: Path, *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None) -> bool:
+    if caller_borrow is not None:
+        return caller_borrow.exists(path)
     try:
         os.lstat(path)
     except FileNotFoundError:
@@ -1624,9 +1727,13 @@ def _lstat_any_entry(path: Path) -> bool:
 
 def _lstat_activation_journal_identity(
     path: Path,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _ActivationFileIdentity | None:
     """Regular-file identity, None when absent, fail-closed for other kinds."""
 
+    if caller_borrow is not None:
+        return caller_borrow.file_identity(path)
     try:
         observed = os.lstat(path)
     except FileNotFoundError:
@@ -1692,10 +1799,355 @@ def _close_activation_journal(descriptor: int) -> None:
 
 
 
+def _append_owned_close_facts(
+    primary: BaseException, error: BaseException, *, context: str = "Owned activation close failed",
+) -> None:
+    if primary is error:
+        return
+    seen: set[int] = set()
+    fact: BaseException | None = error
+    while fact is not None and fact is not primary and id(fact) not in seen:
+        seen.add(id(fact))
+        primary.add_note(f"{context}: {type(fact).__name__}: {fact}")
+        for note in tuple(getattr(fact, "__notes__", ())):
+            primary.add_note(note)
+        fact = fact.__cause__
+
+
+def _with_owned_close_facts(
+    primary: BaseException, error: BaseException, *, context: str = "Owned activation close failed",
+) -> BaseException:
+    """Add a second failure without mutating a body-free platform error."""
+    if primary is error:
+        return primary
+    if isinstance(primary, PlatformFileError):
+        carrier = ActivationPreparationError(
+            "ACTIVATION.RECOVERY_REQUIRED", retryable=True, reason_code=primary.code,
+        )
+        carrier.__cause__ = primary
+        _append_owned_close_facts(carrier, error, context=context)
+        return carrier
+    _append_owned_close_facts(primary, error, context=context)
+    return primary
+
+
+
+class _CallerHeldPosixActivationBorrow:
+    """One activation's non-closing borrow of the original family root/W1."""
+
+    def __init__(
+        self, *, identity: CanonicalResourceIdentity,
+        backend: PlatformFileBackend, root: RootedDirectoryAuthority,
+        lease: LockLease, owner_reproof: Callable[[], None],
+        owner_failure: Callable[[], None],
+        defer_close: Callable[[Callable[[], BaseException | None]], None],
+        handoff_stage: Callable[[ContentFileProof], CandidateFile],
+        handoff_manifest: Callable[[ContentFileProof], CandidateFile] | None = None,
+    ) -> None:
+        self.identity = identity
+        self.backend = backend
+        self.root = root
+        self.lease = lease
+        self._owner_reproof = owner_reproof
+        self._owner_failure = owner_failure
+        self._defer_close = defer_close
+        self._handoff_stage = handoff_stage
+        self._handoff_manifest = handoff_manifest
+        self._sql_guard: BoundExistingFileMutationGuard | None = None
+        self._sql_path: Path | None = None
+        self._thread = threading.get_ident()
+        self._released = False
+        self.io_incomplete: bool = False
+        # A live owner fact only: failed publication requires explicit recovery.
+        self.publication_incomplete: bool = False
+        self.preserve_failed_journal = False
+        self.failed_journal_temporary: tuple[Path, ContentFileProof] | None = None
+
+    def __reduce_ex__(self, protocol: object) -> NoReturn:
+        raise TypeError("activation borrow is live-only")
+
+    def reprove(self) -> None:
+        if self._released or self._thread != threading.get_ident():
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        try:
+            self._owner_reproof()
+            self.root.reprove_location()
+            # Same-parent W1 is insufficient: consume this resource's name and bytes.
+            lock_name = f".{self.identity.canonical_sidecar_path.name}.localcat-initial-activation.lock"
+            lock_payload = ("localcat-initial-activation-lock-v1\0"
+                            f"{self.identity.target_identity}\n").encode("ascii")
+            self.lease.reprove_binding(self.root, lock_name, lock_payload)
+        except BaseException:
+            self._owner_failure()
+            raise
+
+    def require_path(self, path: Path) -> None:
+        self.reprove()
+        if path.parent != self.identity.canonical_sidecar_path.parent:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+
+    def close_owned(
+        self, *authorities: OpaqueAuthority | None,
+        primary: BaseException | None = None,
+    ) -> BaseException | None:
+        """Return every failed owned close to the original family before unwinding."""
+        failures: list[BaseException] = []
+        for authority in authorities:
+            if authority is None or authority.closed:
+                continue
+            try:
+                authority.close()
+            except BaseException as error:
+                failures.append(error)
+                # Keep the exact object even when close raised after marking it
+                # closed. Only an explicit recovery retries this public close.
+                def retry_close(owned: OpaqueAuthority = authority, original: BaseException = error) -> BaseException | None:
+                    try:
+                        owned.close()
+                    except BaseException as retry_error:
+                        _append_owned_close_facts(retry_error, original)
+                        return retry_error
+                    if not owned.closed:
+                        return ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
+                    return None
+                self._defer_close(retry_close)
+        first = failures[0] if failures else None
+        if first is not None:
+            self.io_incomplete = True
+            for error in failures[1:]:
+                _append_owned_close_facts(first, error)
+            if primary is not None:
+                _append_owned_close_facts(primary, first)
+        return first
+
+    def defer_close(self, retry: Callable[[], BaseException | None]) -> None:
+        self._defer_close(retry)
+
+    def defer_connection_close(self, connection: sqlite3.Connection) -> None:
+        """Keep a failed SQL close and its guard together until recovery retries."""
+        self.io_incomplete = True
+        guard, self._sql_guard = self._sql_guard, None
+        def retry_close() -> BaseException | None:
+            try:
+                connection.close()
+                if guard is not None:
+                    guard.close()
+            except BaseException as error:
+                return error
+            self._sql_path = None
+            return None
+        self._defer_close(retry_close)
+
+    def capture(self, path: Path, *, synchronize: bool = False) -> ContentFileProof:
+        self.require_path(path)
+        if self.io_incomplete or self._sql_path == path:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
+        if not isinstance(self.backend, PosixBoundContentObservation):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        opened = self.backend.open_existing_for_synchronization(self.root, PurePath(path.name))
+        operation_error: BaseException | None = None
+        try:
+            if synchronize:
+                opened.synchronize_content(opened.content_facts())
+            result = _capture_posix_bound_content(self.backend, opened)
+            self.reprove()
+            return result
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = self.close_owned(opened, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
+
+    def read_journal(self, path: Path, expected: _ActivationFileIdentity | None) -> tuple[bytes, _ActivationFileIdentity]:
+        self.require_path(path)
+        if self.io_incomplete or self._sql_path == path:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
+        if not isinstance(self.backend, PosixBoundContentObservation):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        opened = self.backend.open_existing_for_synchronization(self.root, PurePath(path.name))
+        operation_error: BaseException | None = None
+        try:
+            proof = _capture_posix_bound_content(self.backend, opened)
+            identity = _ActivationFileIdentity(proof.device, proof.inode)
+            if expected is not None and identity != expected:
+                raise ActivationPreparationError("ACTIVATION.JOURNAL_HANDLE_STALE", retryable=False)
+            payload = b"".join(opened.iter_exact_chunks(opened.snapshot()))
+            if hashlib.sha256(payload).hexdigest() != proof.sha256:
+                raise ActivationPreparationError("ACTIVATION.JOURNAL_HANDLE_STALE", retryable=False)
+            self.reprove()
+            return payload, identity
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = self.close_owned(opened, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
+
+    def exists(self, path: Path) -> bool:
+        self.require_path(path)
+        return self.root.inspect_entry(path.name) is not None
+
+    def file_identity(self, path: Path) -> _ActivationFileIdentity | None:
+        if not self.exists(path):
+            return None
+        proof = self.capture(path)
+        return _ActivationFileIdentity(proof.device, proof.inode)
+
+    def remove(self, path: Path, expected: _ActivationFileIdentity, digest: str | None = None) -> None:
+        self.require_path(path)
+        if not self.exists(path):
+            return
+        opened = self.backend.open_regular(self.root, PurePath(path.name))
+        operation_error: BaseException | None = None
+        try:
+            if not isinstance(self.backend, PosixBoundContentObservation):
+                raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+            proof = _capture_posix_bound_content(self.backend, opened)
+            if _ActivationFileIdentity(proof.device, proof.inode) != expected or (digest is not None and proof.sha256 != digest):
+                raise ActivationPreparationError("ACTIVATION.CLEANUP_FAILED", retryable=False)
+            self.reprove()
+            self.root.unlink_owned(path.name, opened.identity())
+            if self.exists(path):
+                raise ActivationPreparationError("ACTIVATION.CLEANUP_FAILED", retryable=False)
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = self.close_owned(opened, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
+
+    def publish_bytes(self, path: Path, temp_path: Path, payload: bytes) -> _ActivationFileIdentity:
+        self.require_path(path)
+        self.require_path(temp_path)
+        candidate = self.root.create_candidate(temp_path.name, private=False)
+        pending: PendingPublication | None = None
+        operation_error: BaseException | None = None
+        try:
+            candidate.write_all(payload)
+            candidate.flush_content()
+            self.reprove()
+            pending = self.root.begin_publish(candidate, path.name, mode=PublishMode.CREATE_IF_ABSENT, lease=None)
+            candidate = None
+            actual, identity = self.read_journal(path, None)
+            if actual != payload:
+                raise ActivationPreparationError("ACTIVATION.JOURNAL_DURABILITY_UNPROVEN", retryable=False)
+            pending.terminal_reproof()
+            closing, pending = pending, None
+            close_error = self.close_owned(closing)
+            if close_error is not None:
+                raise close_error
+            self.reprove()
+            return identity
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            primary = operation_error
+            if primary is not None and candidate is not None and not candidate.closed:
+                try:
+                    self.reprove()
+                    if self.preserve_failed_journal:
+                        self.retain_failed_journal_temporary(temp_path, candidate)
+                    else:
+                        self.root.unlink_owned(temp_path.name, candidate.identity())
+                except BaseException as cleanup_error:
+                    _append_owned_close_facts(primary, cleanup_error, context="Owned terminal temporary cleanup failed")
+            close_error = self.close_owned(pending, candidate, primary=primary)
+            if primary is None and close_error is not None:
+                raise close_error
+
+    def retain_failed_journal_temporary(self, path: Path, candidate: CandidateFile) -> None:
+        """Remember current live-owned bytes; the disk temporary only blocks cold use."""
+        self.require_path(path)
+        if not isinstance(self.backend, PosixBoundContentObservation):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        opened = self.backend.open_regular(self.root, PurePath(path.name))
+        operation_error: BaseException | None = None
+        try:
+            if opened.identity() != candidate.identity():
+                raise ActivationPreparationError("ACTIVATION.JOURNAL_HANDLE_STALE", retryable=False)
+            self.failed_journal_temporary = (path, _capture_posix_bound_content(self.backend, opened))
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = self.close_owned(opened, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
+
+    def handoff_manifest(self, expected: ContentFileProof) -> CandidateFile:
+        self.reprove()
+        if self._handoff_manifest is None:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        return self._handoff_manifest(expected)
+
+    def enter_sql(self, path: Path, purpose: str) -> None:
+        self.require_path(path)
+        if self._sql_guard is not None or purpose not in {"activation-validation", "stage-inspect"} or not isinstance(self.backend, ExistingFileMutationGuard):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        self._sql_path = path
+        try:
+            self._sql_guard = self.backend.guard_existing_for_mutation(self.root, PurePath(path.name))
+            self.reprove_sql(path, purpose)
+        except BaseException as error:
+            guard, self._sql_guard = self._sql_guard, None
+            self._sql_path = None
+            self.close_owned(guard, primary=error)
+            raise
+
+    def reprove_sql(self, path: Path, purpose: str) -> None:
+        self.require_path(path)
+        if self._sql_guard is None:
+            if self.root.inspect_entry(path.name) is None:
+                raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+            return
+        if self._sql_path != path:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        try:
+            self._sql_guard.reprove()
+        except BaseException:
+            self.fail()
+            raise
+
+    def exit_sql(self, path: Path, purpose: str) -> None:
+        # The connection scope owns its body error; ambient exceptions here
+        # may belong to the original failed publication, not this SQL read.
+        closing_error: BaseException | None = None
+        try:
+            self.reprove_sql(path, purpose)
+        except BaseException as error:
+            closing_error = error
+        finally:
+            guard, self._sql_guard = self._sql_guard, None
+            self._sql_path = None
+            close_error = self.close_owned(guard, primary=closing_error)
+            if closing_error is None:
+                closing_error = close_error
+        if closing_error is not None:
+            raise closing_error
+
+    def handoff_stage(self, expected: ContentFileProof) -> CandidateFile:
+        self.reprove()
+        return self._handoff_stage(expected)
+
+    def fail(self) -> None:
+        self._owner_failure()
+
+    def release(self) -> None:
+        self._released = True
+
+
 def _read_activation_journal_file(
     path: Path,
     expected_identity: _ActivationFileIdentity | None,
+    *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[bytes, _ActivationFileIdentity]:
+    if caller_borrow is not None:
+        return caller_borrow.read_journal(path, expected_identity)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1787,6 +2239,8 @@ def _remove_owned_activation_journal_temp(
 def _remove_owned_activation_journal_final(
     path: Path,
     expected_identity: _ActivationFileIdentity,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Durably remove exactly the handled journal after a Task 5.8 cancel.
 
@@ -1803,6 +2257,9 @@ def _remove_owned_activation_journal_final(
     provable or the recovery fails closed and the journal stays recoverable.
     """
 
+    if caller_borrow is not None:
+        caller_borrow.remove(path, expected_identity)
+        return
     try:
         observed = os.lstat(path)
     except FileNotFoundError as error:
@@ -1858,6 +2315,8 @@ def _remove_owned_activation_journal_final(
 def _remove_owned_activation_terminal_final(
     path: Path,
     expected_identity: _ActivationFileIdentity,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Durably retire exactly the proven terminal record after handoff.
 
@@ -1869,6 +2328,9 @@ def _remove_owned_activation_terminal_final(
     closed with both authorities preserved.
     """
 
+    if caller_borrow is not None:
+        caller_borrow.remove(path, expected_identity)
+        return
     try:
         _remove_owned_activation_journal_final(path, expected_identity)
     except ActivationPreparationError as error:
@@ -2128,6 +2590,8 @@ def _activation_terminal_coexistence_valid(
 
 def _remove_journal_proven_backups(
     record: _ActivationJournalRecord,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Strictly clean only the journal-proven owned recovery backups.
 
@@ -2142,6 +2606,26 @@ def _remove_journal_proven_backups(
     boundary resumes from the journal without orphaning authority files.
     """
 
+    if caller_borrow is not None:
+        if record.had_prior_canonical:
+            triples = [(record.prior_db_backup_path, record.prior_db_backup_identity, record.prior_db_backup_digest)]
+            if not record.prior_manifest_absent:
+                triples.append((record.prior_manifest_backup_path, record.prior_manifest_backup_identity, record.prior_manifest_backup_digest))
+            for path, expected, digest in triples:
+                if path is None or expected is None or digest is None:
+                    raise ActivationPreparationError("ACTIVATION.RECOVERY_MISMATCH", retryable=False)
+                try:
+                    caller_borrow.remove(path, _ActivationFileIdentity(*expected), digest)
+                except (PlatformFileError, OSError, ContentAttestationError, ActivationPreparationError) as error:
+                    retryable = isinstance(error, OSError) or (
+                        isinstance(error, PlatformFileError) and error.code in {
+                            PlatformFileErrorCode.RECOVERY_REQUIRED,
+                            PlatformFileErrorCode.PUBLISH_FAILED,
+                            PlatformFileErrorCode.CAPABILITY_UNAVAILABLE,
+                        }
+                    )
+                    raise ActivationPreparationError("ACTIVATION.RECOVERY_CLEANUP_FAILED", retryable=retryable) from error
+        return
     if not record.had_prior_canonical:
         return
     owned: list[_OwnedRecoveryPath] = []
@@ -2189,7 +2673,8 @@ def _remove_journal_proven_backups(
                 retryable=True,
             ) from error
         if (
-            not stat.S_ISREG(observed.st_mode)
+            entry.identity is None
+            or not stat.S_ISREG(observed.st_mode)
             or observed.st_nlink != 1
             or (observed.st_dev, observed.st_ino)
             != (entry.identity.device, entry.identity.inode)
@@ -2202,6 +2687,7 @@ def _remove_journal_proven_backups(
             capture = _capture_activation_file(
                 entry.path,
                 asset_kind="JOURNAL_CLOSURE",
+                **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
             )
         except ActivationPreparationError as error:
             raise ActivationPreparationError(
@@ -2240,7 +2726,10 @@ def _remove_journal_proven_backups(
         _require_recovery_path_absent(entry.path)
 
 
-def _activation_file_identity(path: Path) -> _ActivationFileIdentity:
+def _activation_file_identity(path: Path, *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None) -> _ActivationFileIdentity:
+    if caller_borrow is not None:
+        proof = caller_borrow.capture(path)
+        return _ActivationFileIdentity(proof.device, proof.inode)
     try:
         observed = os.lstat(path)
     except OSError as error:
@@ -2261,12 +2750,16 @@ def _capture_activation_file(
     path: Path,
     *,
     asset_kind: str,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _PriorAssetCapture:
     # Single-link closure: the journal-managed file must be an exact
     # regular single-link entry at the initial lstat, at the descriptor
     # fstat/read, and at the final revalidation.  A hardlink added at any
     # of these seams fails closed so a foreign link is never captured,
     # copied, or retired as a journal-owned asset.
+    if caller_borrow is not None:
+        proof = caller_borrow.capture(path)
+        return _PriorAssetCapture(asset_kind, path, _ActivationFileIdentity(proof.device, proof.inode), proof.sha256)
     try:
         initial = os.lstat(path)
     except OSError as error:
@@ -2327,9 +2820,14 @@ def _capture_activation_file(
 
 
 
-def _read_activation_file_bytes(capture: _PriorAssetCapture) -> bytes:
+def _read_activation_file_bytes(capture: _PriorAssetCapture, *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None) -> bytes:
     # Keep the backup payload byte-exact for the same reason as the capture
     # above: Windows text-mode reads normalize CRLF.
+    if caller_borrow is not None:
+        payload, _ = caller_borrow.read_journal(capture.path, capture.identity)
+        if hashlib.sha256(payload).hexdigest() != capture.digest:
+            raise ActivationPreparationError("ACTIVATION.PRIOR_ASSET_INVALID", retryable=False)
+        return payload
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -2383,34 +2881,40 @@ def _capture_pre_drain_assets(
     *,
     identity: CanonicalResourceIdentity,
     replacement: bool = False,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[_PriorAssetCapture, ...]:
     if view is None:
-        _require_first_activation_absence(identity)
+        _require_first_activation_absence(identity, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
         return (
             _capture_activation_file(
                 identity.configured_jsonl_path,
                 asset_kind="SOURCE",
+                **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
             ),
         )
     captures = [
         _capture_activation_file(
             view.stage.staged_db_path,
             asset_kind="DATABASE",
+            **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
         ),
     ]
     if not replacement or _lstat_any_entry(
-        identity.snapshot_manifest_path
+        identity.snapshot_manifest_path,
+        **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
     ):
         captures.append(
             _capture_activation_file(
                 identity.snapshot_manifest_path,
                 asset_kind="MANIFEST",
+                **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
             )
         )
     captures.append(
         _capture_activation_file(
             identity.configured_jsonl_path,
             asset_kind="SOURCE",
+            **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
         )
     )
     return tuple(captures)
@@ -2437,7 +2941,13 @@ def _require_same_asset_captures(
 
 def _require_first_activation_absence(
     identity: CanonicalResourceIdentity,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
+    if caller_borrow is not None:
+        if any(caller_borrow.exists(path) for path in (identity.canonical_sidecar_path, identity.snapshot_manifest_path)):
+            raise ActivationPreparationError("ACTIVATION.PRIOR_ASSET_UNEXPECTED", retryable=False)
+        return
     for path in (
         identity.canonical_sidecar_path,
         identity.snapshot_manifest_path,
@@ -2532,6 +3042,8 @@ def _require_recovery_path_absent(path: Path) -> None:
 
 
 def _remove_recovery_path(owned: _OwnedRecoveryPath) -> None:
+    if owned.identity is None:
+        raise ActivationPreparationError("ACTIVATION.CLEANUP_FAILED", retryable=True)
     try:
         observed = os.lstat(owned.path)
     except FileNotFoundError:
@@ -2567,7 +3079,67 @@ def _create_recovery_backup(
     *,
     backup_path: Path,
     owned_paths: list[_OwnedRecoveryPath],
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _RecoveryBackupAsset:
+    if caller_borrow is not None:
+        borrow = caller_borrow
+        borrow.require_path(backup_path)
+        opened = borrow.backend.open_regular(borrow.root, PurePath(capture.path.name))
+        candidate: CandidateFile | None = None
+        pending: PendingPublication | None = None
+        operation_error: BaseException | None = None
+        try:
+            if borrow.capture(capture.path) != ContentFileProof(capture.identity.device, capture.identity.inode, opened.snapshot().byte_count, capture.digest):
+                raise ActivationPreparationError("ACTIVATION.POST_DRAIN_VALIDATION_FAILED", retryable=False)
+            temp_path = backup_path.with_name(backup_path.name + ".tmp")
+            candidate = borrow.root.create_candidate(temp_path.name, private=False)
+            # Creation establishes the live cleanup owner before any write or
+            # flush can fail. Do not convert this opaque identity to v2 proof.
+            temp_index = len(owned_paths)
+            owned_paths.append(_OwnedRecoveryPath(temp_path, None))
+            owned_paths[temp_index] = _OwnedRecoveryPath(temp_path, None, candidate.identity())
+            snapshot = opened.snapshot()
+            candidate.write_chunks(opened.iter_exact_chunks(snapshot), maximum_bytes=snapshot.byte_count)
+            candidate.flush_content()
+            borrow.reprove()
+            try:
+                pending = borrow.root.begin_publish(candidate, backup_path.name, mode=PublishMode.CREATE_IF_ABSENT, lease=None)
+            except BaseException:
+                try:
+                    destination_absent = borrow.root.inspect_entry(backup_path.name) is None
+                except BaseException:
+                    destination_absent = False
+                if not destination_absent:
+                    # The call did not return a pending authority. Retain the
+                    # possible final as unproven in the existing cleanup owner;
+                    # never turn ambiguous naming into READY with no locator.
+                    owned_paths.append(_OwnedRecoveryPath(backup_path, None))
+                raise
+            final_index = len(owned_paths)
+            owned_paths.append(_OwnedRecoveryPath(backup_path, None))
+            owned_paths[final_index] = _OwnedRecoveryPath(
+                backup_path, None, pending.preliminary_facts().destination_identity,
+            )
+            backup = _capture_activation_file(backup_path, asset_kind=capture.asset_kind, caller_borrow=borrow)
+            owned_paths[final_index] = _OwnedRecoveryPath(backup_path, backup.identity)
+            if backup.digest != capture.digest:
+                raise ActivationPreparationError("ACTIVATION.BACKUP_FAILED", retryable=False)
+            _revalidate_prior_assets((capture,), caller_borrow=borrow)
+            pending.terminal_reproof()
+            closing, pending = pending, None
+            close_error = borrow.close_owned(closing)
+            if close_error is not None:
+                raise close_error
+            return _RecoveryBackupAsset(capture.asset_kind, capture.path, backup_path, capture.identity, backup.identity,
+                ActivationBackupEvidence(capture.asset_kind, capture.digest, backup.digest,
+                    (capture.identity.device, capture.identity.inode), (backup.identity.device, backup.identity.inode)))
+        except BaseException as error:
+            operation_error = error
+            raise
+        finally:
+            close_error = borrow.close_owned(pending, candidate, opened, primary=operation_error)
+            if operation_error is None and close_error is not None:
+                raise close_error
     source_flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         source_flags |= os.O_NOFOLLOW
@@ -2607,12 +3179,14 @@ def _create_recovery_backup(
         backup_capture = _capture_activation_file(
             backup_path,
             asset_kind=capture.asset_kind,
+            **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
         )
         if backup_capture.identity != backup_identity:
             raise OSError("backup identity changed")
         current = _capture_activation_file(
             capture.path,
             asset_kind=capture.asset_kind,
+            **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
         )
         if current.identity != capture.identity or current.digest != capture.digest:
             raise ActivationPreparationError(
@@ -2657,6 +3231,7 @@ def _create_recovery_backups(
     preparation_id: str,
     owned_paths: list[_OwnedRecoveryPath],
     manifest_absent: bool = False,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> tuple[_RecoveryBackupAsset, ...]:
     backup_captures = tuple(
         capture
@@ -2685,21 +3260,26 @@ def _create_recovery_backups(
                 capture,
                 backup_path=backup_path,
                 owned_paths=owned_paths,
+                **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
             )
         )
     parents = {asset.backup_path.parent for asset in created}
     if len(parents) != 1:
         raise OSError("recovery backups are not adjacent")
-    _fsync_recovery_directory(next(iter(parents)))
+    if caller_borrow is not None:
+        caller_borrow.reprove()
+    else:
+        _fsync_recovery_directory(next(iter(parents)))
     return tuple(created)
 
 
 
-def _revalidate_prior_assets(captures: tuple[_PriorAssetCapture, ...]) -> None:
+def _revalidate_prior_assets(captures: tuple[_PriorAssetCapture, ...], *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None) -> None:
     for capture in captures:
         current = _capture_activation_file(
             capture.path,
             asset_kind=capture.asset_kind,
+            **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}),
         )
         if current.identity != capture.identity or current.digest != capture.digest:
             raise ActivationPreparationError(
@@ -2711,7 +3291,26 @@ def _revalidate_prior_assets(captures: tuple[_PriorAssetCapture, ...]) -> None:
 
 def _remove_recovery_backups(
     owned_paths: tuple[_OwnedRecoveryPath, ...],
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
+    if caller_borrow is not None:
+        for owned in owned_paths:
+            try:
+                caller_borrow.require_path(owned.path)
+                if not caller_borrow.exists(owned.path):
+                    continue
+                if owned.live_identity is not None:
+                    caller_borrow.root.unlink_owned(owned.path.name, owned.live_identity)
+                    if caller_borrow.exists(owned.path):
+                        raise ActivationPreparationError("ACTIVATION.CLEANUP_FAILED", retryable=True)
+                elif owned.identity is not None:
+                    caller_borrow.remove(owned.path, owned.identity)
+                else:
+                    raise ActivationPreparationError("ACTIVATION.CLEANUP_FAILED", retryable=True)
+            except PlatformFileError as error:
+                raise ActivationPreparationError("ACTIVATION.CLEANUP_FAILED", retryable=True) from error
+        return
     parents = {owned.path.parent for owned in owned_paths}
     for owned in owned_paths:
         _remove_recovery_path(owned)
@@ -2738,7 +3337,13 @@ def _replace_activation_file(source: Path, destination: Path) -> None:
 def _fsync_activation_file(
     path: Path,
     expected_identity: _ActivationFileIdentity,
+    *, caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
+    if caller_borrow is not None:
+        proof = caller_borrow.capture(path, synchronize=True)
+        if _ActivationFileIdentity(proof.device, proof.inode) != expected_identity:
+            raise OSError("activation file identity changed")
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -2980,6 +3585,7 @@ def _quarantine_failed_activation_artifacts(
     record: _ActivationJournalRecord,
     *,
     identity: CanonicalResourceIdentity,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Quarantine every journal-owned failed asset of one activation.
 
@@ -2990,6 +3596,9 @@ def _quarantine_failed_activation_artifacts(
     closed on foreign entries while stage paths leave them untouched.
     """
 
+    if caller_borrow is not None:
+        _quarantine_posix_failed_activation(record, identity, caller_borrow)
+        return
     quarantine_dir = _activation_quarantine_directory(identity, record)
     _require_quarantine_directory(quarantine_dir)
     prior_db_identity = (
@@ -3109,10 +3718,296 @@ def _quarantine_candidate_rename(source: Path, target: Path) -> None:
 
 
 
+def _observe_posix_cancelled_quarantine(
+    record: _ActivationJournalRecord,
+    identity: CanonicalResourceIdentity,
+    borrow: _CallerHeldPosixActivationBorrow,
+) -> dict[str, ContentFileProof]:
+    """Read the complete retained descendant; no observation authorizes mutation."""
+    backend = borrow.backend
+    if not isinstance(backend, LockedDescendantNamespaceInspection) or not isinstance(backend, PosixBoundContentObservation):
+        raise ActivationPreparationError("ACTIVATION.QUARANTINE_FAILED", retryable=False)
+    directory = _activation_quarantine_directory(identity, record)
+    roles = {
+        record.candidate_stage_db_path.name: record.sealed_content_attestation.database,
+        identity.canonical_sidecar_path.name: record.sealed_content_attestation.database,
+        record.candidate_manifest_temp_path.name: record.sealed_content_attestation.manifest,
+        identity.snapshot_manifest_path.name: record.sealed_content_attestation.manifest,
+    }
+    if len(roles) != 4 or borrow.identity != identity:
+        raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+    authorities = []
+    operation_error: BaseException | None = None
+    try:
+        borrow.reprove()
+        if borrow.root.inspect_entry(directory.parent.name) is None:
+            return {}
+        parent = backend.bind_parent(borrow.root, PurePath(directory.parent.name, directory.name))
+        authorities.append(parent)
+        if parent.inspect_entry(directory.name) is None:
+            return {}
+        descendant = backend.bind_parent(borrow.root, PurePath(directory.parent.name, directory.name, record.candidate_stage_db_path.name))
+        authorities.append(descendant)
+        limits = LedgerEnumerationLimits(5, 4096, (1 << 63) - 1)
+        entries = backend.observe_descendant_entries(borrow.root, borrow.lease, descendant, limits)
+        if any(entry.name not in roles for entry in entries):
+            raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+        proofs: dict[str, ContentFileProof] = {}
+        for entry in entries:
+            opened = backend.open_regular(borrow.root, PurePath(directory.parent.name, directory.name, entry.name))
+            authorities.append(opened)
+            if opened.identity() != entry.snapshot.identity:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            proof = _capture_posix_bound_content(backend, opened)
+            expected = roles[entry.name]
+            if (proof.device, proof.inode) != (expected.device, expected.inode):
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            # Receipt SQL may have changed an already quarantined canonical
+            # DB. Its bytes are only preserved, never used as active authority.
+            # Every ordinary stage and both manifest roles remain exact SEALED.
+            if entry.name != identity.canonical_sidecar_path.name and proof != expected:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            proofs[entry.name] = proof
+        if backend.observe_descendant_entries(borrow.root, borrow.lease, descendant, limits) != entries:
+            raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+        borrow.reprove()
+        return proofs
+    except (PlatformFileError, ContentAttestationError) as error:
+        operation_error = ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+        raise operation_error from error
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        close_error = borrow.close_owned(*reversed(authorities), primary=operation_error)
+        if operation_error is None and close_error is not None:
+            raise ActivationPreparationError("ACTIVATION.QUARANTINE_FAILED", retryable=True) from close_error
+
+
+def _quarantine_posix_failed_activation(
+    record: _ActivationJournalRecord,
+    identity: CanonicalResourceIdentity,
+    borrow: _CallerHeldPosixActivationBorrow,
+) -> None:
+    """Preserve failed named assets through the original root and live retirement.
+
+    Complete source/journal/prior proof belongs to the recovery owner.
+    Canonical DB bytes may reflect receipt SQL and are only preserved.
+    Stage DB and manifest roles must still match the original SEALED proof;
+    an unrelated identity can never be moved from an authority name.
+    """
+    backend = borrow.backend
+    if not isinstance(backend, ExistingFileRetirement) or not isinstance(backend, PosixBoundContentObservation):
+        raise ActivationPreparationError("ACTIVATION.QUARANTINE_FAILED", retryable=False)
+    directory = _activation_quarantine_directory(identity, record)
+    authorities: list[OpaqueAuthority] = []
+    operation_error = None
+    try:
+        existing = _observe_posix_cancelled_quarantine(record, identity, borrow)
+        # A rollback cannot manufacture the preservation closure of a deleted
+        # candidate. Prove both recorded objects before moving any member or
+        # retiring the original journal; a same-byte copy is not that object.
+        for names, expected_identity in (
+            ((record.candidate_stage_db_path, identity.canonical_sidecar_path), record.candidate_stage_db_identity),
+            ((record.candidate_manifest_temp_path, identity.snapshot_manifest_path), record.candidate_manifest_temp_identity),
+        ):
+            found = any((proof.device, proof.inode) == expected_identity for proof in existing.values())
+            for path in names:
+                try:
+                    if not borrow.exists(path):
+                        continue
+                    proof = borrow.capture(path)
+                except (PlatformFileError, ContentAttestationError) as error:
+                    raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False) from error
+                if (path in (record.candidate_stage_db_path, record.candidate_manifest_temp_path)
+                        and (proof.device, proof.inode) != expected_identity):
+                    # A terminal cannot replay while a foreign object occupies
+                    # either candidate name. Preserve it and the original phase.
+                    raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+                found = found or (proof.device, proof.inode) == expected_identity
+            if not found:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_MISSING", retryable=False)
+        # The terminal retains SEALED proofs for stage and manifest roles.
+        # Check them before any move, both here and in retained quarantine;
+        # canonical receipt DB content is intentionally not a stage proof.
+        for path, expected in (
+            (record.candidate_stage_db_path, record.sealed_content_attestation.database),
+            (record.candidate_manifest_temp_path, record.sealed_content_attestation.manifest),
+            (identity.snapshot_manifest_path, record.sealed_content_attestation.manifest),
+        ):
+            proof = existing.get(path.name)
+            if proof is None and borrow.exists(path):
+                proof = borrow.capture(path)
+            if (proof is not None and (proof.device, proof.inode) == (expected.device, expected.inode)
+                    and proof != expected):
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+        parent = backend.bind_or_create_child_directory(borrow.root, directory.parent.name)
+        authorities.append(parent)
+        target = backend.bind_or_create_child_directory(parent, directory.name)
+        authorities.append(target)
+        for path, expected, authority, prior_identity, prior_digest in (
+            (identity.canonical_sidecar_path, record.candidate_stage_db_identity, True,
+             record.prior_db_identity if record.prior_db_path == identity.canonical_sidecar_path else None,
+             record.prior_db_digest if record.prior_db_path == identity.canonical_sidecar_path else None),
+            (identity.snapshot_manifest_path, record.candidate_manifest_temp_identity, True,
+             record.prior_manifest_identity, record.prior_manifest_digest),
+            (record.candidate_manifest_temp_path, record.candidate_manifest_temp_identity, False, None, None),
+            (record.candidate_stage_db_path, record.candidate_stage_db_identity, False, None, None),
+        ):
+            borrow.require_path(path)
+            try:
+                if not borrow.exists(path):
+                    continue
+                proof = borrow.capture(path)
+            except (PlatformFileError, ContentAttestationError) as error:
+                if not authority:
+                    continue
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False) from error
+            if (proof.device, proof.inode) != expected:
+                if (prior_identity == (proof.device, proof.inode) and proof.sha256 == prior_digest):
+                    continue
+                if authority:
+                    raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+                continue
+            expected_content = (record.sealed_content_attestation.database
+                                if path == record.candidate_stage_db_path
+                                else record.sealed_content_attestation.manifest)
+            if path != identity.canonical_sidecar_path and proof != expected_content:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            if path.name in existing:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            content = CandidateContentFacts(proof.size, bytes.fromhex(proof.sha256))
+            opened = backend.open_regular(borrow.root, PurePath(path.name))
+            authorities.append(opened)
+            if _capture_posix_bound_content(backend, opened) != proof:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            live_identity = opened.identity()
+            source_parent = backend.bind_retirement_source_directory(borrow.root, PurePath(path.name))
+            authorities.append(source_parent)
+            source = backend.open_existing_retirement_source(source_parent, content)
+            authorities.append(source)
+            if source.reprove().snapshot.identity != live_identity:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            borrow.reprove()
+            retained = backend.retire_existing_exclusive(source_parent, source, target, path.name)
+            authorities.append(retained)
+            if retained.reprove().identity != live_identity:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            borrow.reprove()
+        _ = _observe_posix_cancelled_quarantine(record, identity, borrow)
+    except (PlatformFileError, OSError) as error:
+        operation_error = ActivationPreparationError("ACTIVATION.QUARANTINE_FAILED", retryable=True)
+        raise operation_error from error
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        close_error = borrow.close_owned(*reversed(authorities), primary=operation_error)
+        if operation_error is None and close_error is not None:
+            raise close_error
+
+
+def _posix_cancelled_rollback_closure(
+    record: _ActivationJournalRecord,
+    identity: CanonicalResourceIdentity,
+    borrow: _CallerHeldPosixActivationBorrow,
+) -> bool:
+    """Classify a complete preserved set, not a historical phase from one name."""
+    proofs = _observe_posix_cancelled_quarantine(record, identity, borrow)
+    database = identity.canonical_sidecar_path.name
+    manifest = identity.snapshot_manifest_path.name
+    temporary = record.candidate_manifest_temp_path.name
+    if database not in proofs:
+        if manifest in proofs:
+            raise ActivationPreparationError("ACTIVATION.QUARANTINE_MISSING", retryable=False)
+        return False
+    if (set(proofs) not in ({database, manifest}, {database, temporary})
+            or borrow.exists(record.candidate_stage_db_path)
+            or borrow.exists(record.candidate_manifest_temp_path)):
+        raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+    # The caller must still prove terminal/source and the full prior/legacy
+    # active set before accepting this read-only preservation closure.
+    return True
+
+
+def _retire_posix_cancelled_candidates(
+    record: _ActivationJournalRecord,
+    identity: CanonicalResourceIdentity,
+    borrow: _CallerHeldPosixActivationBorrow,
+) -> None:
+    """Retire the v2 pair using current rooted identity AND sealed content."""
+    backend = borrow.backend
+    if not isinstance(backend, ExistingFileRetirement) or not isinstance(backend, PosixBoundContentObservation):
+        raise ActivationPreparationError("ACTIVATION.QUARANTINE_FAILED", retryable=False)
+    directory = _activation_quarantine_directory(identity, record)
+    authorities = []
+    operation_error: BaseException | None = None
+    try:
+        borrow.reprove()
+        existing = _observe_posix_cancelled_quarantine(record, identity, borrow)
+        expected_names = {record.candidate_stage_db_path.name, record.candidate_manifest_temp_path.name}
+        if not set(existing) <= expected_names:
+            raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+        root = backend.bind_or_create_child_directory(borrow.root, directory.parent.name)
+        authorities.append(root)
+        target = backend.bind_or_create_child_directory(root, directory.name)
+        authorities.append(target)
+        for path, expected in (
+            (record.candidate_stage_db_path, record.sealed_content_attestation.database),
+            (record.candidate_manifest_temp_path, record.sealed_content_attestation.manifest),
+        ):
+            borrow.require_path(path)
+            present = borrow.exists(path)
+            if not present and path.name not in existing:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_MISSING", retryable=False)
+            if present and path.name in existing:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            relative = PurePath(path.name) if present else PurePath(directory.parent.name, directory.name, path.name)
+            opened = backend.open_regular(borrow.root, relative)
+            authorities.append(opened)
+            observed = _capture_posix_bound_content(backend, opened)
+            if observed != expected:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            # Compare while the original name and both live authorities still
+            # agree.  Retirement consumes that name; only its retained authority
+            # may reprove the destination after the move.
+            observed_identity = opened.identity()
+            content = CandidateContentFacts(expected.size, bytes.fromhex(expected.sha256))
+            if present:
+                parent = backend.bind_retirement_source_directory(borrow.root, relative)
+                authorities.append(parent)
+                source = backend.open_existing_retirement_source(parent, content)
+                authorities.append(source)
+                if source.reprove().snapshot.identity != observed_identity:
+                    raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+                retained = backend.retire_existing_exclusive(parent, source, target, path.name)
+            else:
+                parent = backend.bind_parent(borrow.root, PurePath(path.name))
+                authorities.append(parent)
+                retained = backend.rebind_existing_retirement(parent, path.name, target, path.name, content)
+            authorities.append(retained)
+            if retained.reprove().identity != observed_identity:
+                raise ActivationPreparationError("ACTIVATION.QUARANTINE_FOREIGN", retryable=False)
+            borrow.reprove()
+        if set(_observe_posix_cancelled_quarantine(record, identity, borrow)) != expected_names:
+            raise ActivationPreparationError("ACTIVATION.QUARANTINE_MISSING", retryable=False)
+    except PlatformFileError as error:
+        operation_error = ActivationPreparationError("ACTIVATION.QUARANTINE_FAILED", retryable=True)
+        raise operation_error from error
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        close_error = borrow.close_owned(*reversed(authorities), primary=operation_error)
+        if operation_error is None and close_error is not None:
+            raise close_error
+
+
 def _retire_cancelled_candidate_assets(
     record: _ActivationJournalRecord,
     *,
     identity: CanonicalResourceIdentity,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> None:
     """Quarantine the journal-proven candidate DB/manifest pair of a cancel.
 
@@ -3131,6 +4026,9 @@ def _retire_cancelled_candidate_assets(
     terminal authority.
     """
 
+    if caller_borrow is not None:
+        _retire_posix_cancelled_candidates(record, identity, caller_borrow)
+        return
     quarantine_dir = _activation_quarantine_directory(identity, record)
     _require_quarantine_directory(quarantine_dir)
     for path, expected_identity in (
@@ -3357,11 +4255,93 @@ def _require_legacy_content_attestations_for_durable_write(
         raise TypeError("active content attestation must be exact legacy v2")
 
 
+def _write_posix_activation_journal(
+    record: _ActivationJournalRecord, journal_path: Path, *,
+    expected_final_identity: _ActivationFileIdentity | None,
+    caller_borrow: _CallerHeldPosixActivationBorrow,
+) -> _ActivationJournalHandle:
+    """Existing v2 codec, published and independently read through the held root."""
+    borrow = caller_borrow
+    borrow.require_path(journal_path)
+    if (journal_path != _activation_journal_path(borrow.identity)
+            or record.journal_path != journal_path
+            or record.resource_id != borrow.identity.resource_id
+            or record.target_identity != borrow.identity.target_identity):
+        raise ActivationPreparationError("ACTIVATION.JOURNAL_HANDLE_STALE", retryable=False)
+    _require_legacy_content_attestations_for_durable_write(record)
+    payload = _serialize_activation_journal_record(record).encode("utf-8")
+    candidate: CandidateFile | None = None
+    pending: PendingPublication | None = None
+    operation_error: BaseException | None = None
+    try:
+        if expected_final_identity is not None:
+            borrow.read_journal(journal_path, expected_final_identity)
+        elif borrow.root.inspect_entry(journal_path.name) is not None:
+            raise ActivationPreparationError("ACTIVATION.JOURNAL_FINAL_EXISTS", retryable=False)
+        candidate = borrow.root.create_candidate(_activation_journal_temp_path(journal_path).name, private=False)
+        candidate.write_all(payload)
+        candidate.flush_content()
+        borrow.reprove()
+        if expected_final_identity is not None:
+            borrow.read_journal(journal_path, expected_final_identity)
+        elif borrow.root.inspect_entry(journal_path.name) is not None:
+            raise ActivationPreparationError("ACTIVATION.JOURNAL_FINAL_EXISTS", retryable=False)
+        pending = borrow.root.begin_publish(
+            candidate, journal_path.name,
+            mode=(PublishMode.CREATE_IF_ABSENT if expected_final_identity is None else PublishMode.REPLACE_UNDER_LOCK),
+            lease=None if expected_final_identity is None else borrow.lease,
+        )
+        candidate = None
+        retained = pending.retained_destination()
+        if b"".join(retained.iter_exact_chunks(retained.snapshot())) != payload:
+            raise OSError("journal retained bytes changed")
+        # This independent root-relative open is the durable owner reproof.
+        final_bytes, final_identity = _read_activation_journal_file(journal_path, None, caller_borrow=borrow)
+        final_record = _parse_activation_journal_bytes(final_bytes, expected_journal_path=journal_path)
+        if final_bytes != payload or final_record != record:
+            raise OSError("journal independent reproof changed")
+        pending.terminal_reproof()
+        closing_pending, pending = pending, None
+        close_error = borrow.close_owned(closing_pending)
+        if close_error is not None:
+            raise close_error
+        borrow.reprove()
+        return _ActivationJournalHandle(
+            journal_id=record.journal_id, journal_path=journal_path,
+            file_identity=final_identity, phase=record.phase,
+            record_digest=_activation_journal_digest(record),
+            preparation_id=record.preparation_id, _record=record,
+            _factory_key=_ACTIVATION_JOURNAL_FACTORY_KEY,
+        )
+    except (PlatformFileError, OSError) as error:
+        operation_error = ActivationPreparationError("ACTIVATION.JOURNAL_DURABILITY_UNPROVEN", retryable=False)
+        raise operation_error from error
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        primary = operation_error
+        if primary is not None and candidate is not None and not candidate.closed:
+            try:
+                borrow.reprove()
+                temporary = _activation_journal_temp_path(journal_path)
+                if borrow.preserve_failed_journal:
+                    borrow.retain_failed_journal_temporary(temporary, candidate)
+                else:
+                    borrow.root.unlink_owned(temporary.name, candidate.identity())
+            except BaseException as cleanup_error:
+                _append_owned_close_facts(primary, cleanup_error, context="Owned journal temporary cleanup failed")
+        close_error = borrow.close_owned(pending, candidate, primary=primary)
+        if primary is None and close_error is not None:
+            raise close_error
+
+
 def _write_activation_journal(
     record: _ActivationJournalRecord,
     journal_path: Path,
     *,
     expected_final_identity: _ActivationFileIdentity | None,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _ActivationJournalHandle:
     """Publish one journal record with strict exclusive temp + fsync order.
 
@@ -3372,6 +4352,9 @@ def _write_activation_journal(
     fsync; failures after publication fail-stop with a code-only error.
     """
 
+    if caller_borrow is not None:
+        return _write_posix_activation_journal(record, journal_path,
+            expected_final_identity=expected_final_identity, caller_borrow=caller_borrow)
     _require_legacy_content_attestations_for_durable_write(record)
     expected_bytes = _serialize_activation_journal_record(
         record
@@ -3507,6 +4490,8 @@ def _write_activation_journal(
 def _write_activation_terminal(
     identity: CanonicalResourceIdentity,
     record: _ActivationJournalRecord,
+    *,
+    caller_borrow: _CallerHeldPosixActivationBorrow | None = None,
 ) -> _ActivationFileIdentity:
     """Publish one terminal record with strict exclusive temp + fsync.
 
@@ -3519,6 +4504,10 @@ def _write_activation_terminal(
     publication fail-stop with the durable terminal in place.
     """
 
+    if caller_borrow is not None:
+        _require_legacy_content_attestations_for_durable_write(record)
+        path = _activation_terminal_path(identity)
+        return caller_borrow.publish_bytes(path, _activation_terminal_temp_path(path), _serialize_activation_journal_record(record).encode("utf-8"))
     _require_legacy_content_attestations_for_durable_write(record)
     terminal_path = _activation_terminal_path(identity)
     expected_bytes = _serialize_activation_journal_record(
@@ -3529,7 +4518,7 @@ def _write_activation_terminal(
     temp_identity: _ActivationFileIdentity | None = None
     published = False
     try:
-        if _lstat_any_entry(temp_path):
+        if _lstat_any_entry(temp_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
             raise ActivationPreparationError(
                 "ACTIVATION.TERMINAL_TEMP_EXISTS",
                 retryable=False,
@@ -3539,7 +4528,7 @@ def _write_activation_terminal(
                 temp_path
             )
         except OSError as error:
-            if _lstat_any_entry(temp_path):
+            if _lstat_any_entry(temp_path, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
                 raise ActivationPreparationError(
                     "ACTIVATION.TERMINAL_TEMP_EXISTS",
                     retryable=False,
