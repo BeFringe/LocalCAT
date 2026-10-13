@@ -2396,6 +2396,49 @@ class ExactEmptyChildDirectoryRetirement(Protocol):
 
 
 @runtime_checkable
+class ExistingLinkPairCompletion(Protocol):
+    """Finish one authenticated existing pair while borrowing its root and W1.
+
+    The caller first proves the resource's expected lock name and payload;
+    sharing a parent directory does not prove that resource relationship.
+    The adapter requires the original live root and its exact-root lease,
+    verifies both names against retained regular objects and exact content,
+    and removes only the proven temporary link. A missing temporary name is
+    accepted only with an exact single-link final object. Directory sync,
+    terminal reproof and every owned file close precede success. Borrowed
+    authorities remain caller-owned; this is not an atomic namespace CAS.
+    """
+
+    def complete_existing_link_pair(
+        self, root: RootedDirectoryAuthority, lease: LockLease,
+        final_name: str, temporary_name: str, expected_content: CandidateContentFacts,
+    ) -> None:
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        if not isinstance(lease, LockLease):
+            raise TypeError("lease must be LockLease")
+        root._require_open()
+        lease._require_open()
+        checked_final = validate_relative_name(final_name)
+        checked_temporary = validate_relative_name(temporary_name)
+        if checked_final == checked_temporary:
+            raise ValueError("final and temporary names must differ")
+        if type(expected_content) is not CandidateContentFacts:
+            raise TypeError("expected_content must be exact CandidateContentFacts")
+        result = self._complete_existing_link_pair(
+            root, lease, checked_final, checked_temporary, expected_content,
+        )
+        if result is not None:
+            raise TypeError("backend link-pair completion must return None")
+
+    @abstractmethod
+    def _complete_existing_link_pair(
+        self, root: RootedDirectoryAuthority, lease: LockLease,
+        final_name: str, temporary_name: str, expected_content: CandidateContentFacts,
+    ) -> None: ...
+
+
+@runtime_checkable
 class ExistingFileRetirement(Protocol):
     """Retire or freshly rebind one exact existing file without creator state."""
 

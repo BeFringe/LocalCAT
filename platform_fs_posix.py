@@ -37,6 +37,7 @@ from platform_fs_contracts import (
     ExistingFileDurability,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
+    ExistingLinkPairCompletion,
     ExistingRetirementSource,
     FileObjectIdentity,
     LedgerEntryObservation,
@@ -1940,6 +1941,7 @@ class _PosixLockLease(LockLease):
         "_entry_identity",
         "_payload",
         "_issuer",
+        "_root_token",
     )
 
     def __init__(
@@ -1953,6 +1955,7 @@ class _PosixLockLease(LockLease):
         payload: bytes,
         *,
         issuer: object | None = None,
+        root_token: object | None = None,
     ) -> None:
         super().__init__()
         self._descriptor = descriptor
@@ -1963,6 +1966,7 @@ class _PosixLockLease(LockLease):
         self._entry_identity = entry_identity
         self._payload = payload
         self._issuer = issuer
+        self._root_token = root_token
 
     def _reprove_lock(self, *, check_payload: bool = True) -> None:
         try:
@@ -2419,6 +2423,7 @@ class PosixPlatformAdapter(
     MutableFileReservationService,
     OwnedNamespaceRetirement,
     ExistingFileRetirement,
+    ExistingLinkPairCompletion,
     ExistingFileDurability,
     ExistingFileMutationGuard,
     ProcessFileLock,
@@ -2431,6 +2436,120 @@ class PosixPlatformAdapter(
             raise TypeError("_fault_injector must be callable")
         self._fault_injector = _fault_injector
         self._issuer = object()
+
+    def _complete_existing_link_pair(
+        self, root: RootedDirectoryAuthority, lease: LockLease,
+        final_name: str, temporary_name: str, expected_content: CandidateContentFacts,
+    ) -> None:
+        if (
+            type(root) is not _PosixRootedDirectory
+            or root._issuer is not self._issuer
+            or type(lease) is not _PosixLockLease
+            or lease._issuer is not self._issuer
+            or lease._root_token is not root._root_token
+        ):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        owned: list[int] = []
+        armed = False
+        primary: BaseException | None = None
+        try:
+            root.reprove_location()
+            self._stage_lease(lease, root)
+            final = root.inspect_entry(final_name)
+            temporary = root.inspect_entry(temporary_name)
+            links = 1 if temporary is None else 2
+            if final is None:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            if final.identity.kind != "regular" or (
+                temporary is not None and temporary.identity.kind != "regular"
+            ):
+                raise _platform_error(PlatformFileErrorCode.REPARSE_REJECTED, retryable=False)
+            if (
+                final.identity.link_count != links
+                or final.byte_count != expected_content.byte_count
+                or (temporary is not None and temporary != final)
+            ):
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+
+            owned.append(os.open(final_name, _READ_FLAGS | os.O_NONBLOCK, dir_fd=root._directory_fd))
+            _hit_fault(self._fault_injector, "link_pair_after_open_final")
+            if temporary is not None:
+                owned.append(os.open(temporary_name, _READ_FLAGS | os.O_NONBLOCK, dir_fd=root._directory_fd))
+                _hit_fault(self._fault_injector, "link_pair_after_open_temporary")
+
+            def positions(expected_links: int) -> EntrySnapshot:
+                retained = _snapshot_from_stat(os.fstat(owned[0]))
+                if (
+                    not _same_identity(retained.identity, final.identity)
+                    or retained.identity.link_count != expected_links
+                    or retained.byte_count != expected_content.byte_count
+                ):
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                # Keep both file descriptions live across unlink. The second
+                # one proves the selected temporary object, not just its bytes.
+                for descriptor in owned[1:]:
+                    if _snapshot_from_stat(os.fstat(descriptor)) != retained:
+                        raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                if root.inspect_entry(final_name) != retained:
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                named_temporary = root.inspect_entry(temporary_name)
+                if named_temporary != (retained if expected_links == 2 else None):
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                return retained
+
+            def prove(expected_links: int) -> EntrySnapshot:
+                root.reprove_location()
+                self._stage_lease(lease, root)
+                before = positions(expected_links)
+                actual = _digest_fd_exact(owned[0], expected_content.byte_count)
+                after = positions(expected_links)
+                if before != after or actual != expected_content:
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                root.reprove_location()
+                self._stage_lease(lease, root)
+                return after
+
+            initial = prove(links)
+            if initial != final:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            if temporary is not None:
+                _hit_fault(self._fault_injector, "link_pair_before_unlink")
+                if prove(2) != initial:
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                # The syscall may have removed the name even when it raises.
+                # Never infer an absent mutation or attempt rollback here.
+                armed = True
+                os.unlink(temporary_name, dir_fd=root._directory_fd)
+                _hit_fault(self._fault_injector, "link_pair_after_unlink")
+            armed = True
+            _hit_fault(self._fault_injector, "link_pair_before_sync")
+            os.fsync(root._directory_fd)
+            _hit_fault(self._fault_injector, "link_pair_before_terminal")
+            prove(1)
+        except BaseException as error:
+            if armed and isinstance(error, (PlatformFileError, OSError)):
+                primary = _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True)
+            elif isinstance(error, OSError):
+                primary = _map_os_error(error, fallback=PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            else:
+                primary = error
+            raise primary from None
+        finally:
+            close_errors: list[BaseException] = []
+            for descriptor in reversed(owned):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    close_errors.append(_platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True))
+                except BaseException as error:
+                    close_errors.append(error)
+            # Do not retry close: its numeric FD could already be reused.
+            # This local primary excludes an unrelated caller's except block.
+            if close_errors:
+                failures = BaseExceptionGroup("POSIX link-pair file close failures", close_errors)
+                if primary is not None:
+                    raise primary from failures
+                raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True) from failures
 
     def _bind_retirement_source_directory(
         self, root: RootedDirectoryAuthority, relative: PurePath,
@@ -3684,6 +3803,7 @@ class PosixPlatformAdapter(
                 identity,
                 payload,
                 issuer=self._issuer if parent._issuer is self._issuer else None,
+                root_token=parent._root_token,
             )
             descriptor = None
             lease_directory_fds = None

@@ -599,7 +599,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1_
   - _Requirements: 5.1, 5.3, 5.6, 5.7_
 
-- [ ] 11.4c 完成POSIX既有双链接交接
+- [x] 11.4c 完成POSIX既有双链接交接
   - 提供可选ExistingLinkPairCompletion，从同issuer原root与exact-root live W1验证两个安全直接子项为同regular对象、恰好两链接及exact内容，只移除已证明临时名；临时名已缺失且final exact/single-link时支持重复完成。
   - 目录同步、final同对象/single-link/内容、原配置位置及全部自有句柄收尾均完成才返回；借入root/W1不转交、不重入，修改后不明保留事实并交原owner重试。
   - 完成时，合法pair与fresh续接、异对象/内容、第三链接、symlink、外来authority、可观察漂移及删除/同步/终端/close故障符合合同；不放宽通用single-link端口或Windows专用协议。
