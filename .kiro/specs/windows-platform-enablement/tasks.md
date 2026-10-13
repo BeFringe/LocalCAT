@@ -584,7 +584,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1_
   - _Requirements: 5.1, 5.3, 5.6, 5.7_
 
-- [ ] 11.4a 提供原root持锁直接子项metadata观察
+- [x] 11.4a 提供原root持锁直接子项metadata观察
   - 从同adapter原root与exact-parent live lease执行有界、no-follow、无正文的完整直接子项观察，复用中立metadata与取消合同；原root/W1不转交、不另绑Path、不逐项开关文件FD。
   - 完成时，无关目录、链接及其他不可用项保留原名与类型；foreign issuer、错root/lease、已观察漂移、取消、超限、部分枚举和close失败稳定拒绝，借入root/W1不被关闭；既有ledger、独立discovery和Windows后代检查语义不放宽。
   - _Boundary: 平台contracts/POSIX adapter及对应合同测试_

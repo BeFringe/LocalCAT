@@ -32,6 +32,7 @@ from platform_fs_contracts import (
     DirectoryHandleBudget,
     DirectoryHandleReservation,
     DirectoryObservationCancellation,
+    DirectoryObservationLimits,
     EntrySnapshot,
     ExistingFileDurability,
     ExistingFileMutationGuard,
@@ -40,6 +41,7 @@ from platform_fs_contracts import (
     LedgerEntryObservation,
     LedgerEnumerationLimits,
     LockLease,
+    LockedRootDirectoryObservation,
     LockPolicy,
     LockWait,
     MutableFileReservation,
@@ -2220,12 +2222,17 @@ class _PosixDirectoryStream:
             descriptor = None  # fdopendir owns the same fd; it does not dup it.
             cancellation.check()
         except BaseException:
-            if self._pointer:
-                self.close()
-            else:
-                if descriptor is not None:
-                    _close_observation_fd(descriptor)
-                self._reservation.close()
+            try:
+                if self._pointer:
+                    self.close()
+                else:
+                    if descriptor is not None:
+                        _close_observation_fd(descriptor)
+                    self._reservation.close()
+            except BaseException:
+                # Cleanup must not replace the acquisition/cancellation error.
+                # A failed native close leaves its reservation charged.
+                pass
             raise
 
     def __iter__(self) -> _PosixDirectoryStream:
@@ -2259,6 +2266,7 @@ class _PosixDirectoryStream:
 
 class PosixPlatformAdapter(
     ReadOnlyDirectoryObservation,
+    LockedRootDirectoryObservation,
     PosixBoundContentObservation,
     PosixStageHandoff,
     RootedFileSystem,
@@ -2276,6 +2284,72 @@ class PosixPlatformAdapter(
             raise TypeError("_fault_injector must be callable")
         self._fault_injector = _fault_injector
         self._issuer = object()
+
+    def _observe_root_children(
+        self, root: RootedDirectoryAuthority, lease: LockLease,
+        limits: DirectoryObservationLimits, cancellation: DirectoryObservationCancellation,
+    ) -> tuple[DirectoryEntryMetadata, ...]:
+        if type(root) is not _PosixRootedDirectory or root._issuer is not self._issuer:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        root.reprove_location()
+        self._stage_lease(lease, root)
+        resources = DirectoryHandleBudget(limits.maximum_directory_handles)
+
+        def metadata_key(value: os.stat_result) -> tuple[int, ...]:
+            # Links/special entries have no public snapshot, so retain their
+            # no-follow metadata privately too when comparing complete passes.
+            return (value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+                    value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+                    value.st_uid, value.st_gid, value.st_rdev)
+
+        def observe_once() -> tuple[tuple[DirectoryEntryMetadata, tuple[int, ...]], ...]:
+            entries: dict[str, tuple[DirectoryEntryMetadata, tuple[int, ...]]] = {}
+            stream: _PosixDirectoryStream | None = None
+            failed = False
+            try:
+                cancellation.check()
+                generation = metadata_key(os.fstat(root._directory_fd))
+                stream = _PosixDirectoryStream(root._directory_fd, resources, cancellation)
+                for name, inode in stream:
+                    cancellation.check()
+                    if name in entries:
+                        raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                    if len(entries) >= limits.maximum_entries:
+                        raise _platform_error(PlatformFileErrorCode.OBSERVATION_LIMIT_EXCEEDED, retryable=False)
+                    before = os.stat(name, dir_fd=root._directory_fd, follow_symlinks=False)
+                    after = os.stat(name, dir_fd=root._directory_fd, follow_symlinks=False)
+                    key = metadata_key(after)
+                    if inode != before.st_ino or metadata_key(before) != key:
+                        raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                    entries[name] = (_observation_metadata(name, after), key)
+                cancellation.check()
+                if metadata_key(os.fstat(root._directory_fd)) != generation:
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                return tuple(entries[name] for name in sorted(entries))
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except BaseException:
+                        if not failed:
+                            raise
+
+        try:
+            first = observe_once()
+            second = observe_once()
+            if first != second:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            root.reprove_location()
+            self._stage_lease(lease, root)
+            cancellation.check()
+            return tuple(entry for entry, _key in second)
+        except OSError as error:
+            raise _map_os_error(
+                error, fallback=PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False,
+            ) from None
 
     def _open_existing_stage(
         self, parent: BoundDirectoryAuthority, name: str,

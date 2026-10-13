@@ -2240,6 +2240,50 @@ class OwnedNamespaceRetirement(Protocol):
 
 
 @runtime_checkable
+class LockedRootDirectoryObservation(Protocol):
+    """Optional metadata-only observation borrowing the original root and W1.
+
+    The adapter proves same issuer, exact-parent live lease and root location
+    before and after two complete bounded passes. It owns only temporary
+    directory resources; it never opens child files or transfers root/lease.
+    Unavailable entries retain their original names. Results are neither file
+    authority nor an atomic snapshot or persistent qualification.
+    """
+
+    def observe_root_children(
+        self, root: RootedDirectoryAuthority, lease: LockLease,
+        limits: DirectoryObservationLimits, cancellation: DirectoryObservationCancellation,
+    ) -> tuple[DirectoryEntryMetadata, ...]:
+        if not isinstance(root, RootedDirectoryAuthority):
+            raise TypeError("root must be RootedDirectoryAuthority")
+        if not isinstance(lease, LockLease):
+            raise TypeError("lease must be LockLease")
+        root._require_open()
+        lease._require_open()
+        _check_observation_arguments(limits, cancellation)
+        result = self._observe_root_children(root, lease, limits, cancellation)
+        if type(result) is not tuple:
+            raise TypeError("backend root observations must be an exact tuple")
+        if len(result) > limits.maximum_entries:
+            raise PlatformFileError(PlatformFileErrorCode.OBSERVATION_LIMIT_EXCEEDED, retryable=False)
+        names: set[str] = set()
+        for entry in result:
+            if type(entry) is not DirectoryEntryMetadata:
+                raise TypeError("backend must return exact DirectoryEntryMetadata")
+            if entry.name in names:
+                raise PlatformFileError(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            names.add(entry.name)
+        cancellation.check()
+        return result
+
+    @abstractmethod
+    def _observe_root_children(
+        self, root: RootedDirectoryAuthority, lease: LockLease,
+        limits: DirectoryObservationLimits, cancellation: DirectoryObservationCancellation,
+    ) -> tuple[DirectoryEntryMetadata, ...]: ...
+
+
+@runtime_checkable
 class LockedDescendantNamespaceInspection(Protocol):
     """Observe one descendant namespace under an exact ancestor W1 lease."""
 
