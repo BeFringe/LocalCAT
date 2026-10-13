@@ -132,7 +132,7 @@ class TMSchemaUpgradeModuleBoundariesTest(unittest.TestCase):
         self.assertIn("tm_contracts", modules)
         self.assertIn("tm_activation_journal", modules)
         for module in modules:
-            if module in {"tm_contracts", "tm_activation_journal"}:
+            if module in {"tm_contracts", "tm_activation_journal", "platform_fs_contracts"}:
                 continue
             if module.startswith("tm_contracts"):
                 continue

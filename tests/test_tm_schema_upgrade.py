@@ -111,6 +111,19 @@ _BLOCK_RECORDS = (
 )
 
 
+def _fail_first_journal_write():
+    """Only the initial PREPARED write fails; durable cancellation may run."""
+    original = tm_sqlite_store._write_activation_journal
+    calls = 0
+    def write(*args: Any, **kwargs: Any):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected initial PREPARED write")
+        return original(*args, **kwargs)
+    return write
+
+
 def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -569,14 +582,14 @@ class SchemaUpgradeHappyPathTests(unittest.TestCase):
                         ),
                         patch(
                             "tm_stage_sealer._open_stage_write_connection",
-                            side_effect=lambda path: trace_connection(
-                                real_open_write(path)
+                            side_effect=lambda path, **kwargs: trace_connection(
+                                real_open_write(path, **kwargs)
                             ),
                         ),
                         patch(
                             "tm_stage_sealer._open_stage_read_connection",
-                            side_effect=lambda path: trace_connection(
-                                real_open_read(path)
+                            side_effect=lambda path, **kwargs: trace_connection(
+                                real_open_read(path, **kwargs)
                             ),
                         ),
                     ):
@@ -864,12 +877,12 @@ class SchemaUpgradeFailClosedTests(unittest.TestCase):
                     )
                     store_before = prior.staged_db_path.read_bytes()
                     service = _service(coordinator, identity)
-                    real_capture = tm_stage_sealer._capture_content_file
+                    real_capture = tm_stage_sealer._CallerHeldSealBorrow.capture_posix
                     mutated = False
 
-                    def mutate_then_capture(path: Path) -> Any:
+                    def mutate_then_capture(borrow: Any, path: Path, **kwargs: Any) -> Any:
                         nonlocal mutated
-                        if not mutated:
+                        if not mutated and kwargs.get("synchronize"):
                             mutated = True
                             connection = sqlite3.connect(
                                 path,
@@ -902,7 +915,7 @@ class SchemaUpgradeFailClosedTests(unittest.TestCase):
                                 raise
                             finally:
                                 connection.close()
-                        return real_capture(path)
+                        return real_capture(borrow, path, **kwargs)
 
                     with (
                         patch(
@@ -910,8 +923,8 @@ class SchemaUpgradeFailClosedTests(unittest.TestCase):
                             return_value=fts5_available,
                         ),
                         patch(
-                            "tm_stage_sealer._capture_content_file",
-                            side_effect=mutate_then_capture,
+                            "tm_stage_sealer._CallerHeldSealBorrow.capture_posix",
+                            new=mutate_then_capture,
                         ),
                     ):
                         outcome = service.upgrade_schema(
@@ -1914,7 +1927,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
                 patch(
                     "tm_sqlite_store._write_activation_journal",
-                    side_effect=OSError("injected"),
+                    side_effect=_fail_first_journal_write(),
                 ),
             ):
                 outcome = service.upgrade_schema(prior.staged_db_path)
@@ -1951,8 +1964,8 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
             with (
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
                 patch(
-                    "tm_activation_recovery._replace_activation_file",
-                    side_effect=OSError("injected"),
+                    "tm_activation_recovery._replace_activation_database",
+                    side_effect=ActivationPreparationError("ACTIVATION.DB_REPLACE_FAILED", retryable=True),
                 ),
             ):
                 outcome = service.upgrade_schema(prior.staged_db_path)
@@ -2029,6 +2042,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                 journal_path: Path,
                 *,
                 expected_final_identity: _ActivationFileIdentity | None,
+                **kwargs: Any,
             ) -> object:
                 calls["count"] += 1
                 if calls["count"] == 4:
@@ -2037,6 +2051,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                     record,
                     journal_path,
                     expected_final_identity=expected_final_identity,
+                    **kwargs,
                 )
 
             with (
@@ -2137,7 +2152,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
                 patch(
                     "tm_sqlite_store._write_activation_journal",
-                    side_effect=OSError("injected"),
+                    side_effect=_fail_first_journal_write(),
                 ),
                 patch(
                     "tm_sqlite_store.ResourceStoreCoordinator."
@@ -2361,7 +2376,7 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
                     patch("tm_sqlite_store._probe_fts5", return_value=False),
                     patch(
                         "tm_sqlite_store._write_activation_journal",
-                        side_effect=OSError("injected"),
+                        side_effect=_fail_first_journal_write(),
                     ),
                 ):
                     outcome = service.upgrade_schema(prior.staged_db_path)
@@ -2461,14 +2476,14 @@ class SchemaUpgradeFailureReconciliationTests(unittest.TestCase):
 
             cleanup_calls = {"count": 0}
 
-            def fail_cleanup_once(owned_paths: Any) -> None:
+            def fail_cleanup_once(owned_paths: Any, **kwargs: Any) -> None:
                 cleanup_calls["count"] += 1
                 if cleanup_calls["count"] == 1:
                     raise ActivationPreparationError(
                         "ACTIVATION.RECOVERY_BACKUP_INVALID",
                         retryable=False,
                     )
-                original_remove(owned_paths)
+                original_remove(owned_paths, **kwargs)
 
             with (
                 patch("tm_sqlite_store._probe_fts5", return_value=False),
@@ -2755,6 +2770,7 @@ class SchemaUpgradeRecoveryLocatorStrictnessTests(unittest.TestCase):
                         selection: Any,
                         expected_digest: str,
                         fail_stop_code: str,
+                        **kwargs: Any,
                     ) -> None:
                         path = selection.path
                         if kind == "symlink":
@@ -2775,6 +2791,7 @@ class SchemaUpgradeRecoveryLocatorStrictnessTests(unittest.TestCase):
                             selection,
                             expected_digest,
                             fail_stop_code,
+                            **kwargs,
                         )
 
                     with (
@@ -2857,6 +2874,7 @@ class SchemaUpgradeRecoveryLocatorStrictnessTests(unittest.TestCase):
                     def swap_then_promote(
                         path: Path,
                         artifact_identity: tuple[int, int],
+                        **kwargs: Any,
                     ) -> Path:
                         if os.path.lexists(path):
                             if kind == "symlink":
@@ -2876,6 +2894,7 @@ class SchemaUpgradeRecoveryLocatorStrictnessTests(unittest.TestCase):
                         return original_promote(
                             path,
                             artifact_identity,
+                            **kwargs,
                         )
 
                     with (

@@ -10,8 +10,8 @@ journal-authenticated new set cannot be proven at any phase.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from collections.abc import Callable, Generator, Iterator
+from contextlib import nullcontext, AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -102,8 +102,6 @@ from platform_fs_contracts import (
     BoundSynchronizedRegularFile,
     CandidateContentFacts,
     CandidateFile,
-    DirectoryObservationCancellation,
-    DirectoryObservationLimits,
     ExistingCandidateRecovery,
     ExistingFileMutationGuard,
     ExistingFileRetirement,
@@ -113,7 +111,6 @@ from platform_fs_contracts import (
     LockPolicy,
     LockWait,
     LockedDescendantNamespaceInspection,
-    LockedRootDirectoryObservation,
     MutableFileReservation,
     OpaqueAuthority,
     PendingPublication,
@@ -4218,6 +4215,7 @@ def _leave_resource_family(session: _ResourceFamilySession, owner: str) -> None:
                 _FAMILY_SESSIONS.pop(_family_path(session._identity.configured_jsonl_path), None)
 
 
+
 class ResourceStoreCoordinator:
     """Own one resource's leases, sealed registry, and activation authority."""
 
@@ -4266,29 +4264,13 @@ class ResourceStoreCoordinator:
             )
         ):
             raise TypeError("activation digest expectation is invalid")
+        private_stage = None
         if stage is not None:
             private_stage = _snapshot_store_stage(stage)
             identity = private_stage.resource_identity
-            snapshot = inspect_stage_schema(
-                private_stage,
-                canonical_store_id=canonical_store_id,
-                _stage_borrow=_stage_borrow,
-                _allow_diverged_runtime=True,
-                _allow_legacy_schema=_allow_legacy_schema,
-                _allow_active=_allow_active,
-                _expected_active_generation=_expected_active_generation,
-                _expected_activation_digest=_expected_activation_digest,
-            )
-            view: _SQLiteGenerationView | None = _SQLiteStageView(
-                stage=private_stage,
-                canonical_store_id=canonical_store_id,
-                generation=snapshot.generation,
-                fts5_available=snapshot.fts5_available,
-                stage_borrow=_stage_borrow,
-            )
         else:
             identity = _snapshot_store_identity(resource_identity)
-            view = None
+        view: _SQLiteGenerationView | None = None
         self._resource_identity = identity
         self._resource_id = identity.resource_id
         self._target_identity = identity.target_identity
@@ -4338,6 +4320,9 @@ class ResourceStoreCoordinator:
         self._failed_posix_journal_temporary: tuple[Path, ContentFileProof] | None = None
         self._owner_nonce = uuid.uuid4().hex
         self._schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None = None
+        self._schema_io: schema_upgrade_module.SchemaUpgradeIO | None = None
+        self._schema_upgrade_close_prior: tuple[_SQLiteGenerationView, ContentFileProof | None] | None = None
+        self._schema_upgrade_prior_guard: BoundExistingFileMutationGuard | None = None
         self._schema_upgrade_locator_snapshot: (
             _SchemaUpgradeLocatorSnapshot | None
         ) = None
@@ -4348,7 +4333,7 @@ class ResourceStoreCoordinator:
         # not implicitly enter the active resource's admission/W1 protocol.
         self._family = (
             _join_resource_family(identity, self._owner_nonce, _family_root)
-            if sys.platform != "win32" and stage is None
+            if sys.platform != "win32" and (stage is None or (_allow_active and _allow_legacy_schema))
             else None
         )
         self._family_finalizer = (
@@ -4356,6 +4341,26 @@ class ResourceStoreCoordinator:
                 self, _leave_resource_family, self._family, self._owner_nonce,
             )
         )
+        if stage is not None:
+            assert private_stage is not None
+            with self._schema_upgrade_scope() if self._family is not None else nullcontext(None) as io:
+                snapshot = inspect_stage_schema(
+                    private_stage,
+                    canonical_store_id=canonical_store_id,
+                    _stage_borrow=io if io is not None else _stage_borrow,
+                    _allow_diverged_runtime=True,
+                    _allow_legacy_schema=_allow_legacy_schema,
+                    _allow_active=_allow_active,
+                    _expected_active_generation=_expected_active_generation,
+                    _expected_activation_digest=_expected_activation_digest,
+                )
+                self._view = _SQLiteStageView(
+                    stage=private_stage,
+                    canonical_store_id=canonical_store_id,
+                    generation=snapshot.generation,
+                    fts5_available=snapshot.fts5_available,
+                    stage_borrow=_stage_borrow,
+                )
 
     def _ensure_family_available(self) -> None:
         if self._family_closed:
@@ -4818,6 +4823,128 @@ class ResourceStoreCoordinator:
         ):
             yield
 
+    @contextmanager
+    def _schema_upgrade_scope(self, io: schema_upgrade_module.SchemaUpgradeIO | None = None) -> Generator[schema_upgrade_module.SchemaUpgradeIO]:
+        if self._schema_io is not None:
+            self._schema_io.borrow.reprove()
+            yield self._schema_io
+            return
+        if io is None:
+            with self._family_transition() as operation:
+                family = operation._family
+                def no_stage(_expected: ContentFileProof) -> CandidateFile:
+                    raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+                borrow = _CallerHeldPosixActivationBorrow(
+                    identity=self._resource_identity, backend=family._backend,
+                    root=family._root, lease=operation._lease,
+                    owner_reproof=lambda: operation.reprove(self), owner_failure=family.fail,
+                    defer_close=lambda close: self._stop_posix_recovery_admission(pending_close=close),
+                    handoff_stage=no_stage,
+                )
+                try:
+                    with self._schema_upgrade_scope(schema_upgrade_module.SchemaUpgradeIO(borrow)) as issued:
+                        yield issued
+                finally:
+                    borrow.release()
+            return
+        io.borrow.reprove()
+        if io.borrow.identity != self._resource_identity or (self._family is not None and io.borrow.root is not self._family._root):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        self._schema_io = io
+        primary: BaseException | None = None
+        try:
+            yield io
+            io.borrow.reprove()
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            self._schema_io = None
+            if not io.recovery_required and (self._family is None or not self._family._recovery_required):
+                close_error = io.close_reservations(self._schema_upgrade_prior_guard, primary=primary)
+                if close_error is None:
+                    self._schema_upgrade_prior_guard = None
+                    self._schema_upgrade_close_prior = None
+                elif primary is None:
+                    raise close_error
+
+    def _begin_schema_upgrade_close_prior(self, io: schema_upgrade_module.SchemaUpgradeIO) -> None:
+        """Pin this owner's original DB before SQLite can recover its journal."""
+        if self._schema_upgrade_close_prior is not None:
+            return
+        io.borrow.reprove()
+        if self._schema_io is not io or self._view is None or not isinstance(io.borrow.backend, ExistingFileMutationGuard):
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        path = self._view.stage.staged_db_path
+        io.borrow.require_path(path)
+        guard = io.borrow.backend.guard_existing_for_mutation(io.borrow.root, PurePath(path.name))
+        self._schema_upgrade_prior_guard = guard
+        self._schema_upgrade_close_prior = (self._view, None)
+
+    def _remember_schema_upgrade_close_prior(self, io: schema_upgrade_module.SchemaUpgradeIO, proof: ContentFileProof) -> None:
+        """Retain pre-failure facts for this owner's unpublished schema attempt."""
+        io.borrow.reprove()
+        if self._schema_io is not io or self._view is None:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        self._schema_upgrade_close_prior = (self._view, proof)
+        close_error = io.close_reservations(self._schema_upgrade_prior_guard)
+        if close_error is not None:
+            raise close_error
+        self._schema_upgrade_prior_guard = None
+
+    def _resume_schema_upgrade_close_prior(self, port: _CoordinatorStorePort) -> bool:
+        prior = self._schema_upgrade_close_prior
+        borrow = port.posix_activation_borrow
+        if (prior is None or borrow is None or self._preparation is not None
+                or self._cleanup_reservation is not None or self._view is not prior[0]):
+            return False
+        view, expected = prior
+        io = schema_upgrade_module.SchemaUpgradeIO(borrow)
+        with self._schema_upgrade_scope(io):
+            _require_no_pending_activation_assets(self._resource_identity, io=io)
+            path = view.stage.staged_db_path
+            if expected is None:
+                guard = self._schema_upgrade_prior_guard
+                if guard is None or guard.closed:
+                    raise ActivationPreparationError("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=False)
+                try:
+                    _ = guard.reprove()
+                except BaseException:
+                    borrow.fail()
+                    raise
+                io.recover_store(path)
+                expected = io.capture(path, expected_guard=guard)
+                self._remember_schema_upgrade_close_prior(io, expected)
+            elif self._schema_upgrade_prior_guard is not None:
+                # Pending close replay has finished this exact guard. Retire
+                # its reference only after the original proof was retained.
+                self._remember_schema_upgrade_close_prior(io, expected)
+            if io.capture(path) != expected:
+                raise ActivationPreparationError("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=False)
+            digest = schema_upgrade_module._read_active_activation_digest(
+                path, io=io,
+                preflight_error_factory=lambda code: ActivationPreparationError(code, retryable=False),
+            )
+            inspect_stage_schema(
+                view.stage, canonical_store_id=view.canonical_store_id,
+                _stage_borrow=io, _allow_legacy_schema=True, _allow_active=True,
+                _allow_diverged_runtime=True, _expected_active_generation=view.generation,
+                _expected_activation_digest=digest,
+            )
+            _require_schema_upgrade_ancestry_provable(path, io=io)
+            _capture_prior_assets(port, view, identity=self._resource_identity, replacement=False)
+            if io.capture(path) != expected:
+                raise ActivationPreparationError("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=False)
+            ticket = self._schema_upgrade_ticket
+            if ticket is not None:
+                self.retire_schema_upgrade_ticket(ticket)
+            self.release_schema_upgrade_locator_snapshot()
+            self._finish_cold_recovery_pending(port, None)
+            borrow.reprove()
+            self._state = "READY"
+            self._condition.notify_all()
+        return True
+
     def prepare_schema_upgrade_ticket(
         self,
     ) -> _SchemaUpgradeSnapshotTicket:
@@ -4840,8 +4967,17 @@ class ResourceStoreCoordinator:
         tampering, or an unprovable order is never repaired.
         """
 
+        if self._family is not None and self._schema_io is None:
+            with self._schema_upgrade_scope():
+                return self.prepare_schema_upgrade_ticket()
+        io = self._schema_io
         self.release_schema_upgrade_locator_snapshot()
-        port = _CoordinatorStorePort(self)
+        port = _CoordinatorStorePort(self, None if io is None else io.borrow)
+        def capture_prior(view: _SQLiteGenerationView) -> tuple[_PriorAssetCapture, ...]:
+            try:
+                return _capture_prior_assets(port, view, identity=self._resource_identity, replacement=False)
+            except PlatformFileError as error:
+                raise ActivationPreparationError("ACTIVATION.PRIOR_ASSET_INVALID", retryable=False, reason_code=error.code) from error
         with self._condition:
             if (
                 self._state != "READY"
@@ -4860,25 +4996,26 @@ class ResourceStoreCoordinator:
                     "ACTIVATION.UPGRADE_ACTIVE_RESOURCE_REQUIRED",
                     retryable=False,
                 )
-            _require_no_pending_activation_assets(self._resource_identity)
+            _require_no_pending_activation_assets(self._resource_identity, **({"io": io} if io is not None else {}))
             # Fresh v1 ticket mint: strictly sweep only unexposed pending
             # schema-upgrade crash orphans of the deterministic naming
             # family (never stable reported backups or exposed failure
             # locators), so a crash after a previous ticket mint or after
             # guard consumption cannot accumulate hidden full DB copies.
             _sweep_pending_schema_upgrade_artifacts(
-                view.stage.staged_db_path
+                view.stage.staged_db_path, io=io
             )
             initial_generation = view.generation
+            if io is not None:
+                self._begin_schema_upgrade_close_prior(io)
+                io.recover_store(view.stage.staged_db_path)
+                self._remember_schema_upgrade_close_prior(io, io.capture(
+                    view.stage.staged_db_path, expected_guard=self._schema_upgrade_prior_guard,
+                ))
             _require_schema_upgrade_ancestry_provable(
-                view.stage.staged_db_path
+                view.stage.staged_db_path, io=io
             )
-            pre_drain_captures = _capture_prior_assets(
-                port,
-                view,
-                identity=self._resource_identity,
-                replacement=False,
-            )
+            pre_drain_captures = capture_prior(view)
             self._state = "DRAINING"
             self._condition.notify_all()
             deadline = time.monotonic() + self._drain_timeout_seconds
@@ -4906,14 +5043,9 @@ class ResourceStoreCoordinator:
                         retryable=False,
                     )
                 _require_schema_upgrade_ancestry_provable(
-                    view.stage.staged_db_path
+                    view.stage.staged_db_path, io=io
                 )
-                post_drain_captures = _capture_prior_assets(
-                    port,
-                    view,
-                    identity=self._resource_identity,
-                    replacement=False,
-                )
+                post_drain_captures = capture_prior(view)
                 try:
                     _require_same_asset_captures(
                         pre_drain_captures,
@@ -4926,9 +5058,9 @@ class ResourceStoreCoordinator:
                     ) from error
                 database_path = view.stage.staged_db_path
                 db_identity, db_digest = _schema_upgrade_db_capture(
-                    database_path
+                    database_path, io=io
                 )
-                head_revision = _schema_upgrade_head_revision(database_path)
+                head_revision = _schema_upgrade_head_revision(database_path, **({"io": io} if io is not None else {}))
                 token = uuid.uuid4().hex
                 backup_path = _schema_upgrade_backup_path(
                     database_path,
@@ -4937,7 +5069,7 @@ class ResourceStoreCoordinator:
                 backup_identity, backup_digest = (
                     _create_schema_upgrade_backup(
                         database_path,
-                        backup_path,
+                        backup_path, io=io,
                     )
                 )
                 locator_snapshot_path = _schema_upgrade_locator_snapshot_path(
@@ -4947,7 +5079,7 @@ class ResourceStoreCoordinator:
                 locator_snapshot_identity, locator_snapshot_digest = (
                     _create_schema_upgrade_locator_snapshot(
                         database_path,
-                        locator_snapshot_path,
+                        locator_snapshot_path, io=io,
                     )
                 )
                 ticket = _SchemaUpgradeSnapshotTicket(
@@ -4973,10 +5105,12 @@ class ResourceStoreCoordinator:
                 )
                 return ticket
             except BaseException:
+                if io is not None and io.recovery_required:
+                    raise
                 if backup_path is not None and backup_identity is not None:
                     _remove_owned_schema_upgrade_artifact(
                         backup_path,
-                        backup_identity,
+                        backup_identity, io=io,
                     )
                 if (
                     locator_snapshot_path is not None
@@ -4984,12 +5118,13 @@ class ResourceStoreCoordinator:
                 ):
                     _remove_owned_schema_upgrade_artifact(
                         locator_snapshot_path,
-                        locator_snapshot_identity,
+                        locator_snapshot_identity, io=io,
                     )
                     self._schema_upgrade_locator_snapshot = None
                 raise
             finally:
-                self._state = "READY"
+                if self._state != "FAILED" and (io is None or not io.recovery_required):
+                    self._state = "READY"
                 self._condition.notify_all()
 
     def prepare_portable_schema_upgrade_ticket(
@@ -5089,6 +5224,9 @@ class ResourceStoreCoordinator:
         single-use contract cannot be silently violated.
         """
 
+        if self._family is not None and self._schema_io is None:
+            with self._schema_upgrade_scope():
+                return self.retire_schema_upgrade_ticket(ticket)
         if type(ticket) is not _SchemaUpgradeSnapshotTicket:
             raise ActivationPreparationError(
                 "ACTIVATION.UPGRADE_TICKET_INVALID",
@@ -5107,7 +5245,7 @@ class ResourceStoreCoordinator:
                     retryable=False,
                 )
         if remove_backup:
-            _remove_schema_upgrade_backup(ticket)
+            _remove_schema_upgrade_backup(ticket, io=self._schema_io)
 
     @property
     def schema_upgrade_locator_snapshot(
@@ -5132,7 +5270,10 @@ class ResourceStoreCoordinator:
             snapshot = self._schema_upgrade_locator_snapshot
             if snapshot is None:
                 return
-        _remove_schema_upgrade_locator_snapshot(snapshot)
+        if self._family is not None and self._schema_io is None:
+            with self._schema_upgrade_scope():
+                return self.release_schema_upgrade_locator_snapshot()
+        _remove_schema_upgrade_locator_snapshot(snapshot, io=self._schema_io)
         with self._condition:
             self._schema_upgrade_locator_snapshot = None
 
@@ -5183,6 +5324,12 @@ class ResourceStoreCoordinator:
         A save/import in the window fails the stale candidate before any
         journal, restores READY, and requires a fresh snapshot for retry.
         """
+
+        if _posix_borrow is None:
+            schema_io = self._schema_io
+            if schema_io is not None:
+                _posix_borrow = schema_io.borrow
+
 
         if _schema_upgrade_ticket is not None and type(
             _schema_upgrade_ticket
@@ -6052,6 +6199,7 @@ class ResourceStoreCoordinator:
             _require_schema_upgrade_mode_closure(
                 physical_snapshot,
                 schema_upgrade_ticket=schema_upgrade_ticket,
+                io=self._schema_io,
             )
             preparation_id = f"preparation.{uuid.uuid4().hex}"
             if initial_view is None:
@@ -6199,6 +6347,12 @@ class ResourceStoreCoordinator:
         *, _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> None:
         """Fail-safe cancellation before Task 5.6 writes a journal."""
+
+        if _posix_borrow is None:
+            schema_io = self._schema_io
+            if schema_io is not None:
+                _posix_borrow = schema_io.borrow
+
 
         if _posix_borrow is not None:
             try:
@@ -6355,7 +6509,7 @@ class ResourceStoreCoordinator:
                 )
             self._cleanup_in_progress = True
         try:
-            _remove_recovery_backups(reservation.owned_paths)
+            _remove_recovery_backups(reservation.owned_paths, **({"caller_borrow": self._schema_io.borrow} if self._schema_io is not None else {}))
             if reservation.token is not None:
                 self._sealed_registry.cancel(reservation.token)
         except ActivationPreparationError:
@@ -6392,6 +6546,12 @@ class ResourceStoreCoordinator:
         changes.  An already-durable byte-identical PREPARED journal for the
         same preparation is replayed into a fresh handle without rewriting.
         """
+
+        if _posix_borrow is None:
+            schema_io = self._schema_io
+            if schema_io is not None:
+                _posix_borrow = schema_io.borrow
+
 
         if type(preparation) is not _ActivationPreparation:
             raise ActivationPreparationError(
@@ -10502,6 +10662,12 @@ class ResourceStoreCoordinator:
         this method never rewinds or claims READY on a partial publication.
         """
 
+        if _posix_borrow is None:
+            schema_io = self._schema_io
+            if schema_io is not None:
+                _posix_borrow = schema_io.borrow
+
+
         with self._condition:
             return publish_activation(
                 _CoordinatorStorePort(self, _posix_borrow),
@@ -10541,6 +10707,8 @@ class ResourceStoreCoordinator:
                 with self._condition:
                     yield port
                 activation_borrow.reprove()
+                if port._posix_recovery_completed and self._schema_io is not None and self._schema_io.borrow is activation_borrow:
+                    self._schema_io.recovery_completed = True
             except BaseException as error:
                 self._stop_posix_recovery_admission()
                 mapped = self._preserve_verified_recovery(error, port)
@@ -10566,7 +10734,20 @@ class ResourceStoreCoordinator:
                 mapped = self._preserve_verified_recovery(error, port)
                 if mapped is not error:
                     raise mapped from error
+                if (port is not None and port._posix_recovery_completed
+                        and self._schema_upgrade_close_prior is not None):
+                    fact = "Schema prior recovery verified; original owned close incomplete"
+                    if isinstance(error, PlatformFileError):
+                        mapped = ActivationPreparationError(
+                            "ACTIVATION.RECOVERY_REQUIRED", retryable=True,
+                            reason_code=error.code,
+                        )
+                        mapped.add_note(fact)
+                        raise mapped from error
+                    error.add_note(fact)
                 raise
+            if port is not None and port._posix_recovery_completed:
+                self._schema_upgrade_close_prior = None
             return
         borrow.reprove(self)
         borrow._recovery_completed = False
@@ -10696,6 +10877,12 @@ class ResourceStoreCoordinator:
         state without relying on bare absence or caller memory.
         """
 
+        if _posix_borrow is None:
+            schema_io = self._schema_io
+            if schema_io is not None:
+                _posix_borrow = schema_io.borrow
+
+
         with self._posix_recovery_port(activation_borrow=_posix_borrow) as port:
             borrow = port.posix_activation_borrow
             if borrow is not None and self._family is not None:
@@ -10719,6 +10906,8 @@ class ResourceStoreCoordinator:
                                 and (pending_owner._failed_posix_journal_temporary is not None
                                      or record is None or record.preparation_id != preparation.preparation_id)):
                             pending_owner._cancel_posix_unpublished_activation(preparation, borrow)
+            if self._resume_schema_upgrade_close_prior(port):
+                return None
             report = recover_durable_activation(port)
             port.posix_recovery_report = report
             self._finish_cold_recovery_pending(port, report)
@@ -10860,6 +11049,8 @@ class ResourceStoreCoordinator:
         :meth:`recover_durable_activation`.
         """
 
+        if _posix_borrow is None and self._schema_io is not None:
+            _posix_borrow = self._schema_io.borrow
         with self._posix_recovery_port(activation_borrow=_posix_borrow) as port:
             report = rollback_durable_activation(port)
             port.posix_recovery_report = report
@@ -19202,6 +19393,8 @@ def _open_configured_connection(
             database, timeout=BUSY_TIMEOUT_MS / 1000,
             isolation_level=None, uri=uri,
         )
+        if isinstance(_stage_borrow, schema_upgrade_module.SchemaUpgradeIO):
+            _stage_borrow.retain_connection(database_path, connection)
         if _runtime_lease is not None:
             _runtime_lease.reprove()
         if _stage_borrow is not None:
@@ -19255,27 +19448,35 @@ def _open_configured_connection(
                         raise
         except BaseException as error:
             closing_error = error
-        defer_connection = getattr(_stage_borrow, "defer_connection_close", None)
-        deferred_connection = closing_error is not None and not connection_closed and connection is not None and callable(defer_connection)
-        if deferred_connection:
-            assert callable(defer_connection)
-            _ = defer_connection(connection)
-        try:
-            if _stage_borrow is not None and not deferred_connection:
-                _stage_borrow.exit_sql(database_path, purpose)
-            if _runtime_lease is not None:
-                _runtime_lease.reprove()
-        except BaseException as error:
-            if closing_error is None:
-                closing_error = error
-            else:
-                closing_error = _with_owned_close_facts(closing_error, error, context="SQL guard close failed")
-        if closing_error is not None:
-            if operation_error is None:
-                raise closing_error
-            mapped = _with_owned_close_facts(operation_error, closing_error, context="SQL close failed")
-            if mapped is not operation_error:
-                raise mapped from operation_error
+        if isinstance(_stage_borrow, schema_upgrade_module.SchemaUpgradeIO):
+            primary = operation_error
+            if closing_error is not None:
+                primary = closing_error if primary is None else _with_owned_close_facts(primary, closing_error, context="SQL close failed")
+            _stage_borrow.exit_sql(database_path, purpose, primary=primary)
+            if primary is not None and primary is not operation_error:
+                raise primary
+        else:
+            defer_connection = getattr(_stage_borrow, "defer_connection_close", None)
+            deferred_connection = closing_error is not None and not connection_closed and connection is not None and callable(defer_connection)
+            if deferred_connection:
+                assert callable(defer_connection)
+                _ = defer_connection(connection)
+            try:
+                if _stage_borrow is not None and not deferred_connection:
+                    _stage_borrow.exit_sql(database_path, purpose)
+                if _runtime_lease is not None:
+                    _runtime_lease.reprove()
+            except BaseException as error:
+                if closing_error is None:
+                    closing_error = error
+                else:
+                    closing_error = _with_owned_close_facts(closing_error, error, context="SQL guard close failed")
+            if closing_error is not None:
+                if operation_error is None:
+                    raise closing_error
+                mapped = _with_owned_close_facts(operation_error, closing_error, context="SQL close failed")
+                if mapped is not operation_error:
+                    raise mapped from operation_error
 
 
 def _sqlite_connection_target(
@@ -20372,13 +20573,13 @@ def _fsync_schema_upgrade_directory(path: Path) -> None:
 def _create_schema_upgrade_backup(
     source_path: Path,
     backup_path: Path,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> tuple[tuple[int, int], str]:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._create_schema_upgrade_backup(
         source_path,
-        backup_path,
-    )
+        backup_path, **({"io": io} if io is not None else {}))
 
 
 def _remove_partial_schema_upgrade_backup(backup_path: Path) -> None:
@@ -20404,25 +20605,25 @@ def _schema_upgrade_locator_snapshot_path(
 def _create_schema_upgrade_locator_snapshot(
     source_path: Path,
     snapshot_path: Path,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> tuple[tuple[int, int], str]:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._create_schema_upgrade_locator_snapshot(
         source_path,
-        snapshot_path,
-    )
+        snapshot_path, **({"io": io} if io is not None else {}))
 
 
 def _remove_owned_schema_upgrade_artifact(
     path: Path,
     identity: tuple[int, int],
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     schema_upgrade_module._remove_owned_schema_upgrade_artifact(
         path,
-        identity,
-    )
+        identity, **({"io": io} if io is not None else {}))
 
 
 def _schema_upgrade_reported_path(pending_path: Path) -> Path:
@@ -20465,12 +20666,13 @@ def _require_owned_pending_schema_upgrade_name(
     )
 
 
-def _sweep_pending_schema_upgrade_artifacts(store_path: Path) -> None:
+def _sweep_pending_schema_upgrade_artifacts(store_path: Path,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
+) -> None:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     schema_upgrade_module._sweep_pending_schema_upgrade_artifacts(
-        store_path
-    )
+        store_path, **({"io": io} if io is not None else {}))
 
 
 def _promote_pending_schema_upgrade_backup(
@@ -20492,18 +20694,12 @@ def _finish_cold_schema_upgrade_pending(
     """None means observation only, never schema promotion or cancellation."""
 
     if caller_borrow is not None:
-        caller_borrow.require_path(store_path)
-        if not isinstance(caller_borrow.backend, LockedRootDirectoryObservation):
-            raise ActivationPreparationError("ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE", retryable=False)
-        observed = caller_borrow.backend.observe_root_children(
-            caller_borrow.root, caller_borrow.lease,
-            DirectoryObservationLimits(maximum_depth=0, maximum_entries=4096,
-                                       maximum_directory_handles=1),
-            DirectoryObservationCancellation(),
-        )
-        prefix = f".{store_path.name}.localcat-schema-upgrade."
-        if any(item.name.startswith(prefix) and item.name.endswith(".pending") for item in observed):
-            raise ActivationPreparationError("ACTIVATION.UPGRADE_PENDING_UNSAFE", retryable=False)
+        io = schema_upgrade_module.SchemaUpgradeIO(caller_borrow)
+        if completed is None:
+            if io.pending(store_path):
+                raise ActivationPreparationError("ACTIVATION.UPGRADE_PENDING_UNSAFE", retryable=False)
+            return
+        schema_upgrade_module._finish_cold_schema_upgrade_pending(store_path, completed=completed, **({"io": io} if io is not None else {}))
         caller_borrow.reprove()
         return
     if completed is None:
@@ -20583,20 +20779,21 @@ def _recovered_schema_upgrade_pending_root(
 
 def _remove_schema_upgrade_backup(
     ticket: _SchemaUpgradeSnapshotTicket,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
-    schema_upgrade_module._remove_schema_upgrade_backup(ticket)
+    schema_upgrade_module._remove_schema_upgrade_backup(ticket, **({"io": io} if io is not None else {}))
 
 
 def _remove_schema_upgrade_locator_snapshot(
     snapshot: _SchemaUpgradeLocatorSnapshot,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     schema_upgrade_module._remove_schema_upgrade_locator_snapshot(
-        snapshot
-    )
+        snapshot, **({"io": io} if io is not None else {}))
 
 
 def _file_sha256_of_path(path: Path) -> str:
@@ -20607,9 +20804,13 @@ def _file_sha256_of_path(path: Path) -> str:
 
 def _schema_upgrade_db_capture(
     database_path: Path,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> tuple[tuple[int, int], str]:
     """Capture the exact prior active DB identity and digest (no-follow)."""
 
+    if io is not None:
+        proof = io.capture(database_path)
+        return (proof.device, proof.inode), proof.sha256
     capture = _capture_activation_file(database_path, asset_kind="DATABASE")
     return (
         (capture.identity.device, capture.identity.inode),
@@ -20617,29 +20818,31 @@ def _schema_upgrade_db_capture(
     )
 
 
-def _schema_upgrade_head_revision(database_path: Path) -> int:
+def _schema_upgrade_head_revision(database_path: Path, io: schema_upgrade_module.SchemaUpgradeIO | None = None) -> int:
     """Read the active store's head revision strictly read-only."""
 
-    database, uri = _sqlite_uri_connection_target(
-        database_path,
-        mode="ro",
-    )
-    connection = sqlite3.connect(
-        database,
-        uri=uri,
-        isolation_level=None,
-    )
-    try:
-        rows = connection.execute(
-            "SELECT value FROM tm_meta WHERE key = 'head_revision'"
-        ).fetchall()
-    except sqlite3.DatabaseError as error:
-        raise ActivationPreparationError(
-            "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
-            retryable=False,
-        ) from error
-    finally:
-        connection.close()
+    with io.sql(database_path) if io is not None else nullcontext():
+        database, uri = _sqlite_uri_connection_target(
+            database_path,
+            mode="ro",
+        )
+        connection = (io.connect if io is not None else sqlite3.connect)(
+            database,
+            uri=uri,
+            isolation_level=None,
+        )
+        try:
+            rows = connection.execute(
+                "SELECT value FROM tm_meta WHERE key = 'head_revision'"
+            ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
+                retryable=False,
+            ) from error
+        finally:
+            connection.close()
+
     if len(rows) != 1:
         raise ActivationPreparationError(
             "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
@@ -20660,30 +20863,32 @@ def _schema_upgrade_head_revision(database_path: Path) -> int:
     return value
 
 
-def _read_schema_upgrade_marker(database_path: Path) -> str | None:
+def _read_schema_upgrade_marker(database_path: Path, io: schema_upgrade_module.SchemaUpgradeIO | None = None) -> str | None:
     """Read the durable schema-upgrade origin marker, or None when absent."""
 
-    database, uri = _sqlite_uri_connection_target(
-        database_path,
-        mode="ro",
-    )
-    connection = sqlite3.connect(
-        database,
-        uri=uri,
-        isolation_level=None,
-    )
-    try:
-        rows = connection.execute(
-            "SELECT value FROM tm_meta "
-            "WHERE key = 'schema_upgrade_origin'"
-        ).fetchall()
-    except sqlite3.DatabaseError as error:
-        raise ActivationPreparationError(
-            "ACTIVATION.UPGRADE_CANDIDATE_UNREADABLE",
-            retryable=False,
-        ) from error
-    finally:
-        connection.close()
+    with io.sql(database_path) if io is not None else nullcontext():
+        database, uri = _sqlite_uri_connection_target(
+            database_path,
+            mode="ro",
+        )
+        connection = (io.connect if io is not None else sqlite3.connect)(
+            database,
+            uri=uri,
+            isolation_level=None,
+        )
+        try:
+            rows = connection.execute(
+                "SELECT value FROM tm_meta "
+                "WHERE key = 'schema_upgrade_origin'"
+            ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise ActivationPreparationError(
+                "ACTIVATION.UPGRADE_CANDIDATE_UNREADABLE",
+                retryable=False,
+            ) from error
+        finally:
+            connection.close()
+
     if len(rows) == 0:
         return None
     if len(rows) != 1 or type(rows[0][0]) is not str:
@@ -20695,7 +20900,7 @@ def _read_schema_upgrade_marker(database_path: Path) -> str | None:
 
 
 
-def _require_schema_upgrade_ancestry_provable(database_path: Path) -> None:
+def _require_schema_upgrade_ancestry_provable(database_path: Path, io: schema_upgrade_module.SchemaUpgradeIO | None = None) -> None:
     """Prove one pre-v2 store's completion order from the strict block proof.
 
     Task 5.11 fail-closed preflight: the legacy schema records no
@@ -20707,48 +20912,51 @@ def _require_schema_upgrade_ancestry_provable(database_path: Path) -> None:
     sorting.  The store is opened strictly read-only and never mutated.
     """
 
-    database, uri = _sqlite_uri_connection_target(
-        database_path,
-        mode="ro",
-    )
-    connection = sqlite3.connect(
-        database,
-        uri=uri,
-        isolation_level=None,
-    )
-    try:
+    with io.sql(database_path) if io is not None else nullcontext():
+        database, uri = _sqlite_uri_connection_target(
+            database_path,
+            mode="ro",
+        )
+        connection = (io.connect if io is not None else sqlite3.connect)(
+            database,
+            uri=uri,
+            isolation_level=None,
+        )
         try:
-            meta_rows = connection.execute(
-                "SELECT key, value FROM tm_meta"
-            ).fetchall()
-            meta = {str(row[0]): str(row[1]) for row in meta_rows}
-            head_revision = int(str(meta["head_revision"]))
-            record_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM tm_record"
-                ).fetchone()[0]
-            )
-            _legacy_revision_ancestry(
-                connection,
-                head_revision=head_revision,
-                record_count=record_count,
-            )
-        except SQLiteStoreSchemaError as error:
-            raise SchemaUpgradeAncestryError(
-                "SCHEMA.ANCESTRY_UNPROVABLE",
-                retryable=False,
-            ) from error
-        except (TypeError, ValueError, KeyError, sqlite3.DatabaseError) as error:
-            raise ActivationPreparationError(
-                "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
-                retryable=False,
-            ) from error
-    finally:
-        connection.close()
+            try:
+                meta_rows = connection.execute(
+                    "SELECT key, value FROM tm_meta"
+                ).fetchall()
+                meta = {str(row[0]): str(row[1]) for row in meta_rows}
+                head_revision = int(str(meta["head_revision"]))
+                record_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tm_record"
+                    ).fetchone()[0]
+                )
+                _legacy_revision_ancestry(
+                    connection,
+                    head_revision=head_revision,
+                    record_count=record_count,
+                )
+            except SQLiteStoreSchemaError as error:
+                raise SchemaUpgradeAncestryError(
+                    "SCHEMA.ANCESTRY_UNPROVABLE",
+                    retryable=False,
+                ) from error
+            except (TypeError, ValueError, KeyError, sqlite3.DatabaseError) as error:
+                raise ActivationPreparationError(
+                    "ACTIVATION.UPGRADE_ACTIVE_UNREADABLE",
+                    retryable=False,
+                ) from error
+        finally:
+            connection.close()
+
 
 
 def _require_no_pending_activation_assets(
     identity: CanonicalResourceIdentity,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> None:
     """Fail closed when any durable activation asset is pending.
 
@@ -20761,25 +20969,24 @@ def _require_no_pending_activation_assets(
     fails closed exactly like the preparation prechecks.
     """
 
+    caller_borrow = None if io is None else io.borrow
     journal_path = _activation_journal_path(identity)
     try:
-        journal_identity = _lstat_activation_journal_identity(journal_path)
+        journal_identity = _lstat_activation_journal_identity(journal_path, caller_borrow=caller_borrow)
     except ActivationPreparationError as error:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_PENDING",
             retryable=False,
             reason_code=error.code,
         ) from error
-    if journal_identity is not None or _lstat_any_entry(
-        _activation_journal_temp_path(journal_path)
-    ):
+    if journal_identity is not None or (caller_borrow.exists(_activation_journal_temp_path(journal_path)) if caller_borrow is not None else _lstat_any_entry(_activation_journal_temp_path(journal_path))):
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_PENDING",
             retryable=False,
         )
     terminal_path = _activation_terminal_path(identity)
     try:
-        terminal_identity = _lstat_activation_terminal_identity(terminal_path)
+        terminal_identity = _lstat_activation_terminal_identity(terminal_path, caller_borrow=caller_borrow)
     except ActivationPreparationError as error:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_PENDING",
@@ -20787,7 +20994,7 @@ def _require_no_pending_activation_assets(
             reason_code=error.code,
         ) from error
     try:
-        marker_identity = _activation_lineage_marker_state_complete(identity)
+        marker_identity = _activation_lineage_marker_state_complete(identity, caller_borrow=caller_borrow)
     except ActivationPreparationError as error:
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_PENDING",
@@ -20805,6 +21012,7 @@ def _require_schema_upgrade_mode_closure(
     physical_snapshot: Any,
     *,
     schema_upgrade_ticket: _SchemaUpgradeSnapshotTicket | None,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> None:
     """Bind the durable candidate marker to the activation guard.
 
@@ -20816,7 +21024,7 @@ def _require_schema_upgrade_mode_closure(
     """
 
     candidate_path = physical_snapshot.mutable_stage.staged_db_path
-    marker = _read_schema_upgrade_marker(candidate_path)
+    marker = _read_schema_upgrade_marker(candidate_path, **({"io": io} if io is not None else {}))
     if schema_upgrade_ticket is None:
         if marker is not None:
             raise ActivationPreparationError(
@@ -20840,7 +21048,7 @@ def _retire_schema_upgrade_ticket(
             coordinator._schema_upgrade_ticket = None
         else:
             return
-    _remove_schema_upgrade_backup(ticket)
+    _remove_schema_upgrade_backup(ticket, io=coordinator._schema_io)
 
 
 def _require_schema_upgrade_ticket_guard(
@@ -20893,13 +21101,14 @@ def _require_schema_upgrade_ticket_guard(
             or database_capture.digest != ticket.db_digest
         ):
             fail("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=True)
-    live_head = _schema_upgrade_head_revision(view.stage.staged_db_path)
+    live_head = _schema_upgrade_head_revision(view.stage.staged_db_path, io=coordinator._schema_io)
     if live_head != ticket.head_revision:
         fail("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=True)
     try:
         backup_capture = _capture_activation_file(
             ticket.backup_path,
             asset_kind="DATABASE",
+            caller_borrow=None if coordinator._schema_io is None else coordinator._schema_io.borrow,
         )
     except ActivationPreparationError:
         fail("ACTIVATION.UPGRADE_BACKUP_INVALID", retryable=False)

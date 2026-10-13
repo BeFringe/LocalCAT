@@ -2638,6 +2638,7 @@ class TMMigrationService:
         # its callback window.  It is deliberately instance-local: callers
         # create one service per operation, and no second W1 may be minted.
         self._active_owner_reservation: _InitialActivationResourceReservation | None = None
+        self._schema_io: schema_upgrade_module.SchemaUpgradeIO | None = None
         # Cold-open configured recovery uses the same service seam while the
         # completed-runtime W1/root remains live.  The projection exists only
         # for that synchronous call and is always cleared before return.
@@ -7723,6 +7724,52 @@ class TMMigrationService:
         coordinator = self._coordinator
         if coordinator is None:
             raise MigrationPreflightError("SCHEMA.COORDINATOR_UNAVAILABLE")
+        io: schema_upgrade_module.SchemaUpgradeIO | None = None
+        operation_returned = False
+        try:
+            with self._initial_stage_reservation() as reservation:
+                borrow = reservation.posix_recovery_inputs().get("_posix_borrow")
+                assert borrow is not None
+                io = schema_upgrade_module.SchemaUpgradeIO(borrow)
+                with coordinator._schema_upgrade_scope(io):
+                    self._schema_io = io
+                    self._active_owner_reservation = reservation
+                    try:
+                        outcome = self._upgrade_schema_copy_switch(store_path, reservation=reservation)
+                        operation_returned = True
+                        if isinstance(outcome, SchemaUpgradeReport):
+                            io.published_generation = outcome.activated_generation
+                    finally:
+                        if io.recovery_completed and reservation._family_borrow is not None:
+                            reservation._family_borrow._recovery_completed = True
+                        self._schema_io = None
+                        self._active_owner_reservation = None
+            return outcome
+        except BaseException as error:
+            # A successful SQL/publication body is not a completed operation
+            # until its original root/W1 and every owned authority close.
+            # Preserve the direct publication fact without reopening a lost root.
+            if io is not None and io.published_generation is not None:
+                if operation_returned:
+                    coordinator._stop_posix_recovery_admission()
+                fact = f"Schema generation durably published: {io.published_generation}"
+                if isinstance(error, PlatformFileError):
+                    mapped = ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True, reason_code=error.code)
+                    mapped.add_note(fact)
+                    raise mapped from error
+                error.add_note(fact)
+            raise
+
+    def _upgrade_schema_copy_switch(
+        self, store_path: Path, *,
+        reservation: _InitialActivationResourceReservation | None = None,
+    ) -> SchemaUpgradeOutcome:
+        io = self._schema_io
+        attempt: _InitialStageAttempt | None = None
+        activation_inputs: _PosixActivationInputs = {} if io is None else {"_posix_borrow": io.borrow}
+        coordinator = self._coordinator
+        if coordinator is None:
+            raise MigrationPreflightError("SCHEMA.COORDINATOR_UNAVAILABLE")
         active_store_path = coordinator.active_store_path
         if (
             type(store_path) is not _NATIVE_PATH_TYPE
@@ -7730,7 +7777,15 @@ class TMMigrationService:
             or store_path != active_store_path
         ):
             raise MigrationPreflightError("SCHEMA.ACTIVE_STORE_REQUIRED")
-        store_before = _try_file_digest(store_path)
+        if io is not None:
+            coordinator._begin_schema_upgrade_close_prior(io)
+            io.recover_store(store_path)
+        if io is not None:
+            before_proof = io.capture(store_path, expected_guard=coordinator._schema_upgrade_prior_guard)
+            coordinator._remember_schema_upgrade_close_prior(io, before_proof)
+            store_before = before_proof.sha256
+        else:
+            store_before = _try_file_digest(store_path)
         if store_before is None:
             raise MigrationPreflightError("SCHEMA.ACTIVE_STORE_UNREADABLE")
         prior_generation = coordinator.current_generation
@@ -7747,20 +7802,22 @@ class TMMigrationService:
         copy_stage: MutableStageRef | None = None
         stage_identity: _CreatedFileIdentity | None = None
         manifest_identity: _CreatedFileIdentity | None = None
+        primary: BaseException | None = None
         try:
             if coordinator.canonical_store_id != self._canonical_store_id:
                 raise MigrationPreflightError("SCHEMA.COORDINATOR_MISMATCH")
-            if _schema_version_of_store(store_path) == TM_SCHEMA_VERSION:
+            if _schema_version_of_store(store_path, **({"io": io} if io is not None else {})) == TM_SCHEMA_VERSION:
                 raise MigrationPreflightError(
                     "SCHEMA.SCHEMA_ALREADY_CURRENT"
                 )
-            activation_digest = _read_active_activation_digest(store_path)
+            activation_digest = _read_active_activation_digest(store_path, **({"io": io} if io is not None else {}))
             schema = inspect_stage_schema(
                 _upgrade_source_ref(
                     self._resource_identity,
                     store_path,
                 ),
                 canonical_store_id=self._canonical_store_id,
+                _stage_borrow=io,
                 _allow_legacy_schema=True,
                 _allow_active=True,
                 _expected_active_generation=prior_generation,
@@ -7770,7 +7827,7 @@ class TMMigrationService:
                 raise MigrationPreflightError("SCHEMA.SCHEMA_UNSUPPORTED")
             receipt, manifest_kind = _read_legacy_snapshot_facts(
                 store_path,
-                canonical_store_id=self._canonical_store_id,
+                canonical_store_id=self._canonical_store_id, io=io,
             )
             ticket = coordinator.prepare_schema_upgrade_ticket()
             backup_path = ticket.backup_path
@@ -7780,7 +7837,7 @@ class TMMigrationService:
             # the candidate only from that durable recovery snapshot; the
             # live canonical is used again solely by the post-drain ticket
             # guard, which rejects any write that happened after capture.
-            activation_digest = _read_active_activation_digest(backup_path)
+            activation_digest = _read_active_activation_digest(backup_path, **({"io": io} if io is not None else {}))
             stage_label = "COPY"
             copy_stage = _deterministic_stage_ref(
                 self._resource_identity,
@@ -7788,13 +7845,22 @@ class TMMigrationService:
                 stage_prefix="schema-upgrade",
                 path_salt=f"upgrade.{uuid.uuid4().hex}",
             )
+            if reservation is not None and io is not None:
+                attempt = _freeze_initial_stage_attempt(copy_stage, path_salt="initial-schema-" + uuid.uuid4().hex, resource_reservation=reservation)
+                assert attempt.stage_reservation is not None
+                io.reservations[copy_stage.staged_db_path] = attempt.stage_reservation
+                activation_inputs = reservation.posix_activation_inputs(attempt)
+                stage_borrow = activation_inputs.get("_posix_borrow")
+                assert stage_borrow is not None
+                io.borrow = stage_borrow
             stage_identity = _copy_store_into_stage(
                 backup_path,
-                copy_stage.staged_db_path,
+                copy_stage.staged_db_path, io=io,
             )
             inspect_stage_schema(
                 copy_stage,
                 canonical_store_id=self._canonical_store_id,
+                _stage_borrow=io,
                 _allow_legacy_schema=True,
                 _allow_active=True,
                 _expected_active_generation=prior_generation,
@@ -7803,6 +7869,7 @@ class TMMigrationService:
             with _open_configured_connection(
                 copy_stage.staged_db_path,
                 require_existing=True,
+                _stage_borrow=io,
             ) as connection:
                 _migrate_schema_copy(
                     connection,
@@ -7810,7 +7877,7 @@ class TMMigrationService:
                 )
             inspect_stage_schema(
                 copy_stage,
-                canonical_store_id=self._canonical_store_id,
+                canonical_store_id=self._canonical_store_id, _stage_borrow=io,
             )
             manifest = SnapshotManifest(
                 manifest_version=SNAPSHOT_MANIFEST_VERSION,
@@ -7818,17 +7885,26 @@ class TMMigrationService:
                 receipt=receipt,
                 receipt_digest=snapshot_receipt_digest(receipt),
             )
-            manifest_identity = _write_new_file(
-                copy_stage.manifest_temp_path,
-                contract_to_json(manifest).encode("utf-8"),
-            )
+            if attempt is not None and attempt.manifest_reservation is not None:
+                _write_reserved_initial_manifest(copy_stage.manifest_temp_path,
+                    contract_to_json(manifest).encode("utf-8"), attempt.platform_parent, attempt.manifest_reservation)
+                assert io is not None
+                proof = io.capture(copy_stage.manifest_temp_path)
+                manifest_identity = _CreatedFileIdentity(proof.device, proof.inode)
+            else:
+                manifest_identity = _write_new_file(
+                    copy_stage.manifest_temp_path,
+                    contract_to_json(manifest).encode("utf-8"),
+                )
             stage_label = "ACTIVATION"
             sealed = coordinator._seal_stage(
                 copy_stage,
                 canonical_store_id=self._canonical_store_id,
                 expected_prior_generation=prior_generation,
                 schema_upgrade=True,
+                **(reservation.stage_seal_inputs(attempt) if reservation is not None else {}),
             )
+            coordinator._schema_upgrade_close_prior = None
             prepared = coordinator.activate(
                 sealed,
                 _schema_upgrade_ticket=ticket,
@@ -7836,12 +7912,14 @@ class TMMigrationService:
             ticket = None
             handle = coordinator.publish_prepared_activation(prepared)
             generation = coordinator.publish_activation(prepared, handle)
+            if io is not None:
+                io.published_generation = generation
             published_store_path = coordinator.active_store_path
             if published_store_path is None:
                 raise MigrationPreflightError(
                     "SCHEMA.SUCCESS_UNVERIFIABLE"
                 )
-            success_digest = _try_file_digest(published_store_path)
+            success_digest = io.capture(published_store_path).sha256 if io is not None else _try_file_digest(published_store_path)
             if success_digest is None:
                 raise MigrationPreflightError(
                     "SCHEMA.SUCCESS_UNVERIFIABLE"
@@ -7862,6 +7940,11 @@ class TMMigrationService:
                 success_digest=success_digest,
             )
         except BaseException as error:
+            primary = error
+            if io is not None and io.recovery_required:
+                # No preservation claim or cleanup can open raw files while
+                # this exact SQL/owned-close group still belongs to recovery.
+                raise
             if ticket is not None:
                 try:
                     coordinator.retire_schema_upgrade_ticket(ticket)
@@ -7873,15 +7956,16 @@ class TMMigrationService:
                 and stage_identity is not None
                 and sealed is None
             ):
-                if manifest_identity is not None:
+                if io is not None and attempt is not None:
+                    if io._pending_raw is None:
+                        _cleanup_initial_unpublished_stage(attempt)
+                elif manifest_identity is not None:
                     _remove_created_file(
                         copy_stage.manifest_temp_path,
                         manifest_identity,
                     )
-                _remove_created_file(
-                    copy_stage.staged_db_path,
-                    stage_identity,
-                )
+                if io is None:
+                    _remove_created_file(copy_stage.staged_db_path, stage_identity)
             if not isinstance(error, Exception):
                 raise
             if prepared is not None:
@@ -7896,7 +7980,7 @@ class TMMigrationService:
                     backup_identity=backup_identity,
                     backup_digest=backup_digest,
                 )
-            if coordinator.state == "ACTIVATING":
+            if coordinator.state == "ACTIVATING" and coordinator._cleanup_reservation is not None:
                 # The preparation failed before any durable journal but
                 # its cleanup reservation is still pending: retry the
                 # narrow cleanup (or honestly fail stop on that cleanup).
@@ -7921,6 +8005,11 @@ class TMMigrationService:
                 backup_path=backup_path,
                 backup_identity=backup_identity,
             )
+        finally:
+            if io is not None and attempt is not None:
+                close_error = io.close_reservations(attempt.stage_reservation, attempt.manifest_reservation, primary=primary)
+                if close_error is not None:
+                    raise close_error
 
     def _portable_upgrade_schema(
         self,
@@ -9575,13 +9664,13 @@ class TMMigrationService:
         try:
             stable_path = _promote_schema_upgrade_artifact(
                 backup_path,
-                backup_identity,
+                backup_identity, io=self._schema_io,
             )
         except ActivationPreparationError as error:
             raise MigrationPreflightError(
                 "SCHEMA.BACKUP_UNVERIFIABLE"
             ) from error
-        if _strict_locator_proof(stable_path, backup_digest) is None:
+        if _strict_locator_proof(stable_path, backup_digest, io=self._schema_io) is None:
             raise MigrationPreflightError(
                 "SCHEMA.BACKUP_UNVERIFIABLE"
             )
@@ -9621,8 +9710,9 @@ class TMMigrationService:
         never claims VERIFIED_UNCHANGED.
         """
 
+        activation_inputs: _PosixActivationInputs = {} if self._schema_io is None else {"_posix_borrow": self._schema_io.borrow}
         try:
-            journal_phase = coordinator.durable_activation_phase
+            journal_phase = coordinator.durable_activation_phase if self._schema_io is None else coordinator._read_durable_activation_phase(caller_borrow=self._schema_io.borrow)
         except Exception as phase_error:
             return self._schema_upgrade_failure(
                 phase_error,
@@ -9696,7 +9786,7 @@ class TMMigrationService:
                 canonical_store_id=coordinator.canonical_store_id,
                 resource_identity=self._resource_identity,
             )
-            report = recovery_coordinator.recover_durable_activation()
+            report = recovery_coordinator.recover_durable_activation(**activation_inputs)
             if (
                 report is None
                 or getattr(report, "action", None) != "COMPLETED"
@@ -9817,12 +9907,20 @@ class TMMigrationService:
         hidden full DB copies.
         """
 
+        if self._schema_io is not None and self._schema_io.recovery_required:
+            raise error
         error_code = _schema_upgrade_error_code(error)
         retryable = _schema_upgrade_retryable(error)
         active_generation = coordinator.current_generation
         if active_generation is None:
             active_generation = 0
-        store_observed = _try_file_digest(store_path)
+        if self._schema_io is None:
+            store_observed = _try_file_digest(store_path)
+        else:
+            try:
+                store_observed = self._schema_io.capture(store_path).sha256
+            except (OSError, ActivationPreparationError, PlatformFileError):
+                store_observed = None
         locators: list[RecoveryLocator] = []
         locator_path: Path | None = None
         needs_recovery = False
@@ -9885,6 +9983,7 @@ class TMMigrationService:
                 _LocatorSelection(locator_path, selection.identity),
                 store_before,
                 "SCHEMA.PRIOR_STATE_UNRECOVERABLE",
+                io=self._schema_io,
             )
             locators.append(
                 RecoveryLocator(
@@ -9939,21 +10038,21 @@ class TMMigrationService:
 
         for candidate in _recovery_backup_candidates(
             store_path,
-            label="database",
+            label="database", io=self._schema_io,
         ):
-            proof = _strict_locator_proof(candidate, store_before)
+            proof = _strict_locator_proof(candidate, store_before, io=self._schema_io)
             if proof is not None:
                 return _LocatorSelection(candidate, proof[0])
         if backup_path is not None:
-            proof = _strict_locator_proof(backup_path, store_before)
+            proof = _strict_locator_proof(backup_path, store_before, io=self._schema_io)
             if proof is not None:
                 return _LocatorSelection(backup_path, proof[0])
         snapshot = coordinator.schema_upgrade_locator_snapshot
         if snapshot is not None:
-            proof = _strict_locator_proof(snapshot.path, store_before)
+            proof = _strict_locator_proof(snapshot.path, store_before, io=self._schema_io)
             if proof is not None:
                 return _LocatorSelection(snapshot.path, proof[0])
-        proof = _strict_locator_proof(store_path, store_before)
+        proof = _strict_locator_proof(store_path, store_before, io=self._schema_io)
         if proof is not None:
             return _LocatorSelection(store_path, proof[0])
         return None
@@ -9987,7 +10086,7 @@ class TMMigrationService:
             try:
                 return _promote_schema_upgrade_artifact(
                     backup_path,
-                    backup_identity,
+                    backup_identity, io=self._schema_io,
                 )
             except ActivationPreparationError:
                 return None
@@ -9996,7 +10095,7 @@ class TMMigrationService:
             try:
                 return _promote_schema_upgrade_artifact(
                     snapshot.path,
-                    snapshot.identity,
+                    snapshot.identity, io=self._schema_io,
                 )
             except ActivationPreparationError:
                 return None
@@ -10022,7 +10121,7 @@ class TMMigrationService:
         ):
             _remove_owned_schema_upgrade_backup(
                 backup_path,
-                backup_identity,
+                backup_identity, io=self._schema_io,
             )
 
     def _build_stage(
@@ -11977,6 +12076,7 @@ def _remove_created_file(
 def _remove_owned_schema_upgrade_backup(
     path: Path,
     identity: tuple[int, int],
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
@@ -11984,8 +12084,7 @@ def _remove_owned_schema_upgrade_backup(
         path,
         identity,
         preflight_error_factory=MigrationPreflightError,
-        fsync_error_factory=_copy_fsync_error_factory,
-    )
+        fsync_error_factory=_copy_fsync_error_factory, **({"io": io} if io is not None else {}))
 
 
 def _snapshot_resource_identity(
@@ -13061,21 +13160,25 @@ def _disambiguation_retryable(error: Exception) -> bool:
 def _strict_locator_proof(
     path: Path,
     expected_digest: str,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> tuple[tuple[int, int], str] | None:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._strict_locator_proof(
         path,
-        expected_digest,
-    )
+        expected_digest, **({"io": io} if io is not None else {}))
 
 
 def _recovery_backup_candidates(
     sidecar: Path,
     label: str,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> Iterator[Path]:
     """Sorted journal-owned byte-exact recovery backup candidate names."""
 
+    if io is not None:
+        yield from sorted(io.candidates(sidecar, f".{sidecar.name}.localcat-recovery.", f".{label}.bak"), key=str)
+        return
     yield from sorted(
         sidecar.parent.glob(
             f".{sidecar.name}.localcat-recovery.*.{label}.bak"
@@ -13126,6 +13229,7 @@ def _require_locator_return_proof(
     selection: _LocatorSelection,
     expected_digest: str,
     fail_stop_code: str,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> None:
     """Fail-stop re-proof immediately before one locator is returned.
 
@@ -13137,7 +13241,7 @@ def _require_locator_return_proof(
     ``fail_stop_code`` and never deletes or exposes the swapped path.
     """
 
-    proof = _strict_locator_proof(selection.path, expected_digest)
+    proof = _strict_locator_proof(selection.path, expected_digest, **({"io": io} if io is not None else {}))
     if proof is None or proof[0] != selection.identity:
         raise MigrationPreflightError(fail_stop_code)
 
@@ -13180,13 +13284,13 @@ def _schema_upgrade_copy_plan(
 def _promote_schema_upgrade_artifact(
     path: Path,
     identity: tuple[int, int],
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> Path:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._promote_schema_upgrade_artifact(
         path,
-        identity,
-    )
+        identity, **({"io": io} if io is not None else {}))
 
 
 def _schema_upgrade_error_code(error: Exception) -> str:
@@ -13204,13 +13308,12 @@ def _schema_upgrade_retryable(error: Exception) -> bool:
     return retryable if type(retryable) is bool else False
 
 
-def _schema_version_of_store(store_path: Path) -> int:
+def _schema_version_of_store(store_path: Path, io: schema_upgrade_module.SchemaUpgradeIO | None = None) -> int:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._schema_version_of_store(
         store_path,
-        preflight_error_factory=MigrationPreflightError,
-    )
+        preflight_error_factory=MigrationPreflightError, **({"io": io} if io is not None else {}))
 
 
 def _upgrade_source_ref(
@@ -13235,27 +13338,26 @@ def _open_legacy_read_connection(
     )
 
 
-def _read_active_activation_digest(store_path: Path) -> str:
+def _read_active_activation_digest(store_path: Path, io: schema_upgrade_module.SchemaUpgradeIO | None = None) -> str:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._read_active_activation_digest(
         store_path,
-        preflight_error_factory=MigrationPreflightError,
-    )
+        preflight_error_factory=MigrationPreflightError, **({"io": io} if io is not None else {}))
 
 
 def _read_legacy_snapshot_facts(
     store_path: Path,
     *,
     canonical_store_id: str,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> tuple[SnapshotReceipt, SnapshotKind]:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._read_legacy_snapshot_facts(
         store_path,
         canonical_store_id=canonical_store_id,
-        preflight_error_factory=MigrationPreflightError,
-    )
+        preflight_error_factory=MigrationPreflightError, **({"io": io} if io is not None else {}))
 
 
 def _fsync_schema_upgrade_directory(path: Path) -> None:
@@ -13270,6 +13372,7 @@ def _fsync_schema_upgrade_directory(path: Path) -> None:
 def _copy_store_into_stage(
     source_path: Path,
     destination_path: Path,
+    io: schema_upgrade_module.SchemaUpgradeIO | None = None,
 ) -> _CreatedFileIdentity:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
@@ -13278,8 +13381,7 @@ def _copy_store_into_stage(
         destination_path,
         preflight_error_type=MigrationPreflightError,
         preflight_error_factory=MigrationPreflightError,
-        fsync_error_factory=_copy_fsync_error_factory,
-    )
+        fsync_error_factory=_copy_fsync_error_factory, **({"io": io} if io is not None else {}))
     return _CreatedFileIdentity(created.device, created.inode)
 
 

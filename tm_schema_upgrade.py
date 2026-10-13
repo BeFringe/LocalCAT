@@ -32,16 +32,21 @@ Authority retained by the owners:
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import sqlite3
 import stat
-from typing import Protocol
+from typing import Literal, Protocol
 
-from tm_activation_journal import ActivationPreparationError
+from tm_activation_journal import (ActivationPreparationError, _ActivationFileIdentity,
+    _CallerHeldPosixActivationBorrow, _with_owned_close_facts)
+from platform_fs_contracts import (BoundExistingFileMutationGuard, CandidateContentFacts, DirectoryObservationCancellation,
+    DirectoryObservationLimits, ExistingFileMutationGuard, LockedRootDirectoryObservation,
+    MutableFileReservation, OpaqueAuthority, PlatformFileError, PosixStageHandoff, PublishMode)
 from tm_contracts import (
     CanonicalResourceIdentity,
     MutableStageRef,
@@ -50,6 +55,289 @@ from tm_contracts import (
 )
 
 _NATIVE_PATH_TYPE = type(Path())
+
+
+class SchemaUpgradeIO:
+    """Schema data-plane borrow; the coordinator retains root, W1 and state."""
+
+    def __init__(self, borrow: _CallerHeldPosixActivationBorrow) -> None:
+        self.borrow: _CallerHeldPosixActivationBorrow = borrow
+        self.recovery_completed: bool = False
+        self._sql_paths: set[Path] = set()
+        self.reservations: dict[Path, MutableFileReservation] = {}
+        self._contexts: dict[Path, AbstractContextManager[None]] = {}
+        self._connections: dict[Path, list[sqlite3.Connection]] = {}
+        self._pending_raw: list[OpaqueAuthority] | None = None
+        self._pending_removals: list[tuple[Path, MutableFileReservation]] = []
+        self._close_failed = False
+        self.published_generation: int | None = None
+
+    @property
+    def recovery_required(self) -> bool:
+        return self._pending_raw is not None or self._close_failed
+
+    def require_raw_idle(self) -> None:
+        if self._sql_paths or self.recovery_required:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
+
+    def capture(self, path: Path, *, synchronize: bool = False, expected_guard: BoundExistingFileMutationGuard | None = None):
+        self.require_raw_idle()
+        if path in self._sql_paths:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        return self.borrow.capture(path, synchronize=synchronize,
+            **({"expected_guard": expected_guard} if expected_guard is not None else {}))
+
+    def remove(self, path: Path, identity: tuple[int, int]) -> None:
+        self.require_raw_idle()
+        self.borrow.remove(path, _ActivationFileIdentity(*identity))
+
+    def pending(self, store_path: Path) -> list[Path]:
+        return self.candidates(store_path, f".{store_path.name}.localcat-schema-upgrade.", ".pending")
+
+    def candidates(self, store_path: Path, prefix: str, suffix: str) -> list[Path]:
+        self.require_raw_idle()
+        borrow = self.borrow
+        borrow.require_path(store_path)
+        if not isinstance(borrow.backend, LockedRootDirectoryObservation):
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE", retryable=False)
+        entries = borrow.backend.observe_root_children(borrow.root, borrow.lease,
+            DirectoryObservationLimits(maximum_depth=0, maximum_entries=4096, maximum_directory_handles=1),
+            DirectoryObservationCancellation())
+        borrow.reprove()
+        return [store_path.parent / entry.name for entry in entries
+                if entry.name.startswith(prefix) and entry.name.endswith(suffix)]
+
+    def retain_connection(self, path: Path, connection: sqlite3.Connection) -> None:
+        self._connections[path].append(connection)
+
+    def connect(self, database: str, *, uri: bool, isolation_level: Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None) -> sqlite3.Connection:
+        connection = sqlite3.connect(database, uri=uri, isolation_level=isolation_level)
+        # Every call belongs to the currently open group. Keep exact objects
+        # until their entire group can be closed before any raw guard.
+        path = next(reversed(self._connections))
+        self._connections[path].append(connection)
+        return connection
+
+    @contextmanager
+    def sql(self, *paths: Path) -> Generator[None]:
+        """Close the whole backup/statement group before its raw authorities."""
+        if self.recovery_required:
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
+        guards: list[BoundExistingFileMutationGuard] = []
+        registered: list[Path] = []
+        primary: BaseException | None = None
+        try:
+            for path in paths:
+                self.borrow.require_path(path)
+                if path in self._sql_paths or not isinstance(self.borrow.backend, ExistingFileMutationGuard):
+                    raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+                guards.append(self.borrow.backend.guard_existing_for_mutation(self.borrow.root, PurePath(path.name)))
+                self._sql_paths.add(path)
+                self._connections[path] = []
+                registered.append(path)
+            yield
+            for guard in guards:
+                try:
+                    guard.reprove()
+                except BaseException:
+                    self.borrow.fail()
+                    raise
+            self.borrow.reprove()
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            connections = [connection for path in registered for connection in self._connections.get(path, [])]
+            def release_sql_paths():
+                for path in registered:
+                    self._connections.pop(path, None)
+                self._sql_paths.difference_update(registered)
+            def finish_connections():
+                first = None
+                for connection in reversed(connections):
+                    try:
+                        connection.close()
+                    except BaseException as error:
+                        if first is None:
+                            first = error
+                        else:
+                            first = _with_owned_close_facts(first, error, context="Schema SQL close failed")
+                return first
+            sql_error = finish_connections()
+            if sql_error is not None:
+                # A still-live SQL statement can retain POSIX record locks.
+                # Recovery owns these exact connections AND their raw guards.
+                retained: list[OpaqueAuthority] = list(guards)
+                self._pending_raw = retained
+                def retry():
+                    error = finish_connections()
+                    if error is not None:
+                        return error
+                    release_sql_paths()
+                    # The original family invokes this callback only inside
+                    # recovery's proven root/W1 bracket. Never reuse the old
+                    # released borrow/lease or rebind the pathname.
+                    try:
+                        for path, reservation in tuple(self._pending_removals):
+                            self.borrow.root.reprove_location()
+                            self.borrow.root.unlink_owned(path.name, reservation.identity())
+                            self._pending_removals.remove((path, reservation))
+                    except BaseException as cleanup_error:
+                        return cleanup_error
+                    close_error = self.borrow.close_owned(*reversed(retained))
+                    if close_error is None:
+                        self._pending_raw = None
+                    return close_error
+                self.borrow._defer_close(retry)
+                if primary is None:
+                    raise sql_error
+                enriched = _with_owned_close_facts(primary, sql_error, context="Schema SQL close failed")
+                if enriched is not primary:
+                    raise enriched from primary
+            else:
+                release_sql_paths()
+                try:
+                    error = self.borrow.close_owned(*reversed(guards), primary=primary)
+                except BaseException:
+                    self._close_failed = True
+                    raise
+                if error is not None:
+                    self._close_failed = True
+                    if primary is None:
+                        raise error
+
+    def recover_store(self, path: Path) -> None:
+        """Let SQLite finish a legitimate hot journal before byte baselines."""
+        with self.connection(path, mode="rw") as connection:
+            connection.execute("PRAGMA schema_version").close()
+
+    def close_reservations(self, *authorities: OpaqueAuthority | None, primary: BaseException | None = None) -> BaseException | None:
+        if self._pending_raw is not None:
+            self._pending_raw.extend(authority for authority in authorities if authority is not None)
+            return None
+        try:
+            error = self.borrow.close_owned(*authorities, primary=primary)
+        except BaseException:
+            self._close_failed = True
+            raise
+        if error is not None:
+            self._close_failed = True
+        return error
+
+    def reprove_sql(self, path: Path, purpose: str) -> None:
+        del purpose
+        self.borrow.require_path(path)
+
+    def enter_sql(self, path: Path, purpose: str) -> None:
+        del purpose
+        context = self.sql(path)
+        context.__enter__()
+        self._contexts[path] = context
+
+    def exit_sql(self, path: Path, purpose: str, *, primary: BaseException | None = None) -> None:
+        del purpose
+        context = self._contexts.pop(path)
+        if primary is not None:
+            _ = context.__exit__(type(primary), primary, primary.__traceback__)
+        else:
+            _ = context.__exit__(None, None, None)
+
+    @contextmanager
+    def connection(self, path: Path, *, mode: str = "ro") -> Generator[sqlite3.Connection]:
+        with self.sql(path):
+            connection = self.connect(f"{path.as_uri()}?mode={mode}", uri=True, isolation_level=None)
+            try:
+                self.borrow.reprove()
+                yield connection
+            finally:
+                connection.close()
+
+    def copy(self, source_path: Path, destination_path: Path) -> tuple[tuple[int, int], str]:
+        self.require_raw_idle()
+        borrow = self.borrow
+        borrow.require_path(source_path)
+        borrow.require_path(destination_path)
+        reservation = self.reservations.get(destination_path)
+        owned = reservation is None
+        if reservation is None:
+            reservation = borrow.backend.reserve_mutable_file(borrow.root, destination_path.name)
+        primary: BaseException | None = None
+        try:
+            with self.sql(source_path, destination_path):
+                source = self.connect(f"{source_path.as_uri()}?mode=ro", uri=True, isolation_level=None)
+                try:
+                    destination = self.connect(f"{destination_path.as_uri()}?mode=rw", uri=True, isolation_level=None)
+                    try:
+                        borrow.reprove()
+                        destination.enable_load_extension(False)
+                        destination.execute("PRAGMA journal_mode=DELETE").close()
+                        destination.execute("PRAGMA synchronous=FULL").close()
+                        source.backup(destination)
+                    finally:
+                        destination.close()
+                finally:
+                    source.close()
+            proof = self.capture(destination_path, synchronize=True)
+            _ = reservation.identity()
+            return (proof.device, proof.inode), proof.sha256
+        except BaseException as error:
+            primary = error
+            if owned and self._pending_raw is not None:
+                self._pending_removals.append((destination_path, reservation))
+            if owned and self._pending_raw is None:
+                try:
+                    borrow.reprove()
+                    borrow.root.unlink_owned(destination_path.name, reservation.identity())
+                except BaseException as cleanup_error:
+                    enriched = _with_owned_close_facts(error, cleanup_error, context="Schema partial backup cleanup failed")
+                    if enriched is not error:
+                        raise enriched from error
+            raise
+        finally:
+            if owned and self._pending_raw is not None:
+                self._pending_raw.append(reservation)
+            elif owned:
+                close_error = borrow.close_owned(reservation, primary=primary)
+                if primary is None and close_error is not None:
+                    raise close_error
+
+    def promote(self, path: Path, identity: tuple[int, int]) -> Path:
+        self.require_raw_idle()
+        borrow = self.borrow
+        stable = _schema_upgrade_reported_path(path)
+        borrow.require_path(path)
+        if not borrow.exists(path):
+            proof = self.capture(stable)
+            if (proof.device, proof.inode) != identity:
+                raise ActivationPreparationError("ACTIVATION.UPGRADE_PROMOTE_UNSAFE", retryable=False)
+            return stable
+        proof = self.capture(path)
+        if (proof.device, proof.inode) != identity or borrow.exists(stable):
+            raise ActivationPreparationError("ACTIVATION.UPGRADE_PROMOTE_UNSAFE", retryable=False)
+        backend = borrow.backend
+        if not isinstance(backend, PosixStageHandoff):
+            raise ActivationPreparationError("ACTIVATION.RECOVERY_CAPABILITY_UNAVAILABLE", retryable=False)
+        content = CandidateContentFacts(proof.size, bytes.fromhex(proof.sha256))
+        source = candidate = pending = None
+        primary: BaseException | None = None
+        try:
+            source = backend.open_existing_stage(borrow.root, path.name, owner_lease=borrow.lease, expected_content=content)
+            candidate = backend.handoff_stage(source, owner_lease=borrow.lease, expected_content=content)
+            pending = borrow.root.begin_publish(candidate, stable.name, mode=PublishMode.CREATE_IF_ABSENT, lease=None)
+            final = self.capture(stable)
+            if final != proof:
+                raise ActivationPreparationError("ACTIVATION.UPGRADE_PROMOTE_UNSAFE", retryable=False)
+            _ = pending.terminal_reproof()
+            borrow.reprove()
+            return stable
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            close_error = borrow.close_owned(pending, candidate, source, primary=primary)
+            if primary is None and close_error is not None:
+                raise close_error
+
 
 
 @dataclass(frozen=True)
@@ -178,6 +466,7 @@ def _fsync_schema_upgrade_directory(
 def _create_schema_upgrade_backup(
     source_path: Path,
     backup_path: Path,
+    io: SchemaUpgradeIO | None = None,
 ) -> tuple[tuple[int, int], str]:
     """One consistent recovery backup via ``Connection.backup()``.
 
@@ -191,6 +480,10 @@ def _create_schema_upgrade_backup(
     byte digest.  Any failure removes the partially created backup and
     never touches the live canonical.
     """
+
+    if io is not None:
+        return io.copy(source_path, backup_path)
+
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     descriptor = -1
@@ -293,6 +586,7 @@ def _schema_upgrade_locator_snapshot_path(
 def _create_schema_upgrade_locator_snapshot(
     source_path: Path,
     snapshot_path: Path,
+    io: SchemaUpgradeIO | None = None,
 ) -> tuple[tuple[int, int], str]:
     """One strict raw byte-exact copy of the drained prior store.
 
@@ -305,6 +599,45 @@ def _create_schema_upgrade_locator_snapshot(
     Any failure removes the partial snapshot and never touches the live
     canonical.
     """
+
+    if io is not None:
+        borrow = io.borrow
+        borrow.require_path(source_path)
+        borrow.require_path(snapshot_path)
+        opened = borrow.backend.open_regular(borrow.root, PurePath(source_path.name))
+        candidate = pending = None
+        publication_entered = False
+        primary: BaseException | None = None
+        try:
+            facts = opened.content_facts()
+            candidate = borrow.root.create_candidate(snapshot_path.name + ".tmp", private=False)
+            def chunks():
+                for offset in range(0, facts.snapshot.byte_count, 65536):
+                    yield opened.read_at(offset, 65536, facts.snapshot)
+            _ = candidate.write_chunks(chunks(), maximum_bytes=facts.snapshot.byte_count)
+            _ = candidate.flush_content()
+            borrow.reprove()
+            publication_entered = True
+            pending = borrow.root.begin_publish(candidate, snapshot_path.name, mode=PublishMode.CREATE_IF_ABSENT, lease=None)
+            proof = io.capture(snapshot_path)
+            _ = pending.terminal_reproof()
+            return (proof.device, proof.inode), proof.sha256
+        except BaseException as error:
+            primary = error
+            if candidate is not None and not publication_entered:
+                try:
+                    borrow.reprove()
+                    borrow.root.unlink_owned(snapshot_path.name + ".tmp", candidate.identity())
+                except BaseException as cleanup_error:
+                    enriched = _with_owned_close_facts(error, cleanup_error, context="Schema partial locator cleanup failed")
+                    if enriched is not error:
+                        raise enriched from error
+            raise
+        finally:
+            closing = borrow.close_owned(pending, candidate, opened, primary=primary)
+            if primary is None and closing is not None:
+                raise closing
+
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     source_descriptor = -1
@@ -384,8 +717,14 @@ def _create_schema_upgrade_locator_snapshot(
 def _remove_owned_schema_upgrade_artifact(
     path: Path,
     identity: tuple[int, int],
+    io: SchemaUpgradeIO | None = None,
 ) -> None:
     """Strict best-effort removal of one owned schema-upgrade artifact."""
+
+    if io is not None:
+        io.remove(path, identity)
+        return
+
 
     try:
         observed = os.lstat(path)
@@ -423,6 +762,7 @@ def _schema_upgrade_reported_path(pending_path: Path) -> Path:
 def _promote_schema_upgrade_artifact(
     path: Path,
     identity: tuple[int, int],
+    io: SchemaUpgradeIO | None = None,
 ) -> Path:
     """Atomically promote one owned pending artifact to its stable suffix.
 
@@ -434,6 +774,10 @@ def _promote_schema_upgrade_artifact(
     closed so the caller stops instead of exposing or deleting an
     unaccounted artifact.
     """
+
+    if io is not None:
+        return io.promote(path, identity)
+
 
     if (
         type(identity) is not tuple
@@ -495,7 +839,7 @@ def _promote_schema_upgrade_artifact(
     return stable_path
 
 
-def _pending_schema_upgrade_family(store_path: Path) -> list[Path]:
+def _pending_schema_upgrade_family(store_path: Path, io: SchemaUpgradeIO | None = None) -> list[Path]:
     """The deterministic unexposed pending schema-upgrade artifact names.
 
     Only the ``.{name}.localcat-schema-upgrade.*.pending`` family is ever
@@ -504,6 +848,8 @@ def _pending_schema_upgrade_family(store_path: Path) -> list[Path]:
     matched.
     """
 
+    if io is not None:
+        return io.pending(store_path)
     return sorted(
         store_path.parent.glob(
             f".{store_path.name}.localcat-schema-upgrade.*.pending"
@@ -546,7 +892,7 @@ def _require_owned_pending_schema_upgrade_name(
     )
 
 
-def _sweep_pending_schema_upgrade_artifacts(store_path: Path) -> None:
+def _sweep_pending_schema_upgrade_artifacts(store_path: Path, io: SchemaUpgradeIO | None = None) -> None:
     """Strictly remove crash-orphan pending schema-upgrade artifacts.
 
     Every ``*.pending`` entry of the deterministic family is validated
@@ -558,11 +904,18 @@ def _sweep_pending_schema_upgrade_artifacts(store_path: Path) -> None:
     The parent directory is fsynced once after all removals.
     """
 
-    candidates = _pending_schema_upgrade_family(store_path)
+    candidates = _pending_schema_upgrade_family(store_path, io=io)
     if not candidates:
         return
     for candidate in candidates:
         _require_owned_pending_schema_upgrade_name(candidate, store_path)
+        if io is not None:
+            try:
+                proof = io.capture(candidate)
+            except (PlatformFileError, OSError) as error:
+                raise ActivationPreparationError("ACTIVATION.UPGRADE_PENDING_UNSAFE", retryable=False) from error
+            io.remove(candidate, (proof.device, proof.inode))
+            continue
         try:
             observed = os.lstat(candidate)
         except OSError as error:
@@ -582,11 +935,13 @@ def _sweep_pending_schema_upgrade_artifacts(store_path: Path) -> None:
                 "ACTIVATION.UPGRADE_PENDING_CLEANUP_FAILED",
                 retryable=True,
             ) from error
-    _fsync_schema_upgrade_directory(store_path.parent)
+    if io is None:
+        _fsync_schema_upgrade_directory(store_path.parent)
 
 
 def _promote_pending_schema_upgrade_backup(
     store_path: Path,
+    io: SchemaUpgradeIO | None = None,
 ) -> Path | None:
     """Promote the one pending Connection.backup to the stable suffix.
 
@@ -600,7 +955,7 @@ def _promote_pending_schema_upgrade_backup(
 
     candidates = [
         candidate
-        for candidate in _pending_schema_upgrade_family(store_path)
+        for candidate in _pending_schema_upgrade_family(store_path, io=io)
         if candidate.name.endswith(".bak.pending")
     ]
     if not candidates:
@@ -612,6 +967,12 @@ def _promote_pending_schema_upgrade_backup(
         )
     candidate = candidates[0]
     _require_owned_pending_schema_upgrade_name(candidate, store_path)
+    if io is not None:
+        try:
+            proof = io.capture(candidate)
+            return io.promote(candidate, (proof.device, proof.inode))
+        except (PlatformFileError, OSError) as error:
+            raise ActivationPreparationError("ACTIVATION.UPGRADE_PENDING_UNSAFE", retryable=False) from error
     try:
         observed = os.lstat(candidate)
     except OSError as error:
@@ -653,6 +1014,7 @@ def _finish_cold_schema_upgrade_pending(
     store_path: Path,
     *,
     completed: bool,
+    io: SchemaUpgradeIO | None = None,
 ) -> None:
     """Deterministic pending-artifact resolution after cold recovery.
 
@@ -665,12 +1027,13 @@ def _finish_cold_schema_upgrade_pending(
     """
 
     if completed:
-        _promote_pending_schema_upgrade_backup(store_path)
-    _sweep_pending_schema_upgrade_artifacts(store_path)
+        _promote_pending_schema_upgrade_backup(store_path, io=io)
+    _sweep_pending_schema_upgrade_artifacts(store_path, io=io)
 
 
 def _remove_schema_upgrade_backup(
     ticket: _OwnedBackupTicket,
+    io: SchemaUpgradeIO | None = None,
 ) -> None:
     """Safely unlink the exact owned recovery backup of one retired ticket.
 
@@ -679,6 +1042,11 @@ def _remove_schema_upgrade_backup(
     foreign inode is never unlinked but fails closed so the caller can
     stop instead of leaving an unaccounted full DB copy.
     """
+
+    if io is not None:
+        io.remove(ticket.backup_path, ticket.backup_identity)
+        return
+
 
     try:
         observed = os.lstat(ticket.backup_path)
@@ -705,8 +1073,14 @@ def _remove_schema_upgrade_backup(
 
 def _remove_schema_upgrade_locator_snapshot(
     snapshot: _OwnedLocatorSnapshot,
+    io: SchemaUpgradeIO | None = None,
 ) -> None:
     """Strictly delete one coordinator-captured locator snapshot."""
+
+    if io is not None:
+        io.remove(snapshot.path, snapshot.identity)
+        return
+
 
     try:
         observed = os.lstat(snapshot.path)
@@ -757,6 +1131,7 @@ def _file_sha256_of_path(path: Path) -> str:
 def _strict_locator_proof(
     path: Path,
     expected_digest: str,
+    io: SchemaUpgradeIO | None = None,
 ) -> tuple[tuple[int, int], str] | None:
     """One strict prove-or-reject check for a recovery locator candidate.
 
@@ -767,6 +1142,14 @@ def _strict_locator_proof(
     swapped inode, unreadable, or digest-mismatch candidates are rejected
     (``None``) and are never exposed as locators.
     """
+
+    if io is not None:
+        try:
+            proof = io.capture(path)
+            return ((proof.device, proof.inode), proof.sha256) if proof.sha256 == expected_digest else None
+        except (OSError, PlatformFileError):
+            return None
+
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     descriptor = -1
@@ -808,24 +1191,22 @@ def _schema_version_of_store(
     store_path: Path,
     *,
     preflight_error_factory: Callable[[str], BaseException],
+    io: SchemaUpgradeIO | None = None,
 ) -> int:
     """Read the meta schema version of one existing store read-only."""
 
-    connection = sqlite3.connect(
-        f"{store_path.as_uri()}?mode=ro",
-        uri=True,
-        isolation_level=None,
-    )
-    try:
-        rows = connection.execute(
-            "SELECT value FROM tm_meta WHERE key = 'schema_version'"
-        ).fetchall()
-    except sqlite3.DatabaseError as error:
-        raise preflight_error_factory(
-            "SCHEMA.SCHEMA_UNREADABLE"
-        ) from error
-    finally:
-        connection.close()
+    with io.sql(store_path) if io is not None else nullcontext():
+        connection = _open_legacy_read_connection(store_path, io=io)
+        try:
+            rows = connection.execute(
+                "SELECT value FROM tm_meta WHERE key = 'schema_version'"
+            ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise preflight_error_factory(
+                "SCHEMA.SCHEMA_UNREADABLE"
+            ) from error
+        finally:
+            connection.close()
     if len(rows) != 1:
         raise preflight_error_factory("SCHEMA.SCHEMA_UNREADABLE")
     try:
@@ -860,10 +1241,11 @@ def _upgrade_source_ref(
 
 def _open_legacy_read_connection(
     database_path: Path,
+    io: SchemaUpgradeIO | None = None,
 ) -> sqlite3.Connection:
     """One strictly read-only connection that never mutates the source."""
 
-    connection = sqlite3.connect(
+    connection = (io.connect if io is not None else sqlite3.connect)(
         f"{database_path.as_uri()}?mode=ro",
         uri=True,
         isolation_level=None,
@@ -880,6 +1262,7 @@ def _read_active_activation_digest(
     store_path: Path,
     *,
     preflight_error_factory: Callable[[str], BaseException],
+    io: SchemaUpgradeIO | None = None,
 ) -> str:
     """Read the ACTIVE old-schema canonical's activation digest.
 
@@ -888,14 +1271,15 @@ def _read_active_activation_digest(
     published generation; any missing or malformed digest fails closed.
     """
 
-    connection = _open_legacy_read_connection(store_path)
-    try:
-        rows = connection.execute(
-            "SELECT value FROM tm_meta "
-            "WHERE key = 'activation_digest'"
-        ).fetchall()
-    finally:
-        connection.close()
+    with io.sql(store_path) if io is not None else nullcontext():
+        connection = _open_legacy_read_connection(store_path, io=io)
+        try:
+            rows = connection.execute(
+                "SELECT value FROM tm_meta "
+                "WHERE key = 'activation_digest'"
+            ).fetchall()
+        finally:
+            connection.close()
     if (
         len(rows) != 1
         or type(rows[0][0]) is not str
@@ -914,6 +1298,7 @@ def _read_legacy_snapshot_facts(
     *,
     canonical_store_id: str,
     preflight_error_factory: Callable[[str], BaseException],
+    io: SchemaUpgradeIO | None = None,
 ) -> tuple[SnapshotReceipt, SnapshotKind]:
     """Read the one old-schema receipt and binding kind the copy re-publishes.
 
@@ -923,19 +1308,20 @@ def _read_legacy_snapshot_facts(
     manifest temporary must carry the original kind.
     """
 
-    connection = _open_legacy_read_connection(store_path)
-    try:
-        receipt_rows = connection.execute(
-            "SELECT snapshot_id, resource_id, canonical_store_id, "
-            "exported_revision, jsonl_digest, record_count, format_version "
-            "FROM tm_snapshot_receipt ORDER BY snapshot_id"
-        ).fetchall()
-        binding_rows = connection.execute(
-            "SELECT snapshot_kind FROM tm_snapshot_binding "
-            "WHERE binding_id = 1"
-        ).fetchall()
-    finally:
-        connection.close()
+    with io.sql(store_path) if io is not None else nullcontext():
+        connection = _open_legacy_read_connection(store_path, io=io)
+        try:
+            receipt_rows = connection.execute(
+                "SELECT snapshot_id, resource_id, canonical_store_id, "
+                "exported_revision, jsonl_digest, record_count, format_version "
+                "FROM tm_snapshot_receipt ORDER BY snapshot_id"
+            ).fetchall()
+            binding_rows = connection.execute(
+                "SELECT snapshot_kind FROM tm_snapshot_binding "
+                "WHERE binding_id = 1"
+            ).fetchall()
+        finally:
+            connection.close()
     if len(receipt_rows) != 1:
         raise preflight_error_factory("SCHEMA.UPGRADE_UNSUPPORTED")
     row = receipt_rows[0]
@@ -972,6 +1358,7 @@ def _remove_owned_schema_upgrade_backup(
     *,
     preflight_error_factory: Callable[[str], BaseException],
     fsync_error_factory: Callable[[OSError], BaseException],
+    io: SchemaUpgradeIO | None = None,
 ) -> None:
     """Safely unlink one exact owned schema-upgrade recovery backup.
 
@@ -981,6 +1368,11 @@ def _remove_owned_schema_upgrade_backup(
     unaccounted full DB copy.  The parent directory is fsynced after the
     unlink.
     """
+
+    if io is not None:
+        io.remove(path, identity)
+        return
+
 
     try:
         observed = os.lstat(path)
@@ -1011,6 +1403,7 @@ def _copy_store_into_stage(
     preflight_error_type: type[BaseException],
     preflight_error_factory: Callable[[str], BaseException],
     fsync_error_factory: Callable[[OSError], BaseException],
+    io: SchemaUpgradeIO | None = None,
 ) -> _CreatedFileIdentity:
     """One consistent old-schema copy into a fresh exclusively reserved file.
 
@@ -1021,6 +1414,11 @@ def _copy_store_into_stage(
     DB's digest (``Connection.backup()`` may normalize page layout).  Any
     failure removes the partial copy and never touches the live canonical.
     """
+
+    if io is not None:
+        identity, _digest = io.copy(source_path, destination_path)
+        return _CreatedFileIdentity(*identity)
+
 
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     descriptor = -1

@@ -691,14 +691,14 @@
   - _Depends: 10.2b, 10.6_
   - _Requirements: 2.10, 2.13, 4.7, 7.5, 7.8, 7.9, 7.10, 7.11, 7.15, 7.16_
 
-- [ ] 10.8 接入schema重开与双连接backup
+- [x] 10.8 接入schema重开与双连接backup
   - 源/目标 backup 双连接及 statement 全部收尾后才观察/关闭 raw FD；复用原 schema/recovery profile，不新增格式或模块拆分。
   - 完成时，schema copy、backup源/目标及旁路stage检查生命周期闭合；SQL前后顺序正确、cold recovery使用原owner，不新增格式。
   - _Boundary: schema upgrade 与 store backup 端口_
   - _Depends: 10.7_
   - _Requirements: 2.9, 2.11, 2.12, 7.14, 7.15, 7.16_
 
-- [ ] 10.9 扩展其余activation恢复和收尾切点
+- [x] 10.9 扩展其余activation恢复和收尾切点
   - 在未命名取消前置之上扩展其余恢复、rollback 与 cleanup 切点，按真实命名/commit/phase 保留可证明 prior、已发布或 unknown；不删除未知 journal，不重新接管同路径副本。
   - 完成时，PREPARED、MANIFEST_PUBLISHED、GENERATION_PUBLISHED受影响恢复/rollback端口借原root；完整旧/新或recovery-only，漂移后不盲删/接管。
   - _Boundary: activation recovery 与失败收尾_
@@ -730,6 +730,8 @@
 ## Implementation Notes
 
 - Task 10.9／10.10：恢复期间持久 journal 可能已推进，自动回滚须复证原对象与当前记录，不能沿用入口阶段；已完成首次发布的 lineage 不能转成无 prior 的 legacy 终态。隔离资产仍按 stage／canonical receipt 角色核验，搬入隔离目录不改变其内容证明规则。
+
+- Task 10.8／10.9：首次 SQL 关闭失败可能早于任何内容证明；pending 已清空也不等于 prior 可用。恢复须沿原 schema owner 保留的对象关系继续核验，不能由 generic discovery 猜路径或接管同字节副本。无法取得可信恢复定位时须保留既有异常出口，不能为构造失败结果提前 raw 观察。
 
 - Task 10.7／10.8：读取连接也可能先完成 hot-journal 恢复；health 的内容复用基线须建立在这次正常恢复之后。额外 raw 内容观察仍须等全部 SQL 连接与 statement 关闭，再在原 root/W1 内复证，不能把正常恢复造成的字节变化误判为篡改。
 

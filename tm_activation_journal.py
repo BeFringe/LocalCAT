@@ -1831,7 +1831,6 @@ def _with_owned_close_facts(
     return primary
 
 
-
 class _CallerHeldPosixActivationBorrow:
     """One activation's non-closing borrow of the original family root/W1."""
 
@@ -1905,8 +1904,7 @@ class _CallerHeldPosixActivationBorrow:
                     try:
                         owned.close()
                     except BaseException as retry_error:
-                        _append_owned_close_facts(retry_error, original)
-                        return retry_error
+                        return _with_owned_close_facts(retry_error, original)
                     if not owned.closed:
                         return ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
                     return None
@@ -1915,9 +1913,11 @@ class _CallerHeldPosixActivationBorrow:
         if first is not None:
             self.io_incomplete = True
             for error in failures[1:]:
-                _append_owned_close_facts(first, error)
+                first = _with_owned_close_facts(first, error)
             if primary is not None:
-                _append_owned_close_facts(primary, first)
+                enriched = _with_owned_close_facts(primary, first)
+                if enriched is not primary:
+                    raise enriched from primary
         return first
 
     def defer_close(self, retry: Callable[[], BaseException | None]) -> None:
@@ -1938,7 +1938,8 @@ class _CallerHeldPosixActivationBorrow:
             return None
         self._defer_close(retry_close)
 
-    def capture(self, path: Path, *, synchronize: bool = False) -> ContentFileProof:
+    def capture(self, path: Path, *, synchronize: bool = False,
+                expected_guard: BoundExistingFileMutationGuard | None = None) -> ContentFileProof:
         self.require_path(path)
         if self.io_incomplete or self._sql_path == path:
             raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=True)
@@ -1946,10 +1947,21 @@ class _CallerHeldPosixActivationBorrow:
             raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
         opened = self.backend.open_existing_for_synchronization(self.root, PurePath(path.name))
         operation_error: BaseException | None = None
+        def reprove_guard() -> None:
+            if expected_guard is None:
+                return
+            try:
+                if opened.identity() != expected_guard.reprove():
+                    raise ActivationPreparationError("ACTIVATION.UPGRADE_SNAPSHOT_STALE", retryable=False)
+            except BaseException:
+                self.fail()
+                raise
         try:
+            reprove_guard()
             if synchronize:
                 opened.synchronize_content(opened.content_facts())
             result = _capture_posix_bound_content(self.backend, opened)
+            reprove_guard()
             self.reprove()
             return result
         except BaseException as error:
