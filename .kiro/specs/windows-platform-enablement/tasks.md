@@ -591,7 +591,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1_
   - _Requirements: 2.7, 5.5, 5.6, 5.7_
 
-- [ ] 11.4b 接通POSIX既有文件退休与冷续接
+- [x] 11.4b 接通POSIX既有文件退休与冷续接
   - 复用可选ExistingFileRetirement合同，从原root取得受限source-parent/source，核验当前regular/single-link、内容、同issuer/root；与creator-owned退休分开，不以历史identity或任意Path接管。
   - 以retained目录的no-clobber原语移动同一对象并转交close责任；fresh process只在source absent且target exact时重取退休authority，部分完成可续接，借入root/W1仍归外层。
   - 完成时，source/target状态组合、内容/位置漂移、外来authority、arm前后/同步/close失败与冷续接符合原合同；不扩大Windows profile、持久格式或业务恢复状态。

@@ -36,6 +36,7 @@ from platform_fs_contracts import (
     EntrySnapshot,
     ExistingFileDurability,
     ExistingFileMutationGuard,
+    ExistingFileRetirement,
     ExistingRetirementSource,
     FileObjectIdentity,
     LedgerEntryObservation,
@@ -64,6 +65,7 @@ from platform_fs_contracts import (
     RetainedRetirement,
     RetainedObservationDirectory,
     RetirementDirectoryAuthority,
+    RetirementSourceDirectoryAuthority,
     validate_relative_name,
 )
 
@@ -434,6 +436,7 @@ _DIRECTORY_AUTHORITY_SLOTS = (
     "_directory_identities",
     "_fault_injector",
     "_issuer",
+    "_root_token",
 )
 
 
@@ -447,6 +450,7 @@ class _DirectoryAuthorityMixin:
         fault_injector: _FaultInjector | None,
         *,
         issuer: object | None = None,
+        root_token: object | None = None,
     ) -> None:
         try:
             super().__init__()
@@ -465,6 +469,7 @@ class _DirectoryAuthorityMixin:
         # None keeps legacy/foreign-derived authorities ineligible for the
         # optional observation port without changing their existing behavior.
         self._issuer = issuer
+        self._root_token = object() if root_token is None else root_token
 
     @property
     def _directory_fd(self) -> int:
@@ -922,34 +927,37 @@ def _open_directory_chain(
                 _DIRECTORY_FLAGS,
                 dir_fd=descriptors[-1],
             )
+            # Own the new FD before any fallible observation of the child.
+            descriptors.append(descriptor)
             identity = _identity_from_stat(os.fstat(descriptor))
             if identity.kind != "directory":
                 raise _platform_error(
                     PlatformFileErrorCode.REPARSE_REJECTED,
                     retryable=False,
                 )
-            descriptors.append(descriptor)
             names.append(component)
         identities = _capture_directory_identities(tuple(descriptors))
         _reprove_directory_chain(tuple(descriptors), tuple(names), identities)
-    except PlatformFileError:
+    except BaseException as error:
         for descriptor in reversed(descriptors):
-            _close_fd(descriptor)
-        raise
-    except OSError as error:
-        for descriptor in reversed(descriptors):
-            _close_fd(descriptor)
-        if error.errno == errno.ENOTDIR:
-            # O_DIRECTORY | O_NOFOLLOW can report a directory symlink this way.
-            raise _platform_error(
-                PlatformFileErrorCode.REPARSE_REJECTED,
+            try:
+                _close_fd(descriptor)
+            except BaseException:
+                # Cleanup must keep trying without replacing the primary error.
+                pass
+        if isinstance(error, OSError):
+            if error.errno == errno.ENOTDIR:
+                # O_DIRECTORY | O_NOFOLLOW can report a directory symlink this way.
+                raise _platform_error(
+                    PlatformFileErrorCode.REPARSE_REJECTED,
+                    retryable=False,
+                ) from None
+            raise _map_os_error(
+                error,
+                fallback=PlatformFileErrorCode.OUTSIDE_ROOT,
                 retryable=False,
             ) from None
-        raise _map_os_error(
-            error,
-            fallback=PlatformFileErrorCode.OUTSIDE_ROOT,
-            retryable=False,
-        ) from None
+        raise
     return tuple(descriptors), tuple(names)
 
 
@@ -1451,6 +1459,144 @@ class _PosixRetainedRetirement(RetainedRetirement):
         for descriptors in (self._source_fds, self._target_fds):
             for descriptor in reversed(descriptors):
                 _close_fd(descriptor)
+
+
+class _PosixRetirementSourceDirectory(RetirementSourceDirectoryAuthority):
+    __slots__ = ("_parent", "_source_name")
+
+    def __init__(self, parent: _PosixBoundDirectory, source_name: str) -> None:
+        super().__init__()
+        self._parent = parent
+        self._source_name = source_name
+
+    def _reprove_parent(self) -> None:
+        self._parent.reprove()
+
+    def _close_authority(self) -> None:
+        _close_mutation_guard_descriptors(tuple(reversed(self._parent._directory_fds)))
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        try:
+            super().__exit__(exc_type, exc, traceback)
+        except BaseException:
+            if exc is None:
+                raise
+
+
+class _PosixExistingRetirementSource(ExistingRetirementSource):
+    __slots__ = ("_file", "_root_token", "_expected_content", "_issuer")
+
+    def __init__(
+        self, retained: _PosixBoundRegularFile, root_token: object,
+        expected_content: CandidateContentFacts, identity: FileObjectIdentity,
+    ) -> None:
+        super().__init__(identity, expected_content)
+        self._file = retained
+        self._root_token = root_token
+        self._issuer = retained._issuer
+        self._expected_content = expected_content
+
+    def _reprove_source(self) -> BoundContentFacts:
+        return self._file.content_facts()
+
+    def _close_authority(self) -> None:
+        _close_mutation_guard_descriptors((
+            self._file._descriptor, *reversed(self._file._directory_fds),
+        ))
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        try:
+            super().__exit__(exc_type, exc, traceback)
+        except BaseException:
+            if exc is None:
+                raise
+
+
+class _PosixExistingRetainedRetirement(RetainedRetirement):
+    """An exact-content retirement; a live source owns its FD until transfer."""
+
+    __slots__ = (
+        "_source_fds", "_source_names", "_source_identities", "_source_name",
+        "_target_fds", "_target_names", "_target_identities", "_target_name",
+        "_descriptor", "_identity", "_expected_content", "_owns_source",
+    )
+
+    def __init__(
+        self, identity: FileObjectIdentity,
+        source_fds: tuple[int, ...], source_names: tuple[str | None, ...],
+        source_identities: tuple[FileObjectIdentity, ...], source_name: str,
+        target_fds: tuple[int, ...], target_names: tuple[str | None, ...],
+        target_identities: tuple[FileObjectIdentity, ...], target_name: str,
+        descriptor: int, expected_content: CandidateContentFacts, *, owns_source: bool,
+    ) -> None:
+        super().__init__(identity)
+        # Construction does not touch OS resources: the caller transfers its
+        # acquired handles before invoking the first fallible terminal reproof.
+        self._identity = identity
+        self._source_fds = source_fds
+        self._source_names = source_names
+        self._source_identities = source_identities
+        self._source_name = source_name
+        self._target_fds = target_fds
+        self._target_names = target_names
+        self._target_identities = target_identities
+        self._target_name = target_name
+        self._descriptor = descriptor
+        self._expected_content = expected_content
+        self._owns_source = owns_source
+
+    def _reprove_positions(self) -> EntrySnapshot:
+        _reprove_directory_chain(self._source_fds, self._source_names, self._source_identities)
+        _reprove_directory_chain(self._target_fds, self._target_names, self._target_identities)
+        try:
+            os.stat(self._source_name, dir_fd=self._source_fds[-1], follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True)
+        retained = _snapshot_from_stat(os.fstat(self._descriptor))
+        named = _snapshot_from_stat(os.stat(
+            self._target_name, dir_fd=self._target_fds[-1], follow_symlinks=False,
+        ))
+        if (
+            retained.identity != self._identity
+            or retained.identity.kind != "regular"
+            or retained.identity.link_count != 1
+            or named != retained
+            or retained.byte_count != self._expected_content.byte_count
+        ):
+            raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True)
+        return retained
+
+    def _reprove_retirement(self) -> EntrySnapshot:
+        try:
+            before = self._reprove_positions()
+            actual = _digest_fd_exact(self._descriptor, self._expected_content.byte_count)
+            after = self._reprove_positions()
+            if before != after or actual != self._expected_content:
+                raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True)
+            # Recheck both original chains after the terminal name observations.
+            _reprove_directory_chain(self._source_fds, self._source_names, self._source_identities)
+            _reprove_directory_chain(self._target_fds, self._target_names, self._target_identities)
+            return after
+        except (PlatformFileError, OSError):
+            raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True) from None
+
+    def _close_retirement_authority(self) -> None:
+        owned = tuple(reversed(self._target_fds))
+        if self._owns_source:
+            owned = (self._descriptor, *reversed(self._source_fds), *owned)
+        try:
+            _close_mutation_guard_descriptors(owned)
+        except PlatformFileError:
+            raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True) from None
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        try:
+            super().__exit__(exc_type, exc, traceback)
+        except BaseException:
+            if exc is None:
+                raise
 
 
 class _PosixBoundSynchronizedRegularFile(
@@ -2272,6 +2418,7 @@ class PosixPlatformAdapter(
     RootedFileSystem,
     MutableFileReservationService,
     OwnedNamespaceRetirement,
+    ExistingFileRetirement,
     ExistingFileDurability,
     ExistingFileMutationGuard,
     ProcessFileLock,
@@ -2284,6 +2431,215 @@ class PosixPlatformAdapter(
             raise TypeError("_fault_injector must be callable")
         self._fault_injector = _fault_injector
         self._issuer = object()
+
+    def _bind_retirement_source_directory(
+        self, root: RootedDirectoryAuthority, relative: PurePath,
+    ) -> RetirementSourceDirectoryAuthority:
+        if type(root) is not _PosixRootedDirectory or root._issuer is not self._issuer:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        parent = cast(_PosixBoundDirectory, self._bind_parent(root, relative))
+        return _PosixRetirementSourceDirectory(parent, relative.name)
+
+    def _open_existing_retirement_source(
+        self, source_parent: RetirementSourceDirectoryAuthority,
+        expected_content: CandidateContentFacts,
+    ) -> ExistingRetirementSource:
+        if (
+            type(source_parent) is not _PosixRetirementSourceDirectory
+            or source_parent._parent._issuer is not self._issuer
+        ):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        parent = source_parent._parent
+        directories: tuple[int, ...] | None = None
+        descriptor: int | None = None
+        retained: _PosixBoundRegularFile | None = None
+        source: _PosixExistingRetirementSource | None = None
+        try:
+            source_parent.reprove()
+            directories = _duplicate_directory_chain(parent._directory_fds)
+            descriptor = os.open(
+                source_parent._source_name, _READ_FLAGS | os.O_NONBLOCK,
+                dir_fd=directories[-1],
+            )
+            transferred_directories, transferred_descriptor = directories, descriptor
+            directories, descriptor = None, None
+            retained = _PosixBoundRegularFile(
+                transferred_directories, parent._directory_names,
+                transferred_descriptor, source_parent._source_name,
+                self._fault_injector, issuer=self._issuer,
+            )
+            actual = retained.content_facts()
+            if actual.snapshot.identity.link_count != 1:
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            source = _PosixExistingRetirementSource(
+                retained, parent._root_token, expected_content, actual.snapshot.identity,
+            )
+            source.reprove()
+            source_parent.reprove()
+            _hit_fault(self._fault_injector, "existing_retirement_source_before_return")
+            source.reprove()
+            return source
+        except BaseException as error:
+            try:
+                if source is not None:
+                    source.close()
+                elif retained is not None:
+                    _close_mutation_guard_descriptors((
+                        retained._descriptor, *reversed(retained._directory_fds),
+                    ))
+            except BaseException:
+                pass
+            if isinstance(error, OSError):
+                raise _map_os_error(
+                    error, fallback=PlatformFileErrorCode.IDENTITY_STALE, retryable=True,
+                ) from None
+            raise
+        finally:
+            if descriptor is not None:
+                _close_fd(descriptor)
+            if directories is not None:
+                for item in reversed(directories):
+                    _close_fd(item)
+
+    def _retire_existing_exclusive(
+        self, source_parent: RetirementSourceDirectoryAuthority,
+        source: ExistingRetirementSource, target_parent: RetirementDirectoryAuthority,
+        target_name: str,
+    ) -> RetainedRetirement:
+        if (
+            type(source_parent) is not _PosixRetirementSourceDirectory
+            or type(source) is not _PosixExistingRetirementSource
+            or type(target_parent) is not _PosixRetirementDirectory
+            or source_parent._parent._issuer is not self._issuer
+            or source._issuer is not self._issuer
+            or target_parent._issuer is not self._issuer
+            or source._root_token is not source_parent._parent._root_token
+            or target_parent._root_token is not source._root_token
+        ):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        parent = source_parent._parent
+        file = source._file
+        if (
+            file._entry_name != source_parent._source_name
+            or file._directory_names != parent._directory_names
+            or len(file._directory_identities) != len(parent._directory_identities)
+            or not all(_same_identity(left, right) for left, right in zip(
+                file._directory_identities, parent._directory_identities, strict=True,
+            ))
+        ):
+            raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+        armed = False
+        target_fds: tuple[int, ...] | None = None
+        retained: _PosixExistingRetainedRetirement | None = None
+        try:
+            actual = source.reprove()
+            source_parent.reprove()
+            target_parent.reprove()
+            if target_parent.inspect_entry(target_name) is not None:
+                raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True)
+            target_fds = _duplicate_directory_chain(target_parent._directory_fds)
+            _hit_fault(self._fault_injector, "existing_retirement_before_arm")
+            source_parent.reprove()
+            source.reprove()
+            target_parent.reprove()
+            armed = True
+            _rename_owned_exclusive_at(
+                parent._directory_fd, source_parent._source_name,
+                target_parent._directory_fd, target_name,
+            )
+            _hit_fault(self._fault_injector, "existing_retirement_after_arm")
+            os.fsync(parent._directory_fd)
+            if not _same_identity(parent._directory_identity, target_parent._directory_identity):
+                os.fsync(target_parent._directory_fd)
+            retained = _PosixExistingRetainedRetirement(
+                actual.snapshot.identity,
+                file._directory_fds, file._directory_names, file._directory_identities,
+                file._entry_name,
+                target_fds, target_parent._directory_names, target_parent._directory_identities,
+                target_name, file._descriptor, source._expected_content, owns_source=False,
+            )
+            target_fds = None
+            _hit_fault(self._fault_injector, "existing_retirement_before_terminal")
+            retained.reprove()
+            source._mark_authority_transferred()
+            retained._owns_source = True
+            result, retained = retained, None
+            return result
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except Exception as error:
+            if armed:
+                raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True) from None
+            if isinstance(error, PlatformFileError):
+                raise
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False) from None
+        finally:
+            if retained is not None:
+                try:
+                    retained.close()
+                except BaseException:
+                    pass
+            if target_fds is not None:
+                for item in reversed(target_fds):
+                    _close_fd(item)
+
+    def _rebind_existing_retirement(
+        self, source_parent: BoundDirectoryAuthority, source_name: str,
+        target_parent: RetirementDirectoryAuthority, target_name: str,
+        expected_content: CandidateContentFacts,
+    ) -> RetainedRetirement:
+        if (
+            type(source_parent) not in {_PosixRootedDirectory, _PosixBoundDirectory}
+            or not isinstance(source_parent, _DirectoryAuthorityMixin)
+            or type(target_parent) is not _PosixRetirementDirectory
+            or source_parent._issuer is not self._issuer
+            or target_parent._issuer is not self._issuer
+            or source_parent._root_token is not target_parent._root_token
+        ):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        source_fds: tuple[int, ...] | None = None
+        target_fds: tuple[int, ...] | None = None
+        descriptor: int | None = None
+        retained: _PosixExistingRetainedRetirement | None = None
+        try:
+            source_parent.reprove()
+            target_parent.reprove()
+            if source_parent.inspect_entry(source_name) is not None:
+                raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True)
+            target = target_parent.inspect_entry(target_name)
+            if target is None or target.identity.kind != "regular" or target.identity.link_count != 1:
+                raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True)
+            source_fds = _duplicate_directory_chain(source_parent._directory_fds)
+            target_fds = _duplicate_directory_chain(target_parent._directory_fds)
+            descriptor = os.open(target_name, _READ_FLAGS | os.O_NONBLOCK, dir_fd=target_fds[-1])
+            retained = _PosixExistingRetainedRetirement(
+                target.identity,
+                source_fds, source_parent._directory_names, source_parent._directory_identities,
+                source_name,
+                target_fds, target_parent._directory_names, target_parent._directory_identities,
+                target_name, descriptor, expected_content, owns_source=True,
+            )
+            source_fds, target_fds, descriptor = None, None, None
+            _hit_fault(self._fault_injector, "existing_retirement_rebind_before_terminal")
+            retained.reprove()
+            result, retained = retained, None
+            return result
+        except (TypeError, AssertionError, AttributeError):
+            raise
+        except Exception:
+            raise _platform_error(PlatformFileErrorCode.RECOVERY_REQUIRED, retryable=True) from None
+        finally:
+            if retained is not None:
+                try:
+                    retained.close()
+                except BaseException:
+                    pass
+            if descriptor is not None:
+                _close_fd(descriptor)
+            for descriptors in (source_fds, target_fds):
+                if descriptors is not None:
+                    for item in reversed(descriptors):
+                        _close_fd(item)
 
     def _observe_root_children(
         self, root: RootedDirectoryAuthority, lease: LockLease,
@@ -2827,6 +3183,7 @@ class PosixPlatformAdapter(
             _duplicate_directory_chain(parent._directory_fds),
             parent._directory_names, self._fault_injector,
             issuer=self._issuer if cast(_PosixRootedDirectory | _PosixBoundDirectory, parent)._issuer is self._issuer else None,
+            root_token=cast(_PosixRootedDirectory | _PosixBoundDirectory, parent)._root_token,
         )
 
     def open_export_directory(
@@ -2873,6 +3230,7 @@ class PosixPlatformAdapter(
             return _PosixBoundDirectory(
                 descriptors, parent._directory_names + (name,), self._fault_injector,
                 issuer=self._issuer if cast(_PosixRootedDirectory | _PosixBoundDirectory, parent)._issuer is self._issuer else None,
+                root_token=cast(_PosixRootedDirectory | _PosixBoundDirectory, parent)._root_token,
             )
         except Exception as error:
             if created:
@@ -2910,6 +3268,7 @@ class PosixPlatformAdapter(
                 directory_names,
                 self._fault_injector,
                 issuer=self._issuer if root._issuer is self._issuer else None,
+                root_token=root._root_token,
             )
         except PlatformFileError:
             raise
@@ -3052,6 +3411,7 @@ class PosixPlatformAdapter(
                 result_names,
                 self._fault_injector,
                 issuer=self._issuer if parent._issuer is self._issuer else None,
+                root_token=parent._root_token,
             )
         except (TypeError, AssertionError, AttributeError):
             raise
@@ -3472,6 +3832,7 @@ class PosixPlatformAdapter(
                 directory_names,
                 self._fault_injector,
                 issuer=self._issuer if parent._issuer is self._issuer else None,
+                root_token=parent._root_token,
             )
         except BaseException as error:
             if chain is not None:
