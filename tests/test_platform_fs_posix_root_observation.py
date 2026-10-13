@@ -98,7 +98,9 @@ class PosixRootObservationTests(unittest.TestCase):
         self.assertIsInstance(self.backend, capability)
         self.assertNotIsInstance(object(), capability)
         self.assertNotIn("observe_root_children", get_protocol_members(fs.PlatformFileBackend))
-        self.assertNotIsInstance(self.backend, fs.LockedDescendantNamespaceInspection)
+        self.assertIsInstance(self.backend, fs.LockedDescendantNamespaceInspection)
+        self.assertNotIn("observe_descendant_entries", get_protocol_members(capability))
+        self.assertNotIn("observe_root_children", get_protocol_members(fs.LockedDescendantNamespaceInspection))
         self.assertIsInstance(self.backend, fs.ReadOnlyDirectoryObservation)
 
     def test_complete_metadata_preserves_unrelated_and_unavailable_entries(self) -> None:

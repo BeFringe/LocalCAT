@@ -607,7 +607,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1_
   - _Requirements: 5.1, 5.3, 5.6, 5.7_
 
-- [ ] 11.4d 提供POSIX原资源锁下的后代目录闭集观察
+- [x] 11.4d 提供POSIX原资源锁下的后代目录闭集观察
   - 实现既有可选LockedDescendantNamespaceInspection，以同issuer原root/W1和严格后代普通directory authority执行单目录有界双遍闭集观察，不重新绑定Path或获取后代锁。
   - 完成时，合法未知条目保留供owner判断，不可用shape、外来authority、错锁、上限、部分枚举、前后漂移与close失败稳定拒绝；借入对象仍可用，exact-parent ledger、root metadata和Windows既有能力语义不变。
   - _Boundary: POSIX adapter及既有后代闭集合同测试_

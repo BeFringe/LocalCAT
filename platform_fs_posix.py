@@ -43,6 +43,7 @@ from platform_fs_contracts import (
     LedgerEntryObservation,
     LedgerEnumerationLimits,
     LockLease,
+    LockedDescendantNamespaceInspection,
     LockedRootDirectoryObservation,
     LockPolicy,
     LockWait,
@@ -2353,6 +2354,7 @@ class _PosixDirectoryStream:
     def __init__(
         self, parent_fd: int, resources: DirectoryHandleBudget,
         cancellation: DirectoryObservationCancellation,
+        *, preserve_cleanup_error: bool = False,
     ) -> None:
         self._api = _ObservationDirectoryAPI()
         self._cancellation = cancellation
@@ -2371,7 +2373,7 @@ class _PosixDirectoryStream:
                 raise OSError(ctypes.get_errno(), "fdopendir")
             descriptor = None  # fdopendir owns the same fd; it does not dup it.
             cancellation.check()
-        except BaseException:
+        except BaseException as primary:
             try:
                 if self._pointer:
                     self.close()
@@ -2379,9 +2381,13 @@ class _PosixDirectoryStream:
                     if descriptor is not None:
                         _close_observation_fd(descriptor)
                     self._reservation.close()
-            except BaseException:
+            except BaseException as cleanup:
                 # Cleanup must not replace the acquisition/cancellation error.
                 # A failed native close leaves its reservation charged.
+                if preserve_cleanup_error:
+                    raise primary from BaseExceptionGroup(
+                        "POSIX directory stream acquisition cleanup failures", [cleanup],
+                    )
                 pass
             raise
 
@@ -2416,6 +2422,7 @@ class _PosixDirectoryStream:
 
 class PosixPlatformAdapter(
     ReadOnlyDirectoryObservation,
+    LockedDescendantNamespaceInspection,
     LockedRootDirectoryObservation,
     PosixBoundContentObservation,
     PosixStageHandoff,
@@ -2436,6 +2443,112 @@ class PosixPlatformAdapter(
             raise TypeError("_fault_injector must be callable")
         self._fault_injector = _fault_injector
         self._issuer = object()
+
+    def _observe_descendant_entries(
+        self, root: RootedDirectoryAuthority, lease: LockLease,
+        descendant: BoundDirectoryAuthority, limits: LedgerEnumerationLimits,
+    ) -> tuple[LedgerEntryObservation, ...]:
+        if (
+            type(root) is not _PosixRootedDirectory
+            or type(descendant) is not _PosixBoundDirectory
+            or type(lease) is not _PosixLockLease
+            or root._issuer is not self._issuer
+            or descendant._issuer is not self._issuer
+            or lease._issuer is not self._issuer
+            or descendant._root_token is not root._root_token
+            or lease._root_token is not root._root_token
+        ):
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+
+        def reprove() -> None:
+            root.reprove_location()
+            descendant.reprove()
+            root_depth = len(root._directory_names)
+            if (
+                len(descendant._directory_names) <= root_depth
+                or descendant._directory_names[:root_depth] != root._directory_names
+                or not all(
+                    _same_identity(left, right)
+                    for left, right in zip(
+                        root._directory_identities,
+                        descendant._directory_identities[:root_depth], strict=True,
+                    )
+                )
+            ):
+                raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+            self._stage_lease(lease, root)
+
+        resources = DirectoryHandleBudget(1)
+        cancellation = DirectoryObservationCancellation()
+
+        def observe_once() -> tuple[LedgerEntryObservation, ...]:
+            entries: dict[str, LedgerEntryObservation] = {}
+            total_bytes = 0
+            stream: _PosixDirectoryStream | None = None
+            primary: BaseException | None = None
+            try:
+                generation = _snapshot_from_stat(os.fstat(descendant._directory_fd))
+                stream = _PosixDirectoryStream(
+                    descendant._directory_fd, resources, cancellation,
+                    preserve_cleanup_error=True,
+                )
+                for name, inode in stream:
+                    if name in entries:
+                        raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                    try:
+                        name = validate_relative_name(name)
+                        encoded_name = name.encode("utf-8", errors="strict")
+                    except (TypeError, ValueError):
+                        raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False) from None
+                    if len(entries) >= limits.maximum_entries or len(encoded_name) > limits.maximum_name_bytes:
+                        raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+                    before = os.stat(name, dir_fd=descendant._directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(before.st_mode):
+                        raise _platform_error(PlatformFileErrorCode.REPARSE_REJECTED, retryable=False)
+                    after = os.stat(name, dir_fd=descendant._directory_fd, follow_symlinks=False)
+                    snapshot = _snapshot_from_stat(after)
+                    if (
+                        inode != before.st_ino
+                        or _snapshot_from_stat(before) != snapshot
+                        or snapshot.identity.kind != "regular"
+                        or snapshot.identity.link_count != 1
+                    ):
+                        raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                    total_bytes += snapshot.byte_count
+                    if total_bytes > limits.maximum_total_bytes:
+                        raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+                    entries[name] = LedgerEntryObservation(name, snapshot)
+                if _snapshot_from_stat(os.fstat(descendant._directory_fd)) != generation:
+                    raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+                return tuple(entries[name] for name in sorted(entries))
+            except BaseException as error:
+                if isinstance(error, OSError):
+                    primary = _map_os_error(error, fallback=PlatformFileErrorCode.ENTRY_UNAVAILABLE, retryable=False)
+                    # Preserve explicit acquisition cleanup evidence through
+                    # the stable operational error mapping.
+                    raise primary from error.__cause__
+                primary = error
+                raise
+            finally:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except BaseException as cleanup:
+                        failures = BaseExceptionGroup("POSIX descendant observation close failures", [cleanup])
+                        if primary is not None:
+                            raise primary from failures
+                        if isinstance(cleanup, (OSError, PlatformFileError)):
+                            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False) from failures
+                        raise
+
+        reprove()
+        first = observe_once()
+        reprove()
+        second = observe_once()
+        reprove()
+        if first != second:
+            raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+        return second
 
     def _complete_existing_link_pair(
         self, root: RootedDirectoryAuthority, lease: LockLease,
