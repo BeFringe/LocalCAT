@@ -4,10 +4,10 @@
 crash window durably and idempotently: an old completed pair cancels
 the issued receipt, an issued JSONL with an old or absent manifest
 reconstructs the exact ledger manifest and completes, a full issued
-pair completes and rebinds without republishing, and every unsafe,
-foreign, ambiguous or invalid observation durably latches
-``SOURCE_DIVERGED`` without touching foreign paths or canonical
-authority.  Task 5.12 arbitrary-destination export receipts reuse the
+pair completes and rebinds without republishing. Safely observed unmatched
+content latches ``SOURCE_DIVERGED``; invalid issued authority, ambiguity
+and unsafe observation remain ``BLOCKED`` without changing divergence
+or touching foreign paths or canonical authority.  Task 5.12 arbitrary-destination export receipts reuse the
 same protocol without ever touching the active binding or divergence.
 """
 
@@ -1149,7 +1149,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                 binding.receipt.snapshot_id,
             )
 
-    def test_symlink_pair_latches_divergence(self) -> None:
+    def test_symlink_pair_blocks_without_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
@@ -1165,11 +1165,11 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertIn("RECOVERY.PAIR_UNSAFE", outcome.diagnostics)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertTrue(identity.configured_jsonl_path.is_symlink())
             self.assertEqual(
@@ -1177,7 +1177,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                 binding.receipt.snapshot_id,
             )
 
-    def test_hardlink_pair_latches_divergence(self) -> None:
+    def test_hardlink_pair_blocks_without_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
@@ -1193,11 +1193,11 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertIn("RECOVERY.PAIR_UNSAFE", outcome.diagnostics)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertEqual(os.lstat(identity.configured_jsonl_path).st_nlink, 2)
             self.assertEqual(
@@ -1205,7 +1205,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                 binding.receipt.snapshot_id,
             )
 
-    def test_directory_manifest_latches_divergence(self) -> None:
+    def test_directory_manifest_blocks_without_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
@@ -1220,11 +1220,11 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertIn("RECOVERY.PAIR_UNSAFE", outcome.diagnostics)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertTrue(identity.snapshot_manifest_path.is_dir())
             self.assertEqual(
@@ -1232,7 +1232,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                 binding.receipt.snapshot_id,
             )
 
-    def test_ambiguous_issued_receipts_latch_divergence(self) -> None:
+    def test_ambiguous_issued_receipts_block_without_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
@@ -1248,11 +1248,11 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertIn("RECOVERY.AMBIGUOUS_JSONL", outcome.diagnostics)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertEqual(
                 _status_for(stage.staged_db_path, first.snapshot_id),
@@ -1311,7 +1311,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                 binding.receipt.snapshot_id,
             )
 
-    def test_ancestry_invalid_receipt_latches_divergence(self) -> None:
+    def test_ancestry_invalid_receipt_blocks_without_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
@@ -1340,11 +1340,11 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertIn("RECOVERY.ANCESTRY_INVALID", outcome.diagnostics)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertEqual(
                 _status_for(stage.staged_db_path, receipt.snapshot_id),
@@ -1355,7 +1355,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                 binding.receipt.snapshot_id,
             )
 
-    def test_binding_invalid_latches_divergence(self) -> None:
+    def test_binding_invalid_blocks_without_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage, store = _prepared_store(root)
@@ -1378,11 +1378,11 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertIn("RECOVERY.BINDING_INVALID", outcome.diagnostics)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertEqual(
                 _status_for(stage.staged_db_path, receipt.snapshot_id),
@@ -1392,10 +1392,8 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
                 _binding_row(stage.staged_db_path)[4],
                 receipt.snapshot_id,
             )
-            self.assertEqual(
-                store.source_binding_monitor.observe().state,
-                SourceBindingState.SOURCE_DIVERGED,
-            )
+            with self.assertRaisesRegex(SQLiteStoreSchemaError, "STORE.REFRESH_RECOVERY_REQUIRED"):
+                store.source_binding_monitor.observe()
 
     def test_binding_tamper_never_cancels_old_pair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1420,13 +1418,13 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertEqual(
                 outcome.receipts,
                 (
                     IssuedReceiptRecovery(
                         receipt.snapshot_id,
-                        RefreshRecoveryState.DIVERGED,
+                        RefreshRecoveryState.BLOCKED,
                         ("RECOVERY.BINDING_INVALID",),
                     ),
                 ),
@@ -1434,7 +1432,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             self.assertIn("RECOVERY.BINDING_INVALID", outcome.diagnostics)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertEqual(
                 _status_for(stage.staged_db_path, receipt.snapshot_id),
@@ -1506,13 +1504,13 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertEqual(
                 outcome.receipts,
                 (
                     IssuedReceiptRecovery(
                         receipt.snapshot_id,
-                        RefreshRecoveryState.DIVERGED,
+                        RefreshRecoveryState.BLOCKED,
                         ("RECOVERY.LEDGER_IDENTITY_INVALID",),
                     ),
                 ),
@@ -1523,7 +1521,7 @@ class TMRecoveryConfiguredDecisionTests(unittest.TestCase):
             )
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertEqual(
                 _status_for(stage.staged_db_path, receipt.snapshot_id),
@@ -2397,13 +2395,13 @@ class TMRecoveryExportTests(unittest.TestCase):
             outcome = store.recover_configured_refresh()
 
             _assert_recovery_outcome_shape(self, outcome)
-            self.assertIs(outcome.state, RefreshRecoveryState.DIVERGED)
+            self.assertIs(outcome.state, RefreshRecoveryState.BLOCKED)
             self.assertEqual(
                 outcome.receipts,
                 (
                     IssuedReceiptRecovery(
                         second.snapshot_id,
-                        RefreshRecoveryState.DIVERGED,
+                        RefreshRecoveryState.BLOCKED,
                         ("RECOVERY.EXPORT_BINDING_INVALID",),
                     ),
                 ),
@@ -2423,7 +2421,7 @@ class TMRecoveryExportTests(unittest.TestCase):
             self.assertEqual(_pair(identity), prior_pair)
             self.assertEqual(
                 _meta_value(stage.staged_db_path, "divergence_latched"),
-                "1",
+                "0",
             )
             self.assertEqual(
                 _binding_row(stage.staged_db_path)[4],

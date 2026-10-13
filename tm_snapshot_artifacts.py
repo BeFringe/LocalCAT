@@ -30,13 +30,19 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePath, PureWindowsPath
 import stat
 import sys
+import threading
+from typing import final
 
 from platform_fs import compose_platform_file_backend
 from platform_fs_contracts import (
     FileObjectIdentity,
+    BoundDirectoryAuthority, RootedDirectoryAuthority, PlatformFileBackend,
+    LockLease, LockPolicy, LockWait, PosixBoundDirectoryOperations,
+    PosixBoundContentObservation, PosixStageHandoff, CandidateContentFacts,
+    PublishMode, PendingPublication, PosixBoundContentFacts,
     PlatformFileError,
     PlatformFileErrorCode,
 )
@@ -44,6 +50,7 @@ from platform_fs_contracts import (
 from tm_activation_journal import (
     ActivationPreparationError,
     _ActivationFileIdentity,
+    _append_owned_close_facts,
     _activation_journal_path,
     _activation_journal_temp_path,
     _activation_lineage_marker_path,
@@ -80,6 +87,231 @@ class _CreatedFileIdentity:
     inode: int
 
 
+@final
+class _PosixSnapshotParent:
+    """One v2 snapshot destination's retained platform parent and live W1.
+
+    Numeric observations fill the existing codec only. They never bind a
+    directory or grant ownership: every use rechecks this live root/lease.
+    The caller owns a borrowed configured family; a cold arbitrary export
+    owns its separate destination root and closes it at the end of replay.
+    """
+
+    def __init__(
+        self, destination: Path, backend: PlatformFileBackend,
+        root: RootedDirectoryAuthority, parent: BoundDirectoryAuthority,
+        lease: LockLease, *, owner_reprove: Callable[[], None], owned: bool = False,
+        lock_name: str = '.localcat-tm-export-family.lock',
+        lock_payload: bytes = b'localcat.tm.export-family.lock.v1\0parent-family-v1',
+    ) -> None:
+        self.destination = destination
+        self.backend = backend
+        self.root = root
+        self.parent = parent
+        self.lease = lease
+        self._owner_reprove = owner_reprove
+        self._owned = owned
+        self.lock_name = lock_name
+        self.lock_payload = lock_payload
+        self._closed = False
+        self._thread = threading.get_ident()
+        self._pending: PendingPublication | None = None
+        if not isinstance(backend, PosixBoundDirectoryOperations) or not isinstance(backend, PosixBoundContentObservation):
+            raise RecoveryError('RECOVERY.EXPORT_PARENT_UNSAFE', retryable=False)
+        self._directory_operations: PosixBoundDirectoryOperations = backend
+        self._content_observation: PosixBoundContentObservation = backend
+        self.reprove()
+        facts = backend.observe_bound_directory(parent)
+        self.identity = (facts.device, facts.inode)
+
+    @classmethod
+    def bind(cls, destination: Path, backend: PlatformFileBackend, *,
+             owner_reprove: Callable[[], None]) -> _PosixSnapshotParent:
+        root = parent = lease = None
+        try:
+            owner_reprove()
+            root = backend.bind_root(destination.parent)
+            parent = backend.bind_parent(root, PurePath(destination.name))
+            lease = backend.acquire(parent, '.localcat-tm-export-family.lock',
+                b'localcat.tm.export-family.lock.v1\0parent-family-v1', LockPolicy(LockWait.BLOCK))
+            return cls(destination, backend, root, parent, lease,
+                       owner_reprove=owner_reprove, owned=True)
+        except BaseException as error:
+            for item in (lease, parent, root):
+                if item is not None:
+                    try:
+                        item.close()
+                    except BaseException as close_error:
+                        _append_owned_close_facts(error, close_error, context="Snapshot parent bind close failed")
+            raise
+
+    def reprove(self) -> None:
+        if self._closed or self._thread != threading.get_ident():
+            raise RecoveryError('RECOVERY.EXPORT_PARENT_REPLACED', retryable=False)
+        self._owner_reprove()
+        try:
+            self.lease.reprove_binding(self.parent, self.lock_name, self.lock_payload)
+            self.root.reprove()
+            self.parent.reprove()
+        except PlatformFileError as error:
+            raise RecoveryError('RECOVERY.EXPORT_PARENT_REPLACED', retryable=False) from error
+
+    def require(self, destination: Path, identity: tuple[int, int] | None) -> None:
+        self.reprove()
+        if destination != self.destination:
+            raise RecoveryError('RECOVERY.EXPORT_PARENT_REPLACED', retryable=False)
+        try:
+            facts = self._directory_operations.observe_bound_directory(self.parent)
+        except PlatformFileError as error:
+            raise RecoveryError('RECOVERY.EXPORT_PARENT_REPLACED', retryable=False) from error
+        if (facts.device, facts.inode) != identity or identity != self.identity:
+            raise RecoveryError('RECOVERY.EXPORT_PARENT_REPLACED', retryable=False)
+
+    def observe(self, name: str) -> PosixBoundContentFacts | None:
+        self.reprove()
+        _require_recovery_basename(name)
+        try:
+            observed = self.parent.inspect_entry(name)
+            if observed is None:
+                return None
+            retained = self.backend.open_regular(self.root, PurePath(name))
+            with retained:
+                facts = self._content_observation.observe_bound_content(retained)
+                if retained.content_facts().snapshot != observed:
+                    raise RecoveryError('RECOVERY.EXPORT_PAIR_UNSAFE', retryable=False)
+        except PlatformFileError as error:
+            raise RecoveryError('RECOVERY.EXPORT_PAIR_UNSAFE', retryable=False) from error
+        self.reprove()
+        return facts
+
+    def capture(self, name: str, asset_kind: str) -> _RecoveryFileCapture:
+        facts = self.observe(name)
+        if facts is None:
+            raise ActivationPreparationError('ACTIVATION.PRIOR_ASSET_INVALID', retryable=False)
+        return _RecoveryFileCapture(asset_kind, _ActivationFileIdentity(facts.device, facts.inode), facts.content_sha256.hex())
+
+    def state(self, name: str) -> tuple[str, str | None, tuple[int, int] | None]:
+        try:
+            facts = self.observe(name)
+            if facts is None:
+                return ('absent', None, None)
+            return ('present', facts.content_sha256.hex(), (facts.device, facts.inode))
+        except (PlatformFileError, OSError, RecoveryError):
+            return ('unsafe', None, None)
+
+    def require_entry(self, name: str, expected: tuple[int, int] | None) -> None:
+        facts = self.observe(name)
+        if facts is None or (facts.device, facts.inode) != expected:
+            raise RecoveryError('RECOVERY.ARTIFACT_UNPROVEN', retryable=False)
+
+    def absent(self, name: str) -> bool:
+        self.reprove()
+        return self.parent.inspect_entry(name) is None
+
+    def fsync(self) -> None:
+        self.reprove()
+        try:
+            self._directory_operations.synchronize_bound_directory(self.parent, self.lease)
+        except (PlatformFileError, OSError) as error:
+            raise RecoveryError('RECOVERY.EXPORT_IO_FAILED', retryable=True) from error
+        self.reprove()
+
+    def remove(self, name: str, expected: tuple[int, int]) -> bool:
+        self.reprove()
+        snapshot = self.parent.inspect_entry(name)
+        if snapshot is None:
+            return True
+        self.require_entry(name, expected)
+        self.parent.unlink_owned(name, snapshot.identity)
+        self.fsync()
+        return self.absent(name)
+
+    def replace_manifest(self, source: str, destination: str,
+                         expected_identity: tuple[int, int], expected_digest: str) -> None:
+        # The recovery owner already proved receipt, prior pair and handoff.
+        self.require_entry(source, expected_identity)
+        facts = self.observe(source)
+        assert facts is not None
+        if facts.content_sha256.hex() != expected_digest:
+            raise RecoveryError('RECOVERY.MANIFEST_TEMP_INVALID', retryable=False)
+        content = CandidateContentFacts(facts.byte_count, facts.content_sha256)
+        previous = self.parent.inspect_entry(destination)
+        stage_backend = self.backend
+        if not isinstance(stage_backend, PosixStageHandoff):
+            raise RecoveryError('RECOVERY.MANIFEST_TEMP_INVALID', retryable=False)
+        stage = candidate = pending = None
+        primary: BaseException | None = None
+        try:
+            stage = stage_backend.open_existing_stage(self.parent, source,
+                owner_lease=self.lease, expected_content=content)
+            # Numeric ownership and live stage must describe the same inode.
+            self.require_entry(source, expected_identity)
+            if stage.reprove().snapshot != self.parent.inspect_entry(source):
+                raise RecoveryError('RECOVERY.MANIFEST_TEMP_INVALID', retryable=False)
+            candidate = stage_backend.handoff_stage(stage, owner_lease=self.lease, expected_content=content)
+            if self.parent.inspect_entry(destination) != previous:
+                raise RecoveryError('RECOVERY.MANIFEST_DESTINATION_CHANGED', retryable=False)
+            pending = self.parent.begin_publish(candidate, destination,
+                mode=PublishMode.REPLACE_UNDER_LOCK, lease=self.lease)
+            self._pending = pending
+            pending = None
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            close_error: BaseException | None = None
+            for item in (pending, candidate, stage):
+                if item is not None:
+                    try:
+                        item.close()
+                    except BaseException as error:
+                        if primary is not None:
+                            _append_owned_close_facts(primary, error, context="Snapshot manifest stage close failed")
+                        elif close_error is None:
+                            close_error = error
+                        else:
+                            _append_owned_close_facts(close_error, error, context="Snapshot manifest stage close failed")
+            if close_error is not None:
+                raise close_error
+        self.fsync()
+
+    def finish_publication(self) -> None:
+        if self._pending is not None:
+            self.reprove()
+            if self._pending.terminal_reproof() != self._pending.preliminary_facts():
+                raise RecoveryError('RECOVERY.MANIFEST_PUBLISH_VERIFY_FAILED', retryable=False)
+            self._pending.close()
+            self._pending = None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        error: BaseException | None = None
+        authorities = (self._pending,)
+        if self._owned:
+            authorities += (self.lease, self.parent, self.root)
+        for authority in authorities:
+            if authority is not None:
+                try:
+                    authority.close()
+                except BaseException as failure:
+                    if error is None:
+                        error = failure
+                    else:
+                        _append_owned_close_facts(error, failure, context="Snapshot parent close failed")
+        self._pending = None
+        if error is not None:
+            raise error
+
+    def __enter__(self) -> _PosixSnapshotParent:
+        self.reprove()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
 class _ExportParentHandle:
     """Resource-bound no-follow parent directory handle for one publication.
 
@@ -97,13 +329,14 @@ class _ExportParentHandle:
     The raw descriptor is private: contracts/specs never expose it.
     """
 
-    __slots__ = ("destination", "_descriptor", "identity", "_closed")
+    __slots__ = ("destination", "_descriptor", "identity", "_closed", "_owner_reprove")
 
     def __init__(
         self,
         destination: Path,
         descriptor: int,
         identity: tuple[int, int],
+        owner_reprove: Callable[[], None] | None = None,
     ) -> None:
         if type(destination) is not _NATIVE_PATH_TYPE:
             raise TypeError("destination must be an exact native Path")
@@ -120,6 +353,7 @@ class _ExportParentHandle:
         self._descriptor = descriptor
         self.identity = identity
         self._closed = False
+        self._owner_reprove = owner_reprove
 
     @classmethod
     def bind(
@@ -127,6 +361,7 @@ class _ExportParentHandle:
         destination: Path,
         *,
         after_chain_validated: Callable[[Path], None] | None = None,
+        owner_reprove: Callable[[], None] | None = None,
     ) -> _ExportParentHandle:
         """Validate the full parent chain and retain one no-follow dirfd.
 
@@ -143,6 +378,8 @@ class _ExportParentHandle:
         device/inode becomes the retained identity.
         """
 
+        if owner_reprove is not None:
+            owner_reprove()
         _require_export_parent_safe(destination)
         if after_chain_validated is not None:
             after_chain_validated(destination)
@@ -179,6 +416,7 @@ class _ExportParentHandle:
                 destination,
                 descriptor,
                 (observed.st_dev, observed.st_ino),
+                owner_reprove,
             )
         except ExportPreflightError:
             if descriptor >= 0:
@@ -200,6 +438,7 @@ class _ExportParentHandle:
     def fsync(self) -> None:
         """Fsync the retained directory descriptor for durability."""
 
+        self._reprove_owner()
         try:
             os.fsync(self.descriptor)
         except OSError as error:
@@ -215,6 +454,7 @@ class _ExportParentHandle:
         exact retained device/inode passes.
         """
 
+        self._reprove_owner()
         _require_export_parent_safe(self.destination)
         descriptor = -1
         try:
@@ -232,6 +472,13 @@ class _ExportParentHandle:
         if (observed.st_dev, observed.st_ino) != self.identity:
             raise ExportPreflightError("EXPORT.PARENT_REPLACED")
 
+    def _reprove_owner(self) -> None:
+        if self._owner_reprove is not None:
+            try:
+                self._owner_reprove()
+            except Exception as error:
+                raise ExportPreflightError("EXPORT.SOURCE_IDENTITY_STALE") from error
+
     def open(
         self,
         name: str,
@@ -240,6 +487,7 @@ class _ExportParentHandle:
     ) -> int:
         """Open one basename relative to the retained parent descriptor."""
 
+        self._reprove_owner()
         _require_export_basename(name)
         try:
             return os.open(
@@ -254,6 +502,7 @@ class _ExportParentHandle:
     def lstat(self, name: str) -> os.stat_result:
         """No-follow stat of one basename relative to the retained fd."""
 
+        self._reprove_owner()
         _require_export_basename(name)
         try:
             return os.stat(
@@ -267,6 +516,7 @@ class _ExportParentHandle:
     def unlink(self, name: str) -> None:
         """Unlink one basename relative to the retained parent descriptor."""
 
+        self.reprove()
         _require_export_basename(name)
         try:
             os.unlink(name, dir_fd=self.descriptor)
@@ -276,6 +526,7 @@ class _ExportParentHandle:
     def replace(self, source: str, destination: str) -> None:
         """Rename one basename to another relative to the retained fd."""
 
+        self.reprove()
         _require_export_basename(source)
         _require_export_basename(destination)
         try:
@@ -2254,6 +2505,7 @@ class _RecoveryParentHandle:
         "identity",
         "_descriptor",
         "_closed",
+        "_owner_reprove",
     )
 
     def __init__(
@@ -2261,6 +2513,7 @@ class _RecoveryParentHandle:
         destination: Path,
         descriptor: int,
         identity: tuple[int, int],
+        owner_reprove: Callable[[], None] | None = None,
     ) -> None:
         if type(destination) is not _NATIVE_PATH_TYPE:
             raise TypeError("destination must be an exact native Path")
@@ -2277,12 +2530,14 @@ class _RecoveryParentHandle:
         self._descriptor = descriptor
         self.identity = identity
         self._closed = False
+        self._owner_reprove = owner_reprove
 
     @classmethod
     def bind(
         cls,
         destination: Path,
         expected_identity: tuple[int, int],
+        *, owner_reprove: Callable[[], None] | None = None,
     ) -> _RecoveryParentHandle:
         """Validate the full parent chain and retain one no-follow dirfd.
 
@@ -2313,6 +2568,8 @@ class _RecoveryParentHandle:
                 "RECOVERY.EXPORT_PARENT_UNSAFE",
                 retryable=False,
             )
+        if owner_reprove is not None:
+            owner_reprove()
         descriptor = -1
         try:
             descriptor = _open_recovery_parent_chain_no_follow(
@@ -2354,6 +2611,7 @@ class _RecoveryParentHandle:
             destination,
             descriptor,
             (observed.st_dev, observed.st_ino),
+            owner_reprove,
         )
 
     @property
@@ -2370,6 +2628,7 @@ class _RecoveryParentHandle:
     def fsync(self) -> None:
         """Fsync the retained directory descriptor for durability."""
 
+        self.reprove()
         try:
             os.fsync(self.descriptor)
         except OSError:
@@ -2391,6 +2650,8 @@ class _RecoveryParentHandle:
         the moved/replaced parent or any attacker path.
         """
 
+        if self._owner_reprove is not None:
+            self._owner_reprove()
         descriptor = -1
         try:
             descriptor = _open_recovery_parent_chain_no_follow(
@@ -2434,6 +2695,7 @@ class _RecoveryParentHandle:
     ) -> int:
         """Open one basename relative to the retained parent descriptor."""
 
+        self.reprove()
         _require_recovery_basename(name)
         return os.open(
             name,
@@ -2445,6 +2707,7 @@ class _RecoveryParentHandle:
     def lstat(self, name: str) -> os.stat_result:
         """No-follow stat of one basename relative to the retained fd."""
 
+        self.reprove()
         _require_recovery_basename(name)
         return os.stat(
             name,
@@ -2455,12 +2718,14 @@ class _RecoveryParentHandle:
     def unlink(self, name: str) -> None:
         """Unlink one basename relative to the retained parent descriptor."""
 
+        self.reprove()
         _require_recovery_basename(name)
         os.unlink(name, dir_fd=self.descriptor)
 
     def replace(self, source: str, destination: str) -> None:
         """Rename one basename to another relative to the retained fd."""
 
+        self.reprove()
         _require_recovery_basename(source)
         _require_recovery_basename(destination)
         os.replace(
@@ -2491,6 +2756,9 @@ class _RecoveryParentHandle:
         _traceback: object,
     ) -> None:
         self.close()
+
+
+_SnapshotParent = _RecoveryParentHandle | _PosixSnapshotParent
 
 
 def _require_recovery_basename(name: str) -> None:
@@ -2543,7 +2811,7 @@ def _prove_recovery_manifest_source(
     *,
     expected_digest: str,
     expected_identity: tuple[int, int],
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
     parent_capture: Callable[..., _RecoveryFileCapture] | None = None,
 ) -> None:
     """Prove the durable manifest temp by exact digest AND handed-off inode.
@@ -2580,7 +2848,7 @@ def _prove_recovery_manifest_destination(
     *,
     expected_manifest_digest: str | None,
     handoff: _ArtifactHandoffFacts,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> None:
     """Prove the manifest destination against the durable handoff record.
 
@@ -2605,7 +2873,10 @@ def _prove_recovery_manifest_destination(
                 retryable=False,
             )
         try:
-            if parent is not None:
+            if isinstance(parent, _PosixSnapshotParent):
+                if parent.absent(manifest_path.name):
+                    raise FileNotFoundError
+            elif parent is not None:
                 parent.lstat(manifest_path.name)
             else:
                 os.lstat(manifest_path)
@@ -2651,7 +2922,7 @@ def _prove_recovery_manifest_destination(
 def _strict_file_state(
     path: Path,
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> tuple[str, str | None, tuple[int, int] | None]:
     """One descriptor-based no-follow proof of a configured pair entry.
 
@@ -2667,6 +2938,8 @@ def _strict_file_state(
     never re-resolves the parent pathname.
     """
 
+    if isinstance(parent, _PosixSnapshotParent):
+        return parent.state(path.name)
     no_follow = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
     descriptor = -1
     try:
@@ -2763,7 +3036,7 @@ def _unproven_artifact_code(
     handoff: _ArtifactHandoffFacts | None,
     expectations: tuple[tuple[Path, set[str], str], ...],
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> str | None:
     """Blocking error when an existing artifact matches expected content
     but has no durable ownership proof.
@@ -2817,7 +3090,7 @@ def _prior_handoff_digests(
 
 
 def _remove_owned_recovery_artifact(
-    parent: _RecoveryParentHandle,
+    parent: _SnapshotParent,
     name: str,
     expected_identity: _ActivationFileIdentity,
 ) -> bool:
@@ -2831,6 +3104,11 @@ def _remove_owned_recovery_artifact(
     single-link owned inode returns False and the caller fails closed.
     """
 
+    if isinstance(parent, _PosixSnapshotParent):
+        try:
+            return parent.remove(name, (expected_identity.device, expected_identity.inode))
+        except (PlatformFileError, OSError, RecoveryError):
+            return False
     try:
         observed = os.stat(
             name,
@@ -2879,7 +3157,7 @@ class _RecoveryFileCapture:
 
 
 def _recovery_parent_capture(
-    parent: _RecoveryParentHandle,
+    parent: _SnapshotParent,
     name: str,
     asset_kind: str,
 ) -> _RecoveryFileCapture:
@@ -2892,6 +3170,8 @@ def _recovery_parent_capture(
     substitute a foreign entry.
     """
 
+    if isinstance(parent, _PosixSnapshotParent):
+        return parent.capture(name, asset_kind)
     try:
         initial = os.stat(
             name,
@@ -3004,7 +3284,7 @@ def _remove_content_proven_artifact(
     expected_digest: str,
     *,
     expected_identity: tuple[int, int] | None,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> bool:
     """Remove one deterministic artifact proven by strict content proof
     plus the durable handed-off identity.
@@ -3045,7 +3325,7 @@ def _remove_content_proven_artifact(
 
 def _recovery_cleanup_parent_gate(
     destination: Path,
-    parent: _RecoveryParentHandle | None,
+    parent: _SnapshotParent | None,
 ) -> None:
     """Fail closed before any destructive probe when the advertised
     parent pathname can no longer be proven.
@@ -3067,7 +3347,7 @@ def _fsync_artifact_parent(
     destination: Path,
     expected_identity: tuple[int, int] | None,
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> None:
     """No-follow directory-descriptor proof and fsync of the parent.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
+from functools import partial
 import ctypes
 import errno
 import hashlib
@@ -166,6 +167,7 @@ from platform_fs_contracts import (
     RetirementDirectoryAuthority,
     RootedDirectoryAuthority,
 )
+
 
 
 
@@ -453,6 +455,7 @@ class _ExportParentHandle(snapshot_artifacts_module._ExportParentHandle):
         destination: Path,
         *,
         after_chain_validated: Callable[[Path], None] | None = None,
+        owner_reprove: Callable[[], None] | None = None,
     ) -> _ExportParentHandle:
         """Validate the parent chain and retain one no-follow dirfd."""
 
@@ -460,6 +463,7 @@ class _ExportParentHandle(snapshot_artifacts_module._ExportParentHandle):
             _ExportParentHandle,
             super().bind(
                 destination,
+                owner_reprove=owner_reprove,
                 after_chain_validated=(
                     after_chain_validated
                     if after_chain_validated is not None
@@ -921,11 +925,14 @@ def _bound_publish_candidate(
     lease: LockLease,
     publication: _BoundExportPublication,
     prior: _BoundExportPrior,
+    *, owner_reprove: Callable[[], None] | None = None,
 ) -> PendingPublication:
     mode = _bound_publish_mode(prior)
     candidate = publication.candidate
     if not isinstance(candidate, CandidateFile):
         raise TypeError("bound publication candidate is unavailable")
+    if owner_reprove is not None:
+        owner_reprove()
     try:
         pending = parent.begin_publish(
             candidate,
@@ -945,7 +952,8 @@ def _copy_bound_export_prior(
     parent: BoundDirectoryAuthority,
     source_name: str,
     recovery_name: str,
-    prior: _BoundExportPrior, *, candidate_name: str | None = None) -> tuple[
+    prior: _BoundExportPrior, *, candidate_name: str | None = None,
+    owner_lease: LockLease | None = None) -> tuple[
     FileObjectIdentity | None,
     PendingPublication | None,
     BaseException | None,
@@ -991,8 +999,8 @@ def _copy_bound_export_prior(
         pending = parent.begin_publish(
             candidate,
             recovery_name,
-            mode=PublishMode.CREATE_IF_ABSENT,
-            lease=None,
+            mode=PublishMode.CREATE_IF_ABSENT if owner_lease is None else PublishMode.REPLACE_UNDER_LOCK,
+            lease=owner_lease,
         )
         published = pending.preliminary_facts()
         retained = pending.retained_destination().content_facts()
@@ -4736,9 +4744,51 @@ class TMMigrationService:
             raise TypeError("store must be exact SQLiteTMStore")
         if type(destination) is not _NATIVE_PATH_TYPE:
             raise TypeError("destination must be an exact native Path")
+        if self._recovery_profile is _RecoveryProfile.POSIX_V2:
+            return self._run_posix_snapshot_operation(
+                store, lambda: self._run_arbitrary_export(store, destination),
+                stage_prefix="EXPORT",
+            )
         return self._run_arbitrary_export(store, destination)
 
+    def _run_posix_snapshot_operation(
+        self, store: SQLiteTMStore, operation: Callable[[], ExportOutcome],
+        *, stage_prefix: str,
+    ) -> ExportOutcome:
+        outcome: ExportOutcome | None = None
+        publication = None
+        try:
+            with store._snapshot_publication_attempt() as publication, store._snapshot_operation():
+                outcome = operation()
+            return outcome
+        except (SQLiteStoreLifecycleError, SQLiteStoreSchemaError, sqlite3.DatabaseError, OSError) as error:
+            # An outer W1/root close can fail after durable pair+receipt commit.
+            # Retain the publication fact instead of implying an old-output restore.
+            if publication is not None and publication.committed:
+                return export_cleanup_pending_failure(
+                    stage=f"{stage_prefix}.LEDGER",
+                    destination_before=publication.before_digest,
+                    destination_observed=publication.observed_digest,
+                    diagnostics=(_export_diagnostic("EXPORT.CLEANUP_PENDING", "EXPORT_ARTIFACTS_REMAIN"),),
+                )
+            if isinstance(outcome, ExportFailure):
+                return outcome
+            return self._export_failure(error, stage_label=f"{stage_prefix}.PREFLIGHT",
+                                        destination_before=None, destination_observed=None)
+
     def refresh_configured_snapshot(
+        self, store: SQLiteTMStore,
+    ) -> ExportOutcome:
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        if self._recovery_profile is _RecoveryProfile.POSIX_V2:
+            return self._run_posix_snapshot_operation(
+                store, lambda: self._refresh_configured_snapshot(store),
+                stage_prefix="REFRESH",
+            )
+        return self._refresh_configured_snapshot(store)
+
+    def _refresh_configured_snapshot(
         self,
         store: SQLiteTMStore,
     ) -> ExportOutcome:
@@ -4818,6 +4868,9 @@ class TMMigrationService:
                         destination_before=None,
                         destination_observed=None,
                     )
+                if store.coordinator._family is not None:
+                    with store._configured_snapshot_parent() as posix_parent:
+                        return self._publish_posix_configured_snapshot(store, posix_parent)
                 try:
                     (
                         destination_before,
@@ -5024,6 +5077,39 @@ class TMMigrationService:
             existing_retirement=retirement,
             existing_candidate_recovery=retirement,
         )
+
+    def _publish_posix_configured_snapshot(
+        self, store: SQLiteTMStore,
+        posix_parent: snapshot_artifacts_module._PosixSnapshotParent,
+    ) -> ExportOutcome:
+        paths = _export_artifact_paths(self._resource_identity.configured_jsonl_path)
+        backend, root, parent, lease = (posix_parent.backend, posix_parent.root,
+                                      posix_parent.parent, posix_parent.lease)
+        try:
+            destination_prior = _capture_bound_export_prior(backend, root, parent,
+                paths.destination.name, unsafe_code='REFRESH.CONFIGURED_UNSAFE')
+            manifest_prior = _capture_bound_export_prior(backend, root, parent,
+                paths.manifest.name, unsafe_code='REFRESH.MANIFEST_UNSAFE')
+            for path in (paths.jsonl_temp, paths.manifest_temp, paths.jsonl_recovery, paths.manifest_recovery):
+                if not posix_parent.absent(path.name):
+                    raise ExportPreflightError('REFRESH.RECOVERY_REQUIRED')
+            snapshot = store.capture_export_snapshot()
+            if (snapshot.revision.resource_id != self._resource_identity.resource_id
+                    or snapshot.revision.canonical_store_id != self._canonical_store_id):
+                raise ExportPreflightError('REFRESH.STORE_IDENTITY_MISMATCH')
+            family = store.coordinator._family
+            assert family is not None
+            return self._publish_bound_export_snapshot(store,
+                backend=backend, root=root, parent=parent, lease=lease,
+                snapshot=snapshot, paths=paths,
+                destination_prior=destination_prior, manifest_prior=manifest_prior,
+                receipt_id_prefix='snapshot.refresh.', stage_prefix='REFRESH',
+                lock_name=family._lock_name, lock_payload=family._payload,
+                owner_reprove=store._reprove_snapshot_operation, posix_parent=posix_parent)
+        except (ExportPreflightError, RecoveryError, PlatformFileError, OSError,
+                SQLiteStoreLifecycleError, SQLiteStoreSchemaError, sqlite3.DatabaseError) as error:
+            return self._export_failure(error, stage_label='REFRESH.PREFLIGHT',
+                destination_before=None, destination_observed=None)
 
     def _run_bound_configured_refresh(
         self,
@@ -5782,6 +5868,10 @@ class TMMigrationService:
                 != self._canonical_store_id
             ):
                 raise ExportPreflightError("EXPORT.STORE_IDENTITY_MISMATCH")
+            posix_parent = (snapshot_artifacts_module._PosixSnapshotParent(
+                destination, backend, root, parent, lease,
+                owner_reprove=store._reprove_snapshot_operation)
+                if self._recovery_profile is _RecoveryProfile.POSIX_V2 else None)
             outcome = self._publish_bound_export_snapshot(
                 store,
                 backend=backend,
@@ -5792,6 +5882,8 @@ class TMMigrationService:
                 paths=paths,
                 destination_prior=destination_prior,
                 manifest_prior=manifest_prior,
+                posix_parent=posix_parent,
+                owner_reprove=store._reprove_snapshot_operation,
             )
             close_error = _close_bound_export_authorities(lease, parent, root)
             lease = None
@@ -5811,6 +5903,7 @@ class TMMigrationService:
                 )
             return outcome
         except (
+            RecoveryError,
             ExportPreflightError,
             PlatformFileError,
             SQLiteStoreLifecycleError,
@@ -5866,8 +5959,9 @@ class TMMigrationService:
         | None = None,
         cancel_receipt: Callable[[SnapshotReceipt], None] | None = None,
         owner_reprove: Callable[[], None] | None = None,
+        posix_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
     ) -> ExportOutcome:
-        """Publish one Windows JSONL/manifest family under live authorities.
+        """Publish one JSONL/manifest family under live platform authorities.
 
         Task 5.13 parameterizes the Task 5.12 handshake at the owner boundary:
         arbitrary export keeps its historical receipt/ledger callbacks while a
@@ -5894,6 +5988,45 @@ class TMMigrationService:
             raise TypeError("lock_name must be a non-empty string")
         if type(selected_lock_payload) is not bytes or not selected_lock_payload:
             raise TypeError("lock_payload must be non-empty bytes")
+        def numeric(name: str) -> tuple[int, int] | None:
+            assert posix_parent is not None
+            facts = posix_parent.observe(name)
+            return None if facts is None else (facts.device, facts.inode)
+
+        if posix_parent is not None:
+            configured = paths.destination == self._resource_identity.configured_jsonl_path
+            prior_jsonl_identity = numeric(paths.destination.name)
+            prior_manifest_identity = numeric(paths.manifest.name)
+            def register_posix_receipt(value: SnapshotReceipt) -> None:
+                register = (store.register_issued_refresh_receipt if configured else
+                    partial(store.register_issued_export_receipt,
+                        destination_jsonl_path=paths.destination, destination_manifest_path=paths.manifest))
+                register(value,
+                    expected_generation=snapshot.revision.generation, artifact_parent=posix_parent,
+                    artifact_parent_identity=posix_parent.identity,
+                    jsonl_temp_identity=numeric(paths.jsonl_temp.name),
+                    manifest_temp_identity=numeric(paths.manifest_temp.name),
+                    prior_jsonl_identity=prior_jsonl_identity, prior_jsonl_digest=destination_prior.digest,
+                    prior_jsonl_absent=destination_prior.snapshot is None,
+                    prior_manifest_identity=prior_manifest_identity, prior_manifest_digest=manifest_prior.digest,
+                    prior_manifest_absent=manifest_prior.snapshot is None)
+            def complete_posix_receipt(value: SnapshotReceipt,
+                    reprove: Callable[[SnapshotReceipt], None]) -> None:
+                reprove(value)
+                complete = store.complete_issued_refresh_receipt if configured else store.complete_issued_export_receipt
+                jsonl_identity, manifest_identity = numeric(paths.destination.name), numeric(paths.manifest.name)
+                assert jsonl_identity is not None and manifest_identity is not None
+                complete(value.snapshot_id,
+                    expected_generation=snapshot.revision.generation, artifact_parent=posix_parent,
+                    jsonl_identity=jsonl_identity, manifest_identity=manifest_identity)
+            register_receipt = register_posix_receipt
+            complete_receipt = complete_posix_receipt
+            if configured:
+                cancel_receipt = lambda value: store.cancel_issued_refresh_receipt(value.snapshot_id,
+                    expected_generation=snapshot.revision.generation)
+                probe_receipt = lambda value, _reprove: store.probe_issued_receipt_completed(value.snapshot_id,
+                    expected_generation=snapshot.revision.generation, require_bound=True)
+
         if register_receipt is None:
             register_receipt = lambda value: store.register_issued_export_receipt(
                 value,
@@ -6102,6 +6235,11 @@ class TMMigrationService:
                 candidate_identity=manifest_identity,
                 candidate=manifest_candidate,
             )
+            publication = store._snapshot_publication_facts()
+            if publication is not None:
+                publication.snapshot_id = receipt.snapshot_id
+                publication.before_digest = destination_prior.digest
+                publication.observed_digest = receipt.jsonl_digest
             owner_reprove()
             registration_attempted = True
             register_receipt(receipt)
@@ -6117,6 +6255,7 @@ class TMMigrationService:
                 paths.destination.name,
                 paths.jsonl_recovery.name,
                 destination_prior,
+                owner_lease=lease if posix_parent is not None else None,
             )
             if recovery_close_error is not None:
                 raise recovery_close_error
@@ -6131,39 +6270,54 @@ class TMMigrationService:
                 paths.manifest.name,
                 paths.manifest_recovery.name,
                 manifest_prior,
+                owner_lease=lease if posix_parent is not None else None,
             )
             if recovery_close_error is not None:
                 raise recovery_close_error
+            if posix_parent is not None:
+                store.record_export_recovery_handoff(receipt.snapshot_id,
+                    expected_generation=snapshot.revision.generation, artifact_parent=posix_parent,
+                    jsonl_recovery_identity=numeric(paths.jsonl_recovery.name),
+                    manifest_recovery_identity=numeric(paths.manifest_recovery.name))
+            owner_reprove()
             _bound_publish_candidate(
                 parent,
                 lease,
                 jsonl_publication,
                 destination_prior,
+                owner_reprove=owner_reprove,
             )
             _bound_publish_candidate(
                 parent,
                 lease,
                 manifest_publication,
                 manifest_prior,
+                owner_reprove=owner_reprove,
             )
             reprove_family(receipt)
             try:
                 complete_receipt(receipt, reprove_family)
                 owner_completed = True
             except (
+                RecoveryError,
                 ActivationPreparationError,
                 ExportPreflightError,
-                PlatformFileError,
+                PlatformFileError, OSError,
                 SQLiteStoreLifecycleError,
                 SQLiteStoreSchemaError,
                 sqlite3.DatabaseError,
             ):
+                publication = store._snapshot_publication_facts()
+                if publication is not None and publication.committed:
+                    owner_completed = True
+                    raise
                 try:
                     probe = probe_receipt(receipt, reprove_family)
                 except (
+                    RecoveryError,
                     ActivationPreparationError,
                     ExportPreflightError,
-                    PlatformFileError,
+                    PlatformFileError, OSError,
                 ):
                     # The bound refresh probe invokes the family callback only
                     # after proving the durable completed row and binding.  A
@@ -6215,6 +6369,9 @@ class TMMigrationService:
                     (paths.manifest_recovery.name, manifest_recovery_identity),
                 ),
             )
+            if posix_parent is not None:
+                store.clear_issued_receipt_handoff(receipt.snapshot_id,
+                    expected_generation=snapshot.revision.generation, artifact_parent=posix_parent)
             return self._export_report(
                 record_count=record_count,
                 jsonl_digest=receipt.jsonl_digest,
@@ -6223,9 +6380,10 @@ class TMMigrationService:
                 diagnostics=(),
             )
         except (
+            RecoveryError,
             ActivationPreparationError,
             ExportPreflightError,
-            PlatformFileError,
+            PlatformFileError, OSError,
             SQLiteStoreLifecycleError,
             SQLiteStoreSchemaError,
             sqlite3.DatabaseError,
@@ -6364,9 +6522,10 @@ class TMMigrationService:
                     manifest_recovery_pending = None
                     restored = True
                 except (
+                    RecoveryError,
                     ActivationPreparationError,
                     ExportPreflightError,
-                    PlatformFileError,
+                    PlatformFileError, OSError,
                     SQLiteStoreLifecycleError,
                     SQLiteStoreSchemaError,
                     sqlite3.DatabaseError,
@@ -6391,10 +6550,16 @@ class TMMigrationService:
                         ),
                     )
                     owner_reprove()
+                    if posix_parent is not None:
+                        assert receipt is not None
+                        store.clear_issued_receipt_handoff(receipt.snapshot_id,
+                            expected_generation=snapshot.revision.generation, artifact_parent=posix_parent)
                 except (
+                    SQLiteStoreLifecycleError, SQLiteStoreSchemaError, sqlite3.DatabaseError,
+                    RecoveryError,
                     ActivationPreparationError,
                     ExportPreflightError,
-                    PlatformFileError,
+                    PlatformFileError, OSError,
                 ) as cleanup_error:
                     if restore_error is None:
                         restore_error = cleanup_error
@@ -6444,7 +6609,11 @@ class TMMigrationService:
         destination: Path,
     ) -> ExportOutcome:
         backend = self._platform_backend
-        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3:
+        if self._recovery_profile is _RecoveryProfile.WINDOWS_V3 or (
+            store.coordinator._family is not None
+        ):
+            if backend is None and store.coordinator._family is not None:
+                backend = store.coordinator._family._backend
             if backend is None:
                 try:
                     backend = compose_platform_file_backend(destination.parent)
@@ -6612,6 +6781,9 @@ class TMMigrationService:
         shared failure contract.
         """
 
+        publication = store._snapshot_publication_facts()
+        if publication is not None:
+            publication.before_digest = destination_before
         jsonl_temp_identity: _CreatedFileIdentity | None = None
         manifest_temp_identity: _CreatedFileIdentity | None = None
         jsonl_recovery_identity: _CreatedFileIdentity | None = None
@@ -6626,7 +6798,9 @@ class TMMigrationService:
         receipt: SnapshotReceipt | None = None
         parent_handle: _ExportParentHandle | None = None
         try:
-            parent_handle = _ExportParentHandle.bind(paths.destination)
+            parent_handle = _ExportParentHandle.bind(
+                paths.destination, owner_reprove=store._reprove_snapshot_operation,
+            )
             jsonl_digest, record_count, jsonl_temp_identity = (
                 _stream_export_jsonl_temp(
                     paths.jsonl_temp,
@@ -6649,6 +6823,8 @@ class TMMigrationService:
                 jsonl_digest=jsonl_digest,
                 record_count=record_count,
             )
+            if publication is not None:
+                publication.snapshot_id = receipt.snapshot_id
             manifest = SnapshotManifest(
                 manifest_version=SNAPSHOT_MANIFEST_VERSION,
                 snapshot_kind=SnapshotKind.EXPLICIT_EXPORT,
@@ -6795,6 +6971,8 @@ class TMMigrationService:
                 ),
                 parent_handle=parent_handle,
             )
+            if publication is not None:
+                publication.observed_digest = jsonl_digest
             complete_called = True
             complete(
                 receipt.snapshot_id,
@@ -6848,6 +7026,13 @@ class TMMigrationService:
             sqlite3.DatabaseError,
             OSError,
         ) as error:
+            if publication is not None and publication.committed:
+                return export_cleanup_pending_failure(
+                    stage=f"{stage_prefix}.LEDGER",
+                    destination_before=publication.before_digest,
+                    destination_observed=publication.observed_digest,
+                    diagnostics=(_export_diagnostic("EXPORT.CLEANUP_PENDING", "EXPORT_ARTIFACTS_REMAIN"),),
+                )
             if complete_called:
                 assert receipt is not None
                 window_outcome = self._post_completion_exception_window(

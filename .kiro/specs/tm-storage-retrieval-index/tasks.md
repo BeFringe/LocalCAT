@@ -705,7 +705,7 @@
   - _Depends: 10.6, 10.8_
   - _Requirements: 2.4, 2.9, 2.11, 2.12, 7.13, 7.14, 7.16_
 
-- [ ] 10.10 接入snapshot/export/refresh
+- [x] 10.10 接入snapshot/export/refresh
   - canonical 来源与导出目的 root 独立；完整 snapshot/receipt/refresh/cold recovery 仍由原 owner 闭合，退出后迁移不把 pending/hot-journal 残留直接当一致快照。
   - 完成时，来源家族与目的root分开，导出完整快照；refresh/receipt/cold recovery闭合，未完成输出不覆盖有效输出。
   - _Boundary: snapshot artifact/recovery 与 export/refresh 集成_
@@ -728,6 +728,10 @@
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.13, 7.14, 7.15, 7.16, 7.17, 7.18_
 
 ## Implementation Notes
+
+- Task 10.10／10.11：合法 refresh 后的 current binding 不再等同最初 activation receipt，冷重开须分别证明两者。导出 prior 可只有 JSONL，恢复须逐槽消费 handoff 的原 identity／digest／明确缺席事实；新旧摘要相同不能证明同一对象。
+
+- Task 10.10／Resource 6.1：同一家族操作可能先恢复旧 receipt 再发布新快照，提交事实须归属本次 receipt。handoff 清空的终态任意导出不再是 canonical 冷开的目录依赖；仍待恢复的输出保留原目录证明要求。
 
 - Task 10.9／10.10：恢复期间持久 journal 可能已推进，自动回滚须复证原对象与当前记录，不能沿用入口阶段；已完成首次发布的 lineage 不能转成无 prior 的 legacy 终态。隔离资产仍按 stage／canonical receipt 角色核验，搬入隔离目录不改变其内容证明规则。
 

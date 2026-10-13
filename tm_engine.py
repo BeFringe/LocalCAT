@@ -639,6 +639,15 @@ def _open_canonical_tm_store_reserved(
                     f"{_CANONICAL_RECOVERY_FAILED_CODE}:"
                     f"{recovery.error_code or 'RECOVERY.BLOCKED'}"
                 )
+        if sys.platform != "win32":
+            from tm_snapshot_recovery import RefreshRecoveryState
+
+            recovery = store.recover_configured_refresh(_borrow=_borrow)
+            if recovery.state is RefreshRecoveryState.BLOCKED:
+                raise ValueError(
+                    f"{_CANONICAL_RECOVERY_FAILED_CODE}:"
+                    f"{recovery.error_code or 'RECOVERY.BLOCKED'}"
+                )
         if opened_windows_store is None:
             _ = store.canonical_revision(_borrow=_borrow)
     except (

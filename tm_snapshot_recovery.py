@@ -44,7 +44,8 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Callable, Protocol
+from typing import Callable, Protocol, TypedDict
+from platform_fs_contracts import PlatformFileError
 
 from tm_contracts import (
     SNAPSHOT_FORMAT_VERSION,
@@ -468,6 +469,7 @@ def _recovery_artifact_paths(destination: Path) -> _RecoveryArtifactPaths:
 def _recovery_destination_safe(
     facts: _RefreshRecoveryFacts,
     issued: IssuedReceiptFacts,
+    *, require_live_parent: bool = True,
 ) -> str | None:
     """Task 5.12-equivalent recovery-time destination safety proof.
 
@@ -522,7 +524,7 @@ def _recovery_destination_safe(
                 return "RECOVERY.EXPORT_PATH_ALIASED"
             if name.startswith(".localcat-") and sidecar_fragment in name:
                 return "RECOVERY.EXPORT_PATH_ALIASED"
-    if not _parent_chain_safe(destination):
+    if require_live_parent and not _parent_chain_safe(destination):
         return "RECOVERY.EXPORT_PARENT_UNSAFE"
     return None
 
@@ -553,6 +555,7 @@ def _open_recovery_parent_chain_no_follow(destination: Path) -> int:
     )
 
 _RecoveryParentHandle = snapshot_artifacts_module._RecoveryParentHandle
+_SnapshotParent = snapshot_artifacts_module._SnapshotParent
 """_RecoveryParentHandle late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 def _require_recovery_basename(name: str) -> None:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
@@ -593,7 +596,7 @@ def _prove_recovery_manifest_source(
     *,
     expected_digest: str,
     expected_identity: tuple[int, int],
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
@@ -611,7 +614,7 @@ def _prove_recovery_manifest_destination(
     *,
     expected_manifest_digest: str | None,
     handoff: _ArtifactHandoffFacts,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
@@ -622,10 +625,24 @@ def _prove_recovery_manifest_destination(
         parent=parent,
     )
 
+def _rooted_recovery(port: object) -> bool:
+    predicate = getattr(port, 'uses_posix_snapshot_parent', None)
+    return predicate is not None and predicate()
+
+
+class _ParentKeywords(TypedDict, total=False):
+    artifact_parent: snapshot_artifacts_module._PosixSnapshotParent
+
+
+def _parent_kwargs(parent: object) -> _ParentKeywords:
+    return {'artifact_parent': parent} if isinstance(parent, snapshot_artifacts_module._PosixSnapshotParent) else {}
+
+
 def _bind_recovery_parent(
     receipt: IssuedReceiptFacts,
     handoff: _ArtifactHandoffFacts | None,
-) -> _RecoveryParentHandle | None:
+    *, owner_reprove: Callable[[], None] | None = None, port: _SnapshotRecoveryPort | None = None,
+) -> _SnapshotParent | None:
     """Bind the durable parent dirfd for one receipt's recovery work.
 
     Returns ``None`` when the receipt carries no cleanup-pending
@@ -644,9 +661,18 @@ def _bind_recovery_parent(
             "RECOVERY.EXPORT_PARENT_IDENTITY_MISSING",
             retryable=False,
         )
+    if _rooted_recovery(port):
+        assert port is not None
+        try:
+            handle = port.bind_artifact_parent(receipt, handoff)
+            _after_recovery_parent_bound(receipt.destination_jsonl_path, handoff.artifact_parent_identity)
+            return handle
+        except PlatformFileError as error:
+            raise RecoveryError('RECOVERY.EXPORT_PARENT_UNSAFE', retryable=False) from error
     handle = _RecoveryParentHandle.bind(
         receipt.destination_jsonl_path,
         handoff.artifact_parent_identity,
+        owner_reprove=owner_reprove,
     )
     _after_recovery_parent_bound(
         receipt.destination_jsonl_path,
@@ -664,6 +690,13 @@ class _SnapshotRecoveryPort(Protocol):
     propagate unchanged.
     """
 
+    def uses_posix_snapshot_parent(self) -> bool: ...
+    def configured_artifact_parent(self) -> snapshot_artifacts_module._PosixSnapshotParent: ...
+    def bind_artifact_parent(self, receipt: IssuedReceiptFacts, handoff: _ArtifactHandoffFacts) -> snapshot_artifacts_module._PosixSnapshotParent | None: ...
+    def missing_handoff_artifacts_present(self, receipt: IssuedReceiptFacts) -> bool: ...
+
+    def reprove_owner(self) -> None: ...
+
     def read_recovery_facts(self) -> _RefreshRecoveryFacts: ...
 
     def cancel_issued_refresh_receipt(
@@ -678,6 +711,7 @@ class _SnapshotRecoveryPort(Protocol):
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_identity: tuple[int, int] | None = None,
         manifest_identity: tuple[int, int] | None = None,
     ) -> None: ...
@@ -687,6 +721,7 @@ class _SnapshotRecoveryPort(Protocol):
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_identity: tuple[int, int],
         manifest_identity: tuple[int, int],
     ) -> None: ...
@@ -703,6 +738,7 @@ class _SnapshotRecoveryPort(Protocol):
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
     ) -> None: ...
 
     def latch_source_divergence(self, expected_fingerprint: str) -> bool: ...
@@ -793,7 +829,7 @@ class _BoundConfiguredRefreshFamilyPort(Protocol):
 def _strict_file_state(
     path: Path,
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> tuple[str, str | None, tuple[int, int] | None]:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
@@ -805,9 +841,11 @@ def _strict_file_state(
 def _path_exists(
     path: Path,
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> bool:
     try:
+        if isinstance(parent, snapshot_artifacts_module._PosixSnapshotParent):
+            return not parent.absent(path.name)
         if parent is not None:
             os.stat(
                 path.name,
@@ -903,6 +941,7 @@ class _RefreshDecision:
 def _classify_refresh_receipts(
     facts: _RefreshRecoveryFacts,
     issued: tuple[IssuedReceiptFacts, ...],
+    *, parent: _SnapshotParent | None = None,
 ) -> _RefreshDecision:
     """Classify one issued refresh receipt set against durable facts.
 
@@ -910,12 +949,13 @@ def _classify_refresh_receipts(
     completed pair is checked first (cancel), then the issued
     receipt/manifest pair (complete), then the issued JSONL with an old
     or absent manifest (reconstruct), and every other observation
-    durably latches ``SOURCE_DIVERGED``.
+    durably latches ``SOURCE_DIVERGED`` only for safely observed unmatched
+    content. Invalid authority, unsafe observation and ambiguity stay BLOCKED.
     """
 
     if facts.binding_invalid:
         return _RefreshDecision(
-            action="diverged",
+            action="blocked",
             receipts=issued,
             error_code="RECOVERY.BINDING_INVALID",
         )
@@ -923,19 +963,19 @@ def _classify_refresh_receipts(
         row_error = _refresh_receipt_row_error(facts, receipt)
         if row_error is not None:
             return _RefreshDecision(
-                action="diverged",
+                action="blocked",
                 receipts=issued,
                 error_code=row_error,
             )
     jsonl_state, jsonl_digest, jsonl_identity = _strict_file_state(
-        facts.configured_jsonl_path
+        facts.configured_jsonl_path, parent=parent
     )
     manifest_state, manifest_digest, manifest_identity = _strict_file_state(
-        facts.snapshot_manifest_path
+        facts.snapshot_manifest_path, parent=parent
     )
     if jsonl_state == "unsafe" or manifest_state == "unsafe":
         return _RefreshDecision(
-            action="diverged",
+            action="blocked",
             receipts=issued,
             error_code="RECOVERY.PAIR_UNSAFE",
         )
@@ -951,7 +991,11 @@ def _classify_refresh_receipts(
         and manifest_state == "present"
         and manifest_digest == old_manifest_digest
     )
-    if old_pair_matches:
+    if old_pair_matches and not any(
+        (handoff := _handoff_for(facts, receipt.snapshot_id)) is not None
+        and handoff.jsonl_temp_identity == jsonl_identity
+        for receipt in issued
+    ):
         return _RefreshDecision(action="cancel", receipts=issued)
     issued_manifest_digests = {
         receipt.snapshot_id: _manifest_digest_for_receipt(
@@ -976,7 +1020,7 @@ def _classify_refresh_receipts(
         )
     if len(complete_matches) > 1:
         return _RefreshDecision(
-            action="diverged",
+            action="blocked",
             receipts=issued,
             error_code="RECOVERY.AMBIGUOUS_PAIR",
         )
@@ -1008,7 +1052,7 @@ def _classify_refresh_receipts(
         )
     if len(jsonl_matches) > 1:
         return _RefreshDecision(
-            action="diverged",
+            action="blocked",
             receipts=issued,
             error_code="RECOVERY.AMBIGUOUS_JSONL",
         )
@@ -1153,7 +1197,7 @@ def _publish_reconstructed_manifest(
     *,
     expected_manifest_digest: str | None,
     handoff: _ArtifactHandoffFacts | None,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> tuple[int, int]:
     """Publish the exact ledger-reconstructed manifest for one receipt.
 
@@ -1277,7 +1321,10 @@ def _publish_reconstructed_manifest(
             handoff=handoff,
             parent=parent,
         )
-        if parent is not None:
+        if isinstance(parent, snapshot_artifacts_module._PosixSnapshotParent):
+            parent.require_entry(destination.name, handoff.jsonl_temp_identity)
+            parent.replace_manifest(paths.manifest_temp.name, manifest_path.name, temp_identity, expected_digest)
+        elif parent is not None:
             parent.replace(
                 paths.manifest_temp.name,
                 manifest_path.name,
@@ -1308,7 +1355,7 @@ def _publish_reconstructed_manifest(
         return (published.identity.device, published.identity.inode)
     except RecoveryError:
         raise
-    except (OSError, ActivationPreparationError) as error:
+    except (OSError, ActivationPreparationError, PlatformFileError) as error:
         raise RecoveryError(
             "RECOVERY.MANIFEST_PUBLISH_FAILED",
             retryable=True,
@@ -1342,7 +1389,7 @@ def _unproven_artifact_code(
     handoff: _ArtifactHandoffFacts | None,
     expectations: tuple[tuple[Path, set[str], str], ...],
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> str | None:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
@@ -1419,7 +1466,7 @@ def _unproven_artifact_code_for_receipt(
     facts: _RefreshRecoveryFacts,
     receipt: IssuedReceiptFacts,
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> str | None:
     """First unproven-artifact blocker across one receipt's expectations."""
 
@@ -1440,7 +1487,7 @@ def _unproven_artifact_code_for_receipt(
 
 
 def _remove_owned_recovery_artifact(
-    parent: _RecoveryParentHandle,
+    parent: _SnapshotParent,
     name: str,
     expected_identity: _ActivationFileIdentity,
 ) -> bool:
@@ -1455,7 +1502,7 @@ def _remove_owned_recovery_artifact(
 _RecoveryFileCapture = snapshot_artifacts_module._RecoveryFileCapture
 """_RecoveryFileCapture late-bound compatibility alias; implementation moved to tm_snapshot_artifacts."""
 def _recovery_parent_capture(
-    parent: _RecoveryParentHandle,
+    parent: _SnapshotParent,
     name: str,
     asset_kind: str,
 ) -> _RecoveryFileCapture:
@@ -1483,7 +1530,7 @@ def _remove_content_proven_artifact(
     expected_digest: str,
     *,
     expected_identity: tuple[int, int] | None,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> bool:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
@@ -1496,7 +1543,7 @@ def _remove_content_proven_artifact(
 
 def _recovery_cleanup_parent_gate(
     destination: Path,
-    parent: _RecoveryParentHandle | None,
+    parent: _SnapshotParent | None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
@@ -1510,7 +1557,7 @@ def _cleanup_refresh_artifacts(
     receipt: IssuedReceiptFacts,
     *,
     handoff: _ArtifactHandoffFacts | None,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> tuple[str, ...]:
     """Clean owned refresh artifacts after one durable outcome.
 
@@ -1577,7 +1624,7 @@ def _cleanup_export_artifacts(
     issued: IssuedReceiptFacts,
     *,
     handoff: _ArtifactHandoffFacts | None,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> tuple[str, ...]:
     """Clean owned export artifacts after one durable outcome.
 
@@ -1637,47 +1684,27 @@ def _cleanup_export_artifacts(
     return tuple(sorted(set(diagnostics)))
 
 
-def _prior_export_pairs(
-    facts: _RefreshRecoveryFacts,
-    issued: IssuedReceiptFacts,
-) -> dict[str, tuple[str, str]]:
-    """Prior same-destination receipt pairs provable from the ledger.
-
-    A prior row is usable only when its resource/canonical identity
-    matches the live store, its receipt is well-formed, its revision
-    ancestry is exact, and it completed at the same destination pair.
-    Cancelled rows have no publication authority: a cancelled receipt
-    can never cancel a later issued receipt nor grant it ownership of
-    the destination pair.  Any invalid or foreign prior row is excluded
-    so an old-pair cancellation or manifest expectation can never be
-    derived from tampered ledger state.
-    """
-
-    result: dict[str, tuple[str, str]] = {}
-    for row in facts.receipts:
-        if (
-            row.status != "completed"
-            or row.snapshot_id == issued.snapshot_id
-            or row.destination_jsonl_path
-            != issued.destination_jsonl_path
-            or row.destination_manifest_path
-            != issued.destination_manifest_path
-            or row.resource_id != facts.resource_id
-            or row.canonical_store_id != facts.canonical_store_id
-        ):
-            continue
-        try:
-            manifest_digest = _manifest_digest_for_receipt(row.receipt)
-        except (TypeError, ValueError):
-            continue
-        expected_count = _record_count_at(facts, row.exported_revision)
-        if (
-            expected_count is None
-            or row.record_count != expected_count
-        ):
-            continue
-        result[row.snapshot_id] = (row.jsonl_digest, manifest_digest)
-    return result
+def _matches_handoff_prior_pair(
+    handoff: _ArtifactHandoffFacts,
+    jsonl: tuple[str, str | None, tuple[int, int] | None],
+    manifest: tuple[str, str | None, tuple[int, int] | None],
+) -> bool:
+    """Prove each old slot, including a partially existing user output pair."""
+    for observed, absent, digest, identity in (
+        (jsonl, handoff.prior_jsonl_absent, handoff.prior_jsonl_digest,
+         handoff.prior_jsonl_identity),
+        (manifest, handoff.prior_manifest_absent, handoff.prior_manifest_digest,
+         handoff.prior_manifest_identity),
+    ):
+        state, actual_digest, actual_identity = observed
+        if absent is True:
+            if state != "absent":
+                return False
+        elif (absent is not False or state != "present"
+              or digest is None or identity is None
+              or actual_digest != digest or actual_identity != identity):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -1693,7 +1720,7 @@ def _cleanup_and_release_export(
     handoff: _ArtifactHandoffFacts | None,
     reconciliation: _ExportReconciliation,
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> _ExportReconciliation:
     """Remove owned artifacts and release the handoff after a terminal
     export transition.
@@ -1709,6 +1736,8 @@ def _cleanup_and_release_export(
     pathname.
     """
 
+    if isinstance(parent, snapshot_artifacts_module._PosixSnapshotParent):
+        parent.finish_publication()
     diagnostics = _cleanup_export_artifacts(
         issued,
         handoff=handoff,
@@ -1723,6 +1752,7 @@ def _cleanup_and_release_export(
         port.clear_issued_receipt_handoff(
             issued.snapshot_id,
             expected_generation=facts.generation,
+            **_parent_kwargs(parent),
         )
     return _ExportReconciliation(reconciliation.result, diagnostics)
 
@@ -1757,7 +1787,7 @@ def _reconcile_one_export(
                 ("RECOVERY.EXPORT_LEDGER_IDENTITY_INVALID",),
             )
         )
-    destination_error = _recovery_destination_safe(facts, issued)
+    destination_error = _recovery_destination_safe(facts, issued, require_live_parent=not _rooted_recovery(port))
     if destination_error is not None:
         return _ExportReconciliation(
             IssuedReceiptRecovery(
@@ -1795,7 +1825,13 @@ def _reconcile_one_export(
             ("RECOVERY.HANDOFF_MISSING",),
         )
     try:
-        parent_handle = _bind_recovery_parent(issued, handoff)
+        parent_handle = _bind_recovery_parent(issued, handoff, owner_reprove=port.reprove_owner, port=port)
+        assert parent_handle is not None
+        try:
+            parent_handle.reprove()
+        except BaseException:
+            parent_handle.close()
+            raise
     except RecoveryError as error:
         return _ExportReconciliation(
             IssuedReceiptRecovery(
@@ -1840,6 +1876,27 @@ def _reconcile_one_export(
                         (unproven,),
                     )
                 )
+            if _matches_handoff_prior_pair(
+                handoff, (jsonl_state, jsonl_digest, jsonl_identity),
+                (manifest_state, manifest_digest, manifest_identity),
+            ):
+                port.cancel_issued_export_receipt(
+                    issued.snapshot_id,
+                    expected_generation=facts.generation,
+                )
+                return _cleanup_and_release_export(
+                    port,
+                    facts,
+                    issued,
+                    handoff,
+                    _ExportReconciliation(
+                        IssuedReceiptRecovery(
+                            issued.snapshot_id,
+                            RefreshRecoveryState.CANCELLED,
+                        )
+                    ),
+                    parent=parent_handle,
+                )
             if (
                 jsonl_state == "present"
                 and jsonl_digest == issued.jsonl_digest
@@ -1853,6 +1910,7 @@ def _reconcile_one_export(
                     expected_generation=facts.generation,
                     jsonl_identity=jsonl_identity,
                     manifest_identity=manifest_identity,
+                    **_parent_kwargs(parent_handle),
                 )
                 return _cleanup_and_release_export(
                     port,
@@ -1888,6 +1946,11 @@ def _reconcile_one_export(
                             ("RECOVERY.EXPORT_MANIFEST_FOREIGN",),
                         )
                     )
+                if jsonl_identity != handoff.jsonl_temp_identity:
+                    return _ExportReconciliation(IssuedReceiptRecovery(
+                        issued.snapshot_id, RefreshRecoveryState.BLOCKED,
+                        ("RECOVERY.ARTIFACT_UNPROVEN",),
+                    ))
                 published_manifest_identity = _publish_reconstructed_manifest(
                     issued.destination_jsonl_path,
                     issued.destination_manifest_path,
@@ -1902,6 +1965,7 @@ def _reconcile_one_export(
                     expected_generation=facts.generation,
                     jsonl_identity=jsonl_identity,
                     manifest_identity=published_manifest_identity,
+                    **_parent_kwargs(parent_handle),
                 )
                 return _cleanup_and_release_export(
                     port,
@@ -1912,51 +1976,6 @@ def _reconcile_one_export(
                         IssuedReceiptRecovery(
                             issued.snapshot_id,
                             RefreshRecoveryState.COMPLETED,
-                        )
-                    ),
-                    parent=parent_handle,
-                )
-            prior_pairs = list(
-                _prior_export_pairs(facts, issued).values()
-            )
-            if (
-                handoff is not None
-                and handoff.prior_jsonl_absent is False
-                and handoff.prior_manifest_absent is False
-                and handoff.prior_jsonl_digest is not None
-                and handoff.prior_manifest_digest is not None
-            ):
-                prior_pairs.append(
-                    (
-                        handoff.prior_jsonl_digest,
-                        handoff.prior_manifest_digest,
-                    )
-                )
-            old_pair = next(
-                (
-                    pair
-                    for pair in prior_pairs
-                    if jsonl_state == "present"
-                    and jsonl_digest == pair[0]
-                    and manifest_state == "present"
-                    and manifest_digest == pair[1]
-                ),
-                None,
-            )
-            if old_pair is not None:
-                port.cancel_issued_export_receipt(
-                    issued.snapshot_id,
-                    expected_generation=facts.generation,
-                )
-                return _cleanup_and_release_export(
-                    port,
-                    facts,
-                    issued,
-                    handoff,
-                    _ExportReconciliation(
-                        IssuedReceiptRecovery(
-                            issued.snapshot_id,
-                            RefreshRecoveryState.CANCELLED,
                         )
                     ),
                     parent=parent_handle,
@@ -1999,50 +2018,23 @@ def _reconcile_issued_exports(
     BLOCKED/complete/cancel semantics and never touches resource
     divergence.  An invalid active binding makes an export-shaped row
     indistinguishable from a tampered refresh receipt, so the row is
-    never cancelled or completed: divergence is durably latched and the
-    issued row and its files stay untouched.
+    never cancelled or completed: recovery remains BLOCKED and the
+    issued row, divergence and files stay untouched.
     """
 
     results: list[IssuedReceiptRecovery] = []
     diagnostics: list[str] = []
-    latched = False
     issued = _issued_export_receipts(facts)
     if facts.binding_invalid and issued:
-        rounds = 0
-        while True:
-            rounds += 1
-            if rounds > _MAX_RECOVERY_ROUNDS:
-                for row in issued:
-                    results.append(
-                        IssuedReceiptRecovery(
-                            row.snapshot_id,
-                            RefreshRecoveryState.BLOCKED,
-                            ("RECOVERY.ROUND_LIMIT",),
-                        )
-                    )
-                diagnostics.append("RECOVERY.ROUND_LIMIT")
-                break
-            if port.latch_source_divergence(facts.canonical_fingerprint):
-                for row in issued:
-                    results.append(
-                        IssuedReceiptRecovery(
-                            row.snapshot_id,
-                            RefreshRecoveryState.DIVERGED,
-                            ("RECOVERY.EXPORT_BINDING_INVALID",),
-                        )
-                    )
-                diagnostics.append("RECOVERY.EXPORT_BINDING_INVALID")
-                latched = True
-                break
-            facts = port.read_recovery_facts()
-            issued = _issued_export_receipts(facts)
-            if not issued or not facts.binding_invalid:
-                break
-    if not latched:
-        for row in issued:
-            reconciliation = _reconcile_one_export(port, facts, row)
-            results.append(reconciliation.result)
-            diagnostics.extend(reconciliation.diagnostics)
+        return tuple(
+            IssuedReceiptRecovery(row.snapshot_id, RefreshRecoveryState.BLOCKED,
+                                  ("RECOVERY.EXPORT_BINDING_INVALID",))
+            for row in issued
+        ), ("RECOVERY.EXPORT_BINDING_INVALID",)
+    for row in issued:
+        reconciliation = _reconcile_one_export(port, facts, row)
+        results.append(reconciliation.result)
+        diagnostics.extend(reconciliation.diagnostics)
     return tuple(results), tuple(sorted(set(diagnostics)))
 
 
@@ -2062,7 +2054,7 @@ def _fsync_artifact_parent(
     destination: Path,
     expected_identity: tuple[int, int] | None,
     *,
-    parent: _RecoveryParentHandle | None = None,
+    parent: _SnapshotParent | None = None,
 ) -> None:
     """Late-bound wrapper; implementation moved to tm_snapshot_artifacts."""
 
@@ -2075,6 +2067,7 @@ def _fsync_artifact_parent(
 def _terminal_receipt_row_blocker(
     facts: _RefreshRecoveryFacts,
     receipt: IssuedReceiptFacts,
+    *, require_live_parent: bool = True,
 ) -> str | None:
     """Validate one terminal receipt independently of handoff identity.
 
@@ -2115,10 +2108,12 @@ def _terminal_receipt_row_blocker(
             else "RECOVERY.EXPORT_ANCESTRY_INVALID"
         )
     if configured:
-        if not _parent_chain_safe(receipt.destination_jsonl_path):
+        if require_live_parent and not _parent_chain_safe(receipt.destination_jsonl_path):
             return "RECOVERY.EXPORT_PARENT_UNSAFE"
     else:
-        destination_error = _recovery_destination_safe(facts, receipt)
+        destination_error = _recovery_destination_safe(
+            facts, receipt, require_live_parent=require_live_parent,
+        )
         if destination_error is not None:
             return destination_error
     return None
@@ -2127,10 +2122,11 @@ def _terminal_receipt_row_blocker(
 def _terminal_handoff_row_blocker(
     facts: _RefreshRecoveryFacts,
     receipt: IssuedReceiptFacts,
-) -> tuple[str | None, _RecoveryParentHandle | None]:
+    port: _SnapshotRecoveryPort | None = None,
+) -> tuple[str | None, _SnapshotParent | None]:
     """Complete pre-cleanup validation and bind handoff parent authority."""
 
-    blocker = _terminal_receipt_row_blocker(facts, receipt)
+    blocker = _terminal_receipt_row_blocker(facts, receipt, require_live_parent=not _rooted_recovery(port))
     if blocker is not None:
         return blocker, None
     handoff = _handoff_for(facts, receipt.snapshot_id)
@@ -2142,10 +2138,8 @@ def _terminal_handoff_row_blocker(
     if identity is None:
         return "RECOVERY.EXPORT_PARENT_IDENTITY_MISSING", None
     try:
-        parent_handle = _RecoveryParentHandle.bind(
-            receipt.destination_jsonl_path,
-            identity,
-        )
+        parent_handle = _bind_recovery_parent(receipt, handoff,
+            owner_reprove=port.reprove_owner if port is not None else None, port=port)
     except RecoveryError as error:
         return error.error_code, None
     return None, parent_handle
@@ -2154,17 +2148,17 @@ def _terminal_handoff_row_blocker(
 def _terminal_missing_handoff_blocker(
     facts: _RefreshRecoveryFacts,
     receipt: IssuedReceiptFacts,
+    port: _SnapshotRecoveryPort | None = None,
 ) -> str | None:
     """Fail closed when a terminal missing handoff still has artifacts.
 
-    A terminal receipt with no handoff is the normal state only after
-    handoff clear and when all four deterministic temp/recovery members
-    are provably absent beneath a safe current parent chain.  Any member,
-    unsafe observation, invalid receipt or destination keeps every asset
-    untouched and blocks recovery.
+    Completed history needs no live publication parent: its output may have
+    moved after handoff clear. Still validate the receipt and safely observe
+    deterministic artifacts. Any residue or uncertain observation keeps the
+    assets untouched and blocks recovery; only explicit absence is a NOOP.
     """
 
-    blocker = _terminal_receipt_row_blocker(facts, receipt)
+    blocker = _terminal_receipt_row_blocker(facts, receipt, require_live_parent=False)
     if blocker is not None:
         return blocker
     for handoff in facts.handoffs:
@@ -2177,7 +2171,12 @@ def _terminal_missing_handoff_blocker(
             == receipt.destination_manifest_path
         ):
             return None
-    if _missing_handoff_artifacts_present(receipt):
+    if _rooted_recovery(port):
+        assert port is not None
+        present = port.missing_handoff_artifacts_present(receipt)
+    else:
+        present = _missing_handoff_artifacts_present(receipt)
+    if present:
         return "RECOVERY.HANDOFF_MISSING"
     return None
 
@@ -2185,7 +2184,23 @@ def _terminal_missing_handoff_blocker(
 def _missing_handoff_artifacts_present(
     receipt: IssuedReceiptFacts,
 ) -> bool:
-    """Whether any deterministic temp/recovery member is not absent."""
+    """Whether cleanup work exists or cannot safely be ruled out.
+
+    A missing component in an otherwise real directory chain means this
+    ended destination has no work. Permission/I/O errors and unsafe parents
+    are not absence. No mutation authority is acquired for historical output.
+    """
+
+    parent = receipt.destination_jsonl_path.parent
+    for component in reversed((parent, *parent.parents)):
+        try:
+            observed = os.lstat(component)
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError):
+            return True
+        if not stat.S_ISDIR(observed.st_mode):
+            return True
 
     paths = _recovery_artifact_paths(receipt.destination_jsonl_path)
     for artifact in (
@@ -2243,7 +2258,7 @@ def _replay_terminal_handoffs(
             or receipt.snapshot_id in handoff_ids
         ):
             continue
-        blocker = _terminal_missing_handoff_blocker(facts, receipt)
+        blocker = _terminal_missing_handoff_blocker(facts, receipt, port)
         if blocker is None:
             continue
         per_receipt.append(
@@ -2270,10 +2285,9 @@ def _replay_terminal_handoffs(
         if skip_configured and configured:
             continue
         replayed = True
-        blocker, parent_handle = _terminal_handoff_row_blocker(
-            facts,
-            receipt,
-        )
+        port.reprove_owner()
+        blocker, parent_handle = (_terminal_handoff_row_blocker(facts, receipt, port)
+            if _rooted_recovery(port) else _terminal_handoff_row_blocker(facts, receipt))
         if blocker is not None:
             per_receipt.append(
                 IssuedReceiptRecovery(
@@ -2286,6 +2300,7 @@ def _replay_terminal_handoffs(
             state = RefreshRecoveryState.BLOCKED
             continue
         assert parent_handle is not None
+        parent_handle._owner_reprove = port.reprove_owner
         try:
             with parent_handle:
                 if (
@@ -2316,6 +2331,7 @@ def _replay_terminal_handoffs(
                 port.clear_issued_receipt_handoff(
                     receipt.snapshot_id,
                     expected_generation=facts.generation,
+                    **_parent_kwargs(parent_handle),
                 )
         except RecoveryError as error:
             per_receipt.append(
@@ -2444,14 +2460,21 @@ def recover_snapshot_publication(
             overall = replay_state
         if not issued_refresh:
             break
-        decision = _classify_refresh_receipts(facts, issued_refresh)
+        if _rooted_recovery(port):
+            with port.configured_artifact_parent() as configured_parent:
+                decision = _classify_refresh_receipts(facts, issued_refresh, parent=configured_parent)
+        else:
+            decision = _classify_refresh_receipts(facts, issued_refresh)
         try:
+            if decision.action == "blocked":
+                assert decision.error_code is not None
+                raise RecoveryError(decision.error_code, retryable=False)
             if decision.action == "cancel":
                 bound: list[
                     tuple[
                         IssuedReceiptFacts,
                         _ArtifactHandoffFacts | None,
-                        _RecoveryParentHandle | None,
+                        _SnapshotParent | None,
                     ]
                 ] = []
                 try:
@@ -2463,10 +2486,18 @@ def recover_snapshot_publication(
                         parent_handle = _bind_recovery_parent(
                             receipt,
                             handoff,
+                            owner_reprove=port.reprove_owner, port=port,
                         )
                         bound.append(
                             (receipt, handoff, parent_handle)
                         )
+                        assert handoff is not None
+                        if not _matches_handoff_prior_pair(
+                            handoff,
+                            _strict_file_state(receipt.destination_jsonl_path, parent=parent_handle),
+                            _strict_file_state(receipt.destination_manifest_path, parent=parent_handle),
+                        ):
+                            raise RecoveryError("RECOVERY.PRIOR_PAIR_UNPROVEN", retryable=False)
                         unproven = _unproven_artifact_code(
                             handoff,
                             _refresh_artifact_expectations(
@@ -2505,6 +2536,7 @@ def recover_snapshot_publication(
                             port.clear_issued_receipt_handoff(
                                 receipt.snapshot_id,
                                 expected_generation=facts.generation,
+                                **_parent_kwargs(parent_handle),
                             )
                         per_receipt.append(
                             IssuedReceiptRecovery(
@@ -2525,6 +2557,7 @@ def recover_snapshot_publication(
                 parent_handle = _bind_recovery_parent(
                     receipt,
                     handoff,
+                    owner_reprove=port.reprove_owner, port=port,
                 )
                 try:
                     unproven = _unproven_artifact_code(
@@ -2559,7 +2592,10 @@ def recover_snapshot_publication(
                         expected_generation=facts.generation,
                         jsonl_identity=decision.jsonl_identity,
                         manifest_identity=manifest_identity,
+                        **_parent_kwargs(parent_handle),
                     )
+                    if isinstance(parent_handle, snapshot_artifacts_module._PosixSnapshotParent):
+                        parent_handle.finish_publication()
                     diagnostics.extend(
                         _cleanup_refresh_artifacts(
                             facts,
@@ -2578,6 +2614,7 @@ def recover_snapshot_publication(
                         port.clear_issued_receipt_handoff(
                             receipt.snapshot_id,
                             expected_generation=facts.generation,
+                            **_parent_kwargs(parent_handle),
                         )
                 finally:
                     if parent_handle is not None:

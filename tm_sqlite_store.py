@@ -3298,6 +3298,59 @@ def _inspect_completed_active_schema_read_only(
     return snapshot
 
 
+def _validate_completed_runtime_snapshot_lineage(
+    connection: sqlite3.Connection, facts: _SourceBindingFacts,
+    identity: CanonicalResourceIdentity, record: _ActivationJournalRecord,
+) -> None:
+    """Preserve activation authority while accepting a completed refresh.
+
+    A refresh changes only the configured snapshot binding. Its completed
+    receipt may replace that binding, but never the original activation
+    receipt that anchors this canonical generation.
+    """
+    binding = facts.binding
+    if binding is None or facts.diagnostic_codes:
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
+    try:
+        _validate_binding_identity(binding, identity=identity,
+                                   canonical_store_id=record.canonical_store_id)
+    except (TypeError, ValueError) as error:
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID") from error
+    counts = dict(facts.cumulative_record_counts)
+    if counts.get(binding.receipt.exported_revision) != binding.receipt.record_count:
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
+    row = connection.execute(
+        "SELECT resource_id, canonical_store_id, exported_revision, jsonl_digest, "
+        "record_count, format_version, destination_jsonl_path, "
+        "destination_manifest_path, status FROM tm_snapshot_receipt WHERE snapshot_id=?",
+        (record.new_receipt_id,),
+    ).fetchone()
+    if row is None:
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
+    try:
+        original = SnapshotReceipt(
+            snapshot_id=record.new_receipt_id, resource_id=str(row[0]),
+            canonical_store_id=str(row[1]), exported_revision=_row_int(row[2]),
+            jsonl_digest=str(row[3]), record_count=_row_int(row[4]), format_version=str(row[5]),
+        )
+    except (TypeError, ValueError) as error:
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID") from error
+    if (original.resource_id != identity.resource_id
+            or original.canonical_store_id != record.canonical_store_id
+            or snapshot_receipt_digest(original) != record.snapshot_receipt_digest
+            or original.jsonl_digest != record.source_jsonl_digest
+            or counts.get(original.exported_revision) != original.record_count
+            or str(row[6]) != str(identity.configured_jsonl_path)
+            or str(row[7]) != str(identity.snapshot_manifest_path)
+            or str(row[8]) != "completed"):
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
+    if binding.receipt.snapshot_id == original.snapshot_id:
+        if binding.receipt != original:
+            raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
+    elif binding.snapshot_kind is not SnapshotKind.EXPLICIT_EXPORT:
+        raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
+
+
 def _prove_and_hydrate_completed_activation(
     port: _StoreValidationPort,
     record: _ActivationJournalRecord,
@@ -3428,21 +3481,9 @@ def _prove_and_hydrate_completed_activation(
                 connection,
                 lease,
             )
-            binding = facts.binding
-            if binding is None or facts.diagnostic_codes:
-                raise port.store_schema_error(
-                    "STORE.ACTIVE_BINDING_INVALID"
-                )
-            if (
-                binding.receipt.snapshot_id != record.new_receipt_id
-                or snapshot_receipt_digest(binding.receipt)
-                != record.snapshot_receipt_digest
-                or binding.receipt.jsonl_digest
-                != record.source_jsonl_digest
-            ):
-                raise port.store_schema_error(
-                    "STORE.ACTIVE_BINDING_INVALID"
-                )
+            _validate_completed_runtime_snapshot_lineage(
+                connection, facts, identity, record,
+            )
             if not database_is_attested:
                 _recover_activation_indexes(
                     port,
@@ -11404,6 +11445,8 @@ class SourceBindingMonitor:
             if sys.platform == "win32":
                 self._store.require_bound_refresh_observation_ready()
                 return
+            if not self._store._has_pending_snapshot_publication():
+                return
             outcome = self._store.recover_configured_refresh()
             if outcome.state is snapshot_recovery_module.RefreshRecoveryState.BLOCKED:
                 raise SQLiteStoreSchemaError(
@@ -11423,9 +11466,9 @@ class SourceBindingMonitor:
         the gate.
         """
 
-        with self._coordinator._refresh_observation_gate():
+        with (self._store._snapshot_operation() if self._store is not None else nullcontext()), self._coordinator._refresh_observation_gate():
             self._recover_configured_refresh()
-            with self._coordinator._operation_lease() as lease:
+            with (self._store._snapshot_operation_lease() if self._store is not None else self._coordinator._operation_lease()) as lease:
                 while True:
                     with _open_leased_connection(lease) as connection:
                         facts = _read_source_binding_facts(connection, lease)
@@ -12457,6 +12500,76 @@ class _SnapshotRecoveryPort:
             raise TypeError("store must be exact SQLiteTMStore")
         self._store = store
 
+    def reprove_owner(self) -> None:
+        try:
+            self._store._reprove_snapshot_operation()
+        except SQLiteStoreLifecycleError as error:
+            raise snapshot_recovery_module.RecoveryError(
+                error.code, retryable=False,
+            ) from error
+
+    def uses_posix_snapshot_parent(self) -> bool:
+        return isinstance(
+            getattr(self._store._snapshot_local, 'lease', None), _SQLiteOperationLease)
+
+    def configured_artifact_parent(self) -> snapshot_artifacts_module._PosixSnapshotParent:
+        return self._store._configured_snapshot_parent()
+
+    def bind_artifact_parent(self, receipt: snapshot_recovery_module.IssuedReceiptFacts,
+                             handoff: snapshot_artifacts_module._ArtifactHandoffFacts) -> snapshot_artifacts_module._PosixSnapshotParent | None:
+        lease = getattr(self._store._snapshot_local, 'lease', None)
+        if not isinstance(lease, _SQLiteOperationLease):
+            return None
+        lease.reprove()
+        family = lease.borrow._family
+        destination = receipt.destination_jsonl_path
+        if destination == lease.stage.resource_identity.configured_jsonl_path:
+            parent = self.configured_artifact_parent()
+        else:
+            parent = snapshot_artifacts_module._PosixSnapshotParent.bind(
+                destination, family._backend, owner_reprove=self.reprove_owner)
+        try:
+            parent.require(destination, handoff.artifact_parent_identity)
+            return parent
+        except BaseException:
+            parent.close()
+            raise
+
+    def missing_handoff_artifacts_present(self, receipt: snapshot_recovery_module.IssuedReceiptFacts) -> bool:
+        lease = getattr(self._store._snapshot_local, 'lease', None)
+        if not isinstance(lease, _SQLiteOperationLease):
+            return snapshot_recovery_module._missing_handoff_artifacts_present(receipt)
+        lease.reprove()
+        family = lease.borrow._family
+        configured = receipt.destination_jsonl_path == lease.stage.resource_identity.configured_jsonl_path
+        root = family._root if configured else None
+        try:
+            if root is None:
+                parent_path = receipt.destination_jsonl_path.parent
+                root = family._backend.bind_root(Path(parent_path.anchor))
+                prefix = Path(parent_path.anchor)
+                for part in parent_path.parts[1:]:
+                    prefix = prefix / part
+                    try:
+                        next_root = family._backend.bind_root(prefix)
+                    except PlatformFileError:
+                        return root.inspect_entry(part) is not None
+                    root.close()
+                    root = next_root
+            root.reprove()
+            paths = snapshot_recovery_module._recovery_artifact_paths(receipt.destination_jsonl_path)
+            present = any(root.inspect_entry(path.name) is not None for path in
+                (paths.jsonl_temp, paths.manifest_temp, paths.jsonl_recovery, paths.manifest_recovery))
+            root.reprove()
+            lease.reprove()
+            return present
+        except PlatformFileError:
+            # An unsafe existing path cannot be treated as removed output.
+            return True
+        finally:
+            if not configured and root is not None:
+                root.close()
+
     def read_recovery_facts(
         self,
     ) -> snapshot_recovery_module._RefreshRecoveryFacts:
@@ -12498,6 +12611,7 @@ class _SnapshotRecoveryPort:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_identity: tuple[int, int] | None = None,
         manifest_identity: tuple[int, int] | None = None,
     ) -> None:
@@ -12508,6 +12622,7 @@ class _SnapshotRecoveryPort:
                 jsonl_identity=jsonl_identity,
                 manifest_identity=manifest_identity,
                 _allow_history_revision=True,
+                artifact_parent=artifact_parent,
             )
         except (
             SQLiteStoreLifecycleError,
@@ -12524,6 +12639,7 @@ class _SnapshotRecoveryPort:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_identity: tuple[int, int],
         manifest_identity: tuple[int, int],
     ) -> None:
@@ -12531,6 +12647,7 @@ class _SnapshotRecoveryPort:
             self._store.complete_issued_export_receipt(
                 snapshot_id,
                 expected_generation=expected_generation,
+                artifact_parent=artifact_parent,
                 jsonl_identity=jsonl_identity,
                 manifest_identity=manifest_identity,
             )
@@ -12570,11 +12687,13 @@ class _SnapshotRecoveryPort:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
     ) -> None:
         try:
             self._store.clear_issued_receipt_handoff(
                 snapshot_id,
                 expected_generation=expected_generation,
+                artifact_parent=artifact_parent,
             )
         except (
             SQLiteStoreLifecycleError,
@@ -12853,6 +12972,14 @@ def _require_bound_refresh_effect_snapshot(
 
 
 
+@dataclass
+class _SnapshotPublicationFacts:
+    snapshot_id: str | None = None
+    before_digest: str | None = None
+    observed_digest: str | None = None
+    committed: bool = False
+
+
 class SQLiteTMStore:
     """Per-resource store whose public operations use generation leases."""
 
@@ -12880,6 +13007,7 @@ class SQLiteTMStore:
             store=self,
         )
         self._query_view_tokens: set[object] = set()
+        self._snapshot_local = threading.local()
 
     @classmethod
     def from_coordinator(
@@ -12917,6 +13045,7 @@ class SQLiteTMStore:
             store=store,
         )
         store._query_view_tokens = set()
+        store._snapshot_local = threading.local()
         return store
 
     @classmethod
@@ -12956,6 +13085,7 @@ class SQLiteTMStore:
             store=store,
         )
         store._query_view_tokens = set()
+        store._snapshot_local = threading.local()
         return store
 
     @property
@@ -12991,6 +13121,105 @@ class SQLiteTMStore:
             timeout_seconds=timeout_seconds,
         )
 
+    @contextmanager
+    def _snapshot_operation(
+        self, *, borrow: _ResourceOperationBorrow | None = None,
+    ) -> Iterator[None]:
+        """Keep one original POSIX family lease through snapshot publication.
+
+        Only the snapshot owner lends this exact store/thread lease. Other
+        runtime consumers retain normal admission; this is not coordinator
+        reentry or authority inferred from a pathname.
+        """
+        if self._coordinator._family is None:
+            yield
+            return
+        existing = getattr(self._snapshot_local, "lease", None)
+        if existing is not None:
+            existing.reprove()
+            yield
+            existing.reprove()
+            return
+        # The observation gate must be acquired before W1, including exports:
+        # a concurrent configured monitor must never wait for W1 while the
+        # publisher waits for that monitor's gate.
+        with self._coordinator._refresh_observation_gate(require_ready_resource=True):
+            with self._coordinator._operation_lease(borrow=borrow) as lease:
+                assert type(lease) is _SQLiteOperationLease
+                self._snapshot_local.lease = lease
+                try:
+                    yield
+                finally:
+                    del self._snapshot_local.lease
+
+    @contextmanager
+    def _snapshot_publication_attempt(self) -> Iterator[_SnapshotPublicationFacts]:
+        """Keep commit facts local to one explicit publisher, not its family lease.
+
+        Preflight recovery can complete older receipts under the same W1.
+        Nested publishers get their own facts and restore the enclosing attempt.
+        """
+        if self._coordinator._family is None:
+            # Legacy/stage publication keeps its existing completion probe;
+            # no POSIX runtime family close can follow that publication.
+            yield _SnapshotPublicationFacts()
+            return
+        previous = self._snapshot_publication_facts()
+        publication = _SnapshotPublicationFacts()
+        self._snapshot_local.publication = publication
+        try:
+            yield publication
+        finally:
+            if previous is None:
+                del self._snapshot_local.publication
+            else:
+                self._snapshot_local.publication = previous
+
+    @contextmanager
+    def _snapshot_operation_lease(self) -> Iterator[_SQLiteGenerationView | _SQLiteOperationLease]:
+        lease = getattr(self._snapshot_local, "lease", None)
+        if lease is None:
+            with self._coordinator._operation_lease() as issued:
+                yield issued
+            return
+        lease.reprove()
+        yield lease
+        lease.reprove()
+
+    def _reprove_snapshot_operation(self) -> None:
+        lease = getattr(self._snapshot_local, "lease", None)
+        if lease is not None:
+            lease.reprove()
+
+    def _configured_snapshot_parent(self) -> snapshot_artifacts_module._PosixSnapshotParent:
+        lease = getattr(self._snapshot_local, 'lease', None)
+        if not isinstance(lease, _SQLiteOperationLease):
+            raise SQLiteStoreSchemaError('STORE.OPERATION_BORROW_INVALID')
+        lease.reprove()
+        family = lease.borrow._family
+        return snapshot_artifacts_module._PosixSnapshotParent(
+            lease.stage.resource_identity.configured_jsonl_path,
+            family._backend, family._root, family._root, lease.borrow._lease,
+            owner_reprove=self._reprove_snapshot_operation,
+            lock_name=family._lock_name, lock_payload=family._payload)
+
+    def _snapshot_publication_facts(self) -> _SnapshotPublicationFacts | None:
+        return getattr(self._snapshot_local, "publication", None)
+
+    def _has_pending_snapshot_publication(self) -> bool:
+        """Distinguish recovery work from an ordinary binding observation."""
+        with self._snapshot_operation_lease() as lease:
+            with _open_leased_connection(lease) as connection:
+                issued = connection.execute(
+                    "SELECT 1 FROM tm_snapshot_receipt WHERE status='issued' LIMIT 1"
+                ).fetchone()
+                handoff = connection.execute(
+                    "SELECT 1 FROM tm_meta WHERE key LIKE ? OR key LIKE ? LIMIT 1",
+                    (f"{_ARTIFACT_HANDOFF_META_PREFIX}%",
+                     f"{snapshot_recovery_module._BOUND_REFRESH_HANDOFF_META_PREFIX}%"),
+                ).fetchone()
+        return issued is not None or handoff is not None
+
     def canonical_revision(
         self, *, _borrow: _ResourceOperationBorrow | None = None,
     ) -> CanonicalRevisionSnapshot:
@@ -13015,7 +13244,7 @@ class SQLiteTMStore:
         an export can never mix bytes from two different revisions.
         """
 
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             with _open_leased_connection(lease) as connection:
                 connection.execute("BEGIN")
                 try:
@@ -13054,7 +13283,7 @@ class SQLiteTMStore:
 
         if not callable(family_matches):
             raise TypeError("family_matches must be callable")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             with _open_leased_connection(lease) as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -13171,7 +13400,7 @@ class SQLiteTMStore:
         private_jsonl_path = _copy_exact_path(destination_jsonl_path)
         private_manifest_path = _copy_exact_path(destination_manifest_path)
 
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if (
                 private_jsonl_path != identity.configured_jsonl_path
@@ -13250,6 +13479,7 @@ class SQLiteTMStore:
         destination_jsonl_path: Path,
         destination_manifest_path: Path,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_temp_identity: tuple[int, int] | None = None,
         manifest_temp_identity: tuple[int, int] | None = None,
         artifact_parent_identity: tuple[int, int] | None = None,
@@ -13393,7 +13623,7 @@ class SQLiteTMStore:
                 "export destination manifest path is not deterministic"
             )
 
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if (
                 private_jsonl_path == identity.configured_jsonl_path
@@ -13480,10 +13710,11 @@ class SQLiteTMStore:
                     )
                     if jsonl_temp_identity is not None:
                         assert manifest_temp_identity is not None
-                        parent_descriptor = _artifact_parent_dirfd(
-                            private_jsonl_path,
-                            artifact_parent_identity,
-                        )
+                        if artifact_parent is not None:
+                            artifact_parent.require(private_jsonl_path, artifact_parent_identity)
+                            parent_descriptor = -1
+                        else:
+                            parent_descriptor = _artifact_parent_dirfd(private_jsonl_path, artifact_parent_identity)
                         try:
                             _after_artifact_parent_dirfd_bound(
                                 private_jsonl_path,
@@ -13495,18 +13726,16 @@ class SQLiteTMStore:
                                     private_jsonl_path
                                 )
                             )
-                            _artifact_handoff_dirfd_entry(
-                                artifact_paths.jsonl_temp.name,
-                                parent_descriptor,
-                                jsonl_temp_identity,
-                                "STORE.HANDOFF_TEMP_UNPROVEN",
-                            )
-                            _artifact_handoff_dirfd_entry(
-                                artifact_paths.manifest_temp.name,
-                                parent_descriptor,
-                                manifest_temp_identity,
-                                "STORE.HANDOFF_TEMP_UNPROVEN",
-                            )
+                            if artifact_parent is not None:
+                                artifact_parent.require_entry(artifact_paths.jsonl_temp.name, jsonl_temp_identity)
+                            else:
+                                _artifact_handoff_dirfd_entry(artifact_paths.jsonl_temp.name, parent_descriptor,
+                                    jsonl_temp_identity, "STORE.HANDOFF_TEMP_UNPROVEN")
+                            if artifact_parent is not None:
+                                artifact_parent.require_entry(artifact_paths.manifest_temp.name, manifest_temp_identity)
+                            else:
+                                _artifact_handoff_dirfd_entry(artifact_paths.manifest_temp.name, parent_descriptor,
+                                    manifest_temp_identity, "STORE.HANDOFF_TEMP_UNPROVEN")
                             connection.execute(
                                 "INSERT INTO tm_meta(key, value) "
                                 "VALUES (?, ?)",
@@ -13546,7 +13775,10 @@ class SQLiteTMStore:
                                 ),
                             )
                         finally:
-                            os.close(parent_descriptor)
+                            if parent_descriptor >= 0:
+                                os.close(parent_descriptor)
+                    if artifact_parent is not None:
+                        artifact_parent.require(private_jsonl_path, artifact_parent_identity)
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -13557,6 +13789,7 @@ class SQLiteTMStore:
         receipt: SnapshotReceipt,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_temp_identity: tuple[int, int] | None = None,
         manifest_temp_identity: tuple[int, int] | None = None,
         artifact_parent_identity: tuple[int, int] | None = None,
@@ -13671,7 +13904,7 @@ class SQLiteTMStore:
             absent=prior_manifest_absent,
             field_name="prior_manifest",
         )
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if (
                 private_receipt.resource_id != identity.resource_id
@@ -13803,10 +14036,11 @@ class SQLiteTMStore:
                         )
                     if jsonl_temp_identity is not None:
                         assert manifest_temp_identity is not None
-                        parent_descriptor = _artifact_parent_dirfd(
-                            identity.configured_jsonl_path,
-                            artifact_parent_identity,
-                        )
+                        if artifact_parent is not None:
+                            artifact_parent.require(identity.configured_jsonl_path, artifact_parent_identity)
+                            parent_descriptor = -1
+                        else:
+                            parent_descriptor = _artifact_parent_dirfd(identity.configured_jsonl_path, artifact_parent_identity)
                         try:
                             _after_artifact_parent_dirfd_bound(
                                 identity.configured_jsonl_path,
@@ -13818,18 +14052,16 @@ class SQLiteTMStore:
                                     identity.configured_jsonl_path
                                 )
                             )
-                            _artifact_handoff_dirfd_entry(
-                                artifact_paths.jsonl_temp.name,
-                                parent_descriptor,
-                                jsonl_temp_identity,
-                                "STORE.HANDOFF_TEMP_UNPROVEN",
-                            )
-                            _artifact_handoff_dirfd_entry(
-                                artifact_paths.manifest_temp.name,
-                                parent_descriptor,
-                                manifest_temp_identity,
-                                "STORE.HANDOFF_TEMP_UNPROVEN",
-                            )
+                            if artifact_parent is not None:
+                                artifact_parent.require_entry(artifact_paths.jsonl_temp.name, jsonl_temp_identity)
+                            else:
+                                _artifact_handoff_dirfd_entry(artifact_paths.jsonl_temp.name, parent_descriptor,
+                                    jsonl_temp_identity, "STORE.HANDOFF_TEMP_UNPROVEN")
+                            if artifact_parent is not None:
+                                artifact_parent.require_entry(artifact_paths.manifest_temp.name, manifest_temp_identity)
+                            else:
+                                _artifact_handoff_dirfd_entry(artifact_paths.manifest_temp.name, parent_descriptor,
+                                    manifest_temp_identity, "STORE.HANDOFF_TEMP_UNPROVEN")
                             connection.execute(
                                 "INSERT INTO tm_meta(key, value) "
                                 "VALUES (?, ?)",
@@ -13869,7 +14101,10 @@ class SQLiteTMStore:
                                 ),
                             )
                         finally:
-                            os.close(parent_descriptor)
+                            if parent_descriptor >= 0:
+                                os.close(parent_descriptor)
+                    if artifact_parent is not None:
+                        artifact_parent.require(identity.configured_jsonl_path, artifact_parent_identity)
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -13880,6 +14115,7 @@ class SQLiteTMStore:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_recovery_identity: tuple[int, int] | None = None,
         manifest_recovery_identity: tuple[int, int] | None = None,
     ) -> None:
@@ -13911,7 +14147,7 @@ class SQLiteTMStore:
             manifest_recovery_identity,
             "manifest_recovery_identity",
         )
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -13967,10 +14203,11 @@ class SQLiteTMStore:
                         jsonl_recovery_identity is not None
                         or manifest_recovery_identity is not None
                     ):
-                        parent_descriptor = _artifact_parent_dirfd(
-                            destination,
-                            prior.artifact_parent_identity,
-                        )
+                        if artifact_parent is not None:
+                            artifact_parent.require(destination, prior.artifact_parent_identity)
+                            parent_descriptor = -1
+                        else:
+                            parent_descriptor = _artifact_parent_dirfd(destination, prior.artifact_parent_identity)
                         try:
                             _after_artifact_parent_dirfd_bound(
                                 destination,
@@ -13981,21 +14218,20 @@ class SQLiteTMStore:
                                 ._recovery_artifact_paths(destination)
                             )
                             if jsonl_recovery_identity is not None:
-                                _artifact_handoff_dirfd_entry(
-                                    artifact_paths.jsonl_recovery.name,
-                                    parent_descriptor,
-                                    jsonl_recovery_identity,
-                                    "STORE.HANDOFF_RECOVERY_UNPROVEN",
-                                )
+                                if artifact_parent is not None:
+                                    artifact_parent.require_entry(artifact_paths.jsonl_recovery.name, jsonl_recovery_identity)
+                                else:
+                                    _artifact_handoff_dirfd_entry(artifact_paths.jsonl_recovery.name, parent_descriptor,
+                                        jsonl_recovery_identity, "STORE.HANDOFF_RECOVERY_UNPROVEN")
                             if manifest_recovery_identity is not None:
-                                _artifact_handoff_dirfd_entry(
-                                    artifact_paths.manifest_recovery.name,
-                                    parent_descriptor,
-                                    manifest_recovery_identity,
-                                    "STORE.HANDOFF_RECOVERY_UNPROVEN",
-                                )
+                                if artifact_parent is not None:
+                                    artifact_parent.require_entry(artifact_paths.manifest_recovery.name, manifest_recovery_identity)
+                                else:
+                                    _artifact_handoff_dirfd_entry(artifact_paths.manifest_recovery.name, parent_descriptor,
+                                        manifest_recovery_identity, "STORE.HANDOFF_RECOVERY_UNPROVEN")
                         finally:
-                            os.close(parent_descriptor)
+                            if parent_descriptor >= 0:
+                                os.close(parent_descriptor)
                     connection.execute(
                         "UPDATE tm_meta SET value = ? WHERE key = ?",
                         (
@@ -14033,6 +14269,8 @@ class SQLiteTMStore:
                             _artifact_handoff_meta_key(snapshot_id),
                         )
                     )
+                    if artifact_parent is not None:
+                        artifact_parent.require(destination, prior.artifact_parent_identity)
                     connection.commit()
                 except Exception:
                     connection.rollback()
@@ -14043,6 +14281,7 @@ class SQLiteTMStore:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_identity: tuple[int, int],
         manifest_identity: tuple[int, int],
     ) -> None:
@@ -14079,6 +14318,7 @@ class SQLiteTMStore:
         self._complete_issued_export_receipt_strict(
             snapshot_id,
             expected_generation=expected_generation,
+            artifact_parent=artifact_parent,
             jsonl_identity=jsonl_identity,
             manifest_identity=manifest_identity,
         )
@@ -14122,7 +14362,7 @@ class SQLiteTMStore:
             f"{destination_jsonl_path.name}.localcat-snapshot.json"
         ):
             raise ValueError("bound export manifest path is not deterministic")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -14230,7 +14470,7 @@ class SQLiteTMStore:
             raise ValueError("expected_generation is invalid")
         if not callable(family_reprove):
             raise TypeError("family_reprove must be callable")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -14361,7 +14601,7 @@ class SQLiteTMStore:
             raise ValueError("snapshot id must be a non-empty string")
         if not callable(family_reprove):
             raise TypeError("family_reprove must be callable")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -14510,7 +14750,7 @@ class SQLiteTMStore:
     ) -> None:
         if not callable(family_reprove):
             raise TypeError("family_reprove must be callable")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -14583,7 +14823,7 @@ class SQLiteTMStore:
     ) -> None:
         if not callable(family_reprove):
             raise TypeError("family_reprove must be callable")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
                     "STORE.GENERATION_CHANGED",
@@ -14634,7 +14874,7 @@ class SQLiteTMStore:
     ) -> bool:
         if not callable(family_reprove):
             raise TypeError("family_reprove must be callable")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
                     "STORE.GENERATION_CHANGED",
@@ -14676,6 +14916,7 @@ class SQLiteTMStore:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_identity: tuple[int, int],
         manifest_identity: tuple[int, int],
     ) -> None:
@@ -14687,7 +14928,7 @@ class SQLiteTMStore:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -14780,14 +15021,19 @@ class SQLiteTMStore:
                             "STORE.RECEIPT_ANCESTRY_INVALID"
                         )
                     try:
-                        jsonl_capture = _capture_activation_file(
-                            Path(str(row[3])),
-                            asset_kind="EXPORT_DESTINATION",
-                        )
-                        manifest_capture = _capture_activation_file(
-                            Path(str(row[4])),
-                            asset_kind="EXPORT_MANIFEST",
-                        )
+                        if artifact_parent is not None:
+                            artifact_parent.require(Path(str(row[3])), handoff.artifact_parent_identity)
+                            jsonl_capture = artifact_parent.capture(Path(str(row[3])).name, 'EXPORT_DESTINATION')
+                            manifest_capture = artifact_parent.capture(Path(str(row[4])).name, 'EXPORT_MANIFEST')
+                        else:
+                            jsonl_capture = _capture_activation_file(
+                                Path(str(row[3])),
+                                asset_kind="EXPORT_DESTINATION",
+                            )
+                            manifest_capture = _capture_activation_file(
+                                Path(str(row[4])),
+                                asset_kind="EXPORT_MANIFEST",
+                            )
                     except ActivationPreparationError as error:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_PAIR_INVALID"
@@ -14852,7 +15098,12 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.RECEIPT_TRANSITION_FAILED"
                         )
+                    if artifact_parent is not None:
+                        artifact_parent.require(Path(str(row[3])), handoff.artifact_parent_identity)
                     connection.commit()
+                    publication = self._snapshot_publication_facts()
+                    if publication is not None and publication.snapshot_id == snapshot_id:
+                        publication.committed = True
                 except Exception:
                     connection.rollback()
                     raise
@@ -14882,7 +15133,7 @@ class SQLiteTMStore:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -14939,6 +15190,7 @@ class SQLiteTMStore:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
     ) -> None:
         """Release one terminal receipt's cleanup-pending handoff journal.
 
@@ -14974,7 +15226,7 @@ class SQLiteTMStore:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -15034,17 +15286,21 @@ class SQLiteTMStore:
                         raise SQLiteStoreSchemaError(
                             "STORE.HANDOFF_PARENT_IDENTITY_MISSING"
                         )
-                    parent_descriptor = _artifact_parent_dirfd(
-                        destination,
-                        handoff.artifact_parent_identity,
-                    )
+                    if artifact_parent is not None:
+                        artifact_parent.require(destination, handoff.artifact_parent_identity)
+                        parent_descriptor = -1
+                    else:
+                        parent_descriptor = _artifact_parent_dirfd(destination, handoff.artifact_parent_identity)
                     try:
                         _after_artifact_parent_dirfd_bound(
                             destination,
                             handoff.artifact_parent_identity,
                         )
                         try:
-                            os.fsync(parent_descriptor)
+                            if artifact_parent is not None:
+                                artifact_parent.fsync()
+                            else:
+                                os.fsync(parent_descriptor)
                         except OSError:
                             raise SQLiteStoreSchemaError(
                                 "STORE.HANDOFF_PARENT_UNSAFE"
@@ -15059,24 +15315,24 @@ class SQLiteTMStore:
                             artifact_paths.jsonl_recovery.name,
                             artifact_paths.manifest_recovery.name,
                         ):
-                            if not _artifact_handoff_dirfd_absent(
-                                name,
-                                parent_descriptor,
-                            ):
+                            absent = (artifact_parent.absent(name) if artifact_parent is not None else
+                                _artifact_handoff_dirfd_absent(name, parent_descriptor))
+                            if not absent:
                                 raise SQLiteStoreSchemaError(
                                     "STORE.HANDOFF_CLEANUP_PENDING"
                                 )
-                        _artifact_handoff_dirfd_reprove(
-                            destination,
-                            handoff.artifact_parent_identity,
-                        )
+                        if artifact_parent is not None:
+                            artifact_parent.require(destination, handoff.artifact_parent_identity)
+                        else:
+                            _artifact_handoff_dirfd_reprove(destination, handoff.artifact_parent_identity)
                         connection.execute(
                             "DELETE FROM tm_meta WHERE key = ?",
                             (_artifact_handoff_meta_key(snapshot_id),),
                         )
                         connection.commit()
                     finally:
-                        os.close(parent_descriptor)
+                        if parent_descriptor >= 0:
+                            os.close(parent_descriptor)
                 except Exception:
                     connection.rollback()
                     raise
@@ -15086,6 +15342,7 @@ class SQLiteTMStore:
         snapshot_id: str,
         *,
         expected_generation: int,
+        artifact_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
         jsonl_identity: tuple[int, int] | None = None,
         manifest_identity: tuple[int, int] | None = None,
         _allow_history_revision: bool = False,
@@ -15130,7 +15387,7 @@ class SQLiteTMStore:
                 or type(identity_value[1]) is not int
             ):
                 raise ValueError(f"{field_name} is invalid")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -15251,14 +15508,19 @@ class SQLiteTMStore:
                             "STORE.HANDOFF_INVALID"
                         )
                     try:
-                        jsonl_capture = _capture_activation_file(
-                            identity.configured_jsonl_path,
-                            asset_kind="CONFIGURED_JSONL",
-                        )
-                        manifest_capture = _capture_activation_file(
-                            identity.snapshot_manifest_path,
-                            asset_kind="SNAPSHOT_MANIFEST",
-                        )
+                        if artifact_parent is not None:
+                            artifact_parent.require(identity.configured_jsonl_path, handoff.artifact_parent_identity)
+                            jsonl_capture = artifact_parent.capture(identity.configured_jsonl_path.name, 'CONFIGURED_JSONL')
+                            manifest_capture = artifact_parent.capture(identity.snapshot_manifest_path.name, 'SNAPSHOT_MANIFEST')
+                        else:
+                            jsonl_capture = _capture_activation_file(
+                                identity.configured_jsonl_path,
+                                asset_kind="CONFIGURED_JSONL",
+                            )
+                            manifest_capture = _capture_activation_file(
+                                identity.snapshot_manifest_path,
+                                asset_kind="SNAPSHOT_MANIFEST",
+                            )
                     except ActivationPreparationError as error:
                         raise SQLiteStoreSchemaError(
                             "STORE.REFRESH_PAIR_INVALID"
@@ -15341,7 +15603,12 @@ class SQLiteTMStore:
                             SNAPSHOT_BINDING_VERSION,
                         ),
                     )
+                    if artifact_parent is not None:
+                        artifact_parent.require(identity.configured_jsonl_path, handoff.artifact_parent_identity)
                     connection.commit()
+                    publication = self._snapshot_publication_facts()
+                    if publication is not None and publication.snapshot_id == snapshot_id:
+                        publication.committed = True
                 except Exception:
                     connection.rollback()
                     raise
@@ -15370,7 +15637,7 @@ class SQLiteTMStore:
             or expected_generation < 0
         ):
             raise ValueError("expected_generation is invalid")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -15450,7 +15717,7 @@ class SQLiteTMStore:
             for character in expected_fingerprint
         ):
             raise ValueError("expected_fingerprint is invalid")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             return _latch_source_divergence(
                 lease,
                 expected_fingerprint=expected_fingerprint,
@@ -15469,7 +15736,7 @@ class SQLiteTMStore:
         race proof.
         """
 
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             with _open_leased_connection(lease) as connection:
                 connection.execute("BEGIN")
@@ -15654,7 +15921,7 @@ class SQLiteTMStore:
             raise ValueError("expected_generation is invalid")
         if not callable(family_reprove):
             raise TypeError("family_reprove must be callable")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -15775,7 +16042,7 @@ class SQLiteTMStore:
             raise ValueError("expected_generation is invalid")
         if type(require_bound) is not bool:
             raise TypeError("require_bound must be a built-in bool")
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             if lease.generation != expected_generation:
                 raise SQLiteStoreLifecycleError(
@@ -15877,7 +16144,7 @@ class SQLiteTMStore:
         return ReceiptCompletionProbe.COMMITTED
 
     def recover_configured_refresh(
-        self,
+        self, *, _borrow: _ResourceOperationBorrow | None = None,
     ) -> snapshot_recovery_module.RefreshRecoveryOutcome:
         """Close every issued snapshot publication crash window.
 
@@ -15888,7 +16155,7 @@ class SQLiteTMStore:
         pre-existing divergence latch is never cleared.
         """
 
-        with self._coordinator._refresh_observation_gate(
+        with self._snapshot_operation(borrow=_borrow), self._coordinator._refresh_observation_gate(
             require_ready_resource=True,
         ):
             return snapshot_recovery_module.recover_snapshot_publication(
@@ -15958,7 +16225,7 @@ class SQLiteTMStore:
     def require_bound_refresh_observation_ready(self) -> None:
         """Reject a Windows observation until its bound owner is terminal."""
 
-        with self._coordinator._operation_lease() as lease:
+        with self._snapshot_operation_lease() as lease:
             identity = lease.stage.resource_identity
             with _open_leased_connection(lease) as connection:
                 connection.execute("BEGIN")
@@ -19448,6 +19715,18 @@ def _open_configured_connection(
                         raise
         except BaseException as error:
             closing_error = error
+        if (closing_error is not None and not connection_closed
+                and connection is not None and _runtime_lease is not None):
+            retained_connection = connection
+            def retry_runtime_connection_close() -> BaseException | None:
+                try:
+                    retained_connection.close()
+                except BaseException as retry_error:
+                    return retry_error
+                return None
+            _runtime_lease.coordinator._stop_posix_recovery_admission(
+                pending_close=retry_runtime_connection_close,
+            )
         if isinstance(_stage_borrow, schema_upgrade_module.SchemaUpgradeIO):
             primary = operation_error
             if closing_error is not None:
