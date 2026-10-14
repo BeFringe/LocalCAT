@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import struct
 import tempfile
@@ -139,6 +140,27 @@ class ResourcePackageCarrierTests(unittest.TestCase):
 
             if os.name == "nt":
                 replacement.replace(package)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX observable parent replacement")
+    def test_retained_package_rejects_same_bytes_parent_clone_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            parent = root / "source"
+            parent.mkdir()
+            payload = parent / "tm.jsonl"
+            payload.write_bytes(b"{}\n")
+            package = parent / "package.localcat-resource"
+            write_resource_package(package, self._manifest(payload.read_bytes()), payload)
+            held = root / "held"
+            with open_resource_package(package) as sealed:
+                parent.rename(held)
+                shutil.copytree(held, parent)
+                before = {path.name: path.read_bytes() for path in parent.iterdir()}
+                with self.assertRaises(ResourcePortabilityError) as caught:
+                    sealed.reprove()
+                self.assertEqual(caught.exception.code, "RESOURCE.IMPORT.SOURCE_STALE")
+                self.assertEqual({path.name: path.read_bytes() for path in parent.iterdir()}, before)
+                self.assertEqual({path.name: path.read_bytes() for path in held.iterdir()}, before)
 
     def test_raw_profile_rejects_header_flag_method_crc_extra_and_prefix_mutations(self) -> None:
         payload = b"{}\n"

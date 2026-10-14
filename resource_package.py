@@ -141,11 +141,15 @@ class SealedResourcePackage:
         parent = self._parent
         if parent is None:
             raise ValueError("sealed ResourcePackage is closed")
-        if (
-            source.snapshot() != self._snapshot
-            or parent.inspect_entry(self._source_name) != self._snapshot
-            or digest_bound(source, self._snapshot).hex() != self._artifact_digest
-        ):
+        try:
+            stale = (
+                source.snapshot() != self._snapshot
+                or parent.inspect_entry(self._source_name) != self._snapshot
+                or digest_bound(source, self._snapshot).hex() != self._artifact_digest
+            )
+        except PlatformFileError:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.SOURCE_STALE") from None
+        if stale:
             raise ResourcePortabilityError("RESOURCE.IMPORT.SOURCE_STALE")
 
     def copy_payload_to(self, destination: Path) -> None:
@@ -508,13 +512,13 @@ def open_resource_package(
             root,
             _platform_relative_path(source.name),
         )
-    except PlatformFileError:
-        for authority in (opened, parent, root):
-            if authority is not None:
-                authority.close()
-        raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE") from None
-    try:
         snapshot = opened.snapshot()
+        if (
+            snapshot.identity.kind != "regular"
+            or snapshot.identity.link_count != 1
+            or not snapshot.reparse_free
+        ):
+            raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE")
         artifact_size = snapshot.byte_count
         if artifact_size > MAX_ARTIFACT_BYTES or artifact_size < _EOCD.size:
             raise ResourcePortabilityError("RESOURCE.PORTABILITY.LIMIT_EXCEEDED")
@@ -574,10 +578,15 @@ def open_resource_package(
             validation=report,
             payload=payload_member,
         )
-    except BaseException:
+    except BaseException as error:
         for authority in (opened, parent, root):
             if authority is not None:
-                authority.close()
+                try:
+                    authority.close()
+                except BaseException:
+                    pass
+        if isinstance(error, (PlatformFileError, OSError)):
+            raise ResourcePortabilityError("RESOURCE.PACKAGE.SOURCE_UNSAFE") from None
         raise
 
 
