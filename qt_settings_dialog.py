@@ -1810,8 +1810,8 @@ class QtSettingsDialog(QDialog):
             package_export_action.setObjectName(f"exportPackage_{resource.id}")
             package_export_action.setToolTip(
                 (
-                    "将此 managed TM 的完整 canonical snapshot "
-                    "以 TMX payload 封装为 ResourcePackage"
+                    "将完整记忆库导出为可导入的 JSONL 资源包，"
+                    "或仅供导出的 TMX 资源包"
                     if resource.kind is ResourceKind.TRANSLATION_MEMORY
                     else "将此资源的完整快照封装为可验证 ResourcePackage"
                 )
@@ -2476,9 +2476,11 @@ class QtSettingsDialog(QDialog):
     def _prompt_export_package(self, resource: ResourceConfig) -> None:
         locales: tuple[str, str] | None = None
         if resource.kind is ResourceKind.TRANSLATION_MEMORY:
-            locales = self._prompt_tmx_package_locales(resource)
-            if locales is None:
+            selection = self._prompt_tm_package_format(resource)
+            if selection is None:
                 return
+            if selection[0] == "tmx":
+                locales = (selection[1], selection[2])
         selected, _ = QFileDialog.getSaveFileName(
             self,
             "导出 ResourcePackage",
@@ -2568,25 +2570,47 @@ class QtSettingsDialog(QDialog):
         finally:
             dialog.deleteLater()
 
-    def _prompt_tmx_package_locales(
+    def _prompt_tm_package_format(
         self,
         resource: ResourceConfig,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str] | None:
         dialog = QDialog(self)
-        dialog.setObjectName("tmxPackageLocaleDialog")
-        dialog.setWindowTitle("导出 TMX 资源包")
+        dialog.setObjectName("tmPackageFormatDialog")
+        dialog.setWindowTitle("导出翻译记忆资源包")
         dialog.setModal(True)
+        dialog.setMinimumWidth(520)
         layout = QVBoxLayout(dialog)
-        title = QLabel(f"将“{resource.name}”封装为 TMX ResourcePackage")
-        title.setObjectName("tmxPackageLocaleTitle")
+        title = QLabel(f"导出“{resource.name}”的完整翻译记忆库")
+        title.setObjectName("tmPackageFormatTitle")
+        title.setWordWrap(True)
         layout.addWidget(title)
+        format_combo = QComboBox()
+        format_combo.setObjectName("tmPackageFormat")
+        format_combo.setAccessibleName("翻译记忆资源包格式")
+        format_combo.addItem("LocalCAT JSONL（可导入）", "jsonl")
+        format_combo.addItem("TMX（仅导出）", "tmx")
+        configure_combo_popup(
+            format_combo,
+            object_name="tmPackageFormatPopup",
+            accessible_name="翻译记忆资源包格式选项",
+        )
+        layout.addWidget(format_combo)
+
+        def selected_format() -> str:
+            if format_combo.currentIndex() == format_combo.findData("tmx"):
+                return "tmx"
+            return "jsonl"
+
         hint = QLabel(
-            "资源范围固定为该 managed TM 的完整 canonical snapshot；"
-            "请确认 TMX 语言对。"
+            "LocalCAT JSONL 可将完整记忆库导回 LocalCAT。"
+            "TMX 用于与其他翻译工具交换，其资源包不能导入 LocalCAT。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        row = QHBoxLayout()
+        locales = QWidget()
+        locales.setObjectName("tmPackageLocales")
+        row = QHBoxLayout(locales)
+        row.setContentsMargins(0, 0, 0, 0)
         source = QLineEdit()
         source.setObjectName("tmxPackageSourceLocale")
         source.setPlaceholderText("默认 en")
@@ -2597,7 +2621,13 @@ class QtSettingsDialog(QDialog):
         row.addWidget(source)
         row.addWidget(QLabel("目标语言"))
         row.addWidget(target)
-        layout.addLayout(row)
+        layout.addWidget(locales)
+
+        def refresh_format(_index: int = -1) -> None:
+            locales.setVisible(selected_format() == "tmx")
+
+        _ = format_combo.currentIndexChanged.connect(refresh_format)
+        refresh_format()
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel
             | QDialogButtonBox.StandardButton.Ok
@@ -2611,6 +2641,7 @@ class QtSettingsDialog(QDialog):
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return None
             return (
+                selected_format(),
                 source.text().strip() or "en",
                 target.text().strip() or "zh-CN",
             )
@@ -3424,7 +3455,7 @@ QToolButton[resourceMoreButton="true"]:focus {
     color: #ffffff;
     background: transparent;
 }
-QLabel#tmxPackageLocaleTitle {
+QLabel#tmPackageFormatTitle {
     color: #f1f5f9;
     font-size: 18px;
     font-weight: 750;
