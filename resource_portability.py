@@ -612,32 +612,12 @@ class ResourcePortabilityService:
         sealed = plan.sealed
         pending_started = False
         owner_published = False
+        is_tm = False
         prepared_create = None
         try:
-            sealed.reprove()
-            if _repository_baseline(self.repository) != plan.registry_baseline:
-                raise ResourcePortabilityError("RESOURCE.IMPORT.PREVIEW_STALE")
-            if plan.target is not None:
-                current = self.repository.get(plan.target.id)
-                if (
-                    current != plan.target
-                    or _file_snapshot(
-                        self.repository.platform_backend,
-                        current.path,
-                    )
-                    != plan.target_snapshot
-                    or _digest_path(
-                        self.repository.platform_backend,
-                        current.path,
-                    )
-                    != plan.target_digest
-                ):
-                    raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE")
-                if plan.target_owner_baseline is not None:
-                    self._tm.reprove_destination_baseline(
-                        current,
-                        plan.target_owner_baseline,
-                    )
+            self._reprove_import_plan(plan)
+            if plan.target is not None and plan.target_owner_baseline is not None:
+                self._tm.reprove_destination_baseline(plan.target, plan.target_owner_baseline)
             report, owner = self._validate_sealed(sealed)
             with tempfile.TemporaryDirectory(
                 dir=self.repository.config_dir,
@@ -672,94 +652,86 @@ class ResourcePortabilityService:
                     snapshot=owner,
                     durable_state=ResourceDurableState.RECOVERY_REQUIRED,
                 )
-                if preview.mode is ResourceImportMode.CREATE_NEW:
-                    relative_path = destination.path.relative_to(
-                        self.repository.managed_dir
-                    ).as_posix()
-                    self._ledger.begin(
-                        template,
-                        import_mode=preview.mode,
-                        destination_name=destination.name,
-                        destination_relative_path=relative_path,
-                    )
-                else:
-                    self._ledger.begin(template, import_mode=preview.mode)
-                pending_started = True
+                def prepare_under_owner() -> None:
+                    nonlocal pending_started
+                    # Core has already checked store/generation/revision/count
+                    # under the original W1. Do not re-enter a normal TM query
+                    # here: it would wait on our own draining operation.
+                    self._reprove_import_plan(plan)
+                    if preview.mode is ResourceImportMode.CREATE_NEW:
+                        self._ledger.begin(
+                            template, import_mode=preview.mode,
+                            destination_name=destination.name,
+                            destination_relative_path=destination.path.relative_to(
+                                self.repository.managed_dir
+                            ).as_posix(),
+                        )
+                    else:
+                        self._ledger.begin(template, import_mode=preview.mode)
+                    pending_started = True
+
                 receipt: ResourceOperationReceipt | None = None
-                if prepared_create is not None:
-                    def commit_created_resource(
-                        applied_snapshot: PortableResourceSnapshot,
-                    ) -> None:
-                        nonlocal owner_published, receipt
-                        receipt = _import_receipt(
-                            operation_id=preview.operation_id,
-                            report=report,
-                            destination=destination,
-                            before_digest=before_digest,
-                            snapshot=applied_snapshot,
-                            durable_state=ResourceDurableState.COMMITTED,
-                        )
-                        self._mark_pending_receipt_ready(receipt)
-                        owner_published = True
+                published_registry: _RepositoryBaseline | None = None
+
+                def commit_resource(applied_snapshot: PortableResourceSnapshot) -> None:
+                    nonlocal owner_published, receipt, published_registry
+                    receipt = _import_receipt(
+                        operation_id=preview.operation_id, report=report,
+                        destination=destination, before_digest=before_digest,
+                        snapshot=applied_snapshot,
+                        durable_state=ResourceDurableState.COMMITTED,
+                    )
+                    self._mark_pending_receipt_ready(receipt)
+                    owner_published = True
+                    if prepared_create is not None:
                         self.repository.publish_prepared_create(prepared_create)
+                    if destination.kind is ResourceKind.TRANSLATION_MEMORY:
+                        published_registry = (
+                            _repository_baseline(self.repository)
+                            if prepared_create is not None else plan.registry_baseline
+                        )
 
-                    applied = self._apply_owner_snapshot(
-                        destination,
-                        payload,
-                        owner,
-                        create=True,
-                        owner_commit=commit_created_resource,
+                def finalize_resource(applied_snapshot: PortableResourceSnapshot) -> None:
+                    nonlocal pending_started
+                    expected = _import_receipt(
+                        operation_id=preview.operation_id, report=report,
+                        destination=destination, before_digest=before_digest,
+                        snapshot=applied_snapshot,
+                        durable_state=ResourceDurableState.COMMITTED,
                     )
+                    sealed.reprove()
+                    pending = self._ledger.get_pending(preview.operation_id)
+                    if (receipt != expected
+                            or self.repository.get(destination.id) != destination
+                            or _repository_baseline(self.repository) != published_registry
+                            or pending is None
+                            or pending.phase is not ResourcePendingPhase.RECEIPT_READY
+                            or pending.receipt != receipt):
+                        raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+                    self._commit_ready_receipt(expected)
+                    pending_started = False
+
+                is_tm = destination.kind is ResourceKind.TRANSLATION_MEMORY
+                if not is_tm:
+                    prepare_under_owner()
+                applied = self._apply_owner_snapshot(
+                    destination, payload, owner,
+                    create=prepared_create is not None,
+                    expected_destination_baseline=plan.target_owner_baseline,
+                    expected_destination_digest=before_digest,
+                    owner_prepare=prepare_under_owner if is_tm else None,
+                    owner_commit=commit_resource if is_tm or prepared_create is not None else None,
+                    owner_finalize=finalize_resource if is_tm else None,
+                )
+                if not is_tm:
                     if receipt is None:
-                        raise AssertionError(
-                            "created resource owner commit did not issue receipt"
-                        )
+                        commit_resource(applied)
+                    if receipt is None:
+                        raise AssertionError("resource owner did not issue a receipt")
                     self._commit_ready_receipt(receipt)
                     pending_started = False
-                else:
-                    def commit_replaced_resource(
-                        applied_snapshot: PortableResourceSnapshot,
-                    ) -> None:
-                        nonlocal owner_published, receipt
-                        receipt = _import_receipt(
-                            operation_id=preview.operation_id,
-                            report=report,
-                            destination=destination,
-                            before_digest=before_digest,
-                            snapshot=applied_snapshot,
-                            durable_state=ResourceDurableState.COMMITTED,
-                        )
-                        self._mark_pending_receipt_ready(receipt)
-                        owner_published = True
-
-                    applied = self._apply_owner_snapshot(
-                        destination,
-                        payload,
-                        owner,
-                        create=False,
-                        owner_commit=(
-                            commit_replaced_resource
-                            if destination.kind is ResourceKind.TRANSLATION_MEMORY
-                            else None
-                        ),
-                    )
-                    if receipt is None and destination.kind is ResourceKind.TRANSLATION_MEMORY:
-                        raise AssertionError(
-                            "replaced resource owner commit did not issue receipt"
-                        )
-                    if destination.kind is not ResourceKind.TRANSLATION_MEMORY:
-                        owner_published = True
-                        receipt = _import_receipt(
-                            operation_id=preview.operation_id,
-                            report=report,
-                            destination=destination,
-                            before_digest=before_digest,
-                            snapshot=applied,
-                            durable_state=ResourceDurableState.COMMITTED,
-                        )
-                        self._mark_pending_receipt_ready(receipt)
-                    self._commit_ready_receipt(receipt)
-                    pending_started = False
+                if receipt is None:
+                    raise AssertionError("resource owner did not issue a receipt")
             return ResourcePackageImportResult(
                 receipt=receipt,
                 destination_resource_id=destination.id,
@@ -774,7 +746,13 @@ class ResourcePortabilityService:
                 except ResourceError:
                     pass
             if pending_started:
-                if owner_published or _is_recovery_required(error):
+                unproven_tm_failure = (
+                    sys.platform != "win32"
+                    and is_tm
+                    and not (type(error) is ResourcePortabilityError
+                             and error.code == "RESOURCE.IMPORT.APPLY_FAILED")
+                )
+                if owner_published or _is_recovery_required(error) or unproven_tm_failure:
                     raise ResourcePortabilityError(
                         "RESOURCE.IMPORT.RECOVERY_REQUIRED"
                     ) from error
@@ -782,6 +760,33 @@ class ResourcePortabilityService:
             raise
         finally:
             sealed.close()
+
+    def _reprove_import_plan(self, plan: _PreparedResourceImport) -> None:
+        """Reprove Resource-owned inputs without acquiring another TM lease."""
+        try:
+            plan.sealed.reprove()
+        except PlatformFileError as error:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.SOURCE_STALE") from error
+        try:
+            unchanged_registry = _repository_baseline(self.repository) == plan.registry_baseline
+        except (PlatformFileError, ResourceError) as error:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.PREVIEW_STALE") from error
+        if not unchanged_registry:
+            raise ResourcePortabilityError("RESOURCE.IMPORT.PREVIEW_STALE")
+        if plan.target is not None:
+            try:
+                current = self.repository.get(plan.target.id)
+                unchanged_target = (
+                    current == plan.target
+                    and _file_snapshot(self.repository.platform_backend, current.path)
+                    == plan.target_snapshot
+                    and _digest_path(self.repository.platform_backend, current.path)
+                    == plan.target_digest
+                )
+            except (PlatformFileError, ResourceError) as error:
+                raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE") from error
+            if not unchanged_target:
+                raise ResourcePortabilityError("RESOURCE.IMPORT.DESTINATION_STALE")
 
     def _take_import(
         self,
@@ -839,6 +844,11 @@ class ResourcePortabilityService:
                 ResourceRecoveryDisposition.MANUAL_REQUIRED,
                 ("RESOURCE.RECOVERY.DESTINATION_UNKNOWN",),
             )
+        missing_tm_owner = (
+            receipt.resource_kind is PortableResourceKind.TRANSLATION_MEMORY
+            and (receipt.owner_generation is None or receipt.owner_revision is None
+                 or receipt.owner_receipt_digest is None)
+        )
         if pending.import_mode is ResourceImportMode.CREATE_NEW:
             if pending.destination_relative_path is None:
                 return (
@@ -860,6 +870,11 @@ class ResourcePortabilityService:
                     self.repository.platform_backend,
                     path,
                 ) == receipt.destination_after_digest:
+                    if missing_tm_owner:
+                        return (
+                            ResourceRecoveryDisposition.MANUAL_REQUIRED,
+                            ("RESOURCE.RECOVERY.OWNER_PENDING",),
+                        )
                     return (
                         ResourceRecoveryDisposition.COMPLETE_AVAILABLE,
                         ("RESOURCE.RECOVERY.OWNER_PUBLISHED",),
@@ -889,6 +904,11 @@ class ResourcePortabilityService:
                 self.repository.platform_backend,
                 path,
             ) == receipt.destination_after_digest:
+                if missing_tm_owner:
+                    return (
+                        ResourceRecoveryDisposition.MANUAL_REQUIRED,
+                        ("RESOURCE.RECOVERY.OWNER_PENDING",),
+                    )
                 return (
                     ResourceRecoveryDisposition.COMPLETE_AVAILABLE,
                     ("RESOURCE.RECOVERY.OWNER_PUBLISHED",),
@@ -929,6 +949,14 @@ class ResourcePortabilityService:
                     ("RESOURCE.RECOVERY.OWNER_PUBLISHED",),
                 )
             if receipt.destination_before_digest is not None and digest == receipt.destination_before_digest:
+                if receipt.resource_kind is PortableResourceKind.TRANSLATION_MEMORY:
+                    # ARMED/READY stores no public outer cancellation result.
+                    # Source equality, CANCELLED or current canonical health
+                    # cannot prove this Resource operation's complete return.
+                    return (
+                        ResourceRecoveryDisposition.MANUAL_REQUIRED,
+                        ("RESOURCE.RECOVERY.OWNER_PENDING",),
+                    )
                 return (
                     ResourceRecoveryDisposition.ROLLBACK_AVAILABLE,
                     ("RESOURCE.RECOVERY.PRIOR_PRESERVED",),
@@ -1048,6 +1076,10 @@ class ResourcePortabilityService:
         owner: PortableResourceSnapshot,
         *,
         create: bool,
+        expected_destination_baseline: tuple[str, int, int, int] | None = None,
+        expected_destination_digest: str | None = None,
+        owner_prepare: Callable[[], None] | None = None,
+        owner_finalize: Callable[[PortableResourceSnapshot], None] | None = None,
         owner_commit: Callable[[PortableResourceSnapshot], None] | None = None,
     ) -> PortableResourceSnapshot:
         if owner.profile is ResourcePayloadProfile.TMX_LEVEL1_CONTEXT_V1:
@@ -1058,14 +1090,20 @@ class ResourcePortabilityService:
                     destination,
                     payload,
                     owner,
+                    owner_prepare=owner_prepare,
                     owner_commit=owner_commit,
+                    owner_finalize=owner_finalize,
                 )
                 if create
                 else self._tm.replace_snapshot(
                     destination,
                     payload,
                     owner,
+                    expected_destination_baseline=expected_destination_baseline,
+                    expected_destination_digest=expected_destination_digest,
+                    owner_prepare=owner_prepare,
                     owner_commit=owner_commit,
+                    owner_finalize=owner_finalize,
                 )
             )
             return applied
@@ -1246,7 +1284,7 @@ class ResourcePortabilityService:
         self,
         receipt: ResourceOperationReceipt,
     ) -> None:
-        """Append success only after the artifact publisher returned terminal facts."""
+        """Append success only after the owner has proved terminal facts."""
 
         try:
             self._ledger.commit(receipt)

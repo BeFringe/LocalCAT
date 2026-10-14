@@ -9,12 +9,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from editor_contracts import ResourceKind
+from editor_contracts import ResourceConfig, ResourceKind
 from editor_controller import _initial_tm_activation_service
 from resource_package_contracts import (
     PortableResourceKind,
+    PortableResourceSnapshot,
     ResourceImportMode,
     ResourceOperationKind,
+    ResourceOperationReceipt,
     ResourcePayloadProfile,
     ResourcePortabilityError,
     ResourceRecoveryAction,
@@ -22,9 +24,11 @@ from resource_package_contracts import (
 )
 from resource_portability import ResourcePortabilityService
 from resource_receipt_ledger import ResourcePendingPhase
-from resource_repository import ResourceRepository
-from tm_contracts import MigrationReport, TMRecordDraft
+from resource_repository import PreparedResourceCreate, ResourceRepository
+from tm_contracts import CanonicalResourceIdentity, MigrationReport, TMRecordDraft
 from tm_engine import TMEngine
+from tm_migration import _InitialActivationReservationError, _InitialActivationResourceReservation
+from tests.benchmark_worker_test_support import worker_temporary_directory
 
 
 _MIXED_TERMS = (
@@ -160,7 +164,7 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             self.assertEqual(len(service._ledger.list_receipts()), 2)
 
     def test_real_active_canonical_tm_exports_direct_and_package(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
+        with worker_temporary_directory() as raw:
             root = Path(raw)
             repository = ResourceRepository(root / "app")
             resource = repository.create_resource("TM", ResourceKind.TRANSLATION_MEMORY)
@@ -243,10 +247,19 @@ class ResourcePortabilityExportTests(unittest.TestCase):
     def test_tm_package_create_and_replace_use_core_generation_transactions(self) -> None:
         callback_observations: list[str] = []
 
-        def assert_pending_path_locked(path: Path) -> None:
-            """The Core pending publication must retain exclusive handles."""
+        def assert_pending_path_locked(resource: ResourceConfig) -> None:
+            """Windows retains exclusive handles; POSIX retains the original W1."""
 
+            path = resource.path
             self.assertTrue(path.exists())
+            if os.name == "posix":
+                identity = CanonicalResourceIdentity.from_configured_jsonl(resource.id, path)
+                with self.assertRaises(_InitialActivationReservationError):
+                    with _InitialActivationResourceReservation.acquire_with_backend(
+                        identity, destination_repo.platform_backend,
+                    ):
+                        self.fail("competing owner acquired W1 inside callback")
+                return
             with self.assertRaises(PermissionError):
                 path.write_bytes(path.read_bytes())
             with self.assertRaises(PermissionError):
@@ -283,6 +296,7 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             )
             package = root / "tm.localcat-resource"
             source_package = ResourcePortabilityService(source_repo).export_package(source.id, package)
+            package_before = package.read_bytes()
 
             destination_repo = ResourceRepository(root / "destination-app")
             existing = destination_repo.create_resource("Existing TM", ResourceKind.TRANSLATION_MEMORY)
@@ -297,13 +311,13 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             service = ResourcePortabilityService(destination_repo)
             real_mark_ready = service._mark_pending_receipt_ready
 
-            def observe_replace_ready(receipt: object) -> None:
+            def observe_replace_ready(receipt: ResourceOperationReceipt) -> None:
                 real_mark_ready(receipt)
                 pending = service._ledger.list_pending()
                 self.assertEqual(len(pending), 1)
                 self.assertIs(pending[0].phase, ResourcePendingPhase.RECEIPT_READY)
                 self.assertEqual(service._ledger.list_receipts(), ())
-                assert_pending_path_locked(existing.path)
+                assert_pending_path_locked(existing)
                 callback_observations.append("replace")
 
             replace_preview = service.preview_resource_package_import(
@@ -331,12 +345,12 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             receipts_before_create = service._ledger.list_receipts()
             real_publish = destination_repo.publish_prepared_create
 
-            def observe_create_publish(prepared: object) -> object:
+            def observe_create_publish(prepared: PreparedResourceCreate) -> object:
                 pending = service._ledger.list_pending()
                 self.assertEqual(len(pending), 1)
                 self.assertIs(pending[0].phase, ResourcePendingPhase.RECEIPT_READY)
                 self.assertEqual(service._ledger.list_receipts(), receipts_before_create)
-                assert_pending_path_locked(prepared.resource.path)  # type: ignore[attr-defined]
+                assert_pending_path_locked(prepared.resource)  # type: ignore[attr-defined]
                 result = real_publish(prepared)
                 self.assertIsNotNone(
                     destination_repo.get(prepared.resource.id)  # type: ignore[attr-defined]
@@ -364,18 +378,18 @@ class ResourcePortabilityExportTests(unittest.TestCase):
             post = service.export_direct(created_resource.id, exported)
             self.assertEqual(post.receipt.record_count, created.receipt.record_count)
 
-            # Programming errors from the owner callback must remain visible
-            # to the caller, while Core still closes its configured-source
-            # publication and removes the private replace recovery copy.
+            # POSIX callback failure after publication keeps ARMED/manual facts;
+            # Windows retains its original callback/cleanup contract.
             receipts_before_faults = service._ledger.list_receipts()
             real_replace_snapshot = service._tm.replace_snapshot
 
             def raise_type_error(
-                resource: object,
+                resource: ResourceConfig,
                 payload: Path,
-                validated: object,
+                validated: PortableResourceSnapshot,
                 *,
                 owner_commit: object = None,
+                **owner_kwargs,
             ) -> object:
                 del owner_commit
 
@@ -387,6 +401,7 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                     payload,
                     validated,  # type: ignore[arg-type]
                     owner_commit=callback,
+                    **owner_kwargs,  # type: ignore[arg-type]
                 )
 
             fault_replace_preview = service.preview_resource_package_import(
@@ -399,28 +414,36 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                 "replace_snapshot",
                 side_effect=raise_type_error,
             ):
-                with self.assertRaises(TypeError):
+                with self.assertRaises(TypeError if os.name == "nt" else ResourcePortabilityError) as fault:
                     service.apply_resource_package_import(fault_replace_preview)
             self.assertEqual(service._ledger.list_receipts(), receipts_before_faults)
-            self.assertEqual(service._ledger.list_pending(), ())
-            self.assertEqual(
-                list(
-                    created_resource.path.parent.glob(
-                        f".{created_resource.path.name}.localcat-import-recovery-*.jsonl"
-                    )
-                ),
-                [],
-            )
-            created_resource.path.write_bytes(created_resource.path.read_bytes())
+            if os.name == "posix":
+                assert isinstance(fault.exception, ResourcePortabilityError)
+                self.assertEqual(fault.exception.code, "RESOURCE.IMPORT.RECOVERY_REQUIRED")
+                self.assertIsInstance(fault.exception.__cause__, TypeError)
+                self.assertEqual(len(service._ledger.list_pending()), 1)
+                self.assertEqual(created_resource.path.read_bytes(), existing.path.read_bytes())
+            else:
+                self.assertEqual(service._ledger.list_pending(), ())
+                self.assertEqual(
+                    list(
+                        created_resource.path.parent.glob(
+                            f".{created_resource.path.name}.localcat-import-recovery-*.jsonl"
+                        )
+                    ),
+                    [],
+                )
+                created_resource.path.write_bytes(created_resource.path.read_bytes())
 
             real_create_snapshot = service._tm.create_snapshot
 
             def raise_assertion_error(
-                resource: object,
+                resource: ResourceConfig,
                 payload: Path,
-                validated: object,
+                validated: PortableResourceSnapshot,
                 *,
                 owner_commit: object = None,
+                **owner_kwargs,
             ) -> object:
                 del owner_commit
 
@@ -432,6 +455,7 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                     payload,
                     validated,  # type: ignore[arg-type]
                     owner_commit=callback,
+                    **owner_kwargs,  # type: ignore[arg-type]
                 )
 
             fault_create_preview = service.preview_resource_package_import(
@@ -444,10 +468,24 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                 "create_snapshot",
                 side_effect=raise_assertion_error,
             ):
-                with self.assertRaises(AssertionError):
+                with self.assertRaises(AssertionError if os.name == "nt" else ResourcePortabilityError) as create_fault:
                     service.apply_resource_package_import(fault_create_preview)
             self.assertEqual(service._ledger.list_receipts(), receipts_before_faults)
-            self.assertEqual(service._ledger.list_pending(), ())
+            if os.name == "posix":
+                assert isinstance(create_fault.exception, ResourcePortabilityError)
+                self.assertEqual(create_fault.exception.code, "RESOURCE.IMPORT.RECOVERY_REQUIRED")
+                self.assertIsInstance(create_fault.exception.__cause__, AssertionError)
+                self.assertEqual(len(service._ledger.list_pending()), 2)
+                cold = ResourcePortabilityService(ResourceRepository(destination_repo.config_dir))
+                recoveries = cold.inspect_resource_portability_recovery()
+                self.assertEqual(len(recoveries), 2)
+                self.assertTrue(all(item.disposition is ResourceRecoveryDisposition.MANUAL_REQUIRED for item in recoveries))
+                match = TMEngine(str(existing.path), expected_resource_id=existing.id).query_exact("new")
+                assert match is not None
+                self.assertEqual(match.target, "新")
+            else:
+                self.assertEqual(service._ledger.list_pending(), ())
+            self.assertEqual(package.read_bytes(), package_before)
             self.assertEqual(callback_observations, ["replace", "create"])
             self.assertEqual(len(service._ledger.list_receipts()), 3)
 
@@ -680,6 +718,7 @@ class ResourcePortabilityExportTests(unittest.TestCase):
                 expected_resource_id=destination.id,
             ).canonical_store
             self.assertIsNotNone(store)
+            assert store is not None
             store.append(
                 TMRecordDraft(
                     source_raw="local advance",

@@ -305,7 +305,7 @@ Cluster 0 治理/characterization
 
 - [ ] 6. 贯通 POSIX 资源包事务与终态
 
-- [ ] 6.1 集成 POSIX 包 create/replace 与同一资源 owner 的终态
+- [x] 6.1 集成 POSIX 包 create/replace 与同一资源 owner 的终态
   - 资源端口消费 Core 提供并由调用方注入的原家族会话，在首次 source 发布前完成家族准入与排空；子阶段及回调只借用外层操作，不通过新建 engine 或路径重绑清除失效。真实 owner 的端口与事务接线属于本任务，runtime 与 port 的实际 composition 由 UI 10.1 消费该接缝完成。
   - 在 owner 仍有效时闭合 publication、registry callback、既有 runtime callback 接缝、receipt 与 final local resource 冷重开；source package 只作只读输入，不复制 live SQLite 或恢复文件。
   - 完成时，真实 create/replace 返回的 payload semantic digest、counts、新 local authority 与 registry/receipt 一致；无法证明的发布或重开结果返回 recovery-required，保留可确认恢复事实且不签发成功。
@@ -314,7 +314,7 @@ Cluster 0 治理/characterization
   - _Depends: windows-platform-enablement 11.0, tm-storage-retrieval-index 10.6, tm-storage-retrieval-index 10.9, tm-storage-retrieval-index 10.10_
   - _Requirements: 7.7, 8.3, 8.4, 8.6, 8.7, 9.4, 9.6, 11.1, 11.2, 11.3_
 
-- [ ] 6.2 验证包安全、正常失败与资源漂移分类
+- [x] 6.2 验证包安全、正常失败与资源漂移分类
   - 通过注入真实 Core owner 的 ResourcePort 入口验证包 create/replace、callback、receipt 与独立冷重开；支持环境中的故障继续证明 prior resource、registry/runtime callback 与 source package 的各自保留事实。本任务覆盖资源端口集成，实际 runtime/port composition 及完整 Application 消费由 UI 10.1/10.2 闭合。
   - 保留 closed grammar、路径穿越、链接/special file、摘要/计数/profile、preview stale 与 foreign artifact 拒绝；首次 mutation 前 stale 保持零修改，不能借在线替换边界弱化输入保护。
   - 在真实 builder 入口 rename 原 parent 并建立同字节 clone 后继续实际代码，另覆盖首次 mutation、reconnect、应用 publication 与终态检查；完成时原/新目录实际内容、callback、registry 与 receipt 证明不接管副本、不报告未经证明的成功。
@@ -344,6 +344,8 @@ Cluster 0 治理/characterization
 
 ## Implement Notes
 
+- Task 6.2：晚期 source terminal 失败后，公开冷 COMPLETE 可闭合已发布的新 authority 与原 import receipt/pending；没有持久归属定位的遗留私有 source 备份仍会保留，`inspect_resource_portability_recovery()` 不是残留文件枚举入口。
+- Task 6.1：Core 完整取消返回后、Resource `abandon` 前中断时，既有 ledger 不保留 outer 收尾与该 operation id 的完成关联；冷端即使观察到 source 等于 before、canonical 可查询，仍保留 pending/manual-required。实际应用恢复提示须区分该窗口与同次完整失败已正常结束、可重新预览重试的情况。
 - `2.4a`：CSV/v1 direct publication 在 owner receipt callback 返回前保持 `PendingPublication`；ambiguous replace 保留 LKG/candidate。
 - `3.4a`：`SealedResourcePackage.reprove()` 同时复证 retained file 与 pathname/parent entry identity。
 - `4.4a`：Termbase create在`PendingPublication`存活时只推进owner durable READY/registry事实，terminal reproof成功后才完成receipt ledger；delete在同一owner lock内重读registry并经rooted identity/unlink seam发布；Termbase commit复证live source identity。
