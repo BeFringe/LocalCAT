@@ -55,6 +55,8 @@ from platform_fs_contracts import (
     PlatformFileErrorCode,
     PosixBoundContentFacts,
     PosixBoundContentObservation,
+    PosixBoundDirectoryFacts,
+    PosixBoundDirectoryOperations,
     PosixStageHandoff,
     PrivateAccessEvidence,
     PrivateStorageProof,
@@ -2425,6 +2427,7 @@ class PosixPlatformAdapter(
     LockedDescendantNamespaceInspection,
     LockedRootDirectoryObservation,
     PosixBoundContentObservation,
+    PosixBoundDirectoryOperations,
     PosixStageHandoff,
     RootedFileSystem,
     MutableFileReservationService,
@@ -3063,6 +3066,46 @@ class PosixPlatformAdapter(
                     error, fallback=PlatformFileErrorCode.DURABILITY_UNAVAILABLE, retryable=False,
                 ) from None
             raise
+
+    def _codec_directory(
+        self, source: BoundDirectoryAuthority,
+    ) -> _PosixRootedDirectory | _PosixBoundDirectory:
+        if type(source) not in {_PosixRootedDirectory, _PosixBoundDirectory}:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        retained = cast(_PosixRootedDirectory | _PosixBoundDirectory, source)
+        if retained._issuer is not self._issuer:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        return retained
+
+    def _observe_bound_directory(self, source: BoundDirectoryAuthority) -> PosixBoundDirectoryFacts:
+        retained = self._codec_directory(source)
+        try:
+            retained.reprove()
+            observed = os.fstat(retained._directory_fd)
+            if not _same_identity(_identity_from_stat(observed), retained._directory_identity):
+                raise _platform_error(PlatformFileErrorCode.IDENTITY_STALE, retryable=True)
+            _hit_fault(self._fault_injector, "bound_directory_after_stat")
+            retained.reprove()
+            return PosixBoundDirectoryFacts(observed.st_dev, observed.st_ino)
+        except OSError as error:
+            raise _map_os_error(
+                error, fallback=PlatformFileErrorCode.IDENTITY_STALE, retryable=True,
+            ) from None
+
+    def _synchronize_bound_directory(self, source: BoundDirectoryAuthority, owner_lease: LockLease) -> None:
+        retained = self._codec_directory(source)
+        if type(owner_lease) is not _PosixLockLease or owner_lease._root_token is not retained._root_token:
+            raise _platform_error(PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False)
+        try:
+            retained.reprove()
+            self._stage_lease(owner_lease, retained)
+            os.fsync(retained._directory_fd)
+            retained.reprove()
+            self._stage_lease(owner_lease, retained)
+        except OSError as error:
+            raise _map_os_error(
+                error, fallback=PlatformFileErrorCode.DURABILITY_UNAVAILABLE, retryable=False,
+            ) from None
 
     def _observe_bound_content(self, source: BoundRegularFile) -> PosixBoundContentFacts:
         if type(source) not in {_PosixBoundRegularFile, _PosixBoundSynchronizedRegularFile}:

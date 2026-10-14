@@ -562,7 +562,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1_
   - _Requirements: 5.1, 5.6, 5.7_
 
-- [ ] 11.2a 补齐旧POSIX恢复codec的受绑定目录身份与同步
+- [x] 11.2a 补齐旧POSIX恢复codec的受绑定目录身份与同步
   - 通过可选端口观察本 adapter 原 root 或派生 parent 的 live device/inode，并在相应 live lease 下独立同步原目录；前后复证原父链与配置位置，借入 authority 仍由原 owner 关闭。
   - 完成时，合法初次绑定及派生目录返回对应事实；临时文件已缺席时仍可补做目录同步；foreign、closed、错配 lease、位置失效或同步失败均拒绝成功，原 owner 可保留恢复事实。
   - 不以 Path、raw FD、历史数值或 opaque 反解获取权限，不为同步制造文件；保持旧 codec、业务恢复状态及 Windows 合同。

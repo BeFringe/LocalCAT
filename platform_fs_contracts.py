@@ -218,6 +218,26 @@ class PosixBoundContentFacts(_LiveOnlyValue):
 
 
 @dataclass(frozen=True, slots=True)
+class PosixBoundDirectoryFacts(_LiveOnlyValue):
+    """Live retained-directory facts for a legacy codec, never authority.
+
+    Values come from fstat of the borrowed directory, not opaque identity
+    decoding. The consumer owns its persistent schema and recovery checks;
+    these numbers cannot authorize a later operation or a fresh process.
+    """
+
+    device: int
+    inode: int
+
+    def __post_init__(self) -> None:
+        for name, value in (("device", self.device), ("inode", self.inode)):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be exact int")
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
 class BoundContentCapture(_LiveOnlyValue):
     """Materialized bytes and facts from one exact live-handle capture."""
 
@@ -2804,6 +2824,47 @@ class PosixBoundContentObservation(Protocol):
 
     @abstractmethod
     def _observe_bound_content(self, source: BoundRegularFile) -> PosixBoundContentFacts: ...
+
+
+@runtime_checkable
+class PosixBoundDirectoryOperations(Protocol):
+    """Optional POSIX codec operations on an already-issued live directory.
+
+    Accept only this adapter's original root or derived parent. Observe fstat
+    on that retained object and reprove its original name chain/configured
+    location before and after each operation. Synchronization requires the
+    corresponding live lease and works even when the managed file is absent.
+    Failures leave close ownership of both borrowed authorities with the
+    caller. No sentinel, historical-number authority or TM recovery decision
+    is involved. These are finite observations, not a namespace freeze.
+    Windows and PlatformFileBackend do not require this capability.
+    """
+
+    def observe_bound_directory(self, source: BoundDirectoryAuthority) -> PosixBoundDirectoryFacts:
+        if not isinstance(source, BoundDirectoryAuthority):
+            raise TypeError("source must be BoundDirectoryAuthority")
+        source._require_open()
+        facts = self._observe_bound_directory(source)
+        if type(facts) is not PosixBoundDirectoryFacts:
+            raise TypeError("backend observation must return PosixBoundDirectoryFacts")
+        return facts
+
+    @abstractmethod
+    def _observe_bound_directory(self, source: BoundDirectoryAuthority) -> PosixBoundDirectoryFacts: ...
+
+    def synchronize_bound_directory(self, source: BoundDirectoryAuthority, owner_lease: LockLease) -> None:
+        if not isinstance(source, BoundDirectoryAuthority):
+            raise TypeError("source must be BoundDirectoryAuthority")
+        if not isinstance(owner_lease, LockLease):
+            raise TypeError("owner_lease must be LockLease")
+        source._require_open()
+        owner_lease._require_open()
+        result = self._synchronize_bound_directory(source, owner_lease)
+        if result is not None:
+            raise TypeError("backend directory synchronization must return None")
+
+    @abstractmethod
+    def _synchronize_bound_directory(self, source: BoundDirectoryAuthority, owner_lease: LockLease) -> None: ...
 
 
 @runtime_checkable
