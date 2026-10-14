@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePath
 import stat
 import sys
+import threading
 import time
 from typing import Any, Callable, Generator, Iterator, cast
 
@@ -890,8 +891,69 @@ class _DirectoryAuthorityMixin:
             _close_fd(descriptor)
 
 
+class _ReadDirectoryPrefix:
+    """One original root chain, retained independently by its regular readers."""
+
+    __slots__ = ("descriptors", "_lock", "_references", "_root_owned")
+
+    def __init__(self, descriptors: tuple[int, ...]) -> None:
+        self.descriptors: tuple[int, ...] = descriptors
+        self._lock: threading.Lock = threading.Lock()
+        self._references: int = 1
+        self._root_owned: bool = True
+
+    def retain(self) -> None:
+        with self._lock:
+            if not self._root_owned:
+                raise _platform_error(
+                    PlatformFileErrorCode.CAPABILITY_UNAVAILABLE, retryable=False,
+                )
+            self._references += 1
+
+    def release(self, *, root: bool = False) -> None:
+        with self._lock:
+            if root:
+                if not self._root_owned:
+                    return
+                self._root_owned = False
+            self._references -= 1
+            if self._references:
+                return
+        first_error: BaseException | None = None
+        for descriptor in reversed(self.descriptors):
+            try:
+                _close_fd(descriptor)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+
 class _PosixRootedDirectory(_DirectoryAuthorityMixin, RootedDirectoryAuthority):
-    __slots__ = _DIRECTORY_AUTHORITY_SLOTS
+    __slots__ = (*_DIRECTORY_AUTHORITY_SLOTS, "_read_prefix")
+
+    def __init__(
+        self,
+        directory_fds: tuple[int, ...],
+        directory_names: tuple[str | None, ...],
+        fault_injector: _FaultInjector | None,
+        *,
+        issuer: object | None = None,
+        root_token: object | None = None,
+    ) -> None:
+        super().__init__(
+            directory_fds, directory_names, fault_injector,
+            issuer=issuer, root_token=root_token,
+        )
+        try:
+            self._read_prefix: _ReadDirectoryPrefix = _ReadDirectoryPrefix(directory_fds)
+        except BaseException:
+            super()._close_authority()
+            raise
+
+    def _close_authority(self) -> None:
+        self._read_prefix.release(root=True)
 
 
 class _PosixBoundDirectory(_DirectoryAuthorityMixin, BoundDirectoryAuthority):
@@ -920,11 +982,20 @@ def _duplicate_directory_chain(descriptors: tuple[int, ...]) -> tuple[int, ...]:
 def _open_directory_chain(
     root: _PosixRootedDirectory,
     components: tuple[str, ...],
+    *,
+    share_root: bool = False,
 ) -> tuple[tuple[int, ...], tuple[str | None, ...]]:
     root._reprove()
-    descriptors = list(_duplicate_directory_chain(root._directory_fds))
+    descriptors: list[int] = []
+    owned_start = 0
     names = list(root._directory_names)
     try:
+        if share_root:
+            # The regular-file opener already holds its independent prefix ref.
+            descriptors.extend(root._directory_fds)
+            owned_start = len(descriptors)
+        else:
+            descriptors.extend(_duplicate_directory_chain(root._directory_fds))
         for component in components:
             descriptor = os.open(
                 component,
@@ -943,7 +1014,7 @@ def _open_directory_chain(
         identities = _capture_directory_identities(tuple(descriptors))
         _reprove_directory_chain(tuple(descriptors), tuple(names), identities)
     except BaseException as error:
-        for descriptor in reversed(descriptors):
+        for descriptor in reversed(descriptors[owned_start:]):
             try:
                 _close_fd(descriptor)
             except BaseException:
@@ -975,6 +1046,7 @@ class _PosixBoundRegularFile(BoundRegularFile):
         "_bound_identity",
         "_fault_injector",
         "_issuer",
+        "_read_prefix",
     )
 
     def __init__(
@@ -986,9 +1058,12 @@ class _PosixBoundRegularFile(BoundRegularFile):
         fault_injector: _FaultInjector | None,
         *,
         issuer: object | None = None,
+        read_prefix: _ReadDirectoryPrefix | None = None,
     ) -> None:
         super().__init__()
         self._directory_fds = directory_fds
+        self._descriptor = descriptor
+        self._read_prefix: _ReadDirectoryPrefix | None = read_prefix
         try:
             self._directory_identities = _capture_directory_identities(directory_fds)
             _reprove_directory_chain(
@@ -1004,11 +1079,11 @@ class _PosixBoundRegularFile(BoundRegularFile):
                     retryable=False,
                 )
         except BaseException:
-            _close_fd(descriptor)
-            for item in reversed(directory_fds):
-                _close_fd(item)
+            try:
+                self._close_authority()
+            except BaseException:
+                pass
             raise
-        self._descriptor = descriptor
         self._directory_names = directory_names
         self._entry_name = entry_name
         self._bound_identity = identity
@@ -1150,9 +1225,23 @@ class _PosixBoundRegularFile(BoundRegularFile):
         )
 
     def _close_authority(self) -> None:
-        _close_fd(self._descriptor)
-        for descriptor in reversed(self._directory_fds):
-            _close_fd(descriptor)
+        prefix = self._read_prefix
+        owned_start = 0 if prefix is None else len(prefix.descriptors)
+        first_error: BaseException | None = None
+        for descriptor in (self._descriptor, *reversed(self._directory_fds[owned_start:])):
+            try:
+                _close_fd(descriptor)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if prefix is not None:
+            try:
+                prefix.release()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 def _close_mutation_guard_descriptors(descriptors: tuple[int, ...]) -> None:
@@ -3289,13 +3378,14 @@ class PosixPlatformAdapter(
                 retryable=False,
             )
         components = tuple(relative.parts)
-        directories, directory_names = _open_directory_chain(
-            root,
-            components[:-1],
-        )
-        retained_directories: tuple[int, ...] | None = directories
+        read_prefix: _ReadDirectoryPrefix | None = root._read_prefix
+        read_prefix.retain()
+        retained_directories: tuple[int, ...] | None = None
         descriptor: int | None = None
         try:
+            retained_directories, directory_names = _open_directory_chain(
+                root, components[:-1], share_root=True,
+            )
             # Reject a FIFO by retained fstat without waiting for a writer.
             descriptor = os.open(
                 components[-1],
@@ -3304,8 +3394,10 @@ class PosixPlatformAdapter(
             )
             transferred_directories = retained_directories
             transferred_descriptor = descriptor
+            transferred_prefix = read_prefix
             retained_directories = None
             descriptor = None
+            read_prefix = None
             return _PosixBoundRegularFile(
                 transferred_directories,
                 directory_names,
@@ -3313,20 +3405,27 @@ class PosixPlatformAdapter(
                 components[-1],
                 self._fault_injector,
                 issuer=self._issuer if root._issuer is self._issuer else None,
+                read_prefix=transferred_prefix,
             )
-        except PlatformFileError:
+        except BaseException as error:
             if descriptor is not None:
-                _close_fd(descriptor)
+                try:
+                    _close_fd(descriptor)
+                except BaseException:
+                    pass
             if retained_directories is not None:
-                for item in reversed(retained_directories):
-                    _close_fd(item)
-            raise
-        except OSError as error:
-            if descriptor is not None:
-                _close_fd(descriptor)
-            if retained_directories is not None:
-                for item in reversed(retained_directories):
-                    _close_fd(item)
+                for item in reversed(retained_directories[len(root._directory_fds):]):
+                    try:
+                        _close_fd(item)
+                    except BaseException:
+                        pass
+            if read_prefix is not None:
+                try:
+                    read_prefix.release()
+                except BaseException:
+                    pass
+            if not isinstance(error, OSError):
+                raise
             if error.errno in {errno.ENOENT, errno.EACCES, errno.EPERM}:
                 raise _platform_error(
                     PlatformFileErrorCode.ENTRY_UNAVAILABLE,
