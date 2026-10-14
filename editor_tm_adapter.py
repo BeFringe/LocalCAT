@@ -26,6 +26,7 @@ from editor_contracts import (
     FuzzyValidationDisplay,
     FuzzyValidationState,
     ResourceConfig,
+    ResourceKind,
     RetrievalDisplayState,
     SuggestionQueryIdentity,
     TMPreferences,
@@ -43,6 +44,7 @@ from tm_application_composition import (
     LegacyAppendOperationError,
     LegacyExactPort,
     TMRuntimeHost,
+    TMResourceResolver,
     TMRuntimeSnapshot,
     _RuntimeGenerationChanged,
 )
@@ -491,6 +493,9 @@ class EditorTMAdapter:
 
         return self._runtime_host._inspect_resource_statuses(configs)
 
+    def _resource_resolver_for_controller(self) -> TMResourceResolver:
+        return self._runtime_host._resource_resolver_for_controller()
+
     def _inspect_retrieval_status_for_controller(self) -> RetrievalDisplayState:
         """Return the current frozen retrieval display without running a query."""
 
@@ -603,10 +608,15 @@ class EditorTMAdapter:
             target=target,
             file_source=file_source,
         )
-        runtime = self._runtime_host.capture_operation_snapshot()
+        runtime, configs = (
+            self._runtime_host._capture_operation_snapshot_with_configs()
+        )
         runtime.__post_init__()
         outcomes: list[TMResourceWriteOutcome] = []
-        for port in _writable_ports(runtime):
+        for port in _write_targets(runtime, configs):
+            if isinstance(port, TMResourceWriteOutcome):
+                outcomes.append(port)
+                continue
             try:
                 port.append(draft)
             except Exception as error:
@@ -1382,22 +1392,41 @@ def _confirmed_translation_draft(
     )
 
 
-def _writable_ports(runtime: TMRuntimeSnapshot) -> tuple[_WritableTMPort, ...]:
-    ports: dict[str, _WritableTMPort] = {}
-    for port in (*runtime.legacy_ports, *runtime.canonical_ports):
-        if port.resource_id in ports:
-            raise ValueError("runtime resource cannot have two append ports")
-        ports[port.resource_id] = port
-
-    selected: list[_WritableTMPort] = []
+def _write_targets(
+    runtime: TMRuntimeSnapshot,
+    configs: tuple[ResourceConfig, ...],
+) -> tuple[_WritableTMPort | TMResourceWriteOutcome, ...]:
+    ports = {
+        port.resource_id: port
+        for port in (*runtime.legacy_ports, *runtime.canonical_ports)
+    }
+    config_by_id = {config.id: config for config in configs}
+    status_by_id = {status.resource_id: status for status in runtime.statuses}
+    selected: list[_WritableTMPort | TMResourceWriteOutcome] = []
     for resource_id, global_order in runtime.global_order_by_resource_id:
-        port = ports.get(resource_id)
-        if port is None:
+        config = config_by_id[resource_id]
+        if (
+            config.kind is not ResourceKind.TRANSLATION_MEMORY
+            or not config.active
+            or not config.update
+        ):
             continue
-        if port.global_order != global_order:
-            raise ValueError("TM append port drifted from declarative order")
-        if port.active and port.update:
+        port = ports.get(resource_id)
+        if port is not None:
             selected.append(port)
+            continue
+        # The host binds every missing TM port to an UNAVAILABLE status.
+        status = status_by_id[resource_id]
+        selected.append(
+            TMResourceWriteOutcome(
+                resource_id=resource_id,
+                resource_name=status.resource_name,
+                global_order=global_order,
+                written=False,
+                error_code=status.safe_codes[0],
+                retryable=status.retryable,
+            )
+        )
     return tuple(selected)
 
 

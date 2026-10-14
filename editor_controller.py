@@ -132,7 +132,7 @@ from tm_contracts import (
 )
 from tm_engine import SourceUnit, TMEngine, canonical_authority_facts
 from tm_migration import MigrationPreflightError, TMMigrationService
-from tm_sqlite_store import ResourceStoreCoordinator
+from tm_sqlite_store import ResourceStoreCoordinator, SQLiteStoreSchemaError
 from termbase_store import TermbaseStore, TermbaseValidationError
 from target_preprocessor import PreprocessValidationError, preview_preprocessing
 from workspace_state import WorkspaceStateError, WorkspaceStateRepository
@@ -362,7 +362,9 @@ class _PreparedTMActivation:
             raise TypeError("prepared activation action is unsupported")
 
 
-def _initial_tm_activation_service(config: ResourceConfig) -> TMMigrationService:
+def _initial_tm_activation_service(
+    config: ResourceConfig, *, coordinator: ResourceStoreCoordinator | None = None,
+) -> TMMigrationService:
     """Construct the sole Core public first-activation owner for a resource."""
 
     if type(config) is not ResourceConfig:
@@ -372,11 +374,14 @@ def _initial_tm_activation_service(config: ResourceConfig) -> TMMigrationService
         config.id,
         config.path,
     )
-    canonical_store_id = f"store.{config.id}"
-    coordinator = ResourceStoreCoordinator(
-        canonical_store_id=canonical_store_id,
-        resource_identity=identity,
+    canonical_store_id = (
+        f"store.{config.id}" if coordinator is None else coordinator.canonical_store_id
     )
+    if coordinator is None:
+        coordinator = ResourceStoreCoordinator(
+            canonical_store_id=canonical_store_id,
+            resource_identity=identity,
+        )
     return TMMigrationService(
         resource_identity=identity,
         canonical_store_id=canonical_store_id,
@@ -384,22 +389,25 @@ def _initial_tm_activation_service(config: ResourceConfig) -> TMMigrationService
     )
 
 
-def _tm_rebuild_service(config: ResourceConfig) -> TMMigrationService:
+def _tm_rebuild_service(
+    config: ResourceConfig, *, coordinator: ResourceStoreCoordinator | None = None,
+) -> TMMigrationService:
     """Reopen the resource's proven LKG coordinator for explicit rebuild."""
 
     if type(config) is not ResourceConfig:
         raise TypeError("TM rebuild config must be ResourceConfig")
     config.__post_init__()
-    engine = TMEngine(
-        str(config.path),
-        expected_resource_id=config.id,
-    )
-    store = engine.canonical_store
-    if store is None:
-        raise EditorControllerError(
-            "TM rebuild requires an active canonical resource"
+    if coordinator is None:
+        engine = TMEngine(
+            str(config.path),
+            expected_resource_id=config.id,
         )
-    coordinator = store.coordinator
+        store = engine.canonical_store
+        if store is None:
+            raise EditorControllerError(
+                "TM rebuild requires an active canonical resource"
+            )
+        coordinator = store.coordinator
     identity = CanonicalResourceIdentity.from_configured_jsonl(
         config.id,
         config.path,
@@ -413,7 +421,9 @@ def _tm_rebuild_service(config: ResourceConfig) -> TMMigrationService:
     )
 
 
-def _tm_reattestation_service(config: ResourceConfig) -> TMMigrationService:
+def _tm_reattestation_service(
+    config: ResourceConfig, *, coordinator: ResourceStoreCoordinator | None = None,
+) -> TMMigrationService:
     """Construct an explicit owner for one refused canonical authority.
 
     This path consumes only durable identity facts.  It does not open the
@@ -424,7 +434,10 @@ def _tm_reattestation_service(config: ResourceConfig) -> TMMigrationService:
     if type(config) is not ResourceConfig:
         raise TypeError("TM re-attestation config must be ResourceConfig")
     config.__post_init__()
-    facts = canonical_authority_facts(config.path)
+    facts = (
+        canonical_authority_facts(config.path) if coordinator is None
+        else (coordinator.resource_id, coordinator.canonical_store_id)
+    )
     if facts is None:
         raise EditorControllerError(
             "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE"
@@ -438,10 +451,11 @@ def _tm_reattestation_service(config: ResourceConfig) -> TMMigrationService:
         config.id,
         config.path,
     )
-    coordinator = ResourceStoreCoordinator(
-        canonical_store_id=canonical_store_id,
-        resource_identity=identity,
-    )
+    if coordinator is None:
+        coordinator = ResourceStoreCoordinator(
+            canonical_store_id=canonical_store_id,
+            resource_identity=identity,
+        )
     return TMMigrationService(
         resource_identity=identity,
         canonical_store_id=canonical_store_id,
@@ -490,7 +504,7 @@ def _validate_activation_runtime_candidate(
     resource_id: str,
     outcome: MigrationReport | MigrationFailure,
     service_canonical_store_id: str,
-) -> None:
+) -> TMResourceStatus | None:
     """Bind a complete runtime candidate to one exact Core outcome."""
 
     from tm_application_composition import TMRuntimeSnapshot
@@ -549,6 +563,16 @@ def _validate_activation_runtime_candidate(
             raise ValueError("activation report resource identity changed")
         if outcome.canonical_store_id != service_canonical_store_id:
             raise ValueError("activation report service authority changed")
+        if (
+            status.mode is TMResourceDisplayMode.UNAVAILABLE
+            and resource_id not in legacy_ids
+            and resource_id not in canonical_ids
+            and not outcome.context_available
+            and not outcome.fuzzy_available
+        ):
+            # A late Core success cannot revive the stopped resource. Publish
+            # this closed graph, but return its local refusal to the worker.
+            return status
         if (
             status.mode is not TMResourceDisplayMode.CANONICAL_ACTIVE
             or not status.exact_available
@@ -1290,6 +1314,11 @@ class EditorController:
             repository.config_dir
         )
         self._tm_adapter = tm_adapter
+        from tm_application_composition import TMResourceResolver
+        self._tm_resource_resolver = (
+            TMResourceResolver() if tm_adapter is None
+            else tm_adapter._resource_resolver_for_controller()
+        )
         self._tm_query_lock = RLock()
         self._rpy_project_session = None
         self._issued_file_jobs: dict[int, ControllerFileJob] = {}
@@ -1412,10 +1441,17 @@ class EditorController:
         self._term_matcher_handoff: MatcherHandoffSnapshot | None = None
         self._term_store = TermbaseStore()
         from tmx_resource_package_handler import TmxResourcePackagePayloadHandler
+        from tm_resource_port import TMResourceSnapshotPort
+
+        self._tm_resource_port = TMResourceSnapshotPort(
+            repository.platform_backend,
+            owner_resolver=self._tm_resource_resolver.owner_for_resource,
+        )
 
         self._resource_portability = ResourcePortabilityService(
             repository,
             termbase_store=self._term_store,
+            tm_port=self._tm_resource_port,
             tmx_payload_handler=TmxResourcePackagePayloadHandler(),
         )
         self.reload_resources(_refresh_runtime=False)
@@ -4591,6 +4627,10 @@ class EditorController:
             if not resource.active or not resource.lookup:
                 continue
             if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                try:
+                    self._tm_resource_resolver._reprove_legacy_binding(resource)
+                except OSError:
+                    continue
                 engine = self._tm_engines.get(resource.id)
                 match = engine.query_exact(source) if engine is not None else None
                 if match is not None:
@@ -4787,6 +4827,11 @@ class EditorController:
                         or not resource.update
                     ):
                         continue
+                    try:
+                        self._tm_resource_resolver._reprove_legacy_binding(resource)
+                    except OSError:
+                        errors.append(f"{resource.name}: translation memory is unavailable")
+                        continue
                     engine = self._tm_engines.get(resource.id)
                     if engine is None:
                         errors.append(
@@ -4930,7 +4975,17 @@ class EditorController:
                 raise EditorControllerError(
                     "TM activation requires a translation memory resource"
                 )
-            service = _initial_tm_activation_service(config)
+            try:
+                service = _initial_tm_activation_service(
+                    config,
+                    coordinator=self._tm_resource_resolver._operation_owner(
+                        config, initial=True,
+                    ),
+                )
+            except (OSError, ValueError) as error:
+                raise EditorControllerError(
+                    "TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE"
+                ) from error
             action = "INITIAL"
             try:
                 preflight = service.preflight(config.path)
@@ -5026,7 +5081,10 @@ class EditorController:
                     "TM rebuild requires a translation memory resource"
                 )
             try:
-                service = _tm_rebuild_service(config)
+                service = _tm_rebuild_service(
+                    config,
+                    coordinator=self._tm_resource_resolver._operation_owner(config),
+                )
             except (OSError, UnicodeError, ValueError) as error:
                 raise EditorControllerError(
                     "TM rebuild canonical resource is unavailable"
@@ -5097,7 +5155,10 @@ class EditorController:
                     "TM re-attestation requires a translation memory resource"
                 )
             try:
-                service = _tm_reattestation_service(config)
+                service = _tm_reattestation_service(
+                    config,
+                    coordinator=self._tm_resource_resolver._operation_owner(config),
+                )
             except (OSError, UnicodeError, ValueError) as error:
                 raise EditorControllerError(
                     "TM.RUNTIME.CANONICAL_REATTESTATION_NOT_APPLICABLE"
@@ -5302,11 +5363,15 @@ class EditorController:
 
         if outcome is not None and service_canonical_store_id is not None:
             try:
-                self._refresh_runtime_for_activation_outcome(
+                stopped_status = self._refresh_runtime_for_activation_outcome(
                     resource_id=resource_id,
                     outcome=outcome,
                     service_canonical_store_id=service_canonical_store_id,
                 )
+                if stopped_status is not None:
+                    succeeded = False
+                    safe_code = stopped_status.safe_codes[0]
+                    retryable = stopped_status.retryable
             except (ValueError, OSError, UnicodeError):
                 succeeded = False
                 safe_code = "TM.ACTIVATION.RUNTIME_REFRESH_FAILED"
@@ -5341,7 +5406,7 @@ class EditorController:
         resource_id: str,
         outcome: MigrationReport | MigrationFailure,
         service_canonical_store_id: str,
-    ) -> None:
+    ) -> TMResourceStatus | None:
         """Prevalidate and atomically publish one Core-outcome runtime graph."""
 
         if type(resource_id) is not str or not resource_id.strip():
@@ -5372,16 +5437,17 @@ class EditorController:
                         "activation completion resource is unavailable"
                     )
                 tm_engines: dict[str, TMEngine] | None = None
+                stopped_status: TMResourceStatus | None = None
 
                 def validate_candidate(snapshot: object) -> None:
                     from tm_application_composition import TMRuntimeSnapshot
 
-                    nonlocal tm_engines
+                    nonlocal tm_engines, stopped_status
                     if type(snapshot) is not TMRuntimeSnapshot:
                         raise TypeError(
                             "activation runtime candidate must be TMRuntimeSnapshot"
                         )
-                    _validate_activation_runtime_candidate(
+                    stopped_status = _validate_activation_runtime_candidate(
                         snapshot,
                         resource_id=resource_id,
                         outcome=outcome,
@@ -5421,38 +5487,7 @@ class EditorController:
                         )
 
                 if adapter is None:
-                    from tm_application_composition import TMResourceResolver
-
-                    target_engine = self._load_tm_engine(
-                        target_config.path,
-                        target_config.id,
-                    )
-                    _validate_activation_compatibility_engine(
-                        target_engine,
-                        outcome,
-                        service_canonical_store_id=(
-                            service_canonical_store_id
-                        ),
-                    )
-                    # A cold-open engine may retain LKG after source divergence.
-                    # Re-prove the complete lifecycle state before completion.
-                    _validate_activation_runtime_candidate(
-                        TMResourceResolver().resolve((target_config,)),
-                        resource_id=resource_id,
-                        outcome=outcome,
-                        service_canonical_store_id=service_canonical_store_id,
-                    )
-                    tm_engines = {
-                        config.id: (
-                            target_engine
-                            if config.id == resource_id
-                            else self._load_tm_engine(config.path, config.id)
-                        )
-                        for config in configs
-                        if config.active
-                        and config.kind
-                        is ResourceKind.TRANSLATION_MEMORY
-                    }
+                    validate_candidate(self._tm_resource_resolver.resolve(configs))
                 else:
                     _ = adapter._refresh_runtime_after_activation(
                         configs,
@@ -5466,6 +5501,7 @@ class EditorController:
                 if adapter is not None and self._project is not None:
                     _ = self._query_and_issue_current_tm_report()
                 self._tm_runtime_blocked_safe_code = None
+                return stopped_status
             except BaseException:
                 if _activation_outcome_requires_query_block(outcome):
                     if self._tm_runtime_blocked_safe_code is None:
@@ -5512,9 +5548,7 @@ class EditorController:
             configs = self.repository.list_resources()
             adapter = self._tm_adapter
             if adapter is None:
-                from tm_application_composition import TMResourceResolver
-
-                runtime = TMResourceResolver().resolve(configs)
+                runtime = self._tm_resource_resolver.resolve(configs)
                 runtime.__post_init__()
                 statuses = tuple(replace(status) for status in runtime.statuses)
                 retrieval_status = RetrievalDisplayState(
@@ -5554,7 +5588,16 @@ class EditorController:
                     if config is None:
                         classified.append(status)
                         continue
-                    service = _initial_tm_activation_service(config)
+                    try:
+                        service = _initial_tm_activation_service(
+                            config,
+                            coordinator=self._tm_resource_resolver._operation_owner(
+                                config, initial=True,
+                            ),
+                        )
+                    except (OSError, ValueError):
+                        classified.append(status)
+                        continue
                     try:
                         service.preflight_pending_recovery(config.path)
                     except MigrationPreflightError as error:
@@ -5577,6 +5620,18 @@ class EditorController:
                             )
                         )
                 statuses = tuple(classified)
+
+            stopped = {
+                status.resource_id for status in statuses
+                if status.mode is TMResourceDisplayMode.UNAVAILABLE
+            }
+            if stopped and (
+                any(item.resource_id in stopped for item in self._issued_tm_suggestions)
+                or any(item.resource_id in stopped for item in self._issued_legacy_tm_suggestions)
+            ):
+                # A fresh owner refusal revokes old issued results through the
+                # existing epoch, without declaring healthy peers unavailable.
+                self._advance_tm_query_epoch()
 
             current_report = self._current_tm_report
             if current_report is not None:
@@ -6870,6 +6925,7 @@ class EditorController:
         service = ResourcePortabilityService(
             self.repository,
             termbase_store=self._term_store,
+            tm_port=self._tm_resource_port,
             tmx_payload_handler=handler,
         )
         with self._tm_query_lock:
@@ -6942,6 +6998,7 @@ class EditorController:
             except ResourcePortabilityError as error:
                 raise EditorControllerError(error.code) from error
             try:
+                self._retain_imported_tm_owner(result.destination_resource_id)
                 self._reload_resources_after_persisted_mutation()
             except EditorControllerError as error:
                 try:
@@ -6976,6 +7033,8 @@ class EditorController:
                 raise EditorControllerError(error.code) from error
             if outcome.receipt is not None:
                 try:
+                    if outcome.receipt.destination_resource_id is not None:
+                        self._retain_imported_tm_owner(outcome.receipt.destination_resource_id)
                     self._reload_resources_after_persisted_mutation()
                 except EditorControllerError as error:
                     try:
@@ -6988,6 +7047,23 @@ class EditorController:
                         "RESOURCE.IMPORT.RECOVERY_REQUIRED"
                     ) from error
             return outcome
+
+    def _retain_imported_tm_owner(self, resource_id: str) -> None:
+        """Attach a durable import or revoke its superseded query authority."""
+
+        try:
+            resource = self.repository.get(resource_id)
+            if resource.kind is ResourceKind.TRANSLATION_MEMORY:
+                self._tm_resource_resolver._retain_published_owner(
+                    resource, self._tm_resource_port.owner_for_resource(resource),
+                )
+        except (ResourceError, ResourcePortabilityError, OSError, ValueError,
+                SQLiteStoreSchemaError) as error:
+            if self._tm_adapter is None:
+                self._advance_tm_query_epoch()
+            else:
+                self._latch_persisted_runtime_refresh_failure()
+            raise EditorControllerError("RESOURCE.IMPORT.RECOVERY_REQUIRED") from error
 
     def preview_termbase_import(
         self,
@@ -7234,7 +7310,9 @@ class EditorController:
                         glossary_engines,
                         term_records,
                         term_handoff,
-                    ) = self._build_resource_engine_sets(configs)
+                    ) = self._build_resource_engine_sets(
+                        configs, runtime_snapshot=self._tm_resource_resolver.resolve(configs),
+                    )
                 elif not _refresh_runtime:
                     if configs:
                         initial_runtime = adapter._capture_runtime_for_controller(

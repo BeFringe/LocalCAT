@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Any, cast
 import unittest
@@ -51,6 +52,7 @@ from tests.test_capability_host_gate_d import (
     _gate_d_owner,
 )
 from tests.test_editor_controller_tm_activation_completion import (
+    _activation_test_root,
     _fixture as _activation_fixture,
 )
 from tests.test_editor_tm_adapter_mixed import (
@@ -374,7 +376,9 @@ class Feature5UIResourceFailureMatrixTests(unittest.TestCase):
                     (
                         "tm.fixture.primary",
                         TMResourceDisplayMode.DEGRADED,
-                        ("HEALTH", "RETRIEVAL.QUERY_FAILED"),
+                        # POSIX opens SQL during family lease admission;
+                        # Windows retains the query-view health check.
+                        ("HEALTH" if sys.platform == "win32" else "LEASE", "RETRIEVAL.QUERY_FAILED"),
                     ),
                     (
                         "tm.fixture.secondary",
@@ -563,7 +567,7 @@ class Feature5UIActivationFailureMatrixTests(unittest.TestCase):
             )
 
     def test_diverged_update_failure_keeps_canonical_lkg_not_jsonl(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _activation_test_root() as temporary:
             root = Path(temporary).resolve()
             controller, runtime, repository, resource_id = _activation_fixture(
                 root

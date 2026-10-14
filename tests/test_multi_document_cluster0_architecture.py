@@ -229,7 +229,11 @@ _APPLICATION_WORKSPACE_IMPORT_ALLOWLIST = {
             "resource_package_contracts.ResourceRecoveryOutcome",
             "resource_package_contracts.ResourceRecoveryPreview",
             "resource_portability.ResourcePortabilityService",
+            "tm_resource_port.TMResourceSnapshotPort",
         }
+    ),
+    "tm_application_composition": frozenset(
+        {"resource_package_contracts.ResourcePortabilityError"}
     ),
     "project_search": frozenset(
         {

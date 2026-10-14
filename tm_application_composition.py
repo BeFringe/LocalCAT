@@ -24,14 +24,17 @@ from editor_contracts import (
 )
 from tm_activation_journal import ActivationPreparationError
 from tm_contracts import (
+    CanonicalResourceIdentity,
     SourceBindingState,
     StoreHealth,
     TMRecordDraft,
     TMResourceHandle,
     TMStore,
 )
-from tm_engine import SourceUnit, TMEngine, TMMatch
+from tm_engine import SourceUnit, TMEngine, TMMatch, open_canonical_tm_store
 from tm_sqlite_store import (
+    ResourceStoreCoordinator,
+    SQLiteTMStore,
     SQLiteStoreSchemaError,
     SourceBindingObservation,
 )
@@ -602,6 +605,11 @@ class TMRuntimeHost:
         with self._lock:
             return self._snapshot
 
+    def _resource_resolver_for_controller(self) -> TMResourceResolver:
+        if type(self._resolver) is not TMResourceResolver:
+            raise TypeError("application resource operations require TMResourceResolver")
+        return self._resolver
+
     def capture_operation_snapshot(self) -> TMRuntimeSnapshot:
         """Return a defensive snapshot bound to the current published graph."""
 
@@ -615,6 +623,26 @@ class TMRuntimeHost:
             return _clone_runtime_snapshot(
                 self._operation_template,
                 generation=self._operation_template.generation,
+            )
+
+    def _capture_operation_snapshot_with_configs(
+        self,
+    ) -> tuple[TMRuntimeSnapshot, tuple[ResourceConfig, ...]]:
+        """Capture write selection and runtime facts from one publication."""
+
+        with self._lock:
+            if not _runtime_snapshot_matches_private_binding(
+                self._snapshot,
+                self._operation_template,
+                self._configs,
+            ):
+                raise ValueError("runtime snapshot drift")
+            return (
+                _clone_runtime_snapshot(
+                    self._operation_template,
+                    generation=self._operation_template.generation,
+                ),
+                _clone_resource_configs(self._configs),
             )
 
     def _inspect_resource_statuses(
@@ -852,6 +880,117 @@ class TMResourceResolver:
         if not callable(runtime_open):
             raise TypeError("runtime_open must be callable")
         self._runtime_open = runtime_open
+        # Retain the actual open bindings independently of their routing ports.
+        # UNAVAILABLE removes a port, not the original Core family's lifetime.
+        self._bindings: dict[str, tuple[Path, RuntimeOpenBinding]] = {}
+        self._binding_lock = threading.RLock()
+
+    def _open_bound(self, path: Path, resource_id: str) -> RuntimeOpenBinding:
+        with self._binding_lock:
+            prior = self._bindings.get(resource_id)
+            if prior is not None and prior[0] != path:
+                raise ValueError("TM.CANONICAL_IDENTITY_CHANGED")
+            previous = None if prior is None else prior[1]
+            owner = _binding_owner(previous)
+            if (
+                self._runtime_open is _open_runtime_binding
+                and owner is not None
+                and owner.current_generation is not None
+            ):
+                binding = CanonicalOpenBinding(
+                    resource_id=resource_id,
+                    store=SQLiteTMStore.from_coordinator(owner),
+                )
+            else:
+                # In the legacy lane the public factory itself re-proves the
+                # retained family; None remains solely a Core classification.
+                binding = self._runtime_open(path, resource_id)
+                if (
+                    type(binding) is LegacyOpenBinding
+                    and type(binding.backend) is _TMEngineLegacyBackend
+                ):
+                    binding = LegacyOpenBinding(backend=_TMEngineLegacyBackend(
+                        binding.backend._compatibility_engine(), owner=owner,
+                    ))
+            self._bindings[resource_id] = (path, binding)
+            return binding
+
+    def _operation_owner(
+        self, config: ResourceConfig, *, initial: bool = False,
+    ) -> ResourceStoreCoordinator | None:
+        """Retain an application-created legacy owner before issuing a service."""
+        with self._binding_lock:
+            had_binding = config.id in self._bindings
+            try:
+                binding = self._open_bound(config.path, config.id)
+            except (OSError, ValueError, SQLiteStoreSchemaError) as error:
+                if had_binding:
+                    raise ValueError(_CANONICAL_AUTHORITY_UNAVAILABLE_CODE) from error
+                # A never-opened cold resource can still use the existing
+                # explicit pending-recovery/device-only maintenance route.
+                return None
+            if type(binding) is CanonicalOpenBinding:
+                try:
+                    _probe_canonical_status(config, binding)
+                except _ResourcePreconditionFailure as error:
+                    raise ValueError(error.code) from error
+                return _binding_owner(binding)
+            if (
+                type(binding) is LegacyOpenBinding
+                and type(binding.backend) is _TMEngineLegacyBackend
+            ):
+                if initial and binding.backend._owner is None:
+                    binding.backend._owner = ResourceStoreCoordinator(
+                        resource_identity=CanonicalResourceIdentity.from_configured_jsonl(
+                            config.id, config.path,
+                        ),
+                        canonical_store_id=f"store.{config.id}",
+                    )
+                return binding.backend._owner
+            return None
+
+    def _reprove_legacy_binding(self, config: ResourceConfig) -> None:
+        """Check the retained owner without replacing a compatibility LKG."""
+        with self._binding_lock:
+            prior = self._bindings.get(config.id)
+            if prior is None:
+                return
+            if prior[0] != config.path:
+                raise OSError(_CANONICAL_AUTHORITY_UNAVAILABLE_CODE)
+            binding = prior[1]
+            if (
+                type(binding) is LegacyOpenBinding
+                and type(binding.backend) is _TMEngineLegacyBackend
+            ):
+                binding.backend._reprove_legacy_owner()
+
+    def owner_for_resource(self, config: ResourceConfig) -> ResourceStoreCoordinator:
+        """Supply the canonical binding to the existing Resource snapshot port."""
+        owner = self._operation_owner(config)
+        if owner is None or owner.current_generation is None:
+            # Ordinary legacy is not a permanently failed canonical open.
+            from resource_package_contracts import ResourcePortabilityError
+            raise ResourcePortabilityError("RESOURCE.IMPORT.RECOVERY_REQUIRED")
+        return owner
+
+    def _retain_published_owner(
+        self, config: ResourceConfig, owner: ResourceStoreCoordinator,
+    ) -> None:
+        """Receive a Resource create owner before the normal runtime refresh."""
+        store = SQLiteTMStore.from_coordinator(owner)
+        TMEngine.from_open_canonical_store(
+            store, configured_jsonl=config.path, expected_resource_id=config.id,
+        )
+        with self._binding_lock:
+            prior = self._bindings.get(config.id)
+            if prior is not None:
+                # Re-prove an existing binding through Core before accepting
+                # the published facade. Coordinator object identity is not
+                # resource-family identity.
+                self._operation_owner(config)
+            self._bindings[config.id] = (
+                config.path, CanonicalOpenBinding(resource_id=config.id, store=store),
+            )
 
     def resolve(
         self,
@@ -865,6 +1004,10 @@ class TMResourceResolver:
         """
 
         _validate_configs(configs)
+        configured_ids = {config.id for config in configs}
+        with self._binding_lock:
+            for resource_id in self._bindings.keys() - configured_ids:
+                del self._bindings[resource_id]
         global_order = tuple(
             (config.id, position)
             for position, config in enumerate(configs)
@@ -878,7 +1021,7 @@ class TMResourceResolver:
             if config.kind is not ResourceKind.TRANSLATION_MEMORY:
                 continue
             try:
-                binding = self._runtime_open(config.path, config.id)
+                binding = self._open_bound(config.path, config.id)
             except (
                 FileNotFoundError,
                 PermissionError,
@@ -1006,13 +1149,26 @@ class TMResourceResolver:
         )
 
 
+def _binding_owner(
+    binding: RuntimeOpenBinding | None,
+) -> ResourceStoreCoordinator | None:
+    if type(binding) is CanonicalOpenBinding and type(binding.store) is SQLiteTMStore:
+        return binding.store.coordinator
+    if type(binding) is LegacyOpenBinding and type(binding.backend) is _TMEngineLegacyBackend:
+        return binding.backend._owner
+    return None
+
+
 class _TMEngineLegacyBackend:
     """Mechanical contract adapter around the existing legacy TM owner."""
 
-    def __init__(self, engine: TMEngine) -> None:
+    def __init__(
+        self, engine: TMEngine, *, owner: ResourceStoreCoordinator | None = None,
+    ) -> None:
         if type(engine) is not TMEngine or engine.canonical_store is not None:
             raise ValueError("legacy backend requires the classified legacy engine")
         self._engine = engine
+        self._owner = owner
 
     def _compatibility_engine(self) -> TMEngine:
         """Retain the exact owner selected by this runtime's classification."""
@@ -1025,9 +1181,11 @@ class _TMEngineLegacyBackend:
         speaker_raw: str | None,
     ) -> TMMatch | None:
         del speaker_raw
+        self._reprove_legacy_owner()
         return self._engine.query_exact(source)
 
     def append(self, draft: TMRecordDraft) -> None:
+        self._reprove_legacy_owner()
         unit = SourceUnit(
             id="localcat-runtime-append",
             text=draft.source_raw,
@@ -1038,6 +1196,18 @@ class _TMEngineLegacyBackend:
         )
         if not self._engine.save_record(unit, draft.target_raw):
             raise LegacyAppendOperationError()
+
+    def _reprove_legacy_owner(self) -> None:
+        if self._owner is None:
+            return
+        try:
+            store = open_canonical_tm_store(
+                self._engine.tm_path, expected_resource_id=self._owner.resource_id,
+            )
+            if store is not None:
+                raise ValueError("TM.CANONICAL_LEGACY_BINDING_RETIRED")
+        except (OSError, ValueError, SQLiteStoreSchemaError) as error:
+            raise OSError("TM.RUNTIME.CANONICAL_AUTHORITY_UNAVAILABLE") from error
 
 
 def _open_runtime_binding(

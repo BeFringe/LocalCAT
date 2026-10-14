@@ -344,7 +344,7 @@ class EditorTMAdapterAppendTests(unittest.TestCase):
                 },
             )
             runtime_box.append(runtime)
-            original_capture = TMRuntimeHost.capture_operation_snapshot
+            original_capture = TMRuntimeHost._capture_operation_snapshot_with_configs
             captures: list[TMRuntimeHost] = []
 
             def capture_once(host: TMRuntimeHost):  # type: ignore[no-untyped-def]
@@ -353,7 +353,7 @@ class EditorTMAdapterAppendTests(unittest.TestCase):
 
             with patch.object(
                 TMRuntimeHost,
-                "capture_operation_snapshot",
+                "_capture_operation_snapshot_with_configs",
                 autospec=True,
                 side_effect=capture_once,
             ):

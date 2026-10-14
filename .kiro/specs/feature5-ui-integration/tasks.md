@@ -487,7 +487,7 @@
 
 本组消费共享平台 Task 11.0 的非并行治理闭合前置，并沿下列 Core/ResourcePortability 依赖进入实现。共享治理 owner 提供唯一 ADR-033 治理提交与开发基线继承关系，四 owner 范围一致；本组不重建治理任务或资源恢复状态机。
 
-- [ ] 10.1 集成共享资源会话与局部停止投影
+- [x] 10.1 集成共享资源会话与局部停止投影
   - Application runtime/resolver 与 ResourcePort 消费同一原 Core 家族会话；刷新或重建 runtime 不以新建 engine、路径重绑清除失效，同物理家族冲突消费 Core 协调或拒绝结果。
   - 使用原 frozen status/report 和安全 code 表达受影响资源不可用与恢复要求；Core 不能证明 legacy/LKG 可用时不回退，source divergence 与位置失效分别分类。
   - 失效后停止该资源的新查询、写回、导入与重复激活，撤销其旧结果；晚到完成、刷新或 Fuzzy 通知不能恢复已撤销的 owner。其他健康 TM、术语及不冲突的项目编辑和保存继续。
@@ -496,7 +496,7 @@
   - _Depends: windows-platform-enablement 11.0, tm-storage-retrieval-index 10.1, tm-storage-retrieval-index 10.7, language-resource-portability 6.1_
   - _Requirements: 5.6, 5.9, 6.5, 6.6, 6.14_
 
-- [ ] 10.2 验证资源停止、晚到结果与独立项目结果
+- [x] 10.2 验证资源停止、晚到结果与独立项目结果
   - 复用原 7.4 失败矩阵，经已组合的 Application runtime/ResourcePort 调用真实 Core owner，验证首次失败只在原 legacy 可证时保留、更新失败只在 LKG 可证时保留，失效资源再次查询/写回/导入/激活均拒绝。
   - 验证 activation/query completion、runtime refresh 和 Fuzzy 完成通知不能复活旧授权，目录失效不进入 ADR-016 device-only 重证或新的验证按钮。
   - 同时验证健康 peer TM 与术语结果继续，项目 target 编辑和保存按既有 owner 约束可用；确认写回失败不伪报成功，也不改写原确认/导航规则。
@@ -506,6 +506,10 @@
   - _Requirements: 5.6, 5.9, 6.5, 6.6, 6.14_
 
 ## Implementation Notes
+
+- Task 10.2：不可用导致端口撤销，不等于用户取消 Active+Update 写回选择；确认结果仍须包含该目标的失败。设置页只读重观察不发布 runtime，具体安全码应对照操作实际捕获的同代状态。
+
+- Task 10.1：资源包已发布后，Application 交接失败仍需撤销旧建议；COMPLETE 只处理既有恢复事实，不能把交接异常当作未发生持久化。后续晚到结果验证应覆盖此窗口。
 
 - Task 9.2a：实际 ProjectPackage 应用建议暴露了 Controller 在 runtime generation 提交锁内重新读取同一代次的死锁。workspace target 提交仍在原 reservation 内完成，并立即递增 query epoch、清除旧建议；仅将新基线捕获延至下一次查询同步，保留过期拒绝与并发换代保护。局部修复及 source 回归不代答同候选产品验收，任务继续未完成。
 

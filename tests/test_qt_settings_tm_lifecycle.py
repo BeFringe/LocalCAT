@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from threading import Event
 import time
@@ -104,6 +106,10 @@ def _controller(
             ("Hello", f"你好 {index + 1}"),
         )
         resource_ids.append(resource.id)
+    return _open_controller(repository), tuple(resource_ids)
+
+
+def _open_controller(repository: ResourceRepository) -> EditorController:
     runtime_host = TMRuntimeHost(
         resolver=TMResourceResolver(),
         configs=repository.list_resources(),
@@ -119,7 +125,7 @@ def _controller(
             segments=(EditorSegment(id="segment-1", source="Hello"),),
         )
     )
-    return controller, tuple(resource_ids)
+    return controller
 
 
 class QtSettingsTMLifecycleTests(unittest.TestCase):
@@ -319,20 +325,46 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
 
     def test_platform_requalification_action_is_separate_from_fuzzy(self) -> None:
         with _activation_test_root() as root:
-            controller, (resource_id,) = _controller(root)
-            preflight = controller.prepare_tm_activation(resource_id)
-            started = controller.activate_tm_resource(preflight)
-            completed = controller.wait_tm_activation(
-                started.operation_id,
-                timeout=20.0,
+            # A completed app run must release its Core owner before the
+            # durable device attestation is changed to simulate a reboot.
+            activation = subprocess.run(
+                [sys.executable, "-B", "-c", """
+from pathlib import Path
+import sys
+from tests.test_qt_settings_tm_lifecycle import _controller
+controller, (resource_id,) = _controller(Path(sys.argv[1]))
+preflight = controller.prepare_tm_activation(resource_id)
+started = controller.activate_tm_resource(preflight)
+completed = controller.wait_tm_activation(started.operation_id, timeout=20.0)
+assert completed.succeeded, completed
+""", str(root)],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                timeout=40.0,
             )
-            self.assertTrue(completed.succeeded)
-            config = controller.repository.get(resource_id)
+            self.assertEqual(activation.returncode, 0, activation.stdout + activation.stderr)
+            repository = ResourceRepository(root / "app-data")
+            (config,) = (
+                item for item in repository.list_resources()
+                if item.kind is ResourceKind.TRANSLATION_MEMORY
+            )
+            resource_id = config.id
             identity = CanonicalResourceIdentity.from_configured_jsonl(
                 resource_id,
                 config.path,
             )
             journal_path = _activation_journal_path(identity)
+            preserved_paths = (
+                config.path, identity.canonical_sidecar_path, identity.snapshot_manifest_path,
+            )
+            original_bytes = tuple(path.read_bytes() for path in preserved_paths)
+            if os.name != "nt":
+                _rewrite_persisted_devices(
+                    journal_path,
+                    persisted_device=config.path.stat().st_dev + 17,
+                )
+            controller = _open_controller(repository)
             if os.name == "nt":
                 self.assertFalse(journal_path.exists())
                 dialog = QtSettingsDialog(controller)
@@ -357,10 +389,6 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 )
                 dialog.close()
                 return
-            _rewrite_persisted_devices(
-                journal_path,
-                persisted_device=config.path.stat().st_dev + 17,
-            )
             dialog = QtSettingsDialog(controller)
             dialog.show()
             self._events()
@@ -405,6 +433,10 @@ class QtSettingsTMLifecycleTests(unittest.TestCase):
                 TMResourceDisplayMode.CANONICAL_ACTIVE,
             )
             self.assertIn("已完成", dialog.status_label.text())
+            self.assertEqual(
+                tuple(path.read_bytes() for path in preserved_paths),
+                original_bytes,
+            )
             dialog.close()
 
     def test_open_and_refresh_are_read_only_and_show_legacy_status(self) -> None:
