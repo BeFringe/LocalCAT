@@ -455,6 +455,14 @@ class _StoreValidationPort(Protocol):
 
     posix_activation_borrow: _CallerHeldPosixActivationBorrow | None
     receipt_handoff: _PosixReceiptHandoff | None
+    allow_legacy_predecessor: bool
+
+    @property
+    def schema_sql_close_pending(self) -> bool: ...
+
+    def begin_discovered_schema_predecessor(self) -> None: ...
+
+    def finish_discovered_schema_predecessor(self) -> None: ...
 
     @property
     def resource_identity(self) -> CanonicalResourceIdentity: ...
@@ -571,6 +579,8 @@ class _StoreValidationPort(Protocol):
         _expected_active_generation: int | None = None,
         _expected_activation_digest: str | None = None,
     ) -> Any: ...
+    def unique_character_ngrams(self, folded_text: str, gram_size: int) -> tuple[str, ...]: ...
+
     def validate_candidate_proof_index(
         self,
         connection: sqlite3.Connection,
@@ -5320,6 +5330,41 @@ def _recovery_jsonl_winners_digest(
     return digest.hexdigest()
 
 
+def _validate_legacy_activation_indexes(
+    port: _StoreValidationPort, connection: sqlite3.Connection,
+    *, fts5_available: bool,
+) -> None:
+    """Stream the frozen v1 raw/fold/unique-gram and FTS data plane."""
+    from text_matcher import fold_text_v1
+
+    sizes = (1, 2) if fts5_available else (1, 2, 3)
+    with ExitStack() as cursors:
+        records = connection.execute(
+            "SELECT record_id, source_raw, source_fold_v1 FROM tm_record ORDER BY record_id"
+        )
+        cursors.callback(records.close)
+        grams = connection.execute(
+            "SELECT record_id, gram_size, gram FROM tm_gram ORDER BY record_id, gram_size, gram"
+        )
+        cursors.callback(grams.close)
+        fts = None
+        if fts5_available:
+            fts = connection.execute("SELECT record_id, source_fold_v1 FROM tm_fts ORDER BY record_id")
+            cursors.callback(fts.close)
+        while batch := records.fetchmany(256):
+            for record_id, raw, folded in batch:
+                if fold_text_v1(raw).folded_text != folded:
+                    raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+                for size in sizes:
+                    for gram in sorted(port.unique_character_ngrams(folded, size)):
+                        if grams.fetchone() != (record_id, size, gram):
+                            raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+                if fts is not None and fts.fetchone() != (record_id, folded):
+                    raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+        if grams.fetchone() is not None or (fts is not None and fts.fetchone() is not None):
+            raise port.store_schema_error("STORE.CANDIDATE_INDEX_INVALID")
+
+
 def _recover_activation_indexes(
     port: _StoreValidationPort,
     connection: sqlite3.Connection,
@@ -5859,9 +5904,11 @@ def _device_only_rebound_completed_record(
             ),
         ),
     )
+    borrow = port.posix_activation_borrow
+    exists = _lstat_any_entry if borrow is None else borrow.exists
     if (
-        _lstat_any_entry(record.candidate_stage_db_path)
-        or _lstat_any_entry(record.candidate_manifest_temp_path)
+        exists(record.candidate_stage_db_path)
+        or exists(record.candidate_manifest_temp_path)
     ):
         raise ActivationPreparationError(
             "ACTIVATION.REATTESTATION_NOT_APPLICABLE",
@@ -5869,9 +5916,9 @@ def _device_only_rebound_completed_record(
         )
     identity = port.resource_identity
     try:
-        database = _capture_content_file(identity.canonical_sidecar_path)
-        manifest = _capture_content_file(identity.snapshot_manifest_path)
-        source = _capture_content_file(identity.configured_jsonl_path)
+        database = _capture_publication_content(port, identity.canonical_sidecar_path)
+        manifest = _capture_publication_content(port, identity.snapshot_manifest_path)
+        source = _capture_publication_content(port, identity.configured_jsonl_path)
     except ContentAttestationError as error:
         raise ActivationPreparationError(
             "ACTIVATION.REATTESTATION_IDENTITY_INVALID",
@@ -5995,13 +6042,15 @@ def reattest_completed_authority(
         identity = port.resource_identity
         journal_path = _activation_journal_path(identity)
         terminal_path = _activation_terminal_path(identity)
-        journal_identity = _lstat_activation_journal_identity(journal_path)
-        terminal_identity = _lstat_activation_terminal_identity(terminal_path)
+        borrow = port.posix_activation_borrow
+        exists = _lstat_any_entry if borrow is None else borrow.exists
+        journal_identity = _lstat_activation_journal_identity(journal_path, caller_borrow=borrow)
+        terminal_identity = _lstat_activation_terminal_identity(terminal_path, caller_borrow=borrow)
         if (
             journal_identity is None
             or terminal_identity is not None
-            or _lstat_any_entry(_activation_journal_temp_path(journal_path))
-            or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+            or exists(_activation_journal_temp_path(journal_path))
+            or exists(_activation_terminal_temp_path(terminal_path))
         ):
             raise ActivationPreparationError(
                 "ACTIVATION.REATTESTATION_NOT_APPLICABLE",
@@ -6050,13 +6099,15 @@ def completed_authority_requires_reattestation(
     journal_path = _activation_journal_path(identity)
     terminal_path = _activation_terminal_path(identity)
     try:
-        journal_identity = _lstat_activation_journal_identity(journal_path)
-        terminal_identity = _lstat_activation_terminal_identity(terminal_path)
+        borrow = port.posix_activation_borrow
+        exists = _lstat_any_entry if borrow is None else borrow.exists
+        journal_identity = _lstat_activation_journal_identity(journal_path, caller_borrow=borrow)
+        terminal_identity = _lstat_activation_terminal_identity(terminal_path, caller_borrow=borrow)
         if (
             journal_identity is None
             or terminal_identity is not None
-            or _lstat_any_entry(_activation_journal_temp_path(journal_path))
-            or _lstat_any_entry(_activation_terminal_temp_path(terminal_path))
+            or exists(_activation_journal_temp_path(journal_path))
+            or exists(_activation_terminal_temp_path(terminal_path))
         ):
             return False
         record = _load_recovery_journal(
@@ -6131,6 +6182,7 @@ def _revalidate_discovered_active_set(
             active_ref,
             canonical_store_id=canonical_store_id,
             _allow_diverged_runtime=True,
+            _allow_legacy_schema=port.allow_legacy_predecessor,
             _allow_active=True,
             _expected_active_generation=generation,
             _expected_activation_digest=activation_digest,
@@ -6189,6 +6241,7 @@ def _revalidate_discovered_active_set(
                 schema_upgrade = _schema_upgrade_marker(port, connection)
                 if (
                     schema_upgrade is None
+                    and snapshot.schema_version != 1
                     and port.table_count(connection, "tm_record")
                     != binding.receipt.record_count
                 ):
@@ -6196,7 +6249,7 @@ def _revalidate_discovered_active_set(
                 jsonl_parity = _recovery_jsonl_winners_digest(port,
                     identity.configured_jsonl_path
                 )
-                if schema_upgrade is not None:
+                if schema_upgrade is not None or snapshot.schema_version == 1:
                     boundary = _receipt_boundary_record_count(
                         port,
                         facts,
@@ -6217,7 +6270,9 @@ def _revalidate_discovered_active_set(
                     )
                 if not parity_matches:
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
-                _recover_activation_indexes(port,
+                index_validator = (_validate_legacy_activation_indexes
+                    if snapshot.schema_version == 1 else _recover_activation_indexes)
+                index_validator(port,
                     connection,
                     fts5_available=snapshot.fts5_available,
                 )
@@ -6239,11 +6294,15 @@ def _revalidate_discovered_active_set(
     except ActivationPreparationError as error:
         raise error
     except OSError as error:
+        if port.schema_sql_close_pending:
+            raise
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_DISCOVERY_FAILED",
             retryable=True,
         ) from error
     except Exception as error:
+        if port.schema_sql_close_pending:
+            raise
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
             retryable=False,
@@ -7049,6 +7108,8 @@ def _discover_active_canonical(
                 retryable=False,
             )
         return None
+    if port.allow_legacy_predecessor:
+        port.begin_discovered_schema_predecessor()
     discovered_set: tuple[int, bool] | None = None
     if port.posix_activation_borrow is not None:
         try:
@@ -7080,10 +7141,19 @@ def _discover_active_canonical(
             canonical_store_id=port.canonical_store_id,
         )
     except OSError as error:
+        if port.schema_sql_close_pending:
+            raise
         raise ActivationPreparationError(
             "ACTIVATION.RECOVERY_DISCOVERY_FAILED",
             retryable=True,
         ) from error
+    return _adopt_discovered_active_set(port, generation, fts5_available)
+
+
+def _adopt_discovered_active_set(
+    port: _StoreValidationPort, generation: int, fts5_available: bool,
+) -> ActivationRecoveryReport:
+    identity = port.resource_identity
     port.view = _SQLiteGenerationView(
         stage=_canonical_activation_ref(
             identity,
@@ -7093,11 +7163,33 @@ def _discover_active_canonical(
         generation=generation,
         fts5_available=fts5_available,
     )
+    if port.allow_legacy_predecessor:
+        port.finish_discovered_schema_predecessor()
     return ActivationRecoveryReport(
         phase=_ActivationJournalPhase.GENERATION_PUBLISHED.value,
         action="COMPLETED",
         generation=generation,
     )
+
+
+def resume_schema_upgrade_discovery(port: _StoreValidationPort) -> ActivationRecoveryReport:
+    """Continue this owner's pinned discovery after exact SQL close replay.
+
+    The coordinator retains the original guard; this is not cold discovery
+    and never selects another journal, path, or predecessor.
+    """
+    identity = port.resource_identity
+    if not port.allow_legacy_predecessor or port.view is not None:
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_STATE_INVALID", retryable=False)
+    marker = _activation_lineage_marker_state_complete(
+        identity, caller_borrow=port.posix_activation_borrow,
+    )
+    if marker is None:
+        raise ActivationPreparationError("ACTIVATION.LINEAGE_MARKER_INVALID", retryable=False)
+    generation, fts = _revalidate_discovered_active_set(
+        port, identity, canonical_store_id=port.canonical_store_id,
+    )
+    return _adopt_discovered_active_set(port, generation, fts)
 
 
 def _load_recovery_journal(
@@ -7256,6 +7348,49 @@ def _retire_coexisting_terminal(
         terminal_identity,
         **({"caller_borrow": port.posix_activation_borrow} if port.posix_activation_borrow is not None else {}),
     )
+
+
+def _revalidate_recovery_prior_backup(
+    port: _StoreValidationPort,
+    record: _ActivationJournalRecord,
+) -> None:
+    """Close a pending replacement's prior hint against its real backup."""
+
+    prior_id = record.prior_canonical_store_id
+    backup_path = record.prior_db_backup_path
+    if prior_id is None or backup_path is None:
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_PRIOR_SET_INVALID", retryable=False)
+    _require_rollback_backups(record, caller_borrow=port.posix_activation_borrow)
+    identity = port.resource_identity
+    try:
+        with port.open_configured_connection(backup_path, require_existing=True) as connection:
+            port.validate_store_identity(
+                connection, resource_id=identity.resource_id,
+                canonical_store_id=prior_id, target_identity=identity.target_identity,
+            )
+            meta = port.read_meta(connection)
+            prior_status = meta.get("activation_status")
+            if prior_status == "UNPUBLISHED":
+                if record.prior_generation != 0 or "activation_digest" in meta:
+                    raise port.store_schema_error("STORE.ACTIVATION_STATE_INVALID")
+            elif prior_status == "ACTIVE":
+                if (port.meta_int(meta, "generation") != record.prior_generation
+                        or meta.get("activation_digest") is None):
+                    raise port.store_schema_error("STORE.ACTIVATION_STATE_INVALID")
+            else:
+                raise port.store_schema_error("STORE.ACTIVATION_STATE_INVALID")
+            _recovery_prior_completed_binding(
+                port, connection, identity=identity,
+                canonical_store_id=prior_id, record=record,
+            )
+    except (PlatformFileError, OSError, sqlite3.Error, port.store_schema_error) as error:
+        raise ActivationPreparationError(
+            "ACTIVATION.RECOVERY_PRIOR_SET_INVALID", retryable=False,
+            reason_code=getattr(error, "error_code", None),
+        ) from error
+    # SQL and all of its statements have closed before raw identity/hash
+    # observation under the same original root and W1.
+    _require_rollback_backups(record, caller_borrow=port.posix_activation_borrow)
 
 
 def _revalidate_recovery_authority(
@@ -7420,6 +7555,15 @@ def _revalidate_recovery_authority(
                 "ACTIVATION.RECOVERY_VIEW_MISMATCH",
                 retryable=False,
             )
+
+    if (
+        record.prior_canonical_store_id is not None
+        and record.phase in {
+            _ActivationJournalPhase.DB_REPLACED,
+            _ActivationJournalPhase.MANIFEST_PUBLISHED,
+        }
+    ):
+        _revalidate_recovery_prior_backup(port, record)
 
 
 def _complete_prepared_cancellation(

@@ -1,5 +1,5 @@
 {
-  "artifact_digest": "317901da8e1251294cdb7ea7c2efb2fb864eaf436e3d9c3baf563c5369b3cdb9",
+  "artifact_digest": "6480d50c7bec6ec1cc72204ed6e1a77d36a0cac23f88608ba6eece7bc9e5aa0c",
  "artifact_paths": [
   "tm_candidate_index.py",
   "tm_candidate_store_contracts.py",
@@ -11,7 +11,7 @@
   "tm_sqlite_candidate_projection.py",
   "tm_sqlite_store.py"
  ],
-  "build_digest": "781b523a799a047afc54dc706055c2ad45a75bd6bac1724944f1e9e546ea4a8f",
+  "build_digest": "2daae9ac88837e636f12e59961018285eb24274c839980d52e6bc8986b8a93ae",
  "build_paths": [
   "tm_activation_journal.py",
   "tm_candidate_index.py",

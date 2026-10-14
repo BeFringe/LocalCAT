@@ -20,6 +20,7 @@ from tm_activation_journal import (
     _lstat_any_entry,
     _lstat_activation_journal_identity,
     _parse_activation_journal_bytes,
+    _ActivationJournalPhase,
     _read_activation_journal_file,
     _CallerHeldPosixActivationBorrow,
     _parse_activation_lineage_marker_bytes,
@@ -185,6 +186,7 @@ def _journal_activation_facts(
     A pending replacement journal is bound to its candidate store id, so
     the coordinator is bootstrapped with the prior id when one is
     recorded; recovery then re-proves and adopts the correct authority.
+    A completed replacement instead identifies its current candidate.
     """
 
     try:
@@ -209,6 +211,7 @@ def _journal_activation_facts(
     canonical_store_id = (
         record.prior_canonical_store_id
         if record.prior_canonical_store_id is not None
+        and record.phase is not _ActivationJournalPhase.GENERATION_PUBLISHED
         else record.canonical_store_id
     )
     return record.resource_id, canonical_store_id
@@ -231,20 +234,16 @@ def _activation_facts(configured_jsonl: Path, *, caller_borrow: _CallerHeldPosix
         for path in (sidecar, _manifest, journal, terminal, marker)
     ):
         return None
+    # A named candidate is not the current identity while replacement is
+    # pending. Recovery must prove this hint against the prior authority.
+    for transition in (journal, terminal):
+        if _lstat_any_entry(transition, caller_borrow=caller_borrow):
+            return _journal_activation_facts(
+                transition, expected_journal_path=journal,
+                caller_borrow=caller_borrow,
+            )
     if _lstat_any_entry(sidecar, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
         return _sidecar_activation_facts(sidecar, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {}))
-    if _lstat_any_entry(journal, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
-        return _journal_activation_facts(
-            journal,
-            expected_journal_path=journal,
-            caller_borrow=caller_borrow,
-        )
-    if _lstat_any_entry(terminal, **({"caller_borrow": caller_borrow} if caller_borrow is not None else {})):
-        return _journal_activation_facts(
-            terminal,
-            expected_journal_path=journal,
-            caller_borrow=caller_borrow,
-        )
     raise ValueError(_CANONICAL_AMBIGUOUS_CODE)
 
 
@@ -662,7 +661,7 @@ def _open_canonical_tm_store_reserved(
             and error.code
             == "ACTIVATION.ACTIVE_ATTESTATION_IDENTITY_INVALID"
             and coordinator is not None
-            and coordinator.completed_authority_requires_reattestation()
+            and coordinator.completed_authority_requires_reattestation(_borrow=_borrow)
         ):
             raise ValueError(
                 _CANONICAL_REATTESTATION_REQUIRED_CODE

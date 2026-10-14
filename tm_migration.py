@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import nullcontext, ExitStack, contextmanager
 from functools import partial
 import ctypes
 import errno
@@ -23,6 +23,7 @@ from typing import Any, TypedDict, cast
 import uuid
 
 from tm_activation_journal import (
+    _CanonicalStoreRef,
     _append_owned_close_facts,
     _CallerHeldPosixActivationBorrow,
     ActivationRecoveryReport,
@@ -3239,35 +3240,54 @@ class TMMigrationService:
             raise MigrationPreflightError(
                 "MIGRATION.REATTESTATION_OWNER_INVALID"
             )
-        self._validate_source_preconditions(source)
+        if type(source) is not _NATIVE_PATH_TYPE:
+            raise TypeError("source must be an exact native Path")
+        if source != self._resource_identity.configured_jsonl_path:
+            raise MigrationPreflightError("MIGRATION.RESOURCE_IDENTITY_MISMATCH")
+        transition = (
+            coordinator._family_transition(recovery=True)
+            if self._recovery_profile is _RecoveryProfile.POSIX_V2
+            else nullcontext(None)
+        )
         try:
-            reservation = self._acquire_initial_reservation()
-        except _InitialActivationReservationError as error:
-            raise MigrationPreflightError(
-                "MIGRATION.REATTESTATION_LOCK_UNAVAILABLE"
-            ) from error
-        try:
-            with reservation:
-                reservation.reprove()
-                preflight = _scan_jsonl(source)
+            with transition as borrow:
                 try:
-                    recovered = coordinator.reattest_completed_authority()
-                except ActivationPreparationError as error:
-                    raise MigrationPreflightError(error.code) from error
-                reservation.reprove()
-                if recovered.generation is None:
-                    raise MigrationPreflightError(
-                        "MIGRATION.REATTESTATION_RUNTIME_INVALID"
-                    )
-                return self._recovered_reattestation_success_report(
-                    coordinator=coordinator,
-                    preflight=preflight,
-                    generation=recovered.generation,
-                )
+                    with self._acquire_initial_reservation(borrow=borrow) as reservation:
+                        reservation.reprove()
+                        if borrow is None:
+                            self._validate_source_preconditions(source)
+                            preflight = _scan_jsonl(source)
+                        else:
+                            source_read = reservation.open_portable_rooted_read(
+                                source, unavailable_code="MIGRATION.SOURCE_UNREADABLE",
+                            )
+                            try:
+                                preflight = _scan_portable_jsonl(source_read)
+                            finally:
+                                source_read.close()
+                        inputs = reservation.posix_recovery_inputs()
+                        try:
+                            recovered = coordinator.reattest_completed_authority(**inputs)
+                        except ActivationPreparationError as error:
+                            raise MigrationPreflightError(error.code) from error
+                        reservation.reprove()
+                        if recovered.generation is None:
+                            raise MigrationPreflightError("MIGRATION.REATTESTATION_RUNTIME_INVALID")
+                        report = self._recovered_reattestation_success_report(
+                            coordinator=coordinator, preflight=preflight,
+                            generation=recovered.generation, _reservation=reservation,
+                            _activation_borrow=inputs.get("_posix_borrow"),
+                        )
+                        reservation.reprove()
+                    if borrow is not None:
+                        borrow._recovery_completed = True
+                    return report
+                except BaseException:
+                    if borrow is not None:
+                        coordinator._stop_posix_recovery_admission()
+                    raise
         except _InitialActivationReservationError as error:
-            raise MigrationPreflightError(
-                "MIGRATION.REATTESTATION_LOCK_UNAVAILABLE"
-            ) from error
+            raise MigrationPreflightError("MIGRATION.REATTESTATION_LOCK_UNAVAILABLE") from error
 
     def _initial_resource_reservation_failure(
         self,
@@ -4138,6 +4158,8 @@ class TMMigrationService:
         coordinator: ResourceStoreCoordinator,
         preflight: MigrationPreflight,
         generation: int,
+        _reservation: _InitialActivationResourceReservation | None = None,
+        _activation_borrow: _CallerHeldPosixActivationBorrow | None = None,
     ) -> MigrationReport:
         """Project an explicitly re-attested completed generation.
 
@@ -4151,9 +4173,9 @@ class TMMigrationService:
 
         try:
             manifest_payload = (
-                self._resource_identity.snapshot_manifest_path.read_text(
-                    encoding="utf-8"
-                )
+                self._resource_identity.snapshot_manifest_path.read_text(encoding="utf-8")
+                if _activation_borrow is None else _activation_borrow.read_journal(
+                    self._resource_identity.snapshot_manifest_path, None)[0].decode("utf-8")
             )
         except Exception as error:
             if not _is_initial_activation_operational_error(error):
@@ -4204,14 +4226,15 @@ class TMMigrationService:
                 "MIGRATION.REATTESTATION_RUNTIME_INVALID"
             )
         try:
-            if coordinator.durable_activation_phase != "GENERATION_PUBLISHED":
+            if (coordinator.durable_activation_phase if _activation_borrow is None else coordinator._read_durable_activation_phase(caller_borrow=_activation_borrow)) != "GENERATION_PUBLISHED":
                 raise MigrationPreflightError(
                     "MIGRATION.REATTESTATION_RUNTIME_INVALID"
                 )
             store = SQLiteTMStore.from_coordinator(coordinator)
-            health = store.health()
-            revision = store.canonical_revision()
-            with store.query_lease() as query_view:
+            borrow = None if _reservation is None else _reservation._family_borrow
+            health = store.health(_borrow=borrow)
+            revision = store.canonical_revision(_borrow=borrow)
+            with store.query_lease(_borrow=borrow) as query_view:
                 query_health = query_view.health()
         except MigrationPreflightError:
             raise
@@ -7955,6 +7978,7 @@ class TMMigrationService:
         coordinator = self._coordinator
         if coordinator is None:
             raise MigrationPreflightError("SCHEMA.COORDINATOR_UNAVAILABLE")
+        coordinator._prepare_schema_upgrade_predecessor(store_path)
         active_store_path = coordinator.active_store_path
         if (
             type(store_path) is not _NATIVE_PATH_TYPE
@@ -8000,6 +8024,9 @@ class TMMigrationService:
                 _upgrade_source_ref(
                     self._resource_identity,
                     store_path,
+                    canonical_ref=(coordinator._view.stage
+                        if coordinator._view is not None
+                        and isinstance(coordinator._view.stage, _CanonicalStoreRef) else None),
                 ),
                 canonical_store_id=self._canonical_store_id,
                 _stage_borrow=io,
@@ -9911,6 +9938,14 @@ class TMMigrationService:
             )
         if journal_phase is None:
             try:
+                if self._schema_io is not None:
+                    # The consumed ticket handed prior restoration to the
+                    # activation's byte-exact backup. Retire only this live
+                    # attempt's unreported schema artifacts before ordinary
+                    # cancellation checks the remaining pending namespace.
+                    coordinator._retire_schema_upgrade_unpublished_artifacts(
+                        prepared, backup_path=backup_path, backup_identity=backup_identity,
+                    )
                 coordinator.cancel_prepared_activation(prepared)
             except Exception as cancel_error:
                 if _schema_upgrade_error_code(
@@ -13504,12 +13539,13 @@ def _schema_version_of_store(store_path: Path, io: schema_upgrade_module.SchemaU
 def _upgrade_source_ref(
     identity: CanonicalResourceIdentity,
     store_path: Path,
-) -> MutableStageRef:
+    *, canonical_ref: _CanonicalStoreRef | None = None,
+) -> MutableStageRef | _CanonicalStoreRef:
     """Late-bound wrapper; implementation moved to tm_schema_upgrade."""
 
     return schema_upgrade_module._upgrade_source_ref(
         identity,
-        store_path,
+        store_path, canonical_ref=canonical_ref,
     )
 
 

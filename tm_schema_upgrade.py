@@ -43,7 +43,7 @@ import stat
 from typing import Literal, Protocol
 
 from tm_activation_journal import (ActivationPreparationError, _ActivationFileIdentity,
-    _CallerHeldPosixActivationBorrow, _with_owned_close_facts)
+    _CallerHeldPosixActivationBorrow, _CanonicalStoreRef, _with_owned_close_facts)
 from platform_fs_contracts import (BoundExistingFileMutationGuard, CandidateContentFacts, DirectoryObservationCancellation,
     DirectoryObservationLimits, ExistingFileMutationGuard, LockedRootDirectoryObservation,
     MutableFileReservation, OpaqueAuthority, PlatformFileError, PosixStageHandoff, PublishMode)
@@ -1221,13 +1221,21 @@ def _schema_version_of_store(
 def _upgrade_source_ref(
     identity: CanonicalResourceIdentity,
     store_path: Path,
-) -> MutableStageRef:
+    *, canonical_ref: _CanonicalStoreRef | None = None,
+) -> MutableStageRef | _CanonicalStoreRef:
     """One inspection ref over the active old-schema store path.
 
     The inspection only reads the database, so the structural manifest
     temporary is a distinct adjacent placeholder (the published manifest
     path is deliberately never reused as a stage temporary).
     """
+
+    if canonical_ref is not None:
+        if (type(canonical_ref) is not _CanonicalStoreRef
+                or canonical_ref.resource_identity != identity
+                or canonical_ref.staged_db_path != store_path):
+            raise ValueError("canonical inspection ref mismatch")
+        return canonical_ref
 
     return MutableStageRef(
         stage_id="stage.schema-upgrade.source",

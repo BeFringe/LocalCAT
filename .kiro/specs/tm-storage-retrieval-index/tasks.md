@@ -729,6 +729,10 @@
 
 ## Implementation Notes
 
+- Task 10.11／Resource 6.1：显式旧 canonical 升级须由原 discovery factory 证明 v1 内容、ancestry 和历史 snapshot binding；普通 runtime cold open 不因此自动接受旧 schema。合法 append 后的完成态重开消费当前 DB 验证，不能重新要求最初 activation 字节证明。
+
+- Task 10.11／Resource 6.1：首次 journal 未命名失败后，冗余 schema 备份退休须保留本 attempt 的确切 preparation 和继续点；先证明完整 prior 与替代 activation backup，再退休并取消。此前恢复成功的标记不能释放当前失败的准入。
+
 - Task 10.10／10.11：合法 refresh 后的 current binding 不再等同最初 activation receipt，冷重开须分别证明两者。导出 prior 可只有 JSONL，恢复须逐槽消费 handoff 的原 identity／digest／明确缺席事实；新旧摘要相同不能证明同一对象。
 
 - Task 10.10／Resource 6.1：同一家族操作可能先恢复旧 receipt 再发布新快照，提交事实须归属本次 receipt。handoff 清空的终态任意导出不再是 canonical 冷开的目录依赖；仍待恢复的输出保留原目录证明要求。
