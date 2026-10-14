@@ -92,6 +92,9 @@ class ResourceArtifactSaveService:
         pending: PendingPublication | None = None
         lkg_name: str | None = None
         lkg_identity: FileObjectIdentity | None = None
+        lkg_candidate: CandidateFile | None = None
+        lkg_candidate_name: str | None = None
+        lkg_candidate_identity: FileObjectIdentity | None = None
         published = False
         before: EntrySnapshot | None = None
         before_digest: str | None = None
@@ -144,13 +147,17 @@ class ResourceArtifactSaveService:
                         )
                     before_digest = digest_bound(prior, before).hex()
                     lkg_name = _temporary_name(destination.name, "lkg")
-                    lkg_candidate = _candidate_from_bound(parent, lkg_name, prior, before)
+                    lkg_candidate_name = _temporary_name(destination.name, "lkg-candidate")
+                    lkg_candidate = _candidate_from_bound(parent, lkg_candidate_name, prior, before)
+                    lkg_candidate_identity = lkg_candidate.identity()
                     lkg_pending = parent.begin_publish(
                         lkg_candidate,
                         lkg_name,
                         mode=PublishMode.CREATE_IF_ABSENT,
                         lease=None,
                     )
+                    lkg_candidate = None
+                    lkg_candidate_identity = None
                     try:
                         lkg_facts = lkg_pending.preliminary_facts()
                         lkg_retained = lkg_pending.retained_destination()
@@ -267,9 +274,12 @@ class ResourceArtifactSaveService:
                         pending,
                         destination.name,
                         before,
+                        before_digest,
                         lkg_name,
+                        lkg_identity,
                     )
                 except BaseException as rollback_error:
+                    preserve_recovery = True
                     raise ResourcePortabilityError(
                         "RESOURCE.EXPORT.RECOVERY_REQUIRED"
                     ) from rollback_error
@@ -283,6 +293,20 @@ class ResourceArtifactSaveService:
                 "RESOURCE.EXPORT.PUBLICATION_FAILED"
             ) from primary
         finally:
+            if lkg_candidate is not None:
+                try:
+                    lkg_candidate.close()
+                except PlatformFileError:
+                    pass
+            if (
+                lkg_candidate_name is not None
+                and lkg_candidate_identity is not None
+                and parent is not None
+            ):
+                try:
+                    parent.unlink_owned(lkg_candidate_name, lkg_candidate_identity)
+                except PlatformFileError:
+                    pass
             if (
                 not preserve_recovery
                 and lkg_name is not None
@@ -365,7 +389,9 @@ def _restore_bound_publication(
     pending: PendingPublication,
     destination_name: str,
     before: EntrySnapshot | None,
+    before_digest: str | None,
     lkg_name: str | None,
+    lkg_identity: FileObjectIdentity | None,
 ) -> None:
     if root is None:
         raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
@@ -373,8 +399,10 @@ def _restore_bound_publication(
     observed = parent.inspect_entry(destination_name)
     if observed is None or observed.identity != published.destination_identity:
         raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
-    pending.close()
     if before is None:
+        if pending.terminal_reproof() != published:
+            raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+        pending.close()
         parent.unlink_owned(destination_name, published.destination_identity)
         if parent.inspect_entry(destination_name) is not None:
             raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
@@ -384,6 +412,20 @@ def _restore_bound_publication(
     lkg = backend.open_regular(root, platform_relative_path(lkg_name))
     try:
         lkg_snapshot = lkg.snapshot()
+        if (
+            lkg_identity is None
+            or before_digest is None
+            or lkg_snapshot.identity != lkg_identity
+            or lkg_snapshot.byte_count != before.byte_count
+            or not lkg_snapshot.reparse_free
+            or digest_bound(lkg, lkg_snapshot).hex() != before_digest
+            or parent.inspect_entry(lkg_name) != lkg_snapshot
+        ):
+            raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+        # The target must still be this publication after proving its prior.
+        if pending.terminal_reproof() != published:
+            raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
+        pending.close()
         parent.unlink_owned(destination_name, published.destination_identity)
         if parent.inspect_entry(destination_name) is not None:
             raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
@@ -403,11 +445,10 @@ def _restore_bound_publication(
             facts = rollback.preliminary_facts()
             retained = rollback.retained_destination()
             retained_snapshot = retained.snapshot()
-            lkg_digest = digest_bound(lkg, lkg_snapshot)
             if (
-                facts.content_sha256 != lkg_digest
-                or retained_snapshot.byte_count != lkg_snapshot.byte_count
-                or digest_bound(retained, retained_snapshot) != lkg_digest
+                facts.content_sha256.hex() != before_digest
+                or retained_snapshot.byte_count != before.byte_count
+                or digest_bound(retained, retained_snapshot).hex() != before_digest
                 or rollback.terminal_reproof() != facts
             ):
                 raise ResourcePortabilityError("RESOURCE.EXPORT.RECOVERY_REQUIRED")
