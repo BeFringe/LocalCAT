@@ -457,6 +457,10 @@ class _StoreValidationPort(Protocol):
     receipt_handoff: _PosixReceiptHandoff | None
     allow_legacy_predecessor: bool
 
+    def rehydrate_closed_cancelled_runtime(
+        self, record: _ActivationJournalRecord,
+    ) -> ActivationRecoveryReport | None: ...
+
     @property
     def schema_sql_close_pending(self) -> bool: ...
 
@@ -6127,6 +6131,7 @@ def _revalidate_discovered_active_set(
     identity: CanonicalResourceIdentity,
     *,
     canonical_store_id: str,
+    runtime_current: bool = False,
 ) -> tuple[int, bool]:
     """Re-prove one complete active canonical generation from disk alone.
 
@@ -6137,17 +6142,28 @@ def _revalidate_discovered_active_set(
     index closure) is recomputed from disk and must agree before the
     generation view is authorized; a foreign or tampered pair fails closed
     and never authorizes a store.  Returns ``(generation, fts5_available)``.
+
+    Runtime discovery proves completed ledger authority and safe current
+    files independently of configured snapshot content. An unfinished lineage
+    handoff and general recovery retain the exact configured-pair proof.
     """
 
     try:
         db_path = identity.canonical_sidecar_path
         manifest_path = identity.snapshot_manifest_path
-        if not _lstat_any_entry(db_path):
+        borrow = port.posix_activation_borrow
+        current_files = None
+        if runtime_current:
+            if borrow is None:
+                raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+            current_files = tuple(borrow.capture(path) if borrow.exists(path) else None for path in
+                                  (db_path, identity.configured_jsonl_path, manifest_path))
+        if not _lstat_any_entry(db_path, caller_borrow=borrow):
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
                 retryable=False,
             )
-        if not _lstat_any_entry(manifest_path):
+        if not runtime_current and not _lstat_any_entry(manifest_path, caller_borrow=borrow):
             raise ActivationPreparationError(
                 "ACTIVATION.RECOVERY_ACTIVE_SET_INVALID",
                 retryable=False,
@@ -6221,13 +6237,19 @@ def _revalidate_discovered_active_set(
                 )
                 if (
                     facts.binding is None
-                    or facts.divergence_latched
+                    or (facts.divergence_latched and not runtime_current)
                     or facts.diagnostic_codes
                 ):
                     raise port.store_schema_error(
                         "STORE.ACTIVE_BINDING_INVALID"
                     )
                 binding = facts.binding
+                if (binding.configured_jsonl_path != identity.configured_jsonl_path
+                        or binding.manifest_path != identity.snapshot_manifest_path
+                        or binding.receipt.resource_id != identity.resource_id
+                        or binding.receipt.canonical_store_id != canonical_store_id
+                        or _receipt_boundary_record_count(port, facts, binding.receipt) != binding.receipt.record_count):
+                    raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
                 receipt_row, receipt_status = _recovery_receipt_row(
                     port,
                     connection,
@@ -6242,55 +6264,65 @@ def _revalidate_discovered_active_set(
                 if (
                     schema_upgrade is None
                     and snapshot.schema_version != 1
+                    and not runtime_current
                     and port.table_count(connection, "tm_record")
                     != binding.receipt.record_count
                 ):
                     raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
-                jsonl_parity = _recovery_jsonl_winners_digest(port,
-                    identity.configured_jsonl_path
-                )
-                if schema_upgrade is not None or snapshot.schema_version == 1:
-                    boundary = _receipt_boundary_record_count(
-                        port,
-                        facts,
-                        binding.receipt,
+                if not runtime_current:
+                    jsonl_parity = _recovery_jsonl_winners_digest(port,
+                        identity.configured_jsonl_path
                     )
-                    parity_matches = (
-                        _activation_boundary_parity_digest(
+                    if schema_upgrade is not None or snapshot.schema_version == 1:
+                        boundary = _receipt_boundary_record_count(
                             port,
-                            connection,
-                            boundary,
+                            facts,
+                            binding.receipt,
                         )
-                        == jsonl_parity
-                    )
-                else:
-                    parity_matches = (
-                        _activation_exact_parity_digest(port, connection)
-                        == jsonl_parity
-                    )
-                if not parity_matches:
-                    raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
+                        if boundary != binding.receipt.record_count:
+                            raise port.store_schema_error("STORE.ACTIVE_BINDING_INVALID")
+                        parity_matches = (
+                            _activation_boundary_parity_digest(
+                                port,
+                                connection,
+                                boundary,
+                            )
+                            == jsonl_parity
+                        )
+                    else:
+                        parity_matches = (
+                            _activation_exact_parity_digest(port, connection)
+                            == jsonl_parity
+                        )
+                    if not parity_matches:
+                        raise port.store_schema_error("STORE.ACTIVE_COUNT_MISMATCH")
                 index_validator = (_validate_legacy_activation_indexes
                     if snapshot.schema_version == 1 else _recover_activation_indexes)
                 index_validator(port,
                     connection,
                     fts5_available=snapshot.fts5_available,
                 )
-                pair_diagnostics = port.configured_pair_diagnostics(
-                    binding,
-                    identity=identity,
-                    canonical_store_id=canonical_store_id,
-                    head_revision=facts.head_revision,
-                    cumulative_record_counts=facts.cumulative_record_counts,
-                )
-                if pair_diagnostics:
-                    raise port.store_schema_error(
-                        "STORE.ACTIVE_BINDING_INVALID"
+                if not runtime_current:
+                    pair_diagnostics = port.configured_pair_diagnostics(
+                        binding,
+                        identity=identity,
+                        canonical_store_id=canonical_store_id,
+                        head_revision=facts.head_revision,
+                        cumulative_record_counts=facts.cumulative_record_counts,
                     )
+                    if pair_diagnostics:
+                        raise port.store_schema_error(
+                            "STORE.ACTIVE_BINDING_INVALID"
+                        )
                 connection.commit()
             except BaseException:
                 connection.rollback()
                 raise
+        if runtime_current and borrow is not None:
+            if tuple(borrow.capture(path) if borrow.exists(path) else None for path in
+                     (db_path, identity.configured_jsonl_path, manifest_path)) != current_files:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+            borrow.reprove()
     except ActivationPreparationError as error:
         raise error
     except OSError as error:
@@ -7058,6 +7090,7 @@ def _require_cancelled_lineage_consistency(
 
 def _discover_active_canonical(
     port: _StoreValidationPort,
+    *, runtime_current: bool = False,
 ) -> ActivationRecoveryReport | None:
     """Re-prove and rehydrate the active canonical generation (no journal).
 
@@ -7138,7 +7171,7 @@ def _discover_active_canonical(
     try:
         generation, fts5_available = discovered_set if discovered_set is not None else _revalidate_discovered_active_set(port,
             identity,
-            canonical_store_id=port.canonical_store_id,
+            canonical_store_id=port.canonical_store_id, runtime_current=runtime_current,
         )
     except OSError as error:
         if port.schema_sql_close_pending:
@@ -7283,6 +7316,40 @@ def _load_recovery_terminal(
         ) from error
 
 
+def _cancelled_current_closes_main_prior(
+    port: _StoreValidationPort,
+    main_record: _ActivationJournalRecord,
+    terminal_record: _ActivationJournalRecord,
+) -> bool:
+    """Connect a completed cancellation to an exact new PREPARED prior.
+
+    A later completed refresh may advance the binding while retaining the
+    cancelled generation. The new journal must still prove its entire exact
+    prior set; only the already closed predecessor uses current-runtime proof.
+    """
+    if (port.posix_activation_borrow is None
+            or main_record.phase is not _ActivationJournalPhase.PREPARED
+            or terminal_record.phase is not _ActivationJournalPhase.PREPARED
+            or not main_record.had_prior_canonical or not terminal_record.had_prior_canonical
+            or (main_record.prior_canonical_store_id or main_record.canonical_store_id)
+            != (terminal_record.prior_canonical_store_id or terminal_record.canonical_store_id)
+            or main_record.prior_db_path != terminal_record.prior_db_path
+            or main_record.prior_db_identity != terminal_record.prior_db_identity
+            or main_record.prior_generation != terminal_record.prior_generation):
+        return False
+    _revalidate_recovered_prior_set(
+        port, main_record, identity=port.resource_identity,
+        canonical_store_id=port.canonical_store_id, allow_restored_identities=False,
+    )
+    prior_view = port.view
+    try:
+        return port.rehydrate_closed_cancelled_runtime(terminal_record) is not None
+    finally:
+        # The live preparation binds its original prior view object. This
+        # successor check proves authority without replacing that live view.
+        port.view = prior_view
+
+
 def _coexisting_terminal(
     port: _StoreValidationPort,
     main_record: _ActivationJournalRecord,
@@ -7317,10 +7384,8 @@ def _coexisting_terminal(
         terminal_record,
         check_view=False,
     )
-    if not _activation_terminal_coexistence_valid(
-        main_record,
-        terminal_record,
-    ):
+    if (not _activation_terminal_coexistence_valid(main_record, terminal_record)
+            and not _cancelled_current_closes_main_prior(port, main_record, terminal_record)):
         raise ActivationPreparationError(
             "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
             retryable=False,
@@ -7996,6 +8061,10 @@ def _replay_cancelled_terminal_recovery(
             "ACTIVATION.RECOVERY_TERMINAL_INVALID",
             retryable=False,
         )
+    if port.posix_activation_borrow is not None:
+        current = port.rehydrate_closed_cancelled_runtime(record)
+        if current is not None:
+            return current
     preserved_rollback = False
     if port.posix_activation_borrow is not None:
         source = port.posix_activation_borrow.capture(identity.configured_jsonl_path)
@@ -9330,10 +9399,8 @@ def recover_durable_activation(port: _StoreValidationPort) -> ActivationRecovery
             _revalidate_recovery_authority(port,
                 terminal_record
             )
-            if not _activation_terminal_coexistence_valid(
-                record,
-                terminal_record,
-            ):
+            if (not _activation_terminal_coexistence_valid(record, terminal_record)
+                    and not _cancelled_current_closes_main_prior(port, record, terminal_record)):
                 raise ActivationPreparationError(
                     "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
                     retryable=False,
@@ -9578,10 +9645,8 @@ def rollback_durable_activation(
             _revalidate_recovery_authority(port,
                 terminal_record
             )
-            if not _activation_terminal_coexistence_valid(
-                record,
-                terminal_record,
-            ):
+            if (not _activation_terminal_coexistence_valid(record, terminal_record)
+                    and not _cancelled_current_closes_main_prior(port, record, terminal_record)):
                 raise ActivationPreparationError(
                     "ACTIVATION.TERMINAL_COEXISTENCE_INVALID",
                     retryable=False,

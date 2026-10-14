@@ -11,7 +11,7 @@ import hashlib
 import importlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePath
 import sqlite3
 import stat
@@ -25,6 +25,7 @@ import uuid
 from tm_activation_journal import (
     _CanonicalStoreRef,
     _append_owned_close_facts,
+    _with_owned_close_facts,
     _CallerHeldPosixActivationBorrow,
     ActivationRecoveryReport,
     _ActivationPreparation,
@@ -96,6 +97,7 @@ from tm_snapshot_recovery import (
 )
 from tm_sqlite_store import (
     _ResourceOperationBorrow,
+    _SnapshotSourceReturn,
     ReceiptCompletionProbe,
     TM_LEGACY_SCHEMA_VERSION,
     TM_SCHEMA_VERSION,
@@ -155,6 +157,7 @@ from platform_fs_contracts import (
     LockPolicy,
     LockWait,
     MutableFileReservation,
+    OpaqueAuthority,
     PosixStageHandoff,
     PlatformFileBackend,
     PlatformFileError,
@@ -203,6 +206,20 @@ class _BoundExportPublication:
     candidate_identity: FileObjectIdentity
     candidate: CandidateFile | None = None
     pending: PendingPublication | None = None
+
+
+@dataclass(frozen=True)
+class AppliedSnapshotProof:
+    """Transient final owner facts; payload bytes and draft semantics differ."""
+
+    resource_id: str
+    canonical_store_id: str
+    generation: int
+    head_revision: int
+    record_count: int
+    payload_digest: str
+    payload_byte_count: int
+    semantic_digest: str
 
 
 
@@ -1069,6 +1086,66 @@ def _after_bound_export_rollback_unlink(name: str) -> None:
     """Test seam after exact final removal and before create-if-absent restore."""
 
     del name
+
+
+def _handoff_snapshot_source(
+    borrow: _CallerHeldPosixActivationBorrow,
+    source_name: str, target_name: str, prior: _BoundExportPrior,
+) -> tuple[FileObjectIdentity, PendingPublication, BaseException | None]:
+    """Move this outer owner's proven source without copying its identity."""
+    borrow.reprove()
+    if prior.snapshot is None or prior.digest is None or not isinstance(borrow.backend, PosixStageHandoff):
+        raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+    expected = CandidateContentFacts(prior.snapshot.byte_count, bytes.fromhex(prior.digest))
+    source = borrow.backend.open_existing_stage(borrow.root, source_name, owner_lease=borrow.lease, expected_content=expected)
+    candidate = None
+    pending = None
+    primary = None
+    try:
+        if source.reprove().snapshot.identity != prior.snapshot.identity:
+            raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+        candidate = borrow.backend.handoff_stage(source, owner_lease=borrow.lease, expected_content=expected)
+        pending = borrow.root.begin_publish(candidate, target_name, mode=PublishMode.CREATE_IF_ABSENT, lease=None)
+        candidate = None
+        facts = pending.terminal_reproof()
+        if facts.destination_identity != prior.snapshot.identity or facts.content_sha256.hex() != prior.digest:
+            raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+        borrow.reprove()
+        return facts.destination_identity, pending, None
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_error = borrow.close_owned(source, candidate, pending if primary is not None else None, primary=primary)
+        if primary is None and close_error is not None:
+            raise close_error
+
+
+def _return_snapshot_source(
+    prior_owner: _SnapshotSourceReturn, prior: _BoundExportPrior,
+    recovery_name: str, publication: _BoundExportPublication | None,
+) -> None:
+    borrow = prior_owner.borrow
+    destination = borrow.identity.configured_jsonl_path.name
+    if borrow.capture(borrow.identity.configured_jsonl_path.parent / recovery_name) != prior_owner.source:
+        raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+    current = borrow.root.inspect_entry(destination)
+    if current is not None:
+        if publication is None or current.identity != publication.candidate_identity:
+            raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+        actual = borrow.capture(borrow.identity.configured_jsonl_path)
+        if actual.sha256 != publication.content.content_sha256.hex():
+            raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+        borrow.reprove()
+        borrow.root.unlink_owned(destination, current.identity)
+    _, pending, _ = _handoff_snapshot_source(borrow, recovery_name, destination, prior)
+    # Terminal reproof already established the original object's current name.
+    # A later owned-close failure must retain that location without claiming
+    # that pending closure or current-authority verification has completed.
+    prior_owner.source_restored = True
+    close_error = borrow.close_owned(pending)
+    if close_error is not None:
+        raise close_error
 
 
 def _restore_bound_export_member(
@@ -4374,6 +4451,78 @@ class TMMigrationService:
                 retryable=True,
             ) from error
 
+    def _prove_applied_snapshot(
+        self,
+        report: MigrationReport,
+        *,
+        expected_digest: str,
+        expected_record_count: int,
+    ) -> AppliedSnapshotProof:
+        """Reopen real SQL then rooted source while the original apply owns W1.
+
+        The draft projection is the existing import grammar: local record ids,
+        usage counters and origin metadata are not portable draft semantics.
+        No new snapshot/receipt is issued and no export file is created.
+        """
+        generation, revision, count, byte_count = self.project_applied_owner(
+            report, expected_digest=expected_digest,
+            expected_record_count=expected_record_count,
+        )
+        reservation = self._active_owner_reservation
+        coordinator = self._coordinator
+        assert reservation is not None and coordinator is not None
+        try:
+            snapshot = SQLiteTMStore.from_coordinator(coordinator).capture_export_snapshot(
+                _borrow=reservation._family_borrow,
+            )
+            observed = snapshot.revision
+            if (
+                observed.resource_id != report.resource_id
+                or observed.canonical_store_id != report.canonical_store_id
+                or (observed.generation, observed.head_revision, observed.record_count)
+                != (generation, revision, count)
+            ):
+                raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+            canonical_digest = hashlib.sha256()
+            for item in snapshot.records:
+                draft = _draft_from_jsonl(_export_jsonl_row(item))
+                canonical_digest.update(contract_to_json(draft).encode("utf-8") + b"\n")
+
+            # capture_export_snapshot has closed its connection and all SQL.
+            rooted = reservation.open_portable_rooted_read(
+                self._resource_identity.configured_jsonl_path,
+                unavailable_code="IMPORT.RECOVERY_REQUIRED",
+            )
+            source_digest = hashlib.sha256()
+            observation = _StreamingBuildObservation()
+            try:
+                for draft, _line in _iter_portable_draft_pairs(rooted, observation):
+                    source_digest.update(contract_to_json(draft).encode("utf-8") + b"\n")
+                rooted.reprove_digest(expected_digest)
+                if (
+                    rooted.snapshot.byte_count != byte_count
+                    or observation.digest.hexdigest() != expected_digest
+                    or observation.valid_count != expected_record_count
+                    or observation.invalid_count
+                    or source_digest.digest() != canonical_digest.digest()
+                ):
+                    raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+            finally:
+                rooted.close()
+            reservation.reprove()
+            return AppliedSnapshotProof(
+                resource_id=observed.resource_id,
+                canonical_store_id=observed.canonical_store_id,
+                generation=generation, head_revision=revision, record_count=count,
+                payload_digest=expected_digest, payload_byte_count=byte_count,
+                semantic_digest=canonical_digest.hexdigest(),
+            )
+        except MigrationPreflightError:
+            raise
+        except (PlatformFileError, OSError, sqlite3.DatabaseError,
+                SQLiteStoreLifecycleError, SQLiteStoreSchemaError) as error:
+            raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED") from error
+
     def _initial_authority_unavailable_failure(
         self,
         *,
@@ -7500,6 +7649,9 @@ class TMMigrationService:
         expected_record_count: int,
         initial: bool,
         owner_commit: Callable[[MigrationReport], None] | None = None,
+        expected_destination_baseline: tuple[str, int, int, int] | None = None,
+        owner_prepare: Callable[[], None] | None = None,
+        owner_finalize: Callable[[MigrationReport, AppliedSnapshotProof], None] | None = None,
     ) -> MigrationOutcome:
         """Apply one validated external snapshot under the resource W1 owner.
 
@@ -7510,6 +7662,9 @@ class TMMigrationService:
         the canonical work to the existing reserved initial/explicit paths.
         ``owner_commit`` is invoked only after Core has a complete report and
         before the source publication's terminal reproof/close.
+        ``owner_prepare`` follows exact destination admission checks, before
+        any source/candidate mutation. ``owner_finalize`` follows source and
+        input closure and receives fresh semantic facts under the same W1.
         """
 
         if type(payload) is not _NATIVE_PATH_TYPE or not payload.is_absolute():
@@ -7528,6 +7683,22 @@ class TMMigrationService:
             raise TypeError("initial must be exact bool")
         if owner_commit is not None and not callable(owner_commit):
             raise TypeError("owner_commit must be callable or None")
+        if owner_prepare is not None and not callable(owner_prepare):
+            raise TypeError("owner_prepare must be callable or None")
+        if owner_finalize is not None and not callable(owner_finalize):
+            raise TypeError("owner_finalize must be callable or None")
+        if expected_destination_baseline is not None:
+            if (
+                type(expected_destination_baseline) is not tuple
+                or len(expected_destination_baseline) != 4
+                or type(expected_destination_baseline[0]) is not str
+                or not expected_destination_baseline[0].strip()
+                or any(type(value) is not int or value < 0
+                       for value in expected_destination_baseline[1:])
+            ):
+                raise TypeError("destination baseline must be exact store/generation/revision/count")
+            if initial:
+                raise ValueError("initial apply cannot expect an existing canonical")
         coordinator = self._coordinator
         if coordinator is None:
             raise MigrationPreflightError("IMPORT.COORDINATOR_UNAVAILABLE")
@@ -7544,8 +7715,42 @@ class TMMigrationService:
         payload_root: RootedDirectoryAuthority | None = None
         payload_authority: BoundRegularFile | None = None
         owner_started = False
+        snapshot_return: _SnapshotSourceReturn | None = None
+        prior: _BoundExportPrior | None = None
+        reservation: _InitialActivationResourceReservation | None = None
         reservation_entered = False
         reservation_stack = ExitStack()
+        outcome: MigrationOutcome | None = None
+
+        def close_inputs(*authorities: OpaqueAuthority | None) -> BaseException | None:
+            if snapshot_return is not None:
+                return snapshot_return.borrow.close_owned(*authorities)
+            return _close_bound_export_authorities(*authorities)
+
+        def recovery_error(error: BaseException) -> MigrationPreflightError:
+            coordinator._stop_posix_recovery_admission()
+            if reservation is not None and reservation._family_borrow is not None:
+                reservation._family_borrow._recovery_completed = False
+            failure = MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+            if snapshot_return is not None:
+                original = snapshot_return.primary
+                if original is not None and original is not error:
+                    original = _with_owned_close_facts(original, error, context="Snapshot source/authority return incomplete")
+                failure.__cause__ = original if original is not None else error
+                setattr(failure, "_snapshot_source_return", snapshot_return)
+                source_locator = (self._resource_identity.configured_jsonl_path if snapshot_return.source_restored
+                                  else self._resource_identity.configured_jsonl_path.parent / source_recovery_name)
+                setattr(failure, "recovery_locators", (RecoveryLocator(
+                    path=source_locator, asset_kind=AssetKind.ORIGINAL_SOURCE,
+                    expected_digest=snapshot_return.source.sha256,
+                ),))
+                failure.add_note(f"Snapshot prior source restored={snapshot_return.source_restored}; current authority verified={snapshot_return.current_authority_verified}; prior generation={snapshot_return.generation}")
+                if outcome is not None:
+                    setattr(failure, "_verified_snapshot_outcome", outcome)
+            else:
+                failure.__cause__ = error
+            return failure
+
         try:
             reservation = reservation_stack.enter_context(self._initial_stage_reservation())
             reservation_entered = True
@@ -7554,6 +7759,15 @@ class TMMigrationService:
                 reservation.bound_family_inputs()
             )
             source_parent = source_root
+            if expected_destination_baseline is not None:
+                revision = SQLiteTMStore.from_coordinator(coordinator).canonical_revision(
+                    _borrow=reservation._family_borrow,
+                )
+                if (
+                    revision.canonical_store_id, revision.generation,
+                    revision.head_revision, revision.record_count,
+                ) != expected_destination_baseline:
+                    raise MigrationPreflightError("IMPORT.DESTINATION_STALE")
             payload_root = backend.bind_root(payload.parent)
             payload_authority = backend.open_regular(
                 payload_root,
@@ -7581,20 +7795,31 @@ class TMMigrationService:
             if not initial and prior.snapshot is None:
                 raise MigrationPreflightError("IMPORT.DESTINATION_STALE")
 
+            if owner_prepare is not None:
+                owner_prepare()
+                reservation.reprove()
+
+            if (not initial
+                    and self._recovery_profile is _RecoveryProfile.POSIX_V2):
+                snapshot_borrow = reservation.posix_recovery_inputs().get("_posix_borrow")
+                assert snapshot_borrow is not None
+                snapshot_return = coordinator._capture_snapshot_source_return(
+                    snapshot_borrow,
+                )
+
             if prior.snapshot is not None:
                 (
                     source_recovery_identity,
                     source_recovery_pending,
                     recovery_close_error,
-                ) = _copy_bound_export_prior(
-                    backend,
-                    source_root,
-                    source_parent,
-                    destination_name,
-                    source_recovery_name,
-                    prior,
-                    **({"candidate_name": source_recovery_name + ".tmp"}
-                       if reservation._family_borrow is not None else {}),
+                ) = (
+                    _handoff_snapshot_source(snapshot_return.borrow, destination_name, source_recovery_name, prior)
+                    if snapshot_return is not None else _copy_bound_export_prior(
+                        backend, source_root, source_parent, destination_name,
+                        source_recovery_name, prior,
+                        candidate_name=(source_recovery_name + ".tmp"
+                           if reservation._family_borrow is not None else None),
+                    )
                 )
                 if recovery_close_error is not None:
                     raise recovery_close_error
@@ -7610,26 +7835,20 @@ class TMMigrationService:
             )
             mode = (
                 PublishMode.CREATE_IF_ABSENT
-                if prior.snapshot is None
+                if prior.snapshot is None or snapshot_return is not None
                 else PublishMode.REPLACE_UNDER_LOCK
             )
-            try:
-                pending = source_parent.begin_publish(
-                    candidate,
-                    destination_name,
-                    mode=mode,
-                    lease=lease if mode is PublishMode.REPLACE_UNDER_LOCK else None,
-                )
-            finally:
-                candidate = None
             source_publication = _BoundExportPublication(
-                name=destination_name,
-                candidate_name=candidate_name,
-                content=content,
-                candidate_identity=candidate_identity,
-                candidate=None,
-                pending=pending,
+                name=destination_name, candidate_name=candidate_name,
+                content=content, candidate_identity=candidate_identity,
+                candidate=candidate,
             )
+            source_publication.pending = source_parent.begin_publish(
+                candidate, destination_name, mode=mode,
+                lease=lease if mode is PublishMode.REPLACE_UNDER_LOCK else None,
+            )
+            source_publication.candidate = None
+            candidate = None
             if content.content_sha256.hex() != expected_digest:
                 raise MigrationPreflightError("IMPORT.SOURCE_STALE")
             reservation.reprove()
@@ -7645,7 +7864,7 @@ class TMMigrationService:
                 if initial
                 else self._posix_explicit_disambiguation_reserved(
                     self._resource_identity.configured_jsonl_path, resource_id,
-                    reservation=reservation,
+                    reservation=reservation, snapshot_return=snapshot_return,
                 )
                 if self._recovery_profile is _RecoveryProfile.POSIX_V2
                 else self._portable_explicit_disambiguation_reserved(
@@ -7680,7 +7899,7 @@ class TMMigrationService:
                     != source_publication.pending.preliminary_facts()
                 ):
                     raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
-                publication_close_error = _close_bound_export_authorities(
+                publication_close_error = close_inputs(
                     source_publication.pending,
                 )
                 source_publication.pending = None
@@ -7689,7 +7908,7 @@ class TMMigrationService:
                         "IMPORT.RECOVERY_REQUIRED"
                     ) from publication_close_error
                 if source_recovery_pending is not None:
-                    recovery_close_error = _close_bound_export_authorities(
+                    recovery_close_error = close_inputs(
                         source_recovery_pending,
                     )
                     source_recovery_pending = None
@@ -7703,6 +7922,29 @@ class TMMigrationService:
                     )
                 if owner_commit_error is not None:
                     raise owner_commit_error
+                if owner_finalize is not None:
+                    if payload_authority.content_facts() != payload_facts:
+                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
+                    payload_close_error = close_inputs(
+                        payload_authority, payload_root,
+                    )
+                    payload_authority = None
+                    payload_root = None
+                    if payload_close_error is not None:
+                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED") from payload_close_error
+                    proof = self._prove_applied_snapshot(
+                        outcome, expected_digest=expected_digest,
+                        expected_record_count=expected_record_count,
+                    )
+                    owner_finalize(outcome, proof)
+                    # The application callback can publish durable facts.
+                    # Reprove the accepted source/current owner afterwards;
+                    # failure preserves those facts and cannot return success.
+                    self.project_applied_owner(
+                        outcome, expected_digest=expected_digest,
+                        expected_record_count=expected_record_count,
+                    )
+                    reservation.reprove()
                 return outcome
 
             if type(outcome) is MigrationFailure:
@@ -7716,18 +7958,20 @@ class TMMigrationService:
                     # not a durable recovery locator, however; retire that
                     # exact owned artifact instead of leaking an anonymous
                     # file beside the user's resource.
-                    deferred_error = _close_bound_export_authorities(
+                    deferred_error = close_inputs(
                         source_publication.pending,
                     )
                     source_publication.pending = None
                     if source_recovery_pending is not None:
-                        recovery_close_error = _close_bound_export_authorities(
+                        recovery_close_error = close_inputs(
                             source_recovery_pending,
                         )
                         source_recovery_pending = None
                         if deferred_error is None:
                             deferred_error = recovery_close_error
                         try:
+                            if snapshot_return is not None:
+                                raise recovery_error(MigrationPreflightError("IMPORT.RECOVERY_REQUIRED"))
                             _cleanup_bound_export_artifacts(
                                 source_parent,
                                 ((
@@ -7745,7 +7989,7 @@ class TMMigrationService:
                     return outcome
                 if source_publication.pending is None:
                     raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED")
-                close_error = _close_bound_export_authorities(
+                close_error = close_inputs(
                     source_publication.pending,
                 )
                 source_publication.pending = None
@@ -7754,7 +7998,7 @@ class TMMigrationService:
                         "IMPORT.RECOVERY_REQUIRED"
                     ) from close_error
                 if source_recovery_pending is not None:
-                    recovery_close_error = _close_bound_export_authorities(
+                    recovery_close_error = close_inputs(
                         source_recovery_pending,
                     )
                     source_recovery_pending = None
@@ -7762,6 +8006,15 @@ class TMMigrationService:
                         raise MigrationPreflightError(
                             "IMPORT.RECOVERY_REQUIRED"
                         ) from recovery_close_error
+                if snapshot_return is not None:
+                    _return_snapshot_source(snapshot_return, prior, source_recovery_name, source_publication)
+                    coordinator._finish_snapshot_source_return(snapshot_return)
+                    assert reservation._family_borrow is not None
+                    reservation._family_borrow._recovery_completed = True
+                    outcome = replace(outcome, original_source_preservation=_unchanged_preservation(
+                        AssetKind.ORIGINAL_SOURCE, snapshot_return.source.sha256,
+                    ))
+                    return outcome
                 try:
                     rollback = _restore_bound_export_member(
                         backend,
@@ -7776,7 +8029,7 @@ class TMMigrationService:
                         "IMPORT.RECOVERY_REQUIRED"
                     ) from error
                 if rollback is not None:
-                    rollback_close_error = _close_bound_export_authorities(
+                    rollback_close_error = close_inputs(
                         rollback,
                     )
                     if rollback_close_error is not None:
@@ -7800,7 +8053,47 @@ class TMMigrationService:
             ) from error
         except _InitialActivationReservationError as error:
             raise MigrationPreflightError("IMPORT.RESOURCE_LOCK_UNAVAILABLE") from error
-        except (MigrationPreflightError, PlatformFileError, OSError) as error:
+        except (MigrationPreflightError, PlatformFileError, OSError, ActivationPreparationError) as error:
+            if snapshot_return is not None:
+                if not owner_started:
+                    try:
+                        close_error = close_inputs(
+                            source_publication.pending if source_publication is not None else None,
+                            source_publication.candidate if source_publication is not None else None,
+                            source_recovery_pending,
+                        )
+                        if close_error is not None:
+                            raise close_error
+                        if source_publication is not None:
+                            source_publication.pending = None
+                            source_publication.candidate = None
+                            _cleanup_bound_export_artifacts(snapshot_return.borrow.root, (
+                                (source_publication.candidate_name, source_publication.candidate_identity),
+                            ))
+                        source_recovery_pending = None
+                        if snapshot_return.borrow.exists(self._resource_identity.configured_jsonl_path.parent / source_recovery_name):
+                            assert prior is not None
+                            _return_snapshot_source(snapshot_return, prior, source_recovery_name, source_publication)
+                        elif snapshot_return.borrow.capture(self._resource_identity.configured_jsonl_path) != snapshot_return.source:
+                            raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
+                        else:
+                            snapshot_return.source_restored = True
+                        coordinator._finish_snapshot_source_return(snapshot_return)
+                        assert reservation is not None
+                        assert reservation._family_borrow is not None
+                        reservation._family_borrow._recovery_completed = True
+                    except BaseException as restore_error:
+                        snapshot_return.primary = error
+                        raise recovery_error(restore_error)
+                    raise
+                failure = recovery_error(error)
+                if type(outcome) is MigrationReport:
+                    # Publication succeeded. Preserve the existing exception
+                    # contract and the proven new authority; never restore the
+                    # original source after a late cleanup/finalization error.
+                    failure.__cause__ = error.__cause__
+                    raise error from failure
+                raise failure
             # Before Core owns the activation attempt, the configured source
             # publication is the only changed asset.  Restore its exact prior
             # through the bound helper; after owner entry, leave all facts to
@@ -7811,7 +8104,7 @@ class TMMigrationService:
                 and source_recovery_pending is not None
                 and source_parent is not None
             ):
-                recovery_close_error = _close_bound_export_authorities(
+                recovery_close_error = close_inputs(
                     source_recovery_pending,
                 )
                 source_recovery_pending = None
@@ -7835,12 +8128,12 @@ class TMMigrationService:
                 and source_root is not None
                 and source_parent is not None
             ):
-                close_error = _close_bound_export_authorities(
+                close_error = close_inputs(
                     source_publication.pending,
                 )
                 source_publication.pending = None
                 if source_recovery_pending is not None:
-                    recovery_close_error = _close_bound_export_authorities(
+                    recovery_close_error = close_inputs(
                         source_recovery_pending,
                     )
                     source_recovery_pending = None
@@ -7851,6 +8144,7 @@ class TMMigrationService:
                         "IMPORT.RECOVERY_REQUIRED"
                     ) from (close_error or recovery_close_error)
                 try:
+                    assert prior is not None
                     rollback = _restore_bound_export_member(
                         backend,
                         source_root,
@@ -7874,20 +8168,36 @@ class TMMigrationService:
         finally:
             primary = sys.exception()
             try:
-                close_error = _close_bound_export_authorities(
+                close_error = close_inputs(
                     source_publication.pending if source_publication is not None else None,
+                    source_publication.candidate if source_publication is not None else None,
                     source_recovery_pending,
                     payload_authority,
                     payload_root,
                 )
-                if primary is None and close_error is not None:
-                    raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED") from close_error
+                if close_error is not None:
+                    if primary is not None:
+                        _append_owned_close_facts(primary, close_error, context="Snapshot owned close failed")
+                    if snapshot_return is not None:
+                        failure = recovery_error(close_error)
+                        if primary is None:
+                            raise failure
+                    elif primary is None:
+                        raise MigrationPreflightError("IMPORT.RECOVERY_REQUIRED") from close_error
             finally:
-                self._active_owner_reservation = None
+                # A concurrent waiter can time out before acquiring W1. It
+                # must not clear the active call's callback projection scope.
+                if reservation_entered:
+                    self._active_owner_reservation = None
                 try:
                     reservation_stack.close()
-                except BaseException:
-                    if primary is None:
+                except BaseException as close_error:
+                    if snapshot_return is not None:
+                        failure = recovery_error(close_error)
+                        if primary is None:
+                            raise failure
+                        _append_owned_close_facts(primary, close_error, context="Snapshot outer close failed")
+                    elif primary is None:
                         raise
 
     def rebuild_from_snapshot(
@@ -8811,6 +9121,7 @@ class TMMigrationService:
         source: Path,
         resource_id: str,
         *, reservation: _InitialActivationResourceReservation | None = None,
+        snapshot_return: _SnapshotSourceReturn | None = None,
     ) -> MigrationOutcome:
         coordinator = self._coordinator
         stage_label = "PREFLIGHT"
@@ -8923,13 +9234,17 @@ class TMMigrationService:
                     coordinator._stop_posix_recovery_admission()
                     try:
                         inputs = reservation.posix_recovery_inputs()
-                        coordinator.cancel_prepared_activation(prepared, **inputs)
-                        borrow = inputs["_posix_borrow"]
+                        coordinator.cancel_prepared_activation(prepared, _snapshot_return=snapshot_return, **inputs)
+                        borrow = inputs.get("_posix_borrow")
+                        assert borrow is not None
                         if (borrow.capture(self._resource_identity.configured_jsonl_path).sha256 != source_before
                                 or borrow.capture(store_path).sha256 != store_before):
                             raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE")
                         borrow.reprove()
-                        reservation._family_borrow._recovery_completed = True
+                        assert reservation._family_borrow is not None
+                        reservation._family_borrow._recovery_completed = snapshot_return is None
+                        if snapshot_return is not None:
+                            snapshot_return.primary = error
                     except Exception as cleanup_error:
                         _append_owned_close_facts(error, cleanup_error, context="Cancellation failed")
                         raise MigrationPreflightError("IMPORT.PRIOR_STATE_UNRECOVERABLE") from error

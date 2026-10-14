@@ -253,6 +253,7 @@ from tm_activation_journal import (
     _require_activation_journal_digest,
     _require_first_activation_absence,
     _require_quarantine_directory,
+    _observe_posix_cancelled_quarantine,
     _require_recovery_path_absent,
     _require_same_asset_captures,
     _revalidate_prior_assets,
@@ -1785,6 +1786,11 @@ class _CoordinatorStorePort:
         self.posix_recovery_report: ActivationRecoveryReport | None = None
         self._posix_live_cancellation_preparation: _ActivationPreparation | None = None
 
+    def rehydrate_closed_cancelled_runtime(
+        self, record: _ActivationJournalRecord,
+    ) -> ActivationRecoveryReport | None:
+        return _hydrate_closed_cancelled_runtime(self, record)
+
     @property
     def schema_sql_close_pending(self) -> bool:
         io = self._coordinator._schema_io
@@ -2597,6 +2603,10 @@ def _rehydrate_runtime_authority(
     goes through the strict Task 5.8/5.9 protocol unchanged, so incomplete
     activations and canonical corruption keep their recovery-or-fail-stop
     semantics and JSONL is never an implicit fallback.
+
+    Complete POSIX cancellation uses the same current-canonical proof as
+    public CANCELLED replay. No-record discovery requires valid lineage and
+    completed ledger authority, independently of current snapshot contents.
     """
 
     if (
@@ -2661,12 +2671,14 @@ def _rehydrate_runtime_authority(
                 terminal_identity,
             )
             _revalidate_recovery_authority(port, record)
-            if (
-                record.phase
-                is not _ActivationJournalPhase.GENERATION_PUBLISHED
-            ):
+            if record.phase is not _ActivationJournalPhase.GENERATION_PUBLISHED:
                 return recover_durable_activation(port)
             report = _rehydrate_completed_activation(port, record)
+            port.state = "READY"
+            port.notify_all()
+            return report
+        if port.posix_activation_borrow is not None:
+            report = _discover_active_canonical(port, runtime_current=True)
             port.state = "READY"
             port.notify_all()
             return report
@@ -3341,6 +3353,18 @@ def _validate_completed_runtime_snapshot_lineage(
     connection: sqlite3.Connection, facts: _SourceBindingFacts,
     identity: CanonicalResourceIdentity, record: _ActivationJournalRecord,
 ) -> None:
+    _validate_runtime_snapshot_lineage(
+        connection, facts, identity, canonical_store_id=record.canonical_store_id,
+        receipt_id=record.new_receipt_id, receipt_digest=record.snapshot_receipt_digest,
+        source_digest=record.source_jsonl_digest,
+    )
+
+
+def _validate_runtime_snapshot_lineage(
+    connection: sqlite3.Connection, facts: _SourceBindingFacts,
+    identity: CanonicalResourceIdentity, *, canonical_store_id: str,
+    receipt_id: str, receipt_digest: str, source_digest: str | None = None,
+) -> None:
     """Preserve activation authority while accepting a completed refresh.
 
     A refresh changes only the configured snapshot binding. Its completed
@@ -3352,7 +3376,7 @@ def _validate_completed_runtime_snapshot_lineage(
         raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
     try:
         _validate_binding_identity(binding, identity=identity,
-                                   canonical_store_id=record.canonical_store_id)
+                                   canonical_store_id=canonical_store_id)
     except (TypeError, ValueError) as error:
         raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID") from error
     counts = dict(facts.cumulative_record_counts)
@@ -3362,22 +3386,22 @@ def _validate_completed_runtime_snapshot_lineage(
         "SELECT resource_id, canonical_store_id, exported_revision, jsonl_digest, "
         "record_count, format_version, destination_jsonl_path, "
         "destination_manifest_path, status FROM tm_snapshot_receipt WHERE snapshot_id=?",
-        (record.new_receipt_id,),
+        (receipt_id,),
     ).fetchone()
     if row is None:
         raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
     try:
         original = SnapshotReceipt(
-            snapshot_id=record.new_receipt_id, resource_id=str(row[0]),
+            snapshot_id=receipt_id, resource_id=str(row[0]),
             canonical_store_id=str(row[1]), exported_revision=_row_int(row[2]),
             jsonl_digest=str(row[3]), record_count=_row_int(row[4]), format_version=str(row[5]),
         )
     except (TypeError, ValueError) as error:
         raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID") from error
     if (original.resource_id != identity.resource_id
-            or original.canonical_store_id != record.canonical_store_id
-            or snapshot_receipt_digest(original) != record.snapshot_receipt_digest
-            or original.jsonl_digest != record.source_jsonl_digest
+            or original.canonical_store_id != canonical_store_id
+            or snapshot_receipt_digest(original) != receipt_digest
+            or (source_digest is not None and original.jsonl_digest != source_digest)
             or counts.get(original.exported_revision) != original.record_count
             or str(row[6]) != str(identity.configured_jsonl_path)
             or str(row[7]) != str(identity.snapshot_manifest_path)
@@ -3388,6 +3412,84 @@ def _validate_completed_runtime_snapshot_lineage(
             raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
     elif binding.snapshot_kind is not SnapshotKind.EXPLICIT_EXPORT:
         raise SQLiteStoreSchemaError("STORE.ACTIVE_BINDING_INVALID")
+
+
+def _hydrate_closed_cancelled_runtime(
+    port: _StoreValidationPort, record: _ActivationJournalRecord,
+) -> ActivationRecoveryReport | None:
+    """Prove a completed POSIX cancellation before accepting current runtime.
+
+    Live candidates/backups and rollback closures retain the original exact
+    recovery path. A fully retired ordinary cancellation anchors the prior DB
+    identity/generation/receipt; configured source/manifest are safe current
+    observations, whose content classification belongs to the binding monitor.
+    """
+    borrow = port.posix_activation_borrow
+    identity = port.resource_identity
+    if (borrow is None or record.phase is not _ActivationJournalPhase.PREPARED
+            or not record.had_prior_canonical or record.prior_db_path != identity.canonical_sidecar_path
+            or record.prior_generation is None or record.prior_binding_snapshot_id is None
+            or record.prior_receipt_digest is None):
+        return None
+    for path in (record.candidate_stage_db_path, record.candidate_manifest_temp_path,
+                 record.prior_db_backup_path, record.prior_manifest_backup_path,
+                 _activation_lineage_marker_temp_path(_activation_lineage_marker_path(identity))):
+        if path is not None and borrow.exists(path):
+            return None
+    source = borrow.capture(identity.configured_jsonl_path) if borrow.exists(identity.configured_jsonl_path) else None
+    database = borrow.capture(identity.canonical_sidecar_path)
+    manifest = borrow.capture(identity.snapshot_manifest_path) if borrow.exists(identity.snapshot_manifest_path) else None
+    if (database.device, database.inode) != record.prior_db_identity:
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+    # Preserve the existing exact replay and its owned guards when unchanged.
+    # A changed digest alone never authorizes the current-runtime branch.
+    if (source is not None and (source.device, source.inode) == record.source_jsonl_identity
+            and source.sha256 == record.source_jsonl_digest and database.sha256 == record.prior_db_digest
+            and ((manifest is None and record.prior_manifest_absent)
+                 or (manifest is not None and (manifest.device, manifest.inode) == record.prior_manifest_identity
+                     and manifest.sha256 == record.prior_manifest_digest))):
+        return None
+    quarantine = _observe_posix_cancelled_quarantine(record, identity, borrow)
+    if set(quarantine) != {record.candidate_stage_db_path.name, record.candidate_manifest_temp_path.name}:
+        return None
+    _require_cancelled_lineage_consistency(identity, had_prior_canonical=True, caller_borrow=borrow)
+    active_ref = _canonical_activation_ref(identity, journal_id=record.journal_id)
+    with port.open_configured_connection(identity.canonical_sidecar_path, require_existing=True) as connection:
+        meta = port.read_meta(connection)
+        if meta.get("activation_status") != "ACTIVE" or port.meta_int(meta, "generation") != record.prior_generation:
+            raise port.store_schema_error("STORE.ACTIVATION_STATE_INVALID")
+        activation_digest = meta.get("activation_digest")
+    snapshot = port.inspect_stage_schema(
+        active_ref, canonical_store_id=port.canonical_store_id,
+        _allow_diverged_runtime=True, _allow_active=True,
+        _expected_active_generation=record.prior_generation,
+        _expected_activation_digest=activation_digest,
+    )
+    view = _SQLiteGenerationView(stage=active_ref, canonical_store_id=port.canonical_store_id,
+                                 generation=record.prior_generation, fts5_available=snapshot.fts5_available)
+    with port.open_configured_connection(identity.canonical_sidecar_path, require_existing=True) as connection:
+        connection.execute("BEGIN")
+        try:
+            port.validate_store_identity(connection, resource_id=identity.resource_id,
+                                         canonical_store_id=port.canonical_store_id, target_identity=identity.target_identity)
+            if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)] or connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise port.store_schema_error("STORE.INTEGRITY_CHECK_FAILED")
+            facts = port.read_source_binding_facts_in_transaction(connection, view)
+            _validate_runtime_snapshot_lineage(connection, facts, identity,
+                canonical_store_id=port.canonical_store_id, receipt_id=record.prior_binding_snapshot_id,
+                receipt_digest=record.prior_receipt_digest)
+            _recover_activation_indexes(port, connection, fts5_available=snapshot.fts5_available)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+    if (borrow.capture(identity.canonical_sidecar_path) != database
+            or (borrow.capture(identity.configured_jsonl_path) if borrow.exists(identity.configured_jsonl_path) else None) != source
+            or (borrow.capture(identity.snapshot_manifest_path) if borrow.exists(identity.snapshot_manifest_path) else None) != manifest):
+        raise ActivationPreparationError("ACTIVATION.RECOVERY_ASSET_MUTATED", retryable=False)
+    borrow.reprove()
+    port.view = view
+    return ActivationRecoveryReport(phase=record.phase.value, action="CANCELLED", generation=record.prior_generation)
 
 
 def _prove_and_hydrate_completed_activation(
@@ -3899,6 +4001,24 @@ class _StageSQLBorrow(Protocol):
 @dataclass(frozen=True)
 class _SQLiteStageView(_SQLiteGenerationView):
     stage_borrow: _StageSQLBorrow | None = None
+
+
+@dataclass(slots=True)
+class _SnapshotSourceReturn:
+    """One live snapshot's prior, issued and consumed by its original owner."""
+
+    owner: ResourceStoreCoordinator
+    borrow: _CallerHeldPosixActivationBorrow
+    generation: int
+    source: ContentFileProof
+    database: ContentFileProof
+    manifest: ContentFileProof | None
+    cancelled_record: _ActivationJournalRecord | None = None
+    cancelled_identity: _ActivationFileIdentity | None = None
+    cancelled_bytes: bytes | None = None
+    source_restored: bool = False
+    current_authority_verified: bool = False
+    primary: BaseException | None = None
 
 
 class _ResourceOperationBorrow:
@@ -6511,10 +6631,60 @@ class ResourceStoreCoordinator:
                 raise
             raise failure from error
 
+    def _capture_snapshot_source_return(
+        self, borrow: _CallerHeldPosixActivationBorrow,
+    ) -> _SnapshotSourceReturn:
+        """Pin current authority before the outer owner changes its source."""
+        with self._posix_recovery_port(activation_borrow=borrow) as port:
+            report = _rehydrate_runtime_authority(port)
+            if report is None or self.current_generation is None:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_REQUIRED", retryable=False)
+            identity = self._resource_identity
+            return _SnapshotSourceReturn(
+                self, borrow, self.current_generation,
+                borrow.capture(identity.configured_jsonl_path),
+                borrow.capture(identity.canonical_sidecar_path),
+                borrow.capture(identity.snapshot_manifest_path) if borrow.exists(identity.snapshot_manifest_path) else None,
+            )
+
+    def _prove_snapshot_source_return(self, prior: _SnapshotSourceReturn) -> None:
+        if prior.owner is not self:
+            raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+        borrow = prior.borrow
+        with self._posix_recovery_port(activation_borrow=borrow) as port:
+            identity = self._resource_identity
+            if (borrow.capture(identity.configured_jsonl_path) != prior.source
+                    or borrow.capture(identity.canonical_sidecar_path) != prior.database
+                    or (borrow.capture(identity.snapshot_manifest_path) if borrow.exists(identity.snapshot_manifest_path) else None) != prior.manifest):
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_PRIOR_SET_INVALID", retryable=False)
+            if prior.cancelled_record is not None:
+                if (prior.cancelled_identity is None or prior.cancelled_bytes is None
+                        or borrow.read_journal(_activation_terminal_path(identity), prior.cancelled_identity)[0] != prior.cancelled_bytes):
+                    raise ActivationPreparationError("ACTIVATION.RECOVERY_MISMATCH", retryable=False)
+            report = _rehydrate_runtime_authority(port)
+            if report is None or report.generation != prior.generation:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_PRIOR_SET_INVALID", retryable=False)
+            borrow.reprove()
+
+    def _finish_snapshot_source_return(self, prior: _SnapshotSourceReturn) -> None:
+        """Verify current authority after cancellation and same-object source close."""
+        self._prove_snapshot_source_return(prior)
+        prior.source_restored = True
+        borrow = prior.borrow
+        with self._posix_recovery_port(activation_borrow=borrow) as port:
+            report = _rehydrate_runtime_authority(port)
+            if report is None or report.generation != prior.generation:
+                raise ActivationPreparationError("ACTIVATION.RECOVERY_PRIOR_SET_INVALID", retryable=False)
+            self._finish_cold_recovery_pending(port, report)
+            prior.current_authority_verified = True
+            port.state = "READY"
+            port.notify_all()
+
     def cancel_prepared_activation(
         self,
         preparation: _ActivationPreparation,
         *, _posix_borrow: _CallerHeldPosixActivationBorrow | None = None,
+        _snapshot_return: _SnapshotSourceReturn | None = None,
     ) -> None:
         """Fail-safe cancellation before Task 5.6 writes a journal."""
 
@@ -6526,7 +6696,7 @@ class ResourceStoreCoordinator:
 
         if _posix_borrow is not None:
             try:
-                self._cancel_posix_unpublished_activation(preparation, _posix_borrow)
+                self._cancel_posix_unpublished_activation(preparation, _posix_borrow, snapshot_return=_snapshot_return)
             except PlatformFileError as error:
                 raise ActivationPreparationError(
                     "ACTIVATION.RECOVERY_MISMATCH", retryable=error.retryable,
@@ -6668,6 +6838,7 @@ class ResourceStoreCoordinator:
     def _cancel_posix_unpublished_activation(
         self, preparation: _ActivationPreparation,
         borrow: _CallerHeldPosixActivationBorrow,
+        *, snapshot_return: _SnapshotSourceReturn | None = None,
     ) -> None:
         """Prove the complete live closure before cancelling a never-named DB."""
         self._stop_posix_recovery_admission()
@@ -6708,7 +6879,20 @@ class ResourceStoreCoordinator:
             self._family._recovery_preparations.pop(self._owner_nonce, None)
             self._finish_cold_recovery_pending(port, None)
             borrow.reprove()
-            self._state = "READY"
+            if snapshot_return is not None:
+                if snapshot_return.owner is not self or snapshot_return.borrow.root is not borrow.root:
+                    raise ActivationPreparationError("ACTIVATION.RESERVATION_MISMATCH", retryable=False)
+                payload, terminal_identity = borrow.read_journal(_activation_terminal_path(self._resource_identity), None)
+                record = _parse_activation_journal_bytes(payload, expected_journal_path=_activation_journal_path(self._resource_identity))
+                _revalidate_recovery_authority(port, record)
+                _ = _replay_cancelled_terminal_recovery(port, record)
+                snapshot_return.cancelled_record = record
+                snapshot_return.cancelled_identity = terminal_identity
+                snapshot_return.cancelled_bytes = payload
+                port._posix_recovery_completed = False
+                self._state = "ACTIVATING"
+            else:
+                self._state = "READY"
             self._initial_activation_authority_unavailable = False
             self._condition.notify_all()
 
@@ -13470,7 +13654,9 @@ class SQLiteTMStore:
                     lease,
                 )
 
-    def capture_export_snapshot(self) -> CanonicalExportSnapshot:
+    def capture_export_snapshot(
+        self, *, _borrow: _ResourceOperationBorrow | None = None,
+    ) -> CanonicalExportSnapshot:
         """Capture revision and complete record order in one read snapshot.
 
         Task 5.12 export seam: the revision (generation, canonical store
@@ -13479,7 +13665,16 @@ class SQLiteTMStore:
         an export can never mix bytes from two different revisions.
         """
 
-        with self._snapshot_operation_lease() as lease:
+        # A migration final reader already owns the transition W1. Borrow it
+        # directly: taking the refresh observation gate here would invert the
+        # gate-before-W1 lock order. The ordinary snapshot path is unchanged.
+        if _borrow is not None:
+            if type(_borrow) is not _ResourceOperationBorrow:
+                raise TypeError("snapshot borrow must be an exact resource operation")
+            _borrow.reprove(self._coordinator)
+        owner = (self._snapshot_operation_lease() if _borrow is None
+                 else self._coordinator._operation_lease(borrow=_borrow))
+        with owner as lease:
             with _open_leased_connection(lease) as connection:
                 connection.execute("BEGIN")
                 try:

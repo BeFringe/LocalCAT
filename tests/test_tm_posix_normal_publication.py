@@ -246,13 +246,16 @@ class PosixNormalPublicationTests(unittest.TestCase):
         self.assertEqual(record.phase.value, "MANIFEST_PUBLISHED")
 
     def test_source_failure_cleanup_finishes_before_reservation_release(self):
-        first = self.service.activate_initial(self.source, self.identity.resource_id)
+        from pathlib import Path
+        source: Path = getattr(self, "source")
+        root: Path = getattr(self, "root")
+        first = self.service.activate_initial(source, self.identity.resource_id)
         self.assertIs(type(first), migration.MigrationReport)
-        before = self.source.read_bytes()
+        before = (source.stat().st_ino, source.read_bytes())
         payload, digest = self._payload()
         events = []
         real_candidate = migration._bound_candidate_from_opened
-        real_cleanup = migration._cleanup_bound_export_artifacts
+        real_return = migration._return_snapshot_source
         real_release = migration._InitialActivationResourceReservation.release
         primary = OSError("source candidate failure")
 
@@ -261,25 +264,30 @@ class PosixNormalPublicationTests(unittest.TestCase):
                 raise primary
             return real_candidate(parent, name, *args, **kwargs)
 
-        def cleanup(parent, artifacts):
+        def returned(owner, prior, recovery_name, publication):
+            result = real_return(owner, prior, recovery_name, publication)
             reservation = self.service._active_owner_reservation
             self.assertIsNotNone(reservation)
             reservation.reprove()
             self.assertFalse(reservation._lease.closed)
-            events.append("cleanup")
-            return real_cleanup(parent, artifacts)
+            self.assertEqual((source.stat().st_ino, source.read_bytes()), before)
+            self.assertFalse(any("localcat-import-recovery" in p.name for p in root.iterdir()))
+            self.assertFalse(owner.borrow.io_incomplete)
+            events.append("handoff-close")
+            return result
 
         def release(reservation):
+            self.assertEqual(events, ["handoff-close"])
             events.append("release")
             return real_release(reservation)
 
-        with patch.object(migration, "_bound_candidate_from_opened", candidate), patch.object(migration, "_cleanup_bound_export_artifacts", cleanup), patch.object(migration._InitialActivationResourceReservation, "release", release):
+        with patch.object(migration, "_bound_candidate_from_opened", candidate), patch.object(migration, "_return_snapshot_source", returned), patch.object(migration._InitialActivationResourceReservation, "release", release):
             with self.assertRaises(OSError) as caught:
                 self.service.apply_snapshot_payload(payload, self.identity.resource_id, expected_digest=digest, expected_record_count=1, initial=False)
         self.assertIs(caught.exception, primary)
-        self.assertEqual(events, ["cleanup", "release"])
-        self.assertEqual(self.source.read_bytes(), before)
-        self.assertFalse(any("localcat-import" in p.name for p in self.root.iterdir()))
+        self.assertEqual(events, ["handoff-close", "release"])
+        self.assertEqual((source.stat().st_ino, source.read_bytes()), before)
+        self.assertFalse(any("localcat-import" in p.name for p in root.iterdir()))
 
     def test_source_backup_prepublication_failure_cleans_owned_temporary(self):
         from platform_fs_contracts import BoundDirectoryAuthority

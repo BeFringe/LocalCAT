@@ -720,7 +720,7 @@
   - _Depends: 10.10_
   - _Requirements: 2.7, 2.8, 7.15, 7.16, 7.18_
 
-- [ ] 10.11 闭合正常并发恢复与可见漂移矩阵
+- [x] 10.11 闭合正常并发恢复与可见漂移矩阵
   - Mac/Linux source 的 Core 公开 owner 正常链、SOURCE_DIVERGED、hot journal/backup、双进程并发取消及已可见漂移均验证；活事务外部替换另记边界观察，验证检测后停止与诚实结果，不要求全时序零副作用。
   - 完成时，真实builder已换目录时继续实际代码并拒绝错误访问；正常并发、受影响进程中断/重复恢复闭合；活事务外部替换另报边界观察。
   - _Boundary: Core 生命周期、恢复与漂移集成验证_
@@ -728,6 +728,10 @@
   - _Requirements: 2.4, 2.9, 2.10, 2.11, 2.12, 7.13, 7.14, 7.15, 7.16, 7.17, 7.18_
 
 ## Implementation Notes
+
+- Task 10.6a／Resource 6.1：完整 CANCELLED 保留公开重放，旧 canonical 的合法追加／刷新须验证当前业务事实，不能以取消记录的 incoming source 或旧 completion 字节锁死运行。外层 source 回位与 owned close 是不同事实；普通取消失败的资源层投影须核对同次实际返回的完整保全结果，不以 source 摘要相同或 canonical 可查询清除 pending。
+
+- Task 10.5／Resource 6.1：单独完成 preview 版本复证后仍可发生合法写回，目标版本须在 replacement 原 W1 内、任何 source 候选或恢复副本之前核对。READY／registry 回调早于 source terminal，最终 receipt 须由其后且仍持原 owner 的阶段消费真实语义证明；等待失败的并发调用不得清空在用调用的 reservation。
 
 - Task 10.11／Resource 6.1：显式旧 canonical 升级须由原 discovery factory 证明 v1 内容、ancestry 和历史 snapshot binding；普通 runtime cold open 不因此自动接受旧 schema。合法 append 后的完成态重开消费当前 DB 验证，不能重新要求最初 activation 字节证明。
 
