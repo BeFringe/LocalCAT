@@ -78,6 +78,10 @@ class _SourceInputAdapter:
         # Retain only source authorities, never this adapter or common owner.
         # Native close must use its own original-thread rule.
         self.__release = finalize(self, _close_source_authorities, self.__authorities) if self.__owned else None
+        if self.__release is not None:
+            # Shutdown must not wait for a daemon-held source proof window.
+            # Explicit close and runtime GC still release these read-only handles.
+            self.__release.atexit = False
 
     def is_production(self) -> bool:
         return self.__owned

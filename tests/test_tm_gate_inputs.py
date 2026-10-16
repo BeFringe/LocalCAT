@@ -10,6 +10,8 @@ import tempfile
 import os
 import shutil
 import subprocess
+import sys
+import textwrap
 import gc
 import weakref
 from types import SimpleNamespace
@@ -27,6 +29,88 @@ from tm_gate_inputs import (
 
 
 _ROOT = Path(__file__).absolute().parents[1]
+
+
+class SourceInputAdapterLifetimeTests(unittest.TestCase):
+    def test_interpreter_exits_with_daemon_holding_source_proof_window(self) -> None:
+        child_code = textwrap.dedent("""
+            from pathlib import Path
+            import sys
+            from threading import Event, Thread
+            from tm_gate_inputs import (
+                _RETAINED_SOURCE_COMPOSITION_KEY, _SourceInputAdapter,
+            )
+
+            ready = Event()
+            never_released = Event()
+
+            def hold_proof_window():
+                adapter = _SourceInputAdapter(
+                    Path(sys.argv[1]), _key=_RETAINED_SOURCE_COMPOSITION_KEY,
+                )
+                with adapter.proof_window():
+                    if adapter.read_bytes("input.txt", None) != b"retained input":
+                        raise RuntimeError("source read did not retain the input")
+                    ready.set()
+                    never_released.wait()
+
+            Thread(target=hold_proof_window, daemon=True).start()
+            if not ready.wait(30):
+                raise RuntimeError("daemon did not enter the source proof window")
+            print("source-proof-window-held", flush=True)
+        """)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "input.txt").write_bytes(b"retained input")
+            with subprocess.Popen(
+                [sys.executable, "-B", "-c", child_code, str(root)],
+                cwd=_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True,
+            ) as child:
+                try:
+                    # The daemon never releases the window: this is a hang
+                    # watchdog, not a benchmark of interpreter shutdown speed.
+                    stdout, stderr = child.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    stdout, stderr = child.communicate(timeout=10)
+                    self.assertIn("source-proof-window-held", stdout, stderr)
+                    self.fail(
+                        "source finalizer blocked interpreter exit while the "
+                        "daemon held its proof window"
+                    )
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertEqual(stdout.strip(), "source-proof-window-held")
+
+    def test_owned_source_explicit_close_and_runtime_gc_release_retained_files(self) -> None:
+        from tm_gate_inputs import (
+            _RETAINED_SOURCE_COMPOSITION_KEY, _SOURCE_COMPOSITION_KEY,
+            _SourceInputAdapter,
+        )
+
+        for key in (_SOURCE_COMPOSITION_KEY, _RETAINED_SOURCE_COMPOSITION_KEY):
+            for cleanup in ("close", "gc"):
+                with self.subTest(key=key, cleanup=cleanup), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    path = root / "input.txt"
+                    path.write_bytes(b"retained input")
+                    adapter = _SourceInputAdapter(root, _key=key)
+                    authority = cast(Any, adapter)._SourceInputAdapter__authority
+                    with adapter.proof_window():
+                        self.assertEqual(adapter.read_bytes("input.txt", None), b"retained input")
+                    retained_file = authority.bind_path(path)._bound_file()
+                    self.assertFalse(authority.closed)
+                    self.assertFalse(retained_file.closed)
+                    if cleanup == "close":
+                        adapter.close()
+                        adapter.close()
+                    else:
+                        reference = weakref.ref(adapter)
+                        del adapter
+                        gc.collect()
+                        self.assertIsNone(reference())
+                    self.assertTrue(authority.closed)
+                    self.assertTrue(retained_file.closed)
 
 
 class TrustedGateInputSessionTests(unittest.TestCase):
