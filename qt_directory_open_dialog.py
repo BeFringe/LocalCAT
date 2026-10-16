@@ -1,8 +1,12 @@
 """Display-only directory selection and the unified local-open chooser."""
+import re
+
 from PySide6.QtCore import Qt, QTimer, QSignalBlocker
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QPushButton, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout)
+
+from project_directory_contracts import DirectoryEntryKind, DirectoryEntryUnavailableReason
 
 
 class QtLocalProjectOpenDialog(QDialog):
@@ -52,6 +56,10 @@ class QtDirectoryOpenDialog(QDialog):
         self.tree.setHeaderLabels(('相对路径', '状态'))
         self.entry_items = {}
         for entry in review.preview.entries:
+            if (entry.kind is DirectoryEntryKind.REGULAR
+                    and entry.unavailable_reason is DirectoryEntryUnavailableReason.UNSUPPORTED_FORMAT
+                    and re.fullmatch(r'\.parser-[0-9a-f]{32}\.lock', entry.display_name)):
+                continue
             item = QTreeWidgetItem((entry.display_name,
                 '可选择 · ' + str(entry.byte_count) + ' 字节' if entry.selectable
                 else self._REASONS.get(entry.unavailable_reason.value, '不可选择')))

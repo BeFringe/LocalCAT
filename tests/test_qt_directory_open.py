@@ -129,6 +129,79 @@ class QtDirectoryOpenTests(unittest.TestCase):
         blocked.close()
         self.controller.cancel_directory_open(review)
 
+    def test_parser_lock_rows_hidden_without_changing_discovery_or_file_selection(self):
+        lock_name = '.parser-' + 'a' * 32 + '.lock'
+        locks = tuple(directory / lock_name for directory in
+                      (self.root, self.root / 'a', self.root / 'b'))
+        for lock in locks:
+            lock.write_bytes(b'parser control carrier')
+        for directory in (self.root, self.root / 'a', self.root / 'b'):
+            (directory / 'intro.rpy').write_text('translate english intro:\n    "Hello"\n')
+        review = self.preview()
+        observed = review.preview.entries
+        observed_ids = tuple(entry.entry_id for entry in observed)
+        lock_ids = self.ids(review, (lock_name, 'a/' + lock_name, 'b/' + lock_name))
+        expected_refs = ('a/intro.rpy', 'a/same.txt', 'b/deep/same.txt',
+                         'b/intro.rpy', 'bad.json', 'intro.rpy')
+        self.assertEqual(len(observed), 13)
+        self.assertEqual(tuple(entry.source_ref for entry in observed if entry.selectable),
+                         expected_refs)
+        dialog = QtDirectoryOpenDialog(review)
+        try:
+            self.assertTrue(all(entry_id not in dialog.entry_items for entry_id in lock_ids))
+            self.assertEqual(tuple(dialog.entry_items),
+                             tuple(entry_id for entry_id in observed_ids if entry_id not in lock_ids))
+            dialog.select_all_button.click()
+            self.assertEqual(dialog.ordered_entry_ids, self.ids(review, expected_refs))
+            self.assertEqual(dialog.selection_count.text(), '已选 6 / 6 个可选文件')
+            dialog.selected_files.setCurrentRow(5)
+            dialog.move_selected(-1)
+            self.assertEqual(dialog.ordered_entry_ids,
+                             self.ids(review, expected_refs[:4] + ('intro.rpy', 'bad.json')))
+            dialog.clear_selection_button.click()
+            self.assertEqual(dialog.ordered_entry_ids, ())
+            self.assertIs(review.preview.entries, observed)
+            self.assertEqual(tuple(entry.entry_id for entry in observed), observed_ids)
+            self.assertEqual(len(observed), 13)
+            for lock in locks:
+                self.assertEqual(lock.read_bytes(), b'parser control carrier')
+        finally:
+            dialog.close()
+            self.controller.cancel_directory_open(review)
+
+    def test_parser_lock_name_does_not_hide_other_names_or_rejected_entry_kinds(self):
+        from dataclasses import replace
+        from project_directory_contracts import DirectoryEntryKind as Kind
+        from project_directory_contracts import DirectoryEntryUnavailableReason as Reason
+        lock_name = '.parser-' + 'a' * 32 + '.lock'
+        names = ('.parser-' + 'a' * 31 + '.lock', '.parser-' + 'a' * 33 + '.lock',
+                 '.parser-' + 'g' * 32 + '.lock', '.parser-' + 'B' * 32 + '.lock',
+                 lock_name + '.txt', lock_name + '.extra')
+        for name in (lock_name,) + names:
+            (self.root / name).write_text('Ordinary file')
+        review = self.preview()
+        original = next(entry for entry in review.preview.entries if entry.source_ref == lock_name)
+        try:
+            for kind, reason in ((Kind.SYMLINK, Reason.LINK), (Kind.REPARSE, Reason.REPARSE),
+                                 (Kind.DIRECTORY, Reason.DIRECTORY), (Kind.OTHER, Reason.NOT_REGULAR),
+                                 (Kind.REGULAR, Reason.INVALID_REFERENCE), (Kind.REGULAR, None)):
+                with self.subTest(kind=kind, reason=reason):
+                    entry = replace(original, kind=kind, unavailable_reason=reason,
+                                    selectable=reason is None)
+                    entries = tuple(entry if item is original else item for item in review.preview.entries)
+                    projected = replace(review, preview=replace(review.preview, entries=entries))
+                    dialog = QtDirectoryOpenDialog(projected)
+                    try:
+                        self.assertIn(entry.entry_id, dialog.entry_items)
+                        for entry_id in self.ids(review, names):
+                            self.assertIn(entry_id, dialog.entry_items)
+                        self.assertEqual(bool(dialog.entry_items[entry.entry_id].flags()
+                                              & Qt.ItemFlag.ItemIsUserCheckable), reason is None)
+                    finally:
+                        dialog.close()
+        finally:
+            self.controller.cancel_directory_open(review)
+
     def test_folder_bulk_selection_partial_state_order_and_stale_controls(self):
         (self.root / 'b' / 'other.txt').write_text('Third\n')
         (self.root / 'blocked').mkdir()
