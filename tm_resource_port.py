@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 import hashlib
 import sys
 from pathlib import Path
@@ -32,6 +33,8 @@ from tm_migration import (
     ActivationPreparationError,
     AppliedSnapshotProof,
     MigrationPreflightError,
+    PreparedJSONLDiscardReport,
+    PreparedJSONLExport,
     TMMigrationService,
 )
 from tm_sqlite_store import (
@@ -40,6 +43,16 @@ from tm_sqlite_store import (
 
 
 _EXPORT_MANIFEST_SUFFIX = ".localcat-snapshot.json"
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedTMPackageSnapshot:
+    """One TM port's live Core disposal authority and immutable public facts."""
+
+    owner: TMResourceSnapshotPort
+    service: TMMigrationService
+    core: PreparedJSONLExport
+    snapshot: PortableResourceSnapshot
 
 
 class TMResourceSnapshotPort:
@@ -115,6 +128,69 @@ class TMResourceSnapshotPort:
         resource: ResourceConfig,
         destination: Path,
     ) -> PortableResourceSnapshot:
+        service, store = self._export_owner(resource)
+        return self._snapshot_from_export(
+            service.export_jsonl(store, destination), destination,
+        )
+
+    def prepare_package_snapshot(
+        self, resource: ResourceConfig, destination: Path,
+    ) -> _PreparedTMPackageSnapshot:
+        service, store = self._export_owner(resource)
+        prepared = service.prepare_jsonl_export(store, destination)
+        if type(prepared) is ExportFailure:
+            raise ResourcePortabilityError(
+                "RESOURCE.EXPORT.SNAPSHOT_UNAVAILABLE", retryable=prepared.retryable,
+            )
+        if type(prepared) is not PreparedJSONLExport:
+            raise TypeError("TM package export returned an unknown outcome")
+        # Retain the exact service/token before any facts projection can fail.
+        try:
+            snapshot = self._snapshot_from_export(prepared.report, destination)
+            return _PreparedTMPackageSnapshot(self, service, prepared, snapshot)
+        except BaseException as primary:
+            try:
+                self._discard_export(service, prepared)
+            except BaseException as cleanup:
+                primary.add_note("RESOURCE.EXPORT.STAGE_FAILED")
+                if (
+                    type(cleanup) is ResourcePortabilityError
+                    and cleanup.code == "RESOURCE.EXPORT.STAGE_FAILED"
+                ):
+                    for note in getattr(cleanup, "__notes__", ()):
+                        primary.add_note(note)
+            raise
+
+    def discard_package_snapshot(
+        self, prepared: _PreparedTMPackageSnapshot,
+    ) -> PreparedJSONLDiscardReport:
+        if type(prepared) is not _PreparedTMPackageSnapshot:
+            raise TypeError("TM package snapshot must be exact prepared snapshot")
+        if prepared.owner is not self:
+            raise ValueError("TM package snapshot belongs to another port")
+        return self._discard_export(prepared.service, prepared.core)
+
+    @staticmethod
+    def _discard_export(
+        service: TMMigrationService, prepared: PreparedJSONLExport,
+    ) -> PreparedJSONLDiscardReport:
+        result = service.discard_prepared_jsonl_export(prepared)
+        if type(result) is not PreparedJSONLDiscardReport:
+            raise TypeError("TM discard returned an unknown outcome")
+        if not result.complete:
+            error = ResourcePortabilityError("RESOURCE.EXPORT.STAGE_FAILED")
+            error.add_note(
+                "RESOURCE.EXPORT.STAGE_FAILED "
+                f"removed_count={len(result.removed_names)} "
+                f"retained_count={len(result.retained_names)} "
+                f"diagnostics={','.join(result.diagnostic_codes)}"
+            )
+            raise error
+        return result
+
+    def _export_owner(
+        self, resource: ResourceConfig,
+    ) -> tuple[TMMigrationService, SQLiteTMStore]:
         if type(resource) is not ResourceConfig:
             raise TypeError("TM portable resource must be exact ResourceConfig")
         resource.__post_init__()
@@ -137,7 +213,12 @@ class TMResourceSnapshotPort:
             coordinator=coordinator,
             platform_backend=self._backend,
         )
-        outcome = service.export_jsonl(store, destination)
+        return service, store
+
+    @staticmethod
+    def _snapshot_from_export(
+        outcome: ExportReport | ExportFailure, destination: Path,
+    ) -> PortableResourceSnapshot:
         if type(outcome) is ExportFailure:
             raise ResourcePortabilityError(
                 "RESOURCE.EXPORT.SNAPSHOT_UNAVAILABLE",

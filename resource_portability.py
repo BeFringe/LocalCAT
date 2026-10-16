@@ -73,7 +73,7 @@ from resource_platform_io import (
     platform_relative_path,
 )
 from termbase_store import TermbasePortableSnapshot, TermbaseStore
-from tm_resource_port import TMResourceSnapshotPort
+from tm_resource_port import TMResourceSnapshotPort, _PreparedTMPackageSnapshot
 
 
 @dataclass(slots=True)
@@ -283,7 +283,7 @@ class ResourcePortabilityService:
         )
         package_candidate = _candidate_path(destination, "resource-package")
         package_candidate_snapshot: EntrySnapshot | None = None
-        companion: Path | None = None
+        tm_prepared: _PreparedTMPackageSnapshot | None = None
         term_snapshot: TermbasePortableSnapshot | None = None
         tmx_payload: bytes | None = None
         armed = False
@@ -297,15 +297,16 @@ class ResourcePortabilityService:
                     raise TypeError("TMX package payload must be exact immutable bytes")
                 self._validate_handler_snapshot(snapshot, tmx_payload)
             elif resource.kind is ResourceKind.TRANSLATION_MEMORY:
-                snapshot = self._tm.export_snapshot(resource, payload)
-                companion = self._tm.companion_path(payload)
+                tm_prepared = self._tm.prepare_package_snapshot(resource, payload)
+                snapshot = tm_prepared.snapshot
             else:
                 term_snapshot = self._termbase.export_portable_snapshot(
                     resource.path,
                     payload,
                 )
                 snapshot = _portable_term_snapshot(term_snapshot)
-            self._reprove_source(resource, snapshot)
+            if tm_prepared is None:
+                self._reprove_source(resource, snapshot)
             manifest = _manifest_for_snapshot(snapshot)
             writer = write_resource_package if tmx_payload is None else write_resource_package_bytes
             writer(
@@ -319,6 +320,12 @@ class ResourcePortabilityService:
                 package_candidate,
             )
             candidate_report = self.validate_resource_package(package_candidate)
+            if tm_prepared is not None:
+                # Peer exports take source before destination. Release the
+                # destination lease before re-entering this canonical source.
+                self._tm.discard_package_snapshot(tm_prepared)
+                tm_prepared = None
+                self._reprove_source(resource, snapshot)
             expected = self._receipt(
                 operation_id=operation_id,
                 operation_kind=ResourceOperationKind.EXPORT_PACKAGE,
@@ -396,6 +403,19 @@ class ResourcePortabilityService:
             raise
         finally:
             primary = sys.exception()
+            if tm_prepared is not None:
+                try:
+                    self._tm.discard_package_snapshot(tm_prepared)
+                except BaseException as cleanup:
+                    if primary is None:
+                        raise
+                    primary.add_note("RESOURCE.EXPORT.STAGE_FAILED")
+                    if (
+                        type(cleanup) is ResourcePortabilityError
+                        and cleanup.code == "RESOURCE.EXPORT.STAGE_FAILED"
+                    ):
+                        for note in getattr(cleanup, "__notes__", ()):
+                            primary.add_note(note)
             if term_snapshot is not None:
                 try:
                     self._termbase.discard_portable_snapshot(payload, term_snapshot)
@@ -413,12 +433,6 @@ class ResourcePortabilityService:
                     )
                 except PlatformFileError:
                     pass
-                except BaseException:
-                    if primary is None:
-                        raise
-            if companion is not None:
-                try:
-                    companion.unlink(missing_ok=True)
                 except BaseException:
                     if primary is None:
                         raise

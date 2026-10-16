@@ -303,7 +303,7 @@ Cluster 0 治理/characterization
 
 本组消费共享平台 Task 11.0 的非并行治理闭合前置：治理 owner 提供唯一 ADR-033 治理提交及开发基线继承关系，四个 owning Spec 的范围差异一致后再进入实现。Core 的家族生命周期与 v2 同对象技术门沿下列依赖先闭合；本组不重新建立治理任务或把技术门等同于产品完成。
 
-- [ ] 6. 贯通 POSIX 资源包事务与终态
+- [x] 6. 贯通 POSIX 资源包事务与终态
 
 - [x] 6.1 集成 POSIX 包 create/replace 与同一资源 owner 的终态
   - 资源端口消费 Core 提供并由调用方注入的原家族会话，在首次 source 发布前完成家族准入与排空；子阶段及回调只借用外层操作，不通过新建 engine 或路径重绑清除失效。真实 owner 的端口与事务接线属于本任务，runtime 与 port 的实际 composition 由 UI 10.1 消费该接缝完成。
@@ -324,7 +324,7 @@ Cluster 0 治理/characterization
   - _Depends: 6.1, tm-storage-retrieval-index 10.11_
   - _Requirements: 7.7, 8.6, 8.7, 12.3, 12.4, 12.7_
 
-- [ ] 6.3 闭合 JSONL 包私有 stage 的消费与收尾
+- [x] 6.3 闭合 JSONL 包私有 stage 的消费与收尾
   - TM snapshot port 获取 Core prepared 生命周期，完成 facts 投影及失败释放；Resource 在 candidate 完整校验后释放 JSONL、companion 和目的 lease，再复证来源、进入目标 publication；持 prepared 期间不重入 canonical owner。
   - 完成时，正常出包及封包前失败不遗留本次正文/companion；清理失败不发布目标，原主异常、旧目标和未知对象保留，已清理与仍保留项不混淆。
   - 通过真实 canonical TM 验证成功、port/source/candidate 校验故障、清理失败及同资源同输出目录的双操作锁顺序，复核 direct JSONL 与既有 package receipt/recovery 合同；受影响 source/frozen 出口进入后续交付验证。
