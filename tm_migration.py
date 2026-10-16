@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, TypedDict, cast
+from typing import Any, NoReturn, SupportsIndex, TypedDict, cast
 import uuid
 
 from tm_activation_journal import (
@@ -206,6 +206,61 @@ class _BoundExportPublication:
     candidate_identity: FileObjectIdentity
     candidate: CandidateFile | None = None
     pending: PendingPublication | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedJSONLDiscardReport:
+    """Terminal cleanup facts; retained names were not proved removed."""
+
+    removed_names: tuple[str, ...]
+    retained_names: tuple[str, ...]
+    diagnostic_codes: tuple[str, ...]
+
+    @property
+    def complete(self) -> bool:
+        return not self.retained_names and not self.diagnostic_codes
+
+
+@dataclass(slots=True)
+class _PreparedJSONLState:
+    backend: PlatformFileBackend
+    root: RootedDirectoryAuthority
+    parent: BoundDirectoryAuthority
+    lease: LockLease
+    pair: tuple[tuple[str, _BoundExportPrior], ...]
+
+
+class PreparedJSONLExport:
+    """Instance-owned private output, minted after source terminal success.
+
+    The report describes the same export as ``export_jsonl``.  The retained
+    state authorizes only disposal of that exact destination pair; it holds
+    neither a source operation nor canonical access.
+    """
+
+    __slots__ = ("_owner", "_report", "_state", "_discard_result", "_release_lock")
+
+    def __init__(self, owner: object, report: ExportReport, state: _PreparedJSONLState) -> None:
+        self._owner = owner
+        self._report = report
+        self._state: _PreparedJSONLState | None = state
+        self._discard_result: PreparedJSONLDiscardReport | None = None
+        self._release_lock = threading.Lock()
+
+    @property
+    def report(self) -> ExportReport:
+        return self._report
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> NoReturn:
+        del protocol
+        raise TypeError("PreparedJSONLExport is an opaque live object")
+
+    def __copy__(self) -> NoReturn:
+        raise TypeError("PreparedJSONLExport is an opaque live object")
+
+    def __deepcopy__(self, memo: object) -> NoReturn:
+        del memo
+        raise TypeError("PreparedJSONLExport is an opaque live object")
 
 
 @dataclass(frozen=True)
@@ -2720,6 +2775,7 @@ class TMMigrationService:
         self._coordinator = coordinator
         self._platform_backend = platform_backend
         self._recovery_profile = _select_recovery_profile()
+        self._prepared_jsonl_owner = object()
         # The apply seam exposes a caller-held owner projection only during
         # its callback window.  It is deliberately instance-local: callers
         # create one service per operation, and no second W1 may be minted.
@@ -4923,6 +4979,114 @@ class TMMigrationService:
             )
         return self._run_arbitrary_export(store, destination)
 
+    def prepare_jsonl_export(
+        self, store: SQLiteTMStore, destination: Path,
+    ) -> PreparedJSONLExport | ExportFailure:
+        """Export an absent private pair, retaining its original destination owner."""
+        if type(store) is not SQLiteTMStore:
+            raise TypeError("store must be exact SQLiteTMStore")
+        if type(destination) is not _NATIVE_PATH_TYPE:
+            raise TypeError("destination must be an exact native Path")
+        retained: list[_PreparedJSONLState] = []
+        backend = self._platform_backend
+        if backend is None and store.coordinator._family is not None:
+            backend = store.coordinator._family._backend
+        if backend is None:
+            try:
+                backend = compose_platform_file_backend(destination.parent)
+            except PlatformFileError as error:
+                return self._export_failure(
+                    _bound_export_platform_error(error), stage_label="EXPORT.PREFLIGHT",
+                    destination_before=None, destination_observed=None,
+                )
+        try:
+            operation = lambda: self._run_bound_arbitrary_export(
+                store, destination, backend, retained_private=retained,
+            )
+            outcome = (self._run_posix_snapshot_operation(store, operation, stage_prefix="EXPORT")
+                       if self._recovery_profile is _RecoveryProfile.POSIX_V2 else operation())
+        except BaseException as error:
+            for state in retained:
+                if _close_bound_export_authorities(state.lease, state.parent, state.root) is not None:
+                    error.add_note("EXPORT.STAGE.AUTHORITY_CLOSE_FAILED")
+            raise
+        if isinstance(outcome, ExportReport):
+            return PreparedJSONLExport(self._prepared_jsonl_owner, outcome, retained[0])
+        for state in retained:
+            # A source terminal failure may follow a committed destination.
+            # Close its owners but preserve the pair and original recovery facts.
+            if _close_bound_export_authorities(state.lease, state.parent, state.root) is not None:
+                outcome = replace(outcome, diagnostics=outcome.diagnostics + (
+                    _export_diagnostic("EXPORT.CLEANUP_PENDING", "EXPORT_STAGE_AUTHORITY_CLOSE_FAILED"),
+                ))
+        return outcome
+
+    def discard_prepared_jsonl_export(
+        self, prepared: PreparedJSONLExport,
+    ) -> PreparedJSONLDiscardReport:
+        """Dispose only this instance's pair and always close retained authorities."""
+        if type(prepared) is not PreparedJSONLExport:
+            raise TypeError("prepared must be an exact PreparedJSONLExport")
+        if prepared._owner is not self._prepared_jsonl_owner:
+            raise ValueError("prepared belongs to another export owner")
+        with prepared._release_lock:
+            if prepared._discard_result is not None:
+                return prepared._discard_result
+            state = prepared._state
+            assert state is not None
+            removed: list[str] = []
+            diagnostics: list[str] = []
+            try:
+                state.lease.reprove()
+                state.root.reprove()
+                state.parent.reprove()
+                # Validate both before the first mutation, including same-file
+                # content changes.  Reuse the exporter's original rooted reader.
+                for name, expected in state.pair:
+                    observed = _capture_bound_export_prior(
+                        state.backend, state.root, state.parent, name,
+                        unsafe_code="EXPORT.STAGE.IDENTITY_STALE",
+                    )
+                    if observed != expected:
+                        raise ExportPreflightError("EXPORT.STAGE.IDENTITY_STALE")
+                for name, expected in state.pair:
+                    assert expected.snapshot is not None
+                    unlink_error: BaseException | None = None
+                    try:
+                        # The platform owned-unlink includes its existing
+                        # directory durability boundary (fsync on POSIX).
+                        state.parent.unlink_owned(name, expected.snapshot.identity)
+                    except BaseException as error:
+                        unlink_error = error
+                        raise
+                    finally:
+                        # An unlink can succeed before its synchronization fails.
+                        # Only report absence when the original parent proves it.
+                        try:
+                            if state.parent.inspect_entry(name) is None:
+                                removed.append(name)
+                        except BaseException:
+                            if unlink_error is None:
+                                raise
+                    if name not in removed:
+                        raise ExportPreflightError("EXPORT.STAGE.REMOVAL_UNCONFIRMED")
+            except (ExportPreflightError, PlatformFileError, OSError) as error:
+                diagnostics.append(error.error_code if isinstance(error, ExportPreflightError)
+                                   else "EXPORT.STAGE.CLEANUP_FAILED")
+            except BaseException:
+                diagnostics.append("EXPORT.STAGE.CLEANUP_FAILED")
+                raise
+            finally:
+                close_error = _close_bound_export_authorities(state.lease, state.parent, state.root)
+                if close_error is not None:
+                    diagnostics.append("EXPORT.STAGE.AUTHORITY_CLOSE_FAILED")
+                prepared._state = None
+                prepared._discard_result = PreparedJSONLDiscardReport(
+                    tuple(removed), tuple(name for name, _ in state.pair if name not in removed),
+                    tuple(diagnostics),
+                )
+            return prepared._discard_result
+
     def _run_posix_snapshot_operation(
         self, store: SQLiteTMStore, operation: Callable[[], ExportOutcome],
         *, stage_prefix: str,
@@ -5980,6 +6144,7 @@ class TMMigrationService:
         store: SQLiteTMStore,
         destination: Path,
         backend: PlatformFileBackend,
+        *, retained_private: list[_PreparedJSONLState] | None = None,
     ) -> ExportOutcome:
         """Run one Windows export family through neutral rooted ports."""
 
@@ -5989,6 +6154,7 @@ class TMMigrationService:
         lease: LockLease | None = None
         destination_prior = _BoundExportPrior(None, None)
         manifest_prior = _BoundExportPrior(None, None)
+        private_publications: list[tuple[str, FileObjectIdentity, str]] = []
         try:
             _require_bound_export_path(self._resource_identity, paths)
             try:
@@ -6022,6 +6188,10 @@ class TMMigrationService:
                 paths.manifest.name,
                 unsafe_code="EXPORT.MANIFEST_UNSAFE",
             )
+            if retained_private is not None and (
+                destination_prior.snapshot is not None or manifest_prior.snapshot is not None
+            ):
+                raise ExportPreflightError("EXPORT.PRIVATE_DESTINATION_EXISTS")
             if destination_prior.snapshot is None and manifest_prior.snapshot is not None:
                 raise ExportPreflightError("EXPORT.PAIR_INCONSISTENT")
             for artifact, code in (
@@ -6056,7 +6226,30 @@ class TMMigrationService:
                 manifest_prior=manifest_prior,
                 posix_parent=posix_parent,
                 owner_reprove=store._reprove_snapshot_operation,
+                private_publications=private_publications if retained_private is not None else None,
             )
+            if retained_private is not None and isinstance(outcome, ExportReport):
+                try:
+                    pair = tuple((name, _capture_bound_export_prior(
+                        backend, root, parent, name, unsafe_code="EXPORT.DESTINATION_STALE",
+                    )) for name in (paths.destination.name, paths.manifest.name))
+                    if len(private_publications) != 2:
+                        raise ExportPreflightError("EXPORT.DESTINATION_STALE")
+                    for (name, prior), (published_name, identity, digest) in zip(pair, private_publications):
+                        if (name != published_name or prior.snapshot is None
+                                or prior.snapshot.identity != identity or prior.digest != digest):
+                            raise ExportPreflightError("EXPORT.DESTINATION_STALE")
+                except (ExportPreflightError, PlatformFileError, OSError):
+                    return export_cleanup_pending_failure(
+                        stage="EXPORT.LEDGER", destination_before=None,
+                        destination_observed=outcome.destination_digest,
+                        diagnostics=(_export_diagnostic("EXPORT.CLEANUP_PENDING", "EXPORT_STAGE_IDENTITY_UNPROVEN"),),
+                    )
+                retained_private.append(_PreparedJSONLState(backend, root, parent, lease, pair))
+                lease = None
+                parent = None
+                root = None
+                return outcome
             close_error = _close_bound_export_authorities(lease, parent, root)
             lease = None
             parent = None
@@ -6132,6 +6325,7 @@ class TMMigrationService:
         cancel_receipt: Callable[[SnapshotReceipt], None] | None = None,
         owner_reprove: Callable[[], None] | None = None,
         posix_parent: snapshot_artifacts_module._PosixSnapshotParent | None = None,
+        private_publications: list[tuple[str, FileObjectIdentity, str]] | None = None,
     ) -> ExportOutcome:
         """Publish one JSONL/manifest family under live platform authorities.
 
@@ -6544,6 +6738,10 @@ class TMMigrationService:
             if posix_parent is not None:
                 store.clear_issued_receipt_handoff(receipt.snapshot_id,
                     expected_generation=snapshot.revision.generation, artifact_parent=posix_parent)
+            if private_publications is not None:
+                for publication in (jsonl_publication, manifest_publication):
+                    private_publications.append((publication.name, publication.candidate_identity,
+                                                 publication.content.content_sha256.hex()))
             return self._export_report(
                 record_count=record_count,
                 jsonl_digest=receipt.jsonl_digest,

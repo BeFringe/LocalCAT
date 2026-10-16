@@ -623,7 +623,7 @@
 
 本组修改现有 owner 端口并复用原 phase machine。10.1–10.2a 提供隔离生命周期机制门，10.3–10.6 提供 v2 同对象门所需全部正常 I/O 与指定恢复窗口；10.6a 补齐 DB 命名前的取消与家族终态；10.2b 在这些前置完整闭合后启用公开生命周期并复核兼容。10.7–10.11 只在两门及10.2b通过后扩展。技术门不代替产品交付，也不扩展 VFS、驱动、新持久格式或永久单进程独占。
 
-- [ ] 10. 贯通 POSIX 家族生命周期、同对象发布与恢复
+- [x] 10. 贯通 POSIX 家族生命周期、同对象发布与恢复
 
 - [x] 10.1 实现家族会话与显式操作借用
   - 普通 operation 先计入 admission、释放 condition 再取 W1；replacement 先停止 admission 并 drain 再取 W1。借用绑定 resource/operation/thread，外层 owner 唯一关闭 root/W1。
@@ -712,7 +712,7 @@
   - _Depends: 10.7, 10.9_
   - _Requirements: 2.7, 2.8, 7.15, 7.16, 7.18_
 
-- [ ] 10.10a 提供私有 JSONL 导出产物的原授权收尾
+- [x] 10.10a 提供私有 JSONL 导出产物的原授权收尾
   - 复用同一 exporter 与完整 receipt 终态，为原本不存在的私有目标对提供 prepare/discard；保持直接 JSONL 导出合同。
   - 在来源操作完整结束后交出本实例拥有的 prepared 对象；保留原目的 root/parent/lease 和两文件身份，消费结束按原授权清理并关闭。
   - 完成时，正常释放不留正文/companion，重复释放无额外写入；普通失败诚实报告部分清理，失效或未知对象不删除，Core 未完成恢复物不被当成可丢弃 stage。
