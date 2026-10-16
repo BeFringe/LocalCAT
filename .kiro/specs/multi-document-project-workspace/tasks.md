@@ -276,13 +276,13 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - 完成时，普通 Windows frozen 能打开目录预览及章节树，缺源目录时包导航仍可用。
   - _Requirements: 13.5, 13.6_
   - _Boundary: Platform build composition_
-- [ ] 5.10 执行增量端到端与故障回归
+- [x] 5.10 执行增量端到端与故障回归
   - 执行 source 与 Windows 嵌套目录/包/Qt 旅程及原文件入口回归；合成 fixture 不依赖个人目录。
   - 完成时，未选内容不读、drift/取消不提交、包冷重开和目录树状态均有当前实现证据，原 profile/writer 负向边界保留。
   - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6_
   - _Boundary: Project / Platform / Qt acceptance integration_
   - _Depends: 5.7, 5.8, 5.9_
-- [ ] 5.11 闭合实际治理同步与下游消费
+- [x] 5.11 闭合实际治理同步与下游消费
   - 由治理 owner 同步实际实现的目录/单文件边界；RPY 消费此 profile 与选择服务，不复制枚举或持久化。
   - 完成时，实际 diff 与现行合同一致、平台/Parser/Qt 相关回归可核查；未实现项不列为完成，不改写历史验收。
   - _Requirements: 13.4, 13.6_

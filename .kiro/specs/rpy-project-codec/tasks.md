@@ -186,12 +186,12 @@
   - _Requirements: 1.2, 1.4, 3.2, 3.3, 3.4, 4.2, 4.3, 4.4, 4.5, 7.1, 7.2, 7.3, 7.4_
   - _Boundary: RPY / Project / Parser release integration validation_
   - _Depends: 3.4b, 5.2, 5.3_
-- [ ] 6.2 执行多文件编辑和手工包用户旅程
+- [x] 6.2 执行多文件编辑和手工包用户旅程
   - 验证根目录预览选择、嵌套相对路径、树导航与阅读顺序/调和、混合两类 TL、同名分目录导出、TM/术语建议与两个设备的包验证/本地资源选择。
   - 完成时，Project 与 JSONL/CSV ResourcePackage 分别完成冷重开/导入，设备资格未被搬运，未引入 TMX 前置。
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 6.1, 6.2, 6.4, 7.4_
   - _Boundary: Product acceptance integration_
-- [ ] 6.3 闭合治理同步与下游消费验证
+- [x] 6.3 闭合治理同步与下游消费验证
   - 由治理 owner 将实际实现的能力同步到 product/tech/structure/roadmap、spec-ownership 与 Multi 顺序说明；owner 提交只消费唯一治理变更。
   - 完成时，实际 diff 与现行合同一致，Parser/Project/Qt 回归及 Sync 手工包前提可验证；未完成项不得记为 Feature GO。
   - _Requirements: 1.4, 3.4, 6.4, 7.4_
