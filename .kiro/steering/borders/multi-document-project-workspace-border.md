@@ -1,6 +1,14 @@
 # 设计约束清单 — Multi-Document Project Workspace
 
-## 设计来源
+更新：2026-10-16；同步目录与 RPY 的实际能力及后续交付边界。
+
+## 适用范围与后续增量
+
+下文 Cluster 0–4 的门、红线与归档状态保留原始显式文件基线的含义；其中“不启用目录发现”的表述不再覆盖后续 Requirement 13。现行增量按 ADR-030 提供用户触发的 metadata 预览、显式勾选、原根相对路径及非 legacy 单文件项目包；后台自动发现、workbook 和 reader-only 格式写回仍不开放。目录增量的发行、端到端与治理闭合独立于原 Cluster 4 归档。
+
+RPY 只消费上述 Project 接缝，并独立拥有 TL 语法、私有映射与格式内容准备。中立 Parser/平台承担受绑定的逐文件发布，缺失目录按 ADR-032 先准备、再以新预览确认；这不是 ProjectPackage 保存，也不引入跨文件原子性或共同 package authority。RPY 手工 ProjectPackage 与 JSONL/CSV ResourcePackage 闭环先于 Sync，具体前置和并行空间以各 owning Tasks 为准。
+
+## 设计来源（原始 Cluster 0–4）
 
 - 项目 owner 批准从 Multi-Document Cluster 0 回归，先完成 R/D/T、ADR、current-source characterization 与人工批准；业务代码暂为 NO-GO。
 - `multi-document-project-workspace/brief.md` 及待批准 Requirements/Design/Tasks。
@@ -50,7 +58,7 @@ Cluster 0 人工批准
 
 - `language-resource-portability`：现有 brief 在 Cluster 2 package 原语被验证后提升为独立 R/D/T，独立拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告、preview/receipt 和冷重开；sync 分别消费 ProjectPackage 与 ResourcePackage。
 - `tmx-context-interchange`：只拥有 TMX language-resource context/provenance/export profile；TMX 不是 ProjectDocument。
-- `rpy-project-codec`：独立拥有 RPY tokenization、sidecar、placeholder 与 writer；多文件 folder 聚合才消费 workspace，按 ADR-030 先完成 RPY 手工包闭环，再进入 sync。
+- `rpy-project-codec`：独立拥有 RPY tokenization、sidecar、placeholder 与 writer；单个 TL 已消费单 Document workspace，多文件 folder 继续扩展同一聚合模型，按 ADR-030 先完成 RPY 手工包闭环，再进入 sync。
 - PO/POT canonical writer：未来独立 format-codec 决策；本规格不因 readable origin 宣称可写。
 - `feature5-ui-integration`（Integration TM surface）：CONTEXT 精确判断与“上下文一致”标签；本规格不增加 evidence 字段或重算匹配。
 - `collaborative-job-chunks`：完整 Cluster 2 后只引用稳定 segment membership，不拥有 Document identity、项目保存或远程 provider。
@@ -63,9 +71,9 @@ Cluster 0 人工批准
 |---|---|---|---|
 | （空） | | | |
 
-## 当前状态与归档门
+## 原始 Cluster 0–4 状态与归档门
 
-> 当前状态：Cluster 0–4 已按顺序闭合。Cluster 4 真实 UI 冒烟暴露的多文件入口、章节分层、ProjectPackage 语义与 Legacy import 事务偏差已修复；final current-source evidence 已在冻结 tree 重签。
+> 原始基线状态：Cluster 0–4 已按顺序闭合。Cluster 4 真实 UI 冒烟暴露的多文件入口、章节分层、ProjectPackage 语义与 Legacy import 事务偏差已修复；final current-source evidence 已在冻结 tree 重签。
 
 - [x] Requirements / Design / Tasks / ADR-018 / review clustering / border 一致并获人工批准
 - [x] current-source characterization fresh 通过，Cluster 0 production 零变化

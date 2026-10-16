@@ -1,13 +1,23 @@
 # Multi-Document Project Workspace 复审分簇
 
+更新：2026-10-16；同步目录与 RPY 的实际能力及后续交付边界。
+
 > 本文件只定义 `multi-document-project-workspace` 的实施/复审节奏，不代替 Requirements、Design、Tasks 或人工批准。brief 的 Promotion Cluster 1–4 保持编号；Cluster 0 只做治理与 current-source characterization，业务代码 NO-GO。
+
+## 适用范围与增量顺序
+
+Cluster 0–4 记录原始显式文件 intake 与 ProjectPackage 基线。后续 Requirement 13 扩展目录 metadata 预览、显式选择、单文件 profile 与目录树投影，按新增任务独立实施和验收；原 Cluster 的“不枚举/不启用 directory”只约束当时范围，不否定该增量，也不能作为增量已完成的证据。workbook 仍为后续范围。
+
+依赖顺序保持 owner 分离：Project 先提供可消费的选择/profile 接缝，RPY 分别消费它们完成单/多 TL、源更新和格式导出；既有 package 与 JSONL/CSV 资源端口支撑 RPY 手工包旅程。只有该闭环完成才进入 Sync 实施。各项可并行范围以 owning Tasks 为准，不把完整目录增量机械设为单 TL codec 的前置。
+
+RPY 格式导出沿 ADR-030/032 使用中立 Parser 与平台端口，按文件报告发布；缺失目录准备与文件确认分开。它不接管原 Cluster 2 的项目保存/LKG/receipt，也不开放其他格式 writer。
 
 ## 共同不变量胶囊
 
 - Project/Document/Segment 身份由稳定 manifest ID 或规范化相对 `source_ref` 建立；display/sheet name、顺序、列表索引和临时绝对路径都不是 authority。
 - Parser/Codec 只产生单文档内容、能力与诊断；workspace 才聚合多个 Document；Qt/Controller 不复制 grammar、manifest、package 或 reconciliation authority。
 - `codec_private_member` 对 workspace、chunk、sync 与 Qt 始终 opaque；只有 owning codec 可解释或写回。
-- directory 不虚构跨文件原子性，workbook 只允许完整文件原子替换；这些是后续 origin profile 红线，不表示当前产品入口已启用。
+- directory 不虚构跨文件原子性，workbook 只允许完整文件原子替换；目录选择/格式导出按各自增量合同实施，不能从原始 origin 声明推导 writer，workbook 产品 profile 仍未启用。
 - ProjectPackage 只承载项目；TM/术语 ResourcePackage 独立，不抽取共同 authority。
 - chunk 统一后置到完整 Cluster 2；sync 只消费已批准 package；TMX、RPY、PO/POT writer、CONTEXT 均留给各自 owner。
 
@@ -80,7 +90,7 @@
 
 ## 相邻线冻结
 
-- `language-resource-portability`：后续独立 brief；TM JSONL 与术语 CSV/v1 ResourcePackage、报告、冷重开。
+- `language-resource-portability`：独立拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告与冷重开，不与 ProjectPackage 共享 authority。原始手工包基线已闭合；POSIX 按 ADR-033 支持稳定本机目录与 LocalCAT 协调的资源生命周期；RPY 两设备手工包旅程仍按当前候选独立验收。
 - `tmx-context-interchange`：TMX context/provenance/export；TMX 始终是 language resource。
 - `rpy-project-codec`：RPY token/sidecar/writer；folder 聚合依赖 workspace，按 ADR-030 先完成 RPY 手工包闭环，再进入 sync。
 - PO/POT writer：未来 format-codec 决策，不由 origin 或 ProjectPackage 推导。

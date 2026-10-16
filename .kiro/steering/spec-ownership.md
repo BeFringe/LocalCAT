@@ -1,5 +1,7 @@
 # Spec、模板与工作树所有权
 
+更新：2026-10-16；同步目录与 RPY 的实际能力及后续交付边界。
+
 本文件区分“仓库中可见的资料”和“当前开发线可以修改的资料”。Git worktree 始终检出分支的完整仓库，因此在 Feature 5 工作树中看到 Qt 或 Parser 规格是正常现象；所有权由下表和审批阶段决定，而不是由文件是否可见决定。
 
 owner 指拥有 Requirement、Design、Task 与业务合同解释权的 Spec，不指 Agent、thread、branch 或 worktree。branch 只记录获批改动的提交血缘，worktree 只是可选的文件系统隔离；同一执行者或独立 reviewer 可以覆盖多个 Spec，但不能因此跨越各 Spec 的审批门或改写其 authority。
@@ -28,7 +30,7 @@ owner 指拥有 Requirement、Design、Task 与业务合同解释权的 Spec，�
 | `feature/collaborative-job-chunks` | `collaborative-job-chunks`；该线完成时精确同步 structure/tech/roadmap/spec ownership 中的已实现事实 | ProjectPackage/Workspace owner、Parser/Codec、TM/ResourcePackage/TMX、Sync/provider/account 等相邻规格 |
 | `feature/language-resource-portability` | `language-resource-portability`；该线完成时精确同步 structure/tech/roadmap/spec ownership 中的已实现事实 | ProjectPackage/Workspace/Chunk、Parser/Codec、TMX、Sync/provider/account 等相邻规格 |
 | `codex/windows-platform-enablement` | `windows-platform-enablement`；共享平台合同/backends、bootstrap/build、Spec 内 amendment merge ledger 与 Windows release evidence | Parser、Chunk、Project、Resource、TMX、TM Core、Feature5/UI、Qt 与所有 consumer business invariants |
-| `maintenance/project-codec-adjacency`（ADR-030/031） | `rpy-project-codec`、`cross-device-sync-plugin`、Multi Requirement 13；仅对应的 Parser round-trip、平台目录/秘密后端、Project artifact 与 Qt 入口 amendment 按各 owner 分别实现/验证 | TM Core、Chunk 权限、其他格式、既有发行证据；不迁移或合并各 owner 的 authority |
+| `maintenance/project-codec-adjacency`（ADR-030/031/032） | `rpy-project-codec`、`cross-device-sync-plugin`、Multi Requirement 13；仅对应的 Parser round-trip、平台目录观察/分阶段导出准备/秘密后端、Project artifact 与 Qt 入口 amendment 按各 owner 分别实现/验证 | TM Core、Chunk 权限、其他格式、既有发行证据；不迁移或合并各 owner 的 authority |
 | 治理线（分支按当前工作分配） | `.kiro/steering/`、ADR、项目认知治理；经审阅的 SDD 基础设施更新 | 所有功能 Spec |
 
 `feature5-ui-integration.md` 与 `feature5-ui-integration-review-clustering.md` 是 `ui-mvp` 拥有的跨层集成 Spec；`roadmap.md`、`repository-safety.md` 与其他 `.kiro/steering/**` 共享治理文件通常只由专门的治理分支提交。例外仅限上表明示可做精确 Steering 同步的垂直线：`maintenance/tm-store-module-extraction`、`feature/multi-document-project-workspace`、`feature/collaborative-job-chunks` 与 `feature/language-resource-portability` 可与 owning Spec 一起提交其 spec-local border/review clustering 和不改写相邻 authority 的实现事实。这些垂直线都不得借此改写相邻 Feature 或未批准的共享路线图。其余垂直线发现冲突时可以提出修订；治理补丁按 `repository-safety.md` 的共享治理 tip 规则形成唯一提交，由开发线续接，并同时复核受影响的正式 Requirements/Design。`feature5-ui-integration` 的集成实现归 `ui-mvp`；`tm-storage-retrieval-index` 的 Core Spec 与实现归 `feature5`。
@@ -36,6 +38,8 @@ owner 指拥有 Requirement、Design、Task 与业务合同解释权的 Spec，�
 `windows-platform-enablement` 的已批准 scope 只覆盖 backend-neutral 文件/锁/发布/private-proof contracts、POSIX/Windows adapters 与 composition、Windows frozen bootstrap/build composition、amendment merge ledger 和 release evidence。Parser/Chunk/Project/Resource/TMX/TM/Feature5/Qt 继续拥有各自业务状态机、错误、receipt、journal/LKG、DTO 与产品交互；Windows 线只能通过 owning branch 已批准 amendment 接入，不能复制或就地改写相邻 Spec。`tmx-context-interchange` 的唯一 owner branch 为 `ui-mvp`。Qt speaker avatar 只进入 Windows 索引/解码/fallback 功能回归，不改变现有资源语义、ignore 规则或打包 ownership。
 
 `maintenance/project-codec-adjacency` 可承载ADR-033对应的Core、共享平台、ResourcePortability与Feature 5 UI amendment；各owner继续独占自己的R/D/T、运行时合同和验证结论，按owner分别形成语义提交。范围限于POSIX TM分派、同资源家族生命周期、配置位置复证、rooted应用发布、资源级失效投影及其实际交付回归；在此精确范围内补充上表可写边界，其他相邻范围保持只读。同步只消费原包事务入口，不开放Core检索、持久格式、全局平台或其他UI重构。
+
+目录选择、单文件 profile、格式导出与后续 Sync 分别沿上述 owning Spec 执行。RPY 的实现不转移 Project 的身份/包事务、Parser 的中立调用或平台发布 authority；手工包交付也不代表 Sync 已实现。各 owner 的完成状态只由自己的任务闭合，不从同一开发线或另一规格的勾选推导。
 
 ## 当前规格权威顺序
 

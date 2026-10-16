@@ -1,18 +1,20 @@
 # 产品概览
 
+更新：2026-10-16；同步目录与 RPY 的实际能力及后续交付边界。
+
 LocalCAT 是面向个人译者的轻量、模块化、本地优先 CAT 工具。翻译项目、记忆库、术语表与配置均保存在本机，不要求账号、云端或遥测。
 
 ## 当前交付形态
 
 Windows 11 source 已完成 CPython 3.14 x64 专用 venv、源码和轻量 `LocalCAT Source` launcher 的产品闭环，包括项目保存/重开、TM 激活/重启恢复、TMX 导入与 FTS5 查询。用户管理 Python、依赖和源码位置；launcher 只提供开始菜单入口和环境失效诊断。
 
-Windows 首次 frozen 是 0.5.2 的当前交付目标：普通 PyInstaller onedir/windowed 自带 Python/Qt，并在同一候选上完成 Qt、Project、TM、TMX、FTS5 用户旅程、数据保护及 Core Gate C/D 验证。打包烟测只是实施步骤，不拆成单独的可行性发行。W3 不阻塞 source 可用或继续演进。Linux 应用菜单与 macOS 轻量 `.app` 同样依赖外部运行时；不能把轻量 launcher 宣称为自包含发行。长期取舍集中在 [交付与验证边界](delivery-boundaries.md)，安装步骤见根目录 README。
+Windows 0.5.2 已交付首次普通 frozen：普通 PyInstaller onedir/windowed 自带 Python/Qt，并在同一候选上完成 Qt、Project、TM、TMX、FTS5 用户旅程、数据保护及 Core Gate C/D 验证。打包烟测只是实施步骤，不拆成单独的可行性发行。W3 不阻塞 source 可用或继续演进。Linux 应用菜单与 macOS 轻量 `.app` 同样依赖外部运行时；不能把轻量 launcher 宣称为自包含发行。长期取舍集中在 [交付与验证边界](delivery-boundaries.md)，安装步骤见根目录 README。
 
 ## 产品演进
 
 Feature 1/2 建立 Trie 术语与 JSONL 精确 TM；Feature 3 形成 Excel 无状态工作流；Feature 4/4.1 引入 Qt 编辑会话、搜索、预处理和术语管理。Feature 5 将 canonical TM 演进为 SQLite、多译文、EXACT/CONTEXT/FUZZY，并完成 Qt 集成；0.5.1 交付统一 Parser 与多文档基线。既有 Excel 和 JSONL 兼容入口继续保留。
 
-0.5.2 聚焦 Windows 首次自包含交付；0.5.3 规划 `rpy-project-codec` 与后续 `cross-device-sync-plugin`。macOS frozen 尚未立项，可能作为 0.5.4，不能据此列为已批准任务。已发布标签与各阶段能力见根目录 README。
+0.5.2 已发布 Windows 首次自包含交付；0.5.3 正在完成 `rpy-project-codec`，随后推进尚未实现的 `cross-device-sync-plugin`。既有发行不代替新增能力在 source 与普通 frozen 中的交付验收。macOS frozen 尚未立项，可能作为 0.5.4，不能据此列为已批准任务。已发布标签与各阶段能力见根目录 README。
 
 ## 当前产品能力
 
@@ -25,12 +27,14 @@ Feature 1/2 建立 Trie 术语与 JSONL 精确 TM；Feature 3 形成 Excel 无�
 7. **不可变跨层契约**：编辑项目、段落、搜索命中、TM/术语建议、资源状态和操作报告使用 frozen dataclass。
 8. **可恢复桌面工作区**：项目菜单、最近项目、稳定段落断点与本地偏好，并提供 Linux、macOS 与 Windows source 桌面入口。
 9. **浏览/校对模式**：只读双语全文按段自动换行，双击任一行回到同一段专业编辑区。
-10. **多文档与分工**：显式选择多个 JSON/TXT/PO/POT 输入，按文档导航，以 ProjectPackage 保存和恢复；协作分工按稳定段落集合拆分、合并、分配和查看进度，不包含在线协作或自动同步。
+10. **多文档与分工**：显式选择文件，或在根目录预览中勾选当前配置支持的文件，按文档导航，以 ProjectPackage 保存和恢复；相对路径区分不同目录下的同名文件，目录分组不改变阅读顺序；协作分工按稳定段落集合拆分、合并、分配和查看进度，不包含在线协作或自动同步。
 11. **资源交换**：TM JSONL、术语 CSV/v1 支持独立 ResourcePackage 导出、预览和导入应用；TMX 支持资源、项目和选定分工范围导出，其 ResourcePackage profile 仍为 export-only。Fuzzy 资格不随资源跨设备搬运。
+
+12. **Ren'Py TL 项目**：受支持的 dialogue 与 old/new strings 可共存，单个或多个 TL 使用同一项目包保存原始模板与编辑状态；支持源更新正文对照和保留相对路径的格式导出。模板和私有映射保存在包内，兼容 codec 可用时无需原路径即可导出；缺失 codec 时保留中立编辑与包保存。项目包与 JSONL/CSV 资源包可分别手工交给另一台设备；接收端验证包并明确选择本机资源，设备资格不随包搬运。
 
 ## 目标用户与核心流程
 
-- 个人译者打开单文件项目、显式选择多个文档或打开 ProjectPackage，搜索并导航到稳定段，在当前段同时查看 canonical/legacy TM 与术语建议，显式应用后再编辑确认。
+- 个人译者打开单文件项目、显式选择多个文档、从根目录预览勾选文件或打开 ProjectPackage，搜索并导航到稳定段，在当前段同时查看 canonical/legacy TM 与术语建议，显式应用后再编辑确认。
 - 用户从齿轮设置创建、启停、删除或导入语言资源；legacy TM 可显式激活 canonical，术语表可进入集中管理，完成后当前段建议立即更新。
 - 用户在紧凑导航、完整换行和双语浏览之间切换；退出或重开项目时恢复上次段落和显示方式。
 - 既有 Excel 工作流继续通过无状态逻辑接口获得三态结果，不因 Qt MVP 改变。
@@ -44,4 +48,4 @@ Feature 1/2 建立 Trie 术语与 JSONL 精确 TM；Feature 3 形成 Excel 无�
 
 ## 当前非目标
 
-机器翻译、QA/校对通过层、账户、云端同步、公共/共享 TM、实时多人协作和复杂带标签 TMX 不属于当前产品。RPY/XLIFF 项目 codec、多 Sheet workbook 与目录自动发现仍为后续范围；现有分工和多文档能力不等于这些后续能力已完成。
+机器翻译、QA/校对通过层、账户、云端同步、公共/共享 TM、实时多人协作和复杂带标签 TMX 不属于当前产品。XLIFF 项目 codec、多 Sheet workbook 与后台自动发现仍为后续范围；显式根目录预览不自动收录文件。任意 Ren'Py 游戏源码执行不属于 TL codec 的支持范围；可选包同步仍未实现。

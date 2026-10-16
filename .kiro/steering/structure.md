@@ -1,5 +1,7 @@
 # 项目结构
 
+更新：2026-10-16；同步目录与 RPY 的实际能力及后续交付边界。
+
 ## 组织原则
 
 项目继续采用根目录平铺模块，但通过明确的 Layer 与自动化边界测试约束依赖：
@@ -47,6 +49,11 @@ Layer 1 resource / termbase / canonical TM storage
 ├── parser_tmx_codec.py          # TMX Level 1 资源 codec
 ├── parser_tm_json_codec.py      # normalized TM JSON 单输入资源 codec
 ├── parser_termbase_codec.py     # CSV/XLSX 显式列选择资源 codec
+├── platform_fs.py                # fail-closed 平台 backend 组合与只读 self-probe
+├── platform_fs_contracts.py      # backend-neutral rooted/identity/lock/publish/private authority 合同叶
+├── platform_fs_posix.py          # POSIX rooted/lock/publish/private adapter 与唯一 fcntl 生产边界
+├── platform_fs_windows.py        # Windows 主机门与逐组件 retained-handle rooted authority
+├── windows_file_api.py           # Win32 ctypes ABI、错误归一化与 RAII handle 边界
 ├── resource_repository.py       # 资源清单和受控本地文件
 ├── workspace_state.py           # legacy/复合最近项目断点、显示/TM 与设备本地预处理偏好
 ├── resource_importer.py         # TMX/CSV/XLSX Application policy 与事务导入
@@ -98,10 +105,7 @@ Layer 1 resource / termbase / canonical TM storage
 ├── tools/build_windows_ordinary.py # 固定依赖与 owner 驱动的普通 PyInstaller 构建
 ├── requirements-frozen-build.txt # Windows 普通发行构建依赖
 ├── packaging/windows/           # Windows 入口/构建声明、版本资源与保留的 W3 材料
-├── tools/generate_multi_document_current_source_evidence.py # Multi-Document final-roots evidence owner
-├── multi_document_current_source_evidence.json # 19-root canonical current-source evidence
-├── tools/generate_collaborative_chunks_current_source_evidence.py # Chunk overlay evidence owner
-├── collaborative_chunks_current_source_evidence.json # 8-root Chunk current-source overlay
+├── tools/run_posix_characterization.py # 迁移前 POSIX 业务 oracle runner；非 POSIX 主机只报告 STATIC_ONLY
 ├── tests/                       # unittest、Qt offscreen、QtTest、架构守卫
 ├── .kiro/specs/                 # 需求/设计/任务与验证事实
 └── .kiro/steering/              # 当前项目级产品、技术与结构约束
@@ -110,6 +114,15 @@ Layer 1 resource / termbase / canonical TM storage
 `po/` 与 `workloads/` 保留翻译数据和基准夹具；根目录 `tm.jsonl`、`terms.csv` 作为首次启动默认资源注册。
 
 普通 frozen 的 `localcat-candidate.json` 与 `localcat-owner-inputs.json` 随对应产物保存。逐输入摘要用于构建输入与产物关联，以及既有 fingerprint/兼容性判断；contract 与 fixture 由真实内容消费，它们不替代 Gate 执行。普通入口复用 Core 判定、Host 发布/恢复和 Qt 安全投影，不经过 W3 定制 native entry 或完整 Boot TCB。两条路线共存不改变业务 owner 或平台数据保护端口。
+
+## 格式项目与目录边界
+
+`parser_rpy_codec.py` 拥有 TL 解析、私有映射与保真输出；`rpy_project_adapter.py` 接入 Project，`rpy_project_export.py` 与 `rpy_project_batch_export.py` 协调单文件及多文件导出。它们与仅服务旧 TM 查询兼容的 `renpy_tm_compat.py` 分工不同。
+
+- 外部格式按独立 codec 与 Application adapter 组织：如 RPY 的 codec 只依赖中立 Parser 合同与纯文本规则，adapter 消费 Project/Parser 端口。只有可信 composition 注册随产品交付的 provider，本机配置不能指向任意模块或下载地址。
+- Project 目录选择服务（`project_workspace_discovery.py`）负责有界发现策略、候选树和显式选择；平台负责 retained-root 观察，intake 负责确认后的内容验证。目录树只是已保存相对路径的导航投影，不成为文件系统访问入口。
+- 格式导出与项目持久化分开：codec 准备内容，Parser/平台执行受绑定的单文件发布，Application 协调预览、确认和逐文件结果；Qt 只展示中立合同。源更新仍由 Project 按稳定身份分类，正文差异展示不参与匹配。
+- ProjectPackage 保留原始输入与 opaque 私有成员，重开只恢复数据；导出重新取得当前设备的 live codec。单文档与多文档共享包事务，legacy 单 JSON 兼容入口保持独立。
 
 ## 导入规则
 
@@ -125,8 +138,8 @@ Layer 1 resource / termbase / canonical TM storage
 - `parser_registry.py` 不导入具体 codec；只有 `parser_composition.py` 显式注册内建 codec，并向 Application 提供选择、打开、验证、materialize、stream 与 canonical write surface。
 - `editor_project.py`、`resource_importer.py`、`logic_controller.py` 与 `tm_json_importer.py` 只负责既有类型映射、batch policy 和事务，不保留第二份 JSON/TXT/PO/POT/TMX/CSV/XLSX 语法。
 - `project_workspace_identity.py` 与 `project_workspace_contracts.py` 是 Qt/Engine/Store/provider/chunk/resource 无关的中立叶；`editor_project_workspace_adapter.py` 是 legacy 单 JSON 与 workspace 的唯一兼容映射层，只通过 `parser_contracts.py` / `parser_composition.py` 取得 verified terminal，不拥有 JSON grammar 或 writer。
-- `project_workspace_intake.py` 仅对用户显式选中的 JSON/TXT/PO/POT 保留单次 rooted batch binding，通过 Parser 中立 surface 取得 verified facts；不枚举目录、不导入具体 codec/parser_source、不授予 source writer。`project_workspace.py` 只消费已验证 immutable facts，拥有扁平投影、progress 与 reconciliation，不导入 Parser/intake/Qt/TM/Store/provider/chunk/resource。
-- `project_save.py` 只消费 workspace 的 canonical digest/service/contracts，拥有 carrier-neutral save candidate、真实 LKG/逐Document baseline、结构化报告与 cold-recovery 阶段协调；不导入 Parser/codec、物理 archive/carrier、Qt、TM/Store、provider、chunk 或 ResourcePackage。当前显式选择的 JSON/TXT/PO/POT 仍只保存 package overlay，不执行 source write-back。
+- `project_workspace_intake.py` 仅对用户确认选择且配置支持的项目输入保留单次 rooted batch binding，通过 Parser 中立 surface 取得 verified facts；不枚举目录、不导入具体 codec/parser_source、不授予 source writer。`project_workspace.py` 只消费已验证 immutable facts，拥有扁平投影、progress 与 reconciliation，不导入 Parser/intake/Qt/TM/Store/provider/chunk/resource。
+- `project_save.py` 只消费 workspace 的 canonical digest/service/contracts，拥有 carrier-neutral save candidate、真实 LKG/逐Document baseline、结构化报告与 cold-recovery 阶段协调；不导入 Parser/codec、物理 archive/carrier、Qt、TM/Store、provider、chunk 或 ResourcePackage。项目包保存由 Project owner 持久化完整 workspace 快照，包括所需的原始输入、codec 私有成员与中立编辑状态；源更新后的快照也须成功持久化后才进入新的保存基线，不自动写回源格式文件。reader-only 输入不因此获得 source writer，RPY 的显式格式导出使用独立 Parser round-trip 接缝。
 - `project_package.py` 是 ADR-019 批准的唯一 ProjectPackage v1 carrier owner：它拥有严格 `ZIP_STORED` envelope/manifest/member grammar、bounded stream、artifact/content digest、手工 export/validate/preview/import/apply/receipt 与物理 recovery port；不导入具体 codec/registry、Qt、TM/Store、provider、chunk 或 ResourcePackage，不 extract member，不解释 `codec_private_member`。
 - `resource_package_contracts.py` / `resource_package.py` 是独立 ResourcePackage v1 的 leaf contracts 与 strict two-member carrier owner；只承载一个 `localcat-tm-jsonl-v1` 或 `localcat-termbase-csv-v1` payload，不导入 ProjectPackage、Controller、Qt 或资源 owner。`resource_portability.py` 协调 owner snapshot、绑定目标的 artifact publication、sealed preview、create/replace apply 与 path-free receipt/pending；`tm_resource_port.py` 和 `TermbaseStore` 保留各自 payload grammar 与 canonical publication authority。
 - `editor_controller.py` 的多文档入口只消费 C1–C2 frozen service/receipt，以 session/generation/revision 签发 Project/Document/Segment view；source reconcile 与 active package import 使用 owner-issued prepare/discard/commit capability，候选投影完成后才单点切换 session。`project_search.py` 让 legacy 与 workspace request 共用一个 matcher pipeline；workspace 使用独立复合 hit/report，不扩宽既有单 JSON DTO。Qt 不直接取得 workspace、manifest、member、persistence binding 或 recovery authority。
@@ -165,6 +178,13 @@ Layer 1 resource / termbase / canonical TM storage
 - `tests/test_qt_*`：offscreen 组件、后台导入、项目菜单、密度/浏览模式、窗口工作流和真实鼠标/键盘旅程。
 - `tests/test_excel_adapter_contract.py`：Excel 三态和层级边界。
 - `tests/test_parser_*`：contracts/source/registry/composition、八个用途/格式组合、golden/fault/security/facade 与跨格式 completion 矩阵。
+- `tests/test_platform_fs_contracts.py`：共享平台 authority、identity、lock、publish/private port、关闭与非法组合合同。
+- `tests/test_platform_fs_composition.py`：平台组合 import graph、能力门、backend shape、self-probe 与稳定失败矩阵。
+- `tests/test_platform_fs_posix.py`：POSIX adapter rooted chain、candidate/publish、flock、private proof、fault cleanup 与 Windows 隔离导入。
+- `tests/test_platform_fs_posix_characterization.py`：POSIX 历史 tree、业务 oracle method、32 个 direct/deferred boundary 与平台执行语义守卫。
+- `tests/test_windows_file_api.py`：Win32 ABI、函数签名、错误映射与 handle 生命周期。
+- `tests/test_platform_fs_windows.py`：Windows host/volume/storage capability 与 durability gate。
+- `tests/test_platform_fs_windows_rooted.py`：Windows rooted chain、sealed read、reparse/swap/share 与清理竞态。
 - `tests/test_macos_app_launcher.py`：Finder/LaunchServices identity、cwd-independent bootstrap、atomic replacement 与失效路径。
 - `tests/test_tm_schema_upgrade_module_boundaries.py`：schema-upgrade 依赖方向、owner 权威与 late-bound 兼容接缝。
 - `tests/test_tm_snapshot_artifacts_module_boundaries.py`：snapshot artifact 依赖方向、owner 权威、late-bound fault seam 与移动等价性。

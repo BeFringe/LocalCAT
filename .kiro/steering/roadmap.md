@@ -1,12 +1,14 @@
 # LocalCAT 产品与交付路线图
 
+更新：2026-10-16；同步目录与 RPY 的实际能力及后续交付边界。
+
 ## Overview
 
-LocalCAT 已有 PySide6 编辑闭环、单文件与多文档项目、ProjectPackage、协作分工、ResourcePackage、TMX 导入/导出、Trie 术语和 Feature 5 canonical retrieval。Parser 已统一 JSON/TXT、PO/POT、TMX、normalized TM JSON、CSV/XLSX 的单输入语法权威；Application 继续拥有项目会话、batch policy 与资源事务。
+LocalCAT 已有 PySide6 编辑闭环、单文件与多文档项目、ProjectPackage、协作分工、ResourcePackage、TMX 导入/导出、Trie 术语和 Feature 5 canonical retrieval。Parser 已统一 JSON/TXT、PO/POT、TMX、normalized TM JSON、CSV/XLSX 的单输入语法权威，独立 RPY codec 经中立接缝提供受限 TL 读写；Application 继续拥有项目会话、batch policy 与资源事务。
 
-Windows source 已完成 CPython 3.14 x64 专用 venv、源码与轻量 launcher 的用户旅程（Task 6.6b）。当前 0.5.2 交付 Windows 首次普通 frozen：PyInstaller onedir/windowed 打包与同一候选上的真实 Qt、Project、TM、TMX、FTS5 用户旅程、数据保护及 Core Gate C/D 构成一个完整验收目标。烟测与可行性检查是实施步骤，不单独作为发行里程碑。W3 不再阻塞平台迁移或 source 演进；普通 frozen 按 ADR-028 收窄启动来源证明，尚未完成发行验收。长期边界见 [交付与验证边界](delivery-boundaries.md)。
+Windows source 已完成 CPython 3.14 x64 专用 venv、源码与轻量 launcher 的用户旅程（Task 6.6b）。0.5.2 已发布 Windows 首次普通 frozen：PyInstaller onedir/windowed 打包与同一候选上的真实 Qt、Project、TM、TMX、FTS5 用户旅程、数据保护及 Core Gate C/D 构成一个完整验收目标。烟测与可行性检查是实施步骤，不单独作为发行里程碑。W3 不再阻塞平台迁移或 source 演进；普通 frozen 按 ADR-028 收窄启动来源证明，后续新增能力仍按实际 source/frozen 组合独立验收。长期边界见 [交付与验证边界](delivery-boundaries.md)。
 
-Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage portability 已经闭合。RPY 作为 portability 的首个下游消费者优先于跨设备同步推进：单个 Ren'Py translation script 由可配置 format-codec plugin 在仓库边界形成 DDD 防腐层，负责格式映射、token/sidecar 与可选回填/导出；多个 RPY 文件继续以相对路径身份、顺序和项目级调和消费既有多文档模型。单个 XLSX 内由多个 Sheet 分别承载章节仍属于特殊 workbook origin，并接入同一多文档模型。
+Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage portability 的原始基线已经闭合；POSIX 支持稳定本机目录、LocalCAT 协调的资源生命周期与恢复；新增出入口和跨平台手工包按各 owner 当前任务验收，历史基线不代答新增交付。RPY 作为 portability 的首个下游消费者优先于跨设备同步推进：单个 Ren'Py translation script 由可配置 format-codec plugin 在仓库边界形成 DDD 防腐层，负责格式映射、token/sidecar 与可选回填/导出；多个 RPY 文件继续以相对路径身份、顺序和项目级调和消费既有多文档模型。单个 XLSX 内由多个 Sheet 分别承载章节仍属于特殊 workbook origin，并接入同一多文档模型。
 
 ## 版本里程碑
 
@@ -14,8 +16,8 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 
 | 版本 | 范围 | 状态 |
 | --- | --- | --- |
-| 0.5.2 | Windows source 基础上的首次普通 frozen 完整用户交付 | 实施中，未发布 |
-| 0.5.3 | `rpy-project-codec`，随后 `cross-device-sync-plugin` | 规划，仍需各 owning Spec 的阶段审批 |
+| 0.5.2 | Windows source 基础上的首次普通 frozen 完整用户交付 | 已发布基线；新增能力另行验收 |
+| 0.5.3 | `rpy-project-codec`，随后 `cross-device-sync-plugin` | RPY 原型与手工包交付已完成；Sync 尚未实现 |
 | 可能的 0.5.4 | macOS frozen | 尚未立项，版本未定 |
 
 ## 早期双线决策（历史）
@@ -42,7 +44,8 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 | Parser Foundation | `parser-rebaseline` | 中立 contracts/source/registry/composition、八个单输入组合、唯一 Application surface | 不拥有多文档、RPY 实现、chunk、sync 或 TM storage |
 | Windows source | `codex/windows-platform-enablement` | 已完成平台文件/锁/发布/private-proof、业务适配、轻量 launcher 与用户旅程 | 不依赖 W3 完成，不声称自带 Python |
 | Windows frozen | `reassessment` | 0.5.2 普通自包含产品闭环；continuation 独立保留 W3 强证明实现及验收事实 | 不把旧强证明任务自动继承为普通发行前置，不接管业务 owner |
-| Multi-document / Chunk / Resource | 各 owning Spec | 已完成 workspace、ProjectPackage、分工与资源交换；继续维护 | 不改写 Parser 单输入局部身份，不提供在线同步 |
+| Multi-document / Chunk / Resource | 各 owning Spec | 已完成 workspace、ProjectPackage、分工与资源交换；目录选择为后续 Requirement 13 增量，交付闭合单独跟踪 | 不改写 Parser 单输入局部身份，不提供在线同步 |
+| RPY / 目录增量 | `maintenance/project-codec-adjacency` | 单/多 TL、显式目录选择、源更新与格式导出；手工包交付与下游消费已贯通 | 不扩成任意游戏解析，不提前实施 Sync |
 
 `governance/kiro-steering` 不是产品 Delivery Lane；它只是 `.kiro/steering/**`、ADR、`.kiro/settings/**`、SDD Skills 与 `AGENTS.md` 的单一治理发布 worktree，避免在正交产品线重复生成 patch-equivalent 治理提交。Windows Platform Enablement 是平台/发行适配线，也不取得相邻产品 Feature 的业务实现权。`parser-rebaseline` 已按批准的 `parser-subsystem-extraction` Requirements/Design/Tasks 完成契约、Foundation、codec、facade 迁移与 current-source evidence 重验；它没有取得相邻 Feature 的实现权。
 
@@ -75,7 +78,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 - **已实现 — Parser Foundation**:
   - stdlib-only 中立 contracts、rooted/sealed source、guarded terminal、用途感知 registry 与唯一内建 composition；
   - LocalCAT JSON/TXT、PO/POT、TMX Level 1、normalized TM JSON、CSV/XLSX 八个 reader 组合；
-  - 只有 LocalCAT JSON 声明 canonical write；其余 reader-only，外部 plugin token 对 Core opaque；
+  - 首波只有 LocalCAT JSON 声明 canonical write；RPY 后续通过独立 codec 提供 source-preserving round-trip，其余 reader-only 输入不随目录或包能力获得 writer，外部 plugin token 对 Core opaque；
   - 既有 project/resource/CLI/runner facade 已委托单一 grammar，Parser 与 Engine/Store 互不导入。
 - **当前 — Windows source 交付与 frozen 分线**:
   - source 平台和业务适配、轻量入口与用户旅程已完成；普通 frozen 已按 ADR-028 落地 stock onedir/windowed、same-EXE worker 与既有 Host 生命周期。ADR-024/025/027 已分别收窄身份提供方环境、硬断电资格和导出锁收尾；
@@ -87,8 +90,12 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
   - CSV/XLSX 术语导入在 Qt 非阻塞取得 codec-owned 有界列 preview，用户显式选择 source/target 物理列和首行用途；
   - preview 与正式导入绑定完整 source identity，并在同一新 sealed snapshot 上复核可见列数后才允许 stream/Store transaction；
   - 不提供显式选择的调用继续 0/1 + legacy header allowlist；不增加语言列猜测、Sheet 选择、多 Sheet 聚合或资源导出。
+- **当前 — RPY 与显式目录增量**:
+  - 单/多 TL 的受限 dialogue/strings 读取、包保存与离线重开、源更新正文对照及按相对路径导出已实现；目录预览只观察 metadata，确认勾选后才读取内容；
+  - 来源、显示顺序与段落身份保持分离；源变更按稳定身份调和，正文相似度不授权旧译文关联；
+  - 输出预览明确新建/覆盖；缺失目录先准备、重新预览再确认文件发布，逐文件报告部分结果，格式导出不替代项目包保存；
+  - RPY 两设备手工包旅程与 Multi 目录增量已贯通；后续 Sync 复用一致包的本机 validate/preview/apply 入口，不直接复制活动数据库或日志。
 - **Later**:
-  - 独立的单输入 RPY format-codec plugin / repository ACL；
   - RPY 闭合后的可选跨端同步插件；
   - 特殊的多 Sheet workbook 与 XLIFF codec；
   - TMX context profile 和未来 TM Resource Editor。
@@ -126,12 +133,12 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 - **Parser seam**: Parser 按 ADR-015 产生带 source reference/speaker/metadata 的单输入 Document/Segment，并提供格式中立的 plugin port、opaque capability 与 terminal outcome；格式 plugin 自己拥有 token/sidecar/write/round-trip，Parser 不定义搜索、TM 排序、speaker 显示或多输入 Project 聚合。
 - **TMX seam**: TMX 始终属于语言资源 import/export。若未来需要编辑 TMX，另立 TM Resource Editor。
 
-### Future promotion and package boundaries
+### 项目包下游顺序与边界
 
 - `multi-document-project-workspace` 先于 `collaborative-job-chunks`：先冻结 Project/Document/Segment 身份、保存与 reconciliation，再让 chunk 仅引用稳定 segment 身份；split/merge 不得重定义文档或段落。
-- `cross-device-sync-plugin` 只消费已经批准的项目包、资源导入导出和可选 namespaced chunk metadata。chunk schema 未经协作规格批准前，同步规格不得解释、合并或授权 chunk 权限。
+- `cross-device-sync-plugin` 的首版范围只消费 owner 完成的 ProjectPackage 与 JSONL/CSV ResourcePackage；下载仍回到各自的本地验证、预览、目标选择和导入事务。Sync 不解释 codec 私有成员，不搬运或授予 chunk 权限。
 - ADR-013 的 `gate-d-qualification`、`device.key` 与 `qualification.json` 是设备本地运行资格，不属于项目包、TM 资源或 chunk metadata，禁止跨设备复制后直接授权 Fuzzy。设备间可以同步项目与经验证的资源，但每台设备必须用自己的兼容 attestation 或重新验证。
-- 三个未来规格均从 brief 单独提升为 Requirements → Design → Tasks，并分别形成 review cluster。建议顺序为：多文档 identity/origin → aggregate/save/reconcile → Controller/search scope → Qt；协作 chunk contract/split-merge → assignment/permission/progress → Qt；跨端 plugin/package → provider/planner/secrets → apply/recovery/Qt。不得把后续规格的未批准字段预埋为当前单 JSON 的第二套 authority。
+- 多文档与协作分工的原始基线已经闭合；目录选择及非 legacy 单文档包沿 Multi Requirement 13 扩展，RPY 在独立格式边界消费。RPY 手工 ProjectPackage 与 JSONL/CSV ResourcePackage 闭环完成后，才进入 Sync 的 artifact/provider/planner/secrets 与 apply/recovery/Qt 任务；不得从手工搬运推导网络传输或远端权限已经实现。
 
 ## Existing Spec Updates
 
@@ -141,7 +148,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 ## Specs (dependency order)
 
 - [x] `parser-subsystem-extraction` -- 单输入 Parser contracts/source/registry/composition、八个内建用途/格式组合与兼容 facade 迁移。Dependencies: ADR-015
-- [ ] `windows-platform-enablement` -- source Task 1–6 已完成；普通 frozen 设计与实现已按 ADR-028/029 贯通，Task 7–9 登记同候选旅程、数据保护、Core 验证与有限复用，Task 10 独立作最终发行裁决，不反向阻塞 source。
+- [x] `windows-platform-enablement` 0.5.2 基线 -- source 与普通 frozen 已完成首次发行；新增目录/格式组合与其他 amendment 按各自任务验收，旧发行不代答新候选。
 - [x] `termbase-column-selection-import` -- CSV/XLSX codec-owned 有界列 preview、显式物理列/表头选择、source identity与可见列复核、Qt 非阻塞消费。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
 - [x] `qt-editor-json-mvp-increment` 基础产品 -- speaker、搜索/预处理/术语 CRUD 与正式 matcher 入口；Windows source 旅程已完成，frozen amendment 另行验收。
 - [x] `tm-storage-retrieval-index` 基础产品 -- SQLite、JSONL 迁移、Levenshtein/Dice、统一 matcher 与 exact/context/fuzzy；Windows source 和 R4 pre-build 已完成，packaged 资格另行验收。
@@ -149,23 +156,24 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 - [ ] `glossary-management` -- 启用每术语 Match Case / Whole Word、版本化记录与导入迁移。Dependencies: `qt-editor-json-mvp-increment`, `tm-storage-retrieval-index`
 - [ ] `editor-search-preprocessing` -- 启用项目搜索 Match Case / Whole Word、扩展结果语义与大项目优化。Dependencies: `qt-editor-json-mvp-increment`, `tm-storage-retrieval-index`
 - [ ] `speaker-display-profiles` -- 每项目 speaker 显示名/留空/头像。Dependencies: `qt-editor-json-mvp-increment`
-- [x] `multi-document-project-workspace` -- Project/Document/Segment、章节导航、稳定复合 ID、ProjectPackage 事务、多文档保存/恢复报告与 final current-source evidence。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
-- [x] `language-resource-portability` -- 已落地 TM JSONL 与术语 CSV/v1 的独立 ResourcePackage、人工导入导出、preview/apply/receipt、受管恢复与冷重开；不共享 ProjectPackage authority。Dependencies: `multi-document-project-workspace` Cluster 2 的已验证 package 原语
+- [x] `multi-document-project-workspace` 原始基线 -- Project/Document/Segment、章节导航、稳定复合 ID、ProjectPackage 事务、多文档保存/恢复报告与 final current-source evidence。Dependencies: `parser-subsystem-extraction`, `qt-editor-json-mvp-increment`
+- [x] `multi-document-project-workspace` Requirement 13 增量 -- 目录 metadata 预览、显式勾选、原根绑定、单文件 profile 与树导航已实现；发行、端到端与下游消费已闭合。Dependencies: 既有 workspace/ProjectPackage、平台目录观察与 Qt amendment
+- [x] `language-resource-portability` 原始基线 -- 独立 TM JSONL 与术语 CSV/v1 ResourcePackage、人工导入导出、preview/apply/receipt 与冷重开保留历史完成状态；POSIX 按 ADR-033 的稳定目录与应用协调生命周期合同运行，当前候选的 RPY 两设备手工包旅程仍独立验收。不共享 ProjectPackage authority。Dependencies: `multi-document-project-workspace` Cluster 2 的已验证 package 原语
 - [x] `collaborative-job-chunks` -- 已在不改变 Document 身份的前提下落地 exact segment membership、动态拆分/合并、单 assignee、Controller 权限、progress/rebase、namespaced metadata 与 Project 菜单分工切面。Dependencies: `multi-document-project-workspace`
-- [ ] `rpy-project-codec` -- 单个 Ren'Py translation script 的可配置 format-codec plugin / DDD repository ACL；plugin 独立拥有解析映射、token/sidecar、占位符保护与可选回填/导出，LocalCAT Core 不直接写 `.rpy`；多文件集合消费既有 workspace 的相对路径身份与顺序，不以 basename 充当身份。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`, `language-resource-portability`
+- [x] `rpy-project-codec` -- 单/多 TL 的受限 codec、包持久化、源更新和保真导出已实现；两设备手工包旅程与下游消费已闭合。格式私有映射仅由 codec 解释，多文件消费 workspace 相对路径身份与顺序。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`, `language-resource-portability`
 - [ ] `cross-device-sync-plugin` -- RPY 闭合后推进的本地优先可选同步插件边界、远程 provider、base-aware 冲突保护与凭据安全；项目与资源分别消费已批准的 ProjectPackage/ResourcePackage。Dependencies: `multi-document-project-workspace`, `language-resource-portability`; sequencing gate: `rpy-project-codec`
 - [x] `tmx-context-interchange` 基础产品 -- TMX context/provenance 导入、资源/项目/分工导出与资源范围的 export-only TMX ResourcePackage；Windows source 已完成，frozen amendment 另行验收。
 - [ ] `xliff-project-codec` -- XLIFF 2.x Core 最小项目 codec。Dependencies: `parser-subsystem-extraction`, `multi-document-project-workspace`
 
 ## Deferred Format Backlog
 
-- **常规多文件源**：显式选择 JSON/TXT/PO/POT 的 workspace 与 ProjectPackage 已完成；XLSX 项目、目录发现与其他 origin profile 仍为后续范围。
+- **常规多文件源**：显式选择 JSON/TXT/PO/POT 的 workspace 与 ProjectPackage 已完成；用户触发的目录 metadata 预览已作为 Requirement 13 增量接入；后台自动发现、XLSX 项目与其他 origin profile 仍为后续范围。
 - **特殊多 Sheet XLSX**：单个 workbook 可作为复合 origin，由每个受支持 Sheet 对应一章 / Document。`File_ID` 是候选稳定身份，Sheet 名只作显示。2026-08-20 复核的 `CAT_Working_File.xlsx` 样本有 33 个 Sheet、17,221 条数据行，全部使用 `File_ID/Location/Speaker/Source_Text/Target_Text` 五列；它是 RPY 工作任务表参考，不改变术语表仅消费前两列的现行合同。
-- **RPY plugin / folder**：单个 translation script 的 tokenization、段落映射、token/sidecar、占位符保护与可选回填/导出属于独立 `rpy-project-codec` plugin/ACL，只依赖 Parser Foundation 的格式中立端口；LocalCAT Core 不解释 RPY token、不直接写 `.rpy`。当多个 script 组成 folder project 时，每个 script 才作为 Document 接入 multi-document workspace。
+- **RPY plugin / folder（整体验收中）**：单个 translation script 的 tokenization、段落映射、token/sidecar、占位符保护与可选回填/导出属于独立 `rpy-project-codec` plugin/ACL，只依赖 Parser Foundation 的格式中立端口；LocalCAT Core 不解释 RPY token、不直接写 `.rpy`。单个 TL 通过单 Document workspace 持久化；多个 TL 组成 folder project 时，每个 script 分别作为 Document 接入同一 multi-document workspace。
 - **XLIFF**：通过真实 fixture、inline-code 和 Writer capability gate 后实施。
-- **多文档 UI（已落地）**：Document 按导入/manifest 顺序连续导航，顶栏文件夹菜单只以文件图标+名称列出文档，编辑和浏览/校对使用带文件图标的跨列标题投影文档边界，浏览行、当前文档和菜单选中态同步。首页、项目主按钮、项目菜单唯一的本地打开命令和 `Ctrl+O` 按单选/Shift 多选分流，并接受文件直接拖放；不另列多文档入口，多选复用显式选择确认流且不扫描目录或相邻文件。ProjectPackage 打开/导入仍属“项目”菜单。无 active Chunk plan 时项目搜索保持“当前章节 / 搜索全部章节”；激活当前分工后增加“当前分工”范围，仍不把 Chunk 重命名为章节。
+- **多文档 UI（已落地）**：Document 按导入/manifest 顺序连续导航，顶栏文件夹菜单按已保存相对路径分组导航文档，编辑和浏览/校对使用带文件图标的跨列标题投影文档边界，浏览行、当前文档和菜单选中态同步。首页、项目主按钮、项目菜单唯一的本地打开命令和 `Ctrl+O` 按单选/Shift 多选分流，并接受文件直接拖放；不另列多文档入口，直接多选复用显式选择确认流且不扫描目录或相邻文件；显式选择文件夹时另经 metadata 候选树勾选确认。ProjectPackage 打开/导入仍属“项目”菜单。无 active Chunk plan 时项目搜索保持“当前章节 / 搜索全部章节”；激活当前分工后增加“当前分工”范围，仍不把 Chunk 重命名为章节。
 - **协作 chunk（已落地）**：可按稳定 exact segment 集合跨文档划分、合并和分配；它是从 Project 菜单选择的协作切面，编辑、浏览/校对与文档文件夹共用同一 membership，不改变 Project/Document/Segment 规范身份。直接拆分按整项目或源分工动态均分；起点/终点和离散选段只在管理器高级操作中生效。
-- **跨端同步**：独立可选插件，只同步经批准的项目包/资源及 chunk metadata；不把远程副本变成项目权威，也不把文件同步冒充实时协作。
+- **跨端同步（未实现）**：独立可选插件，首版只手动传输 ProjectPackage 与 JSONL/CSV ResourcePackage；远端不成为项目权威，不传递协作权限，不把包传输冒充实时协作。
 
 ## Merge Contract
 
@@ -178,7 +186,7 @@ Parser 重新基线、多文档 workspace、ProjectPackage 与 ResourcePackage p
 
 ## Confirmed Requirements Decisions
 
-1. Qt JSON 首批预处理只修改 target；source 更新、重新导入差异和段落重关联属于后续 Parser / multi-document project reconciliation。
+1. Qt JSON 首批预处理只修改 target；source 更新、重新导入差异和段落重关联由 Project reconciliation 拥有，RPY 消费该合同并提供正文差异展示，不将调和并入预处理。
 2. target 内容变化撤销 `confirmed`，沿用当前编辑会话行为；译文框必须使用平台原生主修饰键提供撤销/重做，macOS 为 `Command`，其他平台为 `Ctrl`。
 3. raw speaker 保持匹配身份；已有头像 catalog/解码与无匹配回退不改写该身份，完整 speaker profile 的后续范围仍由 owning Spec 定义。
 4. 新术语记录默认 `Match Case=false`、`Whole Word=true`；旧两列记录不静默改变。
