@@ -60,13 +60,13 @@ class OrdinaryVersionMetadataTests(unittest.TestCase):
         info = load_version_info_from_text_file(version_resource(ROOT))
         strings = {item.name: item.val for group in info.kids if isinstance(group, StringFileInfo)
                    for table in group.kids for item in table.kids}
-        self.assertEqual(assignment(ROOT / "qt_editor.py", "APPLICATION_VERSION"), "0.5.2")
-        self.assertEqual(strings["FileVersion"], "0.5.2")
-        self.assertEqual(strings["ProductVersion"], "0.5.2")
+        self.assertEqual(assignment(ROOT / "qt_editor.py", "APPLICATION_VERSION"), "0.5.3")
+        self.assertEqual(strings["FileVersion"], "0.5.3")
+        self.assertEqual(strings["ProductVersion"], "0.5.3")
         self.assertEqual(strings["ProductName"], "LocalCAT")
         self.assertEqual(strings["FileDescription"], "LocalCAT")
-        self.assertEqual((info.ffi.fileVersionMS, info.ffi.fileVersionLS), (5, 2 << 16))
-        self.assertEqual((info.ffi.productVersionMS, info.ffi.productVersionLS), (5, 2 << 16))
+        self.assertEqual((info.ffi.fileVersionMS, info.ffi.fileVersionLS), (5, 3 << 16))
+        self.assertEqual((info.ffi.productVersionMS, info.ffi.productVersionLS), (5, 3 << 16))
 
     def test_version_drift_is_rejected_before_collection(self):
         from tools.build_windows_ordinary import ROOT, version_resource
@@ -76,7 +76,7 @@ class OrdinaryVersionMetadataTests(unittest.TestCase):
             resource = root / "packaging/windows/version_info.txt"
             resource.parent.mkdir(parents=True)
             shutil.copyfile(ROOT / "packaging/windows/version_info.txt", resource)
-            (root / "qt_editor.py").write_text('APPLICATION_VERSION = "0.5.3"\n')
+            (root / "qt_editor.py").write_text('APPLICATION_VERSION = "0.5.4"\n')
             with self.assertRaisesRegex(ValueError, "version metadata"):
                 version_resource(root)
 
@@ -132,10 +132,10 @@ class OrdinaryVersionMetadataTests(unittest.TestCase):
             info = load_version_info_from_text_file(version_resource(ROOT))
             write_version_info_to_executable(str(executable), info)
             facts = check_executable_metadata(executable)
-            self.assertEqual(facts["file_version"], [0, 5, 2, 0])
-            self.assertEqual(facts["product_version"], [0, 5, 2, 0])
+            self.assertEqual(facts["file_version"], [0, 5, 3, 0])
+            self.assertEqual(facts["product_version"], [0, 5, 3, 0])
             self.assertEqual(facts["strings"]["ProductName"], "LocalCAT")
-            info.ffi.productVersionLS = 3 << 16
+            info.ffi.productVersionLS = 4 << 16
             write_version_info_to_executable(str(executable), info)
             with self.assertRaisesRegex(AssertionError, "version metadata"):
                 check_executable_metadata(executable)
