@@ -21,14 +21,33 @@ from frozen_candidate import (
 class OrdinaryBuildEnvironmentTests(unittest.TestCase):
     def test_tool_path_and_python_injection_do_not_enter_collection(self):
         from tools.build_windows_ordinary import build_environment
-        environment = build_environment({"SystemRoot": "C:/Windows", "PATH": "C:/unrelated-dlls",
+        system_root = str(Path(tempfile.gettempdir()).resolve() / "Windows")
+        environment = build_environment({"SystemRoot": system_root, "PATH": "C:/unrelated-dlls",
                                          "PYTHONPATH": "C:/other-python", "QT_PLUGIN_PATH": "C:/other-qt",
                                          "TEMP": "C:/Temp"})
         self.assertNotIn("unrelated-dlls", environment["PATH"])
-        self.assertIn(str(Path("C:/Windows") / "System32"), environment["PATH"].split(os.pathsep))
+        self.assertIn(str(Path(system_root) / "System32"), environment["PATH"].split(os.pathsep))
         self.assertNotIn("PYTHONPATH", environment)
         self.assertNotIn("QT_PLUGIN_PATH", environment)
         self.assertEqual(environment["TEMP"], "C:/Temp")
+
+
+class OrdinaryInputCollectionTests(unittest.TestCase):
+    def test_directory_workspace_roots_are_collected_as_code_and_input_digests(self):
+        from tools.build_windows_ordinary import ROOT, collect_inputs
+
+        declaration = json.loads((ROOT / "packaging/windows/frozen_roots.json").read_bytes())
+        owners = [owner for owner in declaration["owners"] if owner["dispatch_id"] == "WA-03"]
+        self.assertEqual(len(owners), 1)
+        self.assertEqual(owners[0]["owning_spec"], "multi-document-project-workspace")
+        inputs, data, modules = collect_inputs(ROOT)
+        for module in ("project_workspace_discovery", "project_directory_contracts"):
+            with self.subTest(module=module):
+                path = module + ".py"
+                self.assertIn(module, owners[0]["module_roots"])
+                self.assertIn(module, modules)
+                self.assertEqual(inputs[path], hashlib.sha256((ROOT / path).read_bytes()).hexdigest())
+                self.assertNotIn(path, data)
 
 
 @unittest.skipUnless(sys.platform == "win32" and importlib.util.find_spec("PyInstaller"),

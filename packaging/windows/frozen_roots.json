@@ -32,10 +32,13 @@
     },
     {
       "dispatch_id": "WA-03",
-      "revision": "R2",
+      "revision": "R3",
       "owning_spec": "multi-document-project-workspace",
-      "reason": "显式 intake、carrier-neutral save 与 ProjectPackage 各保持原 owner。",
-      "module_roots": ["project_package", "project_save", "project_workspace_intake"]
+      "reason": "显式 intake、有界目录发现及其中立合同、carrier-neutral save 与 ProjectPackage 各保持原 owner。",
+      "module_roots": [
+        "project_package", "project_save", "project_workspace_intake",
+        "project_workspace_discovery", "project_directory_contracts"
+      ]
     },
     {
       "dispatch_id": "WA-04",

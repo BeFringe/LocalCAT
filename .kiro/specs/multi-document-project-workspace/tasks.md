@@ -271,7 +271,7 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Requirements: 13.2, 13.5, 13.6_
   - _Boundary: Controller / Qt navigation projection_
   - _Depends: 5.6a_
-- [ ] 5.9 纳入普通发行模块组合
+- [x] 5.9 纳入普通发行模块组合
   - 将新增发现/合同模块纳入 source 与普通 frozen 的显式声明，不扩张 Core/Host/Gate 合同。
   - 完成时，普通 Windows frozen 能打开目录预览及章节树，缺源目录时包导航仍可用。
   - _Requirements: 13.5, 13.6_

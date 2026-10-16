@@ -614,7 +614,7 @@ source 安装和维护见 [README](../../../README.md)。原 source 旅程由 WA
   - _Depends: 11.1_
   - _Requirements: 5.1, 5.6, 5.7_
 
-- [ ] 11.5 复验实际共享变化的Windows普通frozen
+- [x] 11.5 复验实际共享变化的Windows普通frozen
   - 按实现、依赖、调用合同和运行条件判定回归范围；真实变化触发 root/锁/连接/发布/资源链验证，必要 Core Gate 范围由 Core 判定。保持原 0.5.2 Task10.1 与历史证据范围，不以 POSIX 结果或不同候选片段代答。
   - 完成时，受影响root/锁/连接/发布和资源旅程在Windows source及普通frozen符合原合同；新候选与旧发行证据分开。
   - _Boundary: Windows release owner 的实际共享变化集成验证_
