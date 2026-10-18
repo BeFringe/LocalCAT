@@ -1,0 +1,51 @@
+仓库、版本与文件索引
+
+Matecat
+  仓库：https://github.com/matecat/MateCat
+  参考版本：v4.1.7
+  提交：d65d75f5fd695400bbac2d02042b462b4f6928fc
+  保存项目译文时间：
+    https://github.com/matecat/MateCat/blob/d65d75f5fd695400bbac2d02042b462b4f6928fc/lib/Controller/API/App/SetTranslationController.php#L295-L304
+  Job TMX 字段生成：
+    https://github.com/matecat/MateCat/blob/d65d75f5fd695400bbac2d02042b462b4f6928fc/lib/Utils/TMS/TMSService.php#L484-L518
+  私有 TMX 导入入口：
+    https://github.com/matecat/MateCat/blob/d65d75f5fd695400bbac2d02042b462b4f6928fc/lib/Controller/API/App/TMXFileController.php#L31-L51
+    https://github.com/matecat/MateCat/blob/d65d75f5fd695400bbac2d02042b462b4f6928fc/lib/Utils/TMS/TMSService.php#L136-L173
+    https://github.com/matecat/MateCat/blob/d65d75f5fd695400bbac2d02042b462b4f6928fc/lib/Utils/Engines/MyMemory.php#L748-L757
+  官方导出指南：
+    https://guides.matecat.com/finalising-a-project
+  MyMemory 是独立记忆服务；导入转发代码不等于其内部日期保留规则。
+
+LocalCAT
+  仓库：https://github.com/BeFringe/LocalCAT
+  参考分支：reassessment
+  源码版本：0b71bb3eb5de1db679601b2fc061fe481c41b16e
+  TMX 解析：
+    https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/parser_tmx_codec.py
+  导入属性映射：
+    https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/resource_importer.py#L599-L658
+  原生字段与导入 prop 拼装：
+    https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/tmx_context_interchange.py#L225-L251
+  原生 XML 输出：
+    https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/tmx_context_interchange.py#L398-L440
+  字段说明以此公开提交为准；查询其他版本时需重新核对实现。
+
+TMX 标准
+  日期属性、UTC 格式及自定义 prop：
+    https://uri.etsi.org/lis/002/v1.4.2/gs_LIS002v010402p.pdf
+
+文件索引
+  matecat_v4_1_7_job_synthetic.tmx
+    Matecat Job 精简模板。
+  localcat_native_export_synthetic.tmx
+    LocalCAT 原生导出精简模板。
+  localcat_compatible_fixture_synthetic.tmx
+    LocalCAT 兼容相似度示例，用来说明测试自定义属性。
+  TMX_translation_time_notes.txt
+    日期含义、工具映射、三种样式比较及后续设计建议。
+  repositories_and_versions.txt
+    版本、源码入口和文件索引。
+  LocalCAT_local_source_excerpts.txt
+    上述公开 LocalCAT 版本的相关源码节选，附仓库路径与原行号。
+
+三个 TMX 均只含合成数据。源码节选便于离线阅读，不是可独立运行的程序。
