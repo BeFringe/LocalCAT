@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic LocalCAT-compatible similarity fixture. -->
+<!-- All text, IDs, row locations and similarity expectations below are synthetic. -->
+<tmx version="1.4">
+  <header creationtool="LocalCAT" creationtoolversion="feature5-ui-integration-fixture-v1"
+          o-tmf="LocalCAT" creationid="LocalCAT-fixture" datatype="plaintext"
+          segtype="sentence" adminlang="en-US" srclang="en-US" />
+  <body>
+    <tu tuid="demo-exact-000001" datatype="plaintext" srclang="en-US" creationid="LocalCAT-fixture">
+      <prop type="x-localcat-sheet">chapter_example</prop>
+      <prop type="x-localcat-excel-row">2</prop>
+      <prop type="x-localcat-translation-row">1</prop>
+      <prop type="x-localcat-location">rpy:42</prop>
+      <prop type="x-localcat-speaker">guide</prop>
+      <prop type="x-localcat-variant">exact</prop>
+      <prop type="x-localcat-expected-similarity">1.000000</prop>
+      <tuv xml:lang="en-US"><seg>guide "Hello."</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>guide "你好。"</seg></tuv>
+    </tu>
+    <!-- The fuzzy expectation is illustrative; it is not a computed scorer result. -->
+    <tu tuid="demo-fuzzy-000001" datatype="plaintext" srclang="en-US" creationid="LocalCAT-fixture">
+      <prop type="x-localcat-sheet">chapter_example</prop>
+      <prop type="x-localcat-excel-row">2</prop>
+      <prop type="x-localcat-location">rpy:42</prop>
+      <prop type="x-localcat-speaker">guide</prop>
+      <prop type="x-localcat-variant">fuzzy-band-1</prop>
+      <prop type="x-localcat-query-segment-source">guide "Hello."</prop>
+      <prop type="x-localcat-expected-similarity">0.900000</prop>
+      <tuv xml:lang="en-US"><seg>guide "Hello!"</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>guide "你好！"</seg></tuv>
+    </tu>
+  </body>
+</tmx>

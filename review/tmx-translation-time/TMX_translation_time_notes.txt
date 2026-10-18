@@ -1,0 +1,132 @@
+TMX 模板与翻译时间说明
+
+1. 三个精简模板
+
+matecat_v4_1_7_job_synthetic.tmx
+  Matecat v4.1.7 Job TMX，含一条合成翻译单元。
+  展示 Job 元数据、上下文属性，以及由 translation_date 写入的 TU.creationdate。
+
+localcat_native_export_synthetic.tmx
+  LocalCAT 原生导出样式，含一条合成翻译单元。
+  展示 speaker、前后文、来源、确认状态；没有翻译日期或相似度测试属性。
+  实际导出还可以包含 provenance，以及从已有 TMX 导入并保留的 prop。
+
+localcat_compatible_fixture_synthetic.tmx
+  LocalCAT 兼容的相似度测试示例，含 exact、fuzzy 各一条合成翻译单元。
+  expected-similarity、variant、query-segment-source 用于表达测试输入和期望，
+  其中的相似度数字是示意值，不是评分器实际计算的结果。
+
+三个文件的文本、编号、文件名、位置和日期均为合成数据；均不包含 DTD 或实体声明。
+它们用于比较格式和字段语义，不表示所有可选元数据都已列出。
+
+2. translation_date、creationdate、changedate
+
+translation_date
+  Matecat 内部数据库字段，不是 TMX 标准属性。
+  v4.1.7 保存译文时将它设置为此次保存时间，表示项目译文记录的保存/更新时间。
+  保存状态或重新确认也可能更新时间，不能仅据此认定译文文字发生了修正。
+
+creationdate
+  TMX 的元素创建日期；作用域由属性所在元素决定：
+  header 对应容器，tu 对应翻译单元，tuv 对应语言变体。
+  Matecat v4.1.7 Job 导出将项目记录的 translation_date 写入 TU.creationdate，
+  因而在来源明确时，该值表达该项目译文最后保存/更新的时间。
+  导出器按 UTC 解读数据库值；值为 null 或不存在时回退到当前时间。
+  正常记录沿用各自的保存时间，不会统一改成导出时间。
+
+changedate
+  TMX 的元素最后修改日期，也应按 header、tu、tuv 的作用域解释。
+  Matecat v4.1.7 Job 导出器没有单独输出 changedate。
+  缺少 changedate 不代表没有日期；creationdate 也不能在所有来源中都解释为修订时间。
+
+合成日期示例：
+  Matecat translation_date：2026-01-01 02:03:04（导出器按 UTC 解读）
+  TU creationdate：20260101T020304Z
+  UTC+8 显示：2026-01-01 10:03:04
+
+TMX 日期采用 YYYYMMDDThhmmssZ，Z 表示 UTC。
+日期的含义需要结合生成工具和来源判断；打包时间、导出时间、文件修改时间
+不能自动当作真实翻译时间，仅凭 creationtool 也不能证明日期语义。
+
+3. Matecat 的导入、保存与导出
+
+导入 TMX
+  私有记忆导入通过 TMXFileController → TMSService.addTmxInMyMemory →
+  MyMemory.importMemory 把文件上传到记忆服务。
+  该流程没有把每条外部 TU.creationdate 直接映射成项目的 translation_date。
+  MyMemory 服务内部如何保留导入日期，需另查该服务的实现。
+
+保存项目译文
+  SetTranslationController 更新该项目片段的 translation_date。
+  候选原有的记忆日期和当前项目此次保存时间属于不同事实。
+
+导出 Job TMX
+  导出器读取各片段的 translation_date，格式化为 TU.creationdate。
+  某片段后来再次保存，再次导出时，其日期可能随之变化。
+  已下载的 TMX 是静态文件，不会持续跟随项目自动更新。
+
+4. LocalCAT 原生字段与测试属性
+
+三个模板使用相同的 TMX 基本结构：header、body/tu、tuv/seg。
+主要区别在于可选属性与工具自定义 prop：
+
+  Matecat Job
+    header：Matecat-Cattool / v4.1.7，o-tmf=Matecat。
+    TU 标识：项目 segment ID；日期：TU.creationdate。
+    元数据：job、segment、filename、status、chunk、x-context-pre/post。
+
+  LocalCAT 原生导出
+    header：LocalCAT / 1，o-tmf=LocalCAT，adminlang=en，datatype=PlainText。
+    TU 标识：localcat- 加确定性摘要。
+    元数据：可选 speaker、前后文、来源、status、provenance，以及 confirmed。
+    当前生成器不主动写 TU/TUV 日期属性。
+
+  LocalCAT 兼容相似度示例
+    header：LocalCAT / feature5-ui-integration-fixture-v1。
+    元数据：示意位置、speaker，以及 variant、expected-similarity、
+    可选 query-segment-source；这些测试字段不代表原生导出固定字段。
+
+TMX 1.4b 没有统一定义匹配相似度字段。
+prop 可以携带工具自定义数据，其含义由工具约定。
+原生导出不会主动生成 x-localcat-expected-similarity；
+它是某次测试的期望值，不是记忆条目的固有属性。
+
+LocalCAT 对元数据的处理：
+  speaker、前后文、来源等已识别字段：映射到内部语义字段。
+  x-localcat-status / x-MateCAT-status：专门记录其状态来源。
+  expected-similarity、variant、query-segment-source：作为未知 prop 保留，
+    不控制实际评分或匹配类型。
+  TU/TUV 的日期属性：当前尚未映射成翻译日期。
+
+资源导入将 prop 保留进 provenance；后续原生导出可以再次带出这些已导入的 prop。
+“可以保留”不表示生成器会主动计算这些字段。
+TMMatch.last_used 表示记忆使用时间，不能代替译文保存或修改时间。
+
+5. XML 兼容边界
+
+LocalCAT 的 TMX 解析器拒绝 DTD、实体声明和外部实体。
+包含这些声明时可报 PARSER.TMX.UNSAFE_XML。
+MyMemory 或其他工具生成的 TMX 可能带有 DOCTYPE；
+安全兼容模板应省略此类声明，并保留合法的双语 XML 内容。
+PlainText / plaintext、日期和自定义 prop 等差异，需分别判断其解析与语义支持。
+
+6. 翻译时间字段的设计建议（尚未实现）
+
+可分开保留以下事实：
+  source_creationdate：原始创建日期。
+  source_changedate：原始修改日期。
+  translation_updated_at：语义可确定的译文保存/更新时间，统一为 UTC。
+  date_origin：来源属性、工具及 synthetic / unknown 等来源标记。
+  imported_at：导入本机的时间。
+
+可讨论的取值顺序：
+  1. 选定目标 TUV 的有效 changedate；
+  2. TU 的有效 changedate；
+  3. 来源确认的 Matecat Job TU.creationdate；
+  4. 其他来源仅有 creationdate 时，保留其创建日期语义，翻译更新时间维持未知。
+
+header 日期不能替代每条译文日期。
+缺失或非法日期应保持未知，不用导入时间、文件修改时间或“现在”填充。
+日期显示、日期排序和编辑耗时是不同需求；是否用时间打破同分应单独决定。
+
+版本与出处见 repositories_and_versions.txt。

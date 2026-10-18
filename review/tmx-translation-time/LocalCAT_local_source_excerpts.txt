@@ -1,0 +1,199 @@
+LocalCAT TMX 源码节选
+
+公开版本：0b71bb3eb5de1db679601b2fc061fe481c41b16e
+仓库：https://github.com/BeFringe/LocalCAT
+以下只摘录日期字段与属性传递相关代码，保留仓库路径和原始行号。
+完整上下文以对应源码链接为准；节选不是可独立运行的程序。
+
+parser_tmx_codec.py — TU 解析状态
+https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/parser_tmx_codec.py#L148-L158
+148: @dataclass(slots=True)
+149: class _UnitState:
+150:     ordinal: int
+151:     depth: int
+152:     source_choice: _LocaleChoice
+153:     target_choice: _LocaleChoice
+154:     props: list[tuple[str, str, str, str]] = field(default_factory=list)
+155:     metadata_entries: int = 0
+156:     metadata_chars: int = 0
+157:     inline_xml: bool = False
+158:     segment_oversized: bool = False
+
+parser_contracts.py — 解析器输出的记忆记录
+https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/parser_contracts.py#L1404-L1410
+1404: @dataclass(frozen=True, slots=True)
+1405: class ResourceRecord:
+1406:     local_id: str
+1407:     source: str
+1408:     target: str
+1409:     speaker: RawSpeaker
+1410:     format_metadata: tuple[MetadataEntry, ...]
+
+resource_importer.py — 导入属性与内部字段映射
+https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/resource_importer.py#L599-L658
+599: def _tmx_import_draft(
+600:     record: ResourceRecord,
+601:     file_name: str,
+602: ) -> TMRecordDraft:
+603:     """One exact import draft with lossless TMX prop provenance.
+604: 
+605:     Parser owns XML safety and the ordered prop grammar.  This adapter only
+606:     recognizes LocalCAT-owned semantic props plus the verified MateCAT status
+607:     prop; every prop is also retained in canonical JSON form so unknown and
+608:     duplicate properties survive a later TMX export.
+609:     """
+610: 
+611:     speaker: str | None = None
+612:     context_prev: str | None = None
+613:     context_next: str | None = None
+614:     file_source: str | None = file_name
+615:     provenance: list[tuple[str, str]] = [
+616:         ("source", "tmx-import"),
+617:         ("file", file_name),
+618:     ]
+619:     for scope, prop_type, language, value in _tmx_record_props(record):
+620:         raw_prop = json.dumps(
+621:             (scope, prop_type, language, value),
+622:             ensure_ascii=False,
+623:             allow_nan=False,
+624:             separators=(",", ":"),
+625:         )
+626:         provenance.append(("tmx.prop", raw_prop))
+627:         normalized_type = prop_type.casefold()
+628:         if scope == "tu" and normalized_type == "x-localcat-context-prev":
+629:             context_prev = value or None
+630:         elif scope == "tu" and normalized_type == "x-localcat-context-next":
+631:             context_next = value or None
+632:         elif scope == "tu" and normalized_type == "x-localcat-speaker":
+633:             speaker = value or None
+634:         elif scope == "tu" and normalized_type == "x-localcat-file-source":
+635:             file_source = value or None
+636:         elif normalized_type in {"x-localcat-status", "x-matecat-status"}:
+637:             provenance.append(("tmx.status", value))
+638:         elif scope == "tu" and normalized_type == "x-localcat-provenance":
+639:             try:
+640:                 decoded = json.loads(value)
+641:             except (TypeError, ValueError, json.JSONDecodeError):
+642:                 decoded = None
+643:             if (
+644:                 type(decoded) is list
+645:                 and len(decoded) == 2
+646:                 and all(type(item) is str and item for item in decoded)
+647:             ):
+648:                 provenance.append((decoded[0], decoded[1]))
+649: 
+650:     return TMRecordDraft(
+651:         source_raw=record.source,
+652:         target_raw=record.target,
+653:         speaker_raw=speaker,
+654:         context_prev_raw=context_prev,
+655:         context_next_raw=context_next,
+656:         file_source=file_source,
+657:         provenance=tuple(provenance),
+658:     )
+
+tm_contracts.py — 内部记忆草稿字段
+https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/tm_contracts.py#L218-L228
+218: @dataclass(frozen=True)
+219: class TMRecordDraft:
+220:     """A record body accepted by a future canonical store append port."""
+221: 
+222:     source_raw: str
+223:     target_raw: str
+224:     speaker_raw: str | None
+225:     context_prev_raw: str | None
+226:     context_next_raw: str | None
+227:     file_source: str | None
+228:     provenance: tuple[tuple[str, str], ...]
+
+tm_engine.py — 候选记录的使用时间字段
+https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/tm_engine.py#L70-L82
+70: @dataclass(frozen=True)
+71: class TMMatch:
+72:     """
+73:     Represents a translation memory match result.
+74:     Strictly follows Blueprint V1.
+75:     """
+76:     source: str             # Source text in TM
+77:     target: str             # Translation in TM
+78:     similarity: float       # Similarity score (0.0 - 1.0)
+79:     match_type: str         # "EXACT", "FUZZY", "CONTEXT"
+80:     tm_source: str          # Source TM filename
+81:     usage_count: int = 0
+82:     last_used: str = ""     # ISO timestamp
+
+tmx_context_interchange.py — 原生字段与导入属性拼装
+https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/tmx_context_interchange.py#L225-L251
+225: def _localcat_props(unit: TmxExportUnit) -> tuple[TmxOrderedProp, ...]:
+226:     props: list[TmxOrderedProp] = []
+227:     for prop_type, value in (
+228:         ("x-localcat-speaker", unit.speaker),
+229:         ("x-localcat-context-prev", unit.context_prev),
+230:         ("x-localcat-context-next", unit.context_next),
+231:         ("x-localcat-file-source", unit.file_source),
+232:     ):
+233:         if value is not None:
+234:             props.append(TmxOrderedProp(prop_type, value))
+235:     props.append(TmxOrderedProp("x-localcat-confirmed", "true" if unit.confirmed else "false"))
+236:     if unit.status is not None:
+237:         props.append(TmxOrderedProp("x-localcat-status", unit.status))
+238:     for provenance in unit.provenance:
+239:         props.append(
+240:             TmxOrderedProp(
+241:                 "x-localcat-provenance",
+242:                 json.dumps(
+243:                     [provenance.key, provenance.value],
+244:                     ensure_ascii=False,
+245:                     allow_nan=False,
+246:                     separators=(",", ":"),
+247:                 ),
+248:             )
+249:         )
+250:     props.extend(unit.imported_props)
+251:     return tuple(props)
+
+tmx_context_interchange.py — 原生 XML 输出结构
+https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/tmx_context_interchange.py#L398-L440
+398:     lines = [
+399:         '<?xml version="1.0" encoding="UTF-8"?>',
+400:         '<tmx version="1.4">',
+401:         (
+402:             '  <header creationtool="LocalCAT" creationtoolversion="1" '
+403:             f'segtype="sentence" o-tmf="LocalCAT" adminlang="en" '
+404:             f'srclang={quoteattr(source_locale)} '
+405:             'datatype="PlainText"/>'
+406:         ),
+407:         "  <body>",
+408:     ]
+409:     parser_units: list[object] = []
+410:     prop_count = 0
+411:     metadata_chars_total = 0
+412:     for unit, props in included:
+413:         lines.append(f"    <tu tuid={quoteattr(_tu_id(binding, unit))}>")
+414:         for prop in props:
+415:             if prop.scope is TmxPropScope.TU:
+416:                 lines.append(_prop_xml(prop, indent="      "))
+417:         lines.append(f"      <tuv xml:lang={quoteattr(source_locale)}>")
+418:         for prop in props:
+419:             if prop.scope is TmxPropScope.SOURCE_TUV:
+420:                 lines.append(_prop_xml(prop, indent="        "))
+421:         lines.append(f"        <seg>{escape(unit.source)}</seg>")
+422:         lines.append("      </tuv>")
+423:         lines.append(f"      <tuv xml:lang={quoteattr(target_locale)}>")
+424:         for prop in props:
+425:             if prop.scope is TmxPropScope.TARGET_TUV:
+426:                 lines.append(_prop_xml(prop, indent="        "))
+427:         lines.append(f"        <seg>{escape(unit.target)}</seg>")
+428:         lines.append("      </tuv>")
+429:         lines.append("    </tu>")
+430:         parser_units.append(_parser_facts(unit.source, unit.target, props, effective_locales))
+431:         prop_count += len(props)
+432:         metadata_chars_total += sum(
+433:             len(prop.scope.value)
+434:             + len(prop.type)
+435:             + len(prop.value)
+436:             + (len(prop.xml_lang) if prop.xml_lang is not None else 0)
+437:             for prop in props
+438:         )
+439:     lines.extend(("  </body>", "</tmx>"))
+440:     data = ("\n".join(lines) + "\n").encode("utf-8")

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tmx version="1.4">
+  <header creationtool="LocalCAT" creationtoolversion="1" segtype="sentence" o-tmf="LocalCAT" adminlang="en" srclang="en-US" datatype="PlainText"/>
+  <body>
+    <tu tuid="localcat-4b74dbbc9f29f41f06b2b4f2918a15f0c6c5a9623728004129a743c51064b061">
+      <prop type="x-localcat-speaker">guide</prop>
+      <prop type="x-localcat-context-prev">guide "Welcome."</prop>
+      <prop type="x-localcat-context-next">guide "Let us begin."</prop>
+      <prop type="x-localcat-file-source">chapter_example.rpy</prop>
+      <prop type="x-localcat-confirmed">true</prop>
+      <prop type="x-localcat-status">confirmed</prop>
+      <tuv xml:lang="en-US">
+        <seg>guide "Hello."</seg>
+      </tuv>
+      <tuv xml:lang="zh-CN">
+        <seg>guide "你好。"</seg>
+      </tuv>
+    </tu>
+  </body>
+</tmx>
