@@ -1,7 +1,7 @@
 {
   "feature_name": "rpy-project-codec",
   "created_at": "2026-10-05T06:58:14+00:00",
-  "updated_at": "2026-10-05T09:30:00+00:00",
+  "updated_at": "2026-10-18",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -18,5 +18,15 @@
       "approved": true
     }
   },
-  "ready_for_implementation": true
+  "ready_for_implementation": true,
+  "approved_amendments": {
+    "tl_language_declaration": {
+      "scope": "Requirement 1.5、RpyCodec 顶层语言声明设计、Task 2.1a。",
+      "requirements": true,
+      "design": true,
+      "tasks": true,
+      "approved": true,
+      "ready_for_implementation": true
+    }
+  }
 }

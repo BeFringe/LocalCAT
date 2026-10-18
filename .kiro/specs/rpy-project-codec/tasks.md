@@ -34,6 +34,12 @@
   - 完成时，正反 fixture 全部分类正确，超限/截断不会输出可提交候选。
   - _Requirements: 1.1, 1.2, 2.1, 7.1, 7.2, 7.3_
   - _Boundary: RpyCodec_
+- [ ] 2.1a 兼容 TL 顶层语言声明
+  - 在现有块扫描中识别语言字符串声明与尾注，结束前块后将声明作为模板内容保留。
+  - 完成时，声明可位于块前、块间和末尾；含声明的单／多 TL 可编辑、存包、冷重开及导出，无修改逐字节一致，修改仅影响目标跨度。
+  - 覆盖声明错误、前块不完整和声明后缩进错误；仅声明变化的源更新保留段落身份、译文与确认状态。
+  - _Requirements: 1.1, 1.2, 1.5, 2.1, 3.2, 4.2, 4.3, 5.3, 7.3_
+  - _Boundary: RpyCodec / Project round-trip 集成_
 - [x] 2.2 映射翻译槽、speaker 与稳定局部身份
   - 构造中立 source/target，speaker 取角色标识符或姓名字符串，姓名 interpolation 不求值；属性及 transition 留在结构跨度，strings 不继承角色，extend/centered 不展开求值，首次导入 confirmed=false。
   - 完成时，重复 label/old key 明确失败，显示顺序不改变身份，控制行不成为段落。

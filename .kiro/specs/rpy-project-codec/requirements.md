@@ -13,6 +13,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 ### Scope Lineage
 
 - **Owning spec**：`rpy-project-codec`。
+- **TL 控制行增量**：扩展本规格 Requirement 1.1/1.2 与 Design「RpyCodec 与 TL profile」的有限语法，新增顶层 `define config.language` 字符串声明的原样保留。
 - **被修订的既有范围说明**：Multi Requirements 3.5 的 RPY 延期范围；Multi Design 的 single-file origin 和未来 source writer 接缝；Parser 中立 source-round-trip capability 的执行扩展。
 - **相邻规格 / 契约**：`parser-subsystem-extraction`、`multi-document-project-workspace`、`qt-editor-json-mvp-increment`、`windows-platform-enablement`。
 - **范围差异**：单 TL 采用非 legacy ProjectPackage profile，目录选择由 Multi 提供；Parser 提供中立 round-trip 准备/发布，RPY 手工包闭环先于 Sync。 具体 owner 合同与执行依赖见 [跨规格合同](cross-spec-amendments.md)。
@@ -28,6 +29,7 @@ LocalCAT 为 Ren'Py TL 译者提供独立的格式支持：打开翻译模板，
 2. If 输入属于未支持语法、损坏编码、歧义源文/译文对应关系或混合目标语言, the LocalCAT shall 给出文件位置和原因，并保留当前项目及源文件。
 3. If codec 缺失、禁用或不兼容, the LocalCAT shall 显示明确的不可用原因，不以 TXT 或其他格式猜测读取/写回。
 4. The LocalCAT shall 从自身发行内容和本机配置提供该能力，运行和测试均不要求其他项目的目录、脚本或 Ren'Py 安装。
+5. When 受支持的 TL 含顶层 `define config.language = <单行字符串字面量>` 及可选行尾注释, the LocalCAT shall 接受并在保存、冷重开和 TL 导出中将该声明作为模板内容原样保留；目标语言由翻译块声明确定，非法声明提供位置和原因。
 
 ### Requirement 2：翻译槽、中立编辑与稳定身份
 

@@ -138,6 +138,7 @@ stateDiagram-v2
 支持 UTF-8（可带 BOM）、LF/CRLF、空行、注释和空格缩进。支持的 grammar 明确限定为：
 
 - `translate <language> <label>:`，其中一个源文注释 say 与一个目标 say 一一对应；支持 narrator 的单字符串，或 `speaker [attributes] <quoted-string> [with transition]`。speaker 为单个标识符或单行姓名字符串；姓名字符串解码为 raw speaker，只有其后的台词字符串进入翻译槽。属性为零个或多个标识符/负属性（`-name`），可有一个 `@` 分隔临时属性（其后至少一个属性）；transition 限单个标识符，不求值。源/目标的 speaker 内容及形式必须一致，字符串姓名与同名标识符不混同；属性及 transition 各自保留，不要求翻译前后显示效果相同。可保留 `voice <quoted-string>` 与 `nvl clear`；纯控制 block 不产生段落。
+- 顶层 `define config.language = <quoted-string>` 使用同一单行字符串词法，允许单／双引号、词间空格和可选行尾 `#` 注释；声明可位于 TL 块前、块间或块后。整行作为模板内容保留，目标语言由 `translate` 的语言 token 判定。其他变量、表达式、调用、缩进声明及物理多行形式不在此规则内。只有声明而没有受支持 TL 块的文件不建立翻译项目。
 - `translate <language> strings:` 中一一对应的 `old <quoted-string>` / `new <quoted-string>`；可有多个 pair 和多个 strings block，但同一文档同一语言的重复 old key 拒绝。dialogue 与 strings 按块状态区分，可在同一文档交替出现；strings 无 speaker，不从相邻 dialogue 继承角色。
 - 字符串为单行单/双引号文本，允许声明的反斜杠转义（反斜杠、相应引号、n/r/t）；未声明转义、物理多行字符串、三引号、上述有限属性/transition 以外的 say 表达式或调用参数、`pass` 代替译文、多 say 对一 source、Python/style/条件块、原始游戏语句均整文档 unsupported。不保留无法确定边界的“未知代码”。
 - 一文档仅一个目标语言 token；language 按原 token 保存，不强制 BCP 47。`None` 只允许 strings。空目标、评论中的引号/井号按词法识别，不靠行过滤。
@@ -145,6 +146,8 @@ stateDiagram-v2
 speaker 映射示例：`guide thinking "Source"` 的中立 speaker 是 `guide`，`thinking` 只保留在 codec 的结构跨度中；`guide -thinking @ happy "Source" with dissolve` 采用同一规则。`"Alarm clock" "Ring"` 的 speaker 是 `Alarm clock`，`"[character]" "Hello"` 的 speaker 是 `[character]`，姓名插值不求值，姓名字节不属于可回填的译文跨度。narrator 没有 speaker；`extend`、`centered` 按原始特殊 say 标识保留，不执行游戏去推断前一角色或显示别名。属性不会因未显示在 speaker 列而从导出文件删除。翻译单元 label 的摘要样式后缀是身份线索，不视为加密文本。
 
 局部 ID：dialogue 使用 language+label 的无歧义编码；strings 使用 language+完整解码 old（含 `{#...}`）的 SHA-256 派生值，若碰撞或重复直接拒绝。ID 不使用当前序号。dialogue 的 label 不变而源文改变时 ID 保持，交给 Project 判定 source_changed、保留 target 并清除 confirmed；label 改变或 strings 的 old key 改变时产生 new/removed，交给显式调和，不靠相似文本自动合并。source 相同而显示/顺序变化不改变 ID。
+
+顶层语言声明由 `RpyCodec` 在块边界处理：先结束并验证前一个块，再清除该块状态；后续缩进行不得继续附着于旧块。识别复用字面量及尾注词法，不按 `#` 切分原始行。原始 source 保存声明字节，现有私有映射继续定位 target 字符串内部的替换跨度。扩展后的 parser 可读取旧合法 TL 和旧包；含声明的新模板需要使用支持该语法的版本导出。源更新重新解析完整新模板，只有声明字节变化时，段落身份和源事实不变，预览须区分源文一致与模板字节不同。
 
 ### RpyTextRules
 
@@ -207,7 +210,7 @@ Controller 继续校验 issued identity、session/revision 与 Chunk mutation pe
 
 | 需求 | 组件/合同 | 验证 |
 | --- | --- | --- |
-| 1.1, 1.2, 1.3, 1.4 | RpyCodec、CodecSettings、Parser surface | 完整读取、拒绝矩阵、缺失/禁用、独立发行 |
+| 1.1, 1.2, 1.3, 1.4, 1.5 | RpyCodec、CodecSettings、Parser surface | 完整读取、拒绝矩阵、缺失/禁用、独立发行 |
 | 2.1, 2.2, 2.3, 2.4 | TL grammar、局部 ID、Project overlay | 空槽/已有译文/重复身份/默认未确认 |
 | 3.1, 3.2, 3.3, 3.4 | 单文件 profile、ProjectPackage、private handoff | 保存/冷重开/缺失 codec/发布失败 |
 | 4.1, 4.2, 4.3, 4.4, 4.5 | RpyTextRules、round-trip prepare、ProjectExportView | golden、错误转义/标签、stale 与不确定发布 |
@@ -221,6 +224,7 @@ codec 使用 Parser 既有安全诊断容器，RPY 错误 namespace 区分 unsup
 
 ## Testing Strategy
 
+- 顶层语言声明：块前／块间／末尾、引号内井号及行尾注释、BOM/CRLF 的无改动导出；编辑只改变目标跨度；不完整前块、声明后错误缩进、非字面量与多 say 仍拒绝。真实项目包冷重开和仅声明变化的源更新复用同一映射与导出路径，覆盖 1.5、3.2、4.2、4.3、5.3、7.3。
 - 词法与 golden：每个支持 grammar 正/反例；引号、井号、空目标、BOM/CRLF、Unicode、dialogue/strings 同文件、多 strings block、speaker/属性分离、extend/centered、with transition 与控制行；验证 1、2、4、7。
 - 私有数据攻击/失效：越界/重叠 span、重复 ID、foreign/version/stale token、错误摘要；核对拒绝发生在目标打开前，覆盖 3.3、4.4、7.2。
 - 项目集成：真实单 Document 包冷重开、无原路径导出、无 codec 编辑保存；根目录预览后单选/多选、至少两层目录与同 basename、树导航不改变阅读顺序、按原目录导出、rename/source change 与 Chapter/Chunk 稳定身份，覆盖 3、5。

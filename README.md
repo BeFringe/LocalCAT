@@ -4,9 +4,9 @@ LocalCAT 是面向个人译者的轻量、模块化、本地优先 CAT 工具。
 
 ## Windows 快速开始
 
-适用于 Windows 11 x64，解压即可运行，无需安装 Python 或 Qt。
+当前预发布为 [0.5.3 RPY](https://github.com/BeFringe/LocalCAT/releases/tag/v0.5.3-rpy)，提供 Windows 11 x64 自包含 ZIP，解压即可运行，无需安装 Python 或 Qt。本版包含 Ren'Py TL 项目和手工跨设备包交换；自动同步尚未交付。macOS 和 Linux 继续从源码运行。
 
-1. 将 Windows ZIP 完整解压到本机硬盘上的一个文件夹。
+1. 从发布页下载 `LocalCAT-0.5.3-rpy-windows-x64.zip`，完整解压到本机 NTFS 硬盘上的一个文件夹。
 2. 打开其中的 `LocalCAT/LocalCAT.exe`。请保留同文件夹里的其他文件。
 3. 在首页打开项目，选择段落后即可编辑译文。已有翻译记忆库或术语表可在「语言资源」设置中导入。
 
@@ -30,7 +30,7 @@ LocalCAT 从 **Trie 术语 + JSONL 精确 TM → Excel 无状态工作流 → Qt
 | Feature 5 · 0.5.0 | canonical SQLite、多译文、JSONL 迁移、EXACT/CONTEXT/FUZZY、统一文本匹配；接入 Qt 建议、阈值与资源生命周期 | Core 与 UI 集成已完成 · `v0.5.0-feature5`、`v0.5-feature5-integration` |
 | 0.5.1 · Parser / Multi-document | 统一用途感知 Parser、多文档身份与 ProjectPackage，承接分工、资源交换及 TMX 互操作 | 已完成 · `v0.5.1-parser+multidoc` |
 | **0.5.2 · Windows 首次 frozen** | Windows source 与轻量 launcher，以及普通 PyInstaller onedir/windowed 自包含交付，用户无需安装 Python/Qt | 已发布 · [`v0.5.2-windows-frozen`](https://github.com/BeFringe/LocalCAT/releases/tag/v0.5.2-windows-frozen) |
-| 0.5.3 · RPY codec 与同步 | 先由 `rpy-project-codec` 接入 Ren'Py translation script，再由 `cross-device-sync-plugin` 消费项目包与资源包 | 规划中 |
+| **0.5.3 · RPY 与手工包交换** | Ren'Py TL 导入、源更新对照、单/多章节保真导出，项目包与资源包手工交换；后续同步插件尚未实现 | RPY 阶段已预发布 · [`v0.5.3-rpy`](https://github.com/BeFringe/LocalCAT/releases/tag/v0.5.3-rpy) |
 | 可能的 0.5.4 · macOS frozen | macOS 自包含发行；现有轻量 `.app` 仍依赖外部 Python 和源码 | 尚未立项，版本未定 |
 
 已发布标签见 [GitHub Tags](https://github.com/BeFringe/LocalCAT/tags)。表中的规划版本不是发布承诺。
@@ -45,13 +45,14 @@ LocalCAT 从 **Trie 术语 + JSONL 精确 TM → Excel 无状态工作流 → Qt
 ## 当前可用范围
 
 - **Qt 编辑器**：三栏编辑、确认进度、未保存保护、最近项目、段落断点、快捷键、字号调整和双语浏览/校对。
-- **项目与搜索**：单文件 JSON/TXT、显式多文档 JSON/TXT/PO/POT、章节导航与 ProjectPackage 保存/恢复；搜索 source、target、raw speaker，支持 Match Case、Whole Word 和状态筛选。
+- **项目与搜索**：JSON/TXT/PO/POT/RPY 项目，可显式选择文件，或从根目录预览中勾选章节；嵌套同名文件按相对路径区分，以 ProjectPackage 保存/恢复。搜索 source、target、raw speaker，支持 Match Case、Whole Word 和状态筛选。
+- **Ren'Py TL**：支持一条原文对应一条译文的 dialogue，以及 `old`/`new` strings。源更新可查看旧文／新文和词级差异；单/多章节导出保留相对路径，并预览新建或覆盖。项目包保存原始模板，重开后无需找回原文件即可导出。
 - **翻译记忆库**：legacy JSONL 精确兼容；激活后的 canonical SQLite 提供多译文、EXACT/CONTEXT/FUZZY、确定性 top-10、60%～100% 阈值和确认写回。Fuzzy 需本机资格验证，不自动应用建议。
 - **术语与资源**：Trie 术语建议、术语 CRUD、CSV/XLSX 显式列选择导入、TMX 导入；TM JSONL 与术语 CSV/v1 可通过 ResourcePackage 导出、预览及导入应用。
 - **分工与交换**：按稳定段落划分/分配本地协作任务；TMX 可从托管资源、项目或选定分工导出。TMX ResourcePackage 当前仅支持导出与验证，不支持导入应用。
 - **Excel 兼容入口**：保留 xlwings/openpyxl 的既有无状态工作流；Qt 不依赖 Microsoft Excel 或 xlwings。
 
-RPY/XLIFF 项目 codec、多 Sheet workbook、目录自动发现、机器翻译、QA、账户、云端同步和实时多人协作仍属后续范围。TMX/CSV/XLSX 的语言资源支持不等于相同格式可作为编辑项目打开。
+RPY 当前只支持有限的 TL 语法，不是任意游戏脚本编辑器；`define config.language` 和同一原文下连续多条译句尚不支持。XLIFF 项目、多 Sheet workbook、后台自动发现、机器翻译、QA、账户、云端同步和实时多人协作仍属后续范围。TMX/CSV/XLSX 的语言资源支持不等于相同格式可作为编辑项目打开。
 
 ## 从源码运行（Windows）
 
@@ -120,11 +121,11 @@ macOS 普通终端启动会在创建 Qt 前经 LaunchServices 打开已签名入
 - 项目、TM 和资源各自拥有保存、发布与恢复语义；失败不能静默替换原数据。Windows 使用自己的句柄、锁和 ACL/MIC 端口，POSIX 使用本机原语。
 - TMX 拒绝 DTD/ENTITY/外部实体；含不支持 XML 行内元素的单元会跳过并反馈。大型导入仍受格式限额约束。
 - canonical Fuzzy 启动时恢复兼容的本机资格；缺失或失配时从设置中手动验证，期间可以继续编辑和保存。完整验证中仅时间指标超限时，Fuzzy 仍可使用并显示性能提示，性能报告继续保留失败；正确性、内存等必要条件仍限制准入。JSONL/ResourcePackage 搬运数据，不搬运资格。
-- 普通 frozen 保留必要数据保护、真实 Core Gate 和包内业务验收，按 ADR-028 收窄旧 W3 的完整启动来源证明；0.5.2 当前候选已完成发行裁决。
+- Windows 自包含发行保留必要数据保护、真实 Core Gate 和包内业务验收；macOS/Linux 的轻量入口仍依赖本机 Python 和源码。
 
 ## 开发与验证
 
-0.5.2 使用普通 PyInstaller onedir/windowed 打包，当前支持本地 NTFS。候选 `681a898d51c7` 已在同一产物上完成 Qt、Project、TM、TMX、FTS5 用户旅程、必要的数据保护及 Core Gate C/D 验证，最终发行裁决为 **VERIFIED**；性能结果及复用范围见[验收记录](.kiro/specs/windows-platform-enablement/cross-spec-amendments.md#时间准入修订候选-681a)。构建和资源/SQLite 烟测只是其中的步骤。
+Windows 使用普通 PyInstaller onedir/windowed 打包，支持本地 NTFS。0.5.3 RPY 预发布已在实际 ZIP 解压副本完成项目、资源包、Fuzzy 与冷启动恢复验证，具体交付范围和已知问题见[发布说明](https://github.com/BeFringe/LocalCAT/releases/tag/v0.5.3-rpy)。此前 0.5.2 的[验收记录](.kiro/specs/windows-platform-enablement/cross-spec-amendments.md#时间准入修订候选-681a)继续保留。
 
 依赖方向为 Qt / Excel → Application / Logic → Engine / Parser → Storage。Qt 经 `EditorController` 消费不可变契约；Parser 与 Engine/Store 互不导入。旧 `LogicController` 保持 Excel 所需的无状态三态接口。
 
