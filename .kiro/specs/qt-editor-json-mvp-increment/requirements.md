@@ -16,6 +16,8 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 
 项目搜索、只读 speaker inventory 与预处理偏好分别由 Requirements 1、3、4 定义。目录选择、格式导出与手动同步增加 Requirements 10、11 的中立视图；格式、项目和网络能力由对应 owner 提供，不扩展 Qt 的解析或持久化权限。
 
+资源改名与结果提示增量接续既有 `qt-editor-mvp` Requirement 8 的语言资源列表与配置更新，以及本规格 Requirement 8 的紧凑资源操作和 Requirement 10 的项目保存视图，新增 Requirements 12、13。适用于编辑项目及资源设置，名称保存复用 Controller 的资源配置入口。
+
 ### Windows Compatibility Amendment WA-08
 
 **普通frozen修订范围**：来源、入口及候选验收接缝；原Qt/source完成事实保留原范围。
@@ -202,3 +204,25 @@ LocalCAT Qt 单 JSON MVP 增量面向在一个本地 JSON 项目中持续工作�
 1. When 用户进入手动同步, the Qt 编辑器 shall 提供连接设置、计划/冲突/导入确认与部分失败结果，只回传 issued IDs 和用户选择，不持有 provider 或包内部 authority。
 2. When 显示秘密字段, the Qt 编辑器 shall 默认以星号遮蔽，允许显式显示，关窗重开恢复遮蔽；显隐不写配置、不复制秘密，也不提供内容加密开关。
 3. When 同步被取消、项目切换、窗口关闭或相关内容改变, the Controller shall 校验 issued session/generation 并拒绝晚到结果，保留未保存编辑、保存能力与 Chunk mutation guards。
+
+### Requirement 12：语言资源显示名编辑
+
+**目标：** 作为译者，我希望直接修改已有 TM 或术语表的显示名称，以便识别资源而不搬动数据。
+
+#### 验收标准
+
+1. When 用户在语言资源设置编辑活动或非活动资源的名称, the LocalCAT Qt 编辑器 shall 在该行提供可发现且可键盘使用的编辑入口；确认后保存名称，取消后恢复已保存名称。
+2. When 用户提交有效的新名称, the LocalCAT shall 保存去除首尾空白后的显示名，并在资源列表、相关建议来源及重新打开设置后显示一致的名称；名称不需要唯一，资源仍按原身份区分。
+3. While 用户改名, the LocalCAT shall 保持资源 ID、类型、文件路径、资源内容及 Active/Lookup/Update 设置不变，不要求重新导入或重新验证 Fuzzy。
+4. If 名称为空或名称保存失败, the LocalCAT shall 显示原因并保留已保存的名称；若名称已保存而运行时刷新失败，应如实显示已保存名称与刷新失败状态，不声称已回滚。
+
+### Requirement 13：执行结果通知的停留时间
+
+**目标：** 作为译者，我希望完成操作后继续阅读正文，不让过期的成功提示长期占据编辑或校对空间，同时看得见仍需处理的问题。
+
+#### 验收标准
+
+1. When 项目保存、资源配置更新、导入完成摘要、术语变更、分工操作完成、预处理应用／撤销／规则保存或无后续处置的取消产生简短完成提示, the LocalCAT Qt 界面 shall 在 7 秒后清除该临时提示并释放其独占空间；若该位置承载常态说明，则恢复当前状态对应的说明。
+2. When 用户切换编辑与浏览模式, the LocalCAT Qt 编辑器 shall 保持同一次保存通知的剩余停留时间，已消失的通知不因重绘、切章或模式切换重新出现。
+3. If 操作尚在进行、结果失败／不确定、需要恢复或存在待处置项, the LocalCAT Qt 界面 shall 保留相应状态和可操作反馈，不按成功提示的时限隐藏；用户正在审阅的逐文件结果、预览、搜索结果和能力状态不作为临时通知自动清除。
+4. When 新通知替代旧通知，或项目／对话框已关闭或切换, the LocalCAT Qt 界面 shall 取消旧提示的清除安排，不让旧计时清掉新消息、恢复旧内容或改变项目与资源状态。

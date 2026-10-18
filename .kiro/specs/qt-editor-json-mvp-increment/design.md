@@ -623,6 +623,35 @@ Controller 负责 Application 协调、issued identity、session/generation 与�
 
 目录节点仅展开，文档导航保持 manifest 阅读顺序；打开和单文件项目规则消费 [Multi Design](../multi-document-project-workspace/design.md#显式根目录选择与单文件项目)，格式导出消费 [RPY Design](../rpy-project-codec/design.md)，同步流程消费 [Sync Design](../cross-device-sync-plugin/design.md)。秘密显隐仅作用于当前字段，不写配置或复制值，关窗后恢复遮蔽。取消、换项目、关窗或相关修改使旧结果失效；既有未保存保护、编辑权限与 Chunk guards 继续生效。
 
+### 资源显示名编辑
+
+资源名称列采用行内编辑，TM 和术语表、活动和非活动资源一致；常态文本保持紧凑，hover/focus 显示可编辑样式并提供“编辑资源名称”提示。Enter 或失焦提交，Esc 取消；程序触发表格刷新前取消尚未确认的草稿，不把重绘当作用户提交。提交时按稳定 resource ID 从 Controller 读取当前配置，只替换 name，调用现有 `update_resource()`；不复用旧行快照覆盖后来变更的开关。空白名称拒绝，未变化不重复写入。
+
+`ResourceRepository.update_resource()` 已原子保存显示名并保护路径／类型；Controller 继续使用既有资源刷新路径，保持当前 canonical coordinator 与资源数据。名称随当前资源投影更新到列表与建议来源。成功后刷新同资源行及建议来源；写前失败恢复已保存名，已持久化但 runtime 刷新失败时重新显示当前配置和现有资源错误，不伪造回滚。现有忙碌态期间禁用名称编辑。
+
+文件边界为 `qt_settings_dialog.py` 的资源行和事件，消费 `editor_controller.py` 的既有更新合同及 `resource_repository.py` 的既有保存行为。对应 Qt 设置／Controller 测试验证行内键盘、两类资源、重开、ID/path/flags/content 不变与失败反馈。
+
+### 完成提示与持续状态
+
+使用当前窗口拥有的单次 `QTimer`，默认 7000 ms。调用处按操作结果显式选择临时回执或持续状态。新消息替换旧计时；关闭／换项目停止计时并清理当前反馈。清除只影响 UI 文本与可见性，不触发 Controller mutation。
+
+| 表面 | 临时结果 | 保留的状态／内容 | 文件 |
+| --- | --- | --- | --- |
+| 编辑／浏览的项目反馈 | 创建／保存／导入完成摘要及无待办取消 | 保存失败、不确定、恢复需要、部分失败 | `qt_editor_window.py` |
+| 语言资源设置 | 改名、配置、新建／删除、资源包导入完成、canonical 完成及阈值更新摘要 | 正在运行、能力不可用、失败／恢复；TMX／术语批量导入的统计与错误明细 | `qt_settings_dialog.py`，主窗 Fuzzy 完成反馈调用处 |
+| 术语管理 | 新增／更新／删除成功摘要 | 冲突、失败、隔离／恢复及表格当前记录 | `qt_termbase_dialog.py` |
+| 文字预处理 | 保存规则、应用、撤销、取消摘要 | 当前预览、待确认提示、错误、常态“预览不修改项目”说明 | `qt_preprocess_dialog.py` |
+| 分工管理 | 已发布操作的完成摘要 | 分工列表、范围／预览、阻断与待发布状态 | `qt_chunk_manager_dialog.py` |
+
+主窗的两种模式共享同一个保存反馈计时，清除后都隐藏标签；章节菜单刷新仅根据当前文本决定显示，不重建旧提示或留下空白条。dirty 标记和进度仍按 Controller 实时显示。资源设置到期后恢复当前数量／忙碌状态，不恢复捕获的过期成功字符串；术语反馈无内容时隐藏，预处理回到当前常态／预览说明。逐文件结果、导出报告和源更新后的待保存提示保持可查。
+
+验证采用真实 Qt 事件循环触发到期，覆盖重绘、两模式切换、新消息替代、后继持久错误及对话框／项目切换；时间到期不改变 dirty、已保存事实或资源状态。测试实例可缩短计时间隔；实际 UI 使用 7 秒。普通 Windows frozen 在同一候选上复验名称编辑与各类通知。
+
+| 需求 | 接线 | 验证结果应表现为 |
+| --- | --- | --- |
+| 12.1–12.4 | 资源行编辑 → Controller 更新 → 当前资源投影 | 名称冷重开可恢复，其他数据不变，失败如实显示 |
+| 13.1–13.4 | 各现有反馈 setter 与窗口计时 | 简短完成提示到期清除，持续状态与后继消息不受旧计时影响 |
+
 ### Future compatibility seams
 
 - 当前单 JSON 的 segment id 对后续 workspace 视为 opaque local identity；多文档规格负责把它提升为 `(document_id, local_segment_id)`，当前 UI 不预埋 document/chunk 字段，也不按显示顺序重铸身份。

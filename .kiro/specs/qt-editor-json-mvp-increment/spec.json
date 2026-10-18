@@ -1,7 +1,7 @@
 {
   "feature_name": "qt-editor-json-mvp-increment",
   "created_at": "2026-07-27T09:51:22Z",
-  "updated_at": "2026-10-05T09:30:00+00:00",
+  "updated_at": "2026-10-18",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -31,6 +31,14 @@
       ],
       "scope": "Requirements 10–11；Design「项目打开、格式导出与手动同步视图」。",
       "approved": true
+    },
+    "resource_name_and_feedback": {
+      "scope": "Requirements 12–13；Design「资源显示名编辑」「完成提示与持续状态」；Tasks 6.1–6.2。",
+      "requirements": true,
+      "design": true,
+      "tasks": true,
+      "approved": true,
+      "ready_for_implementation": true
     }
   }
 }
