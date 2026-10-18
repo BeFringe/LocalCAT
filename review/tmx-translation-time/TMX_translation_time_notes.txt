@@ -1,4 +1,4 @@
-Matecat Job TMX 与翻译时间参考
+Matecat Job、LocalCAT 原生导出与翻译时间参考
 
 1. 合成模板
 
@@ -7,6 +7,15 @@ matecat_v4_1_7_job_synthetic.tmx 只有一条合成 TU。
 保留 v4.1.7 Job TMX 的 header、TU、语言对及常见 prop；无 DOCTYPE/ENTITY。
 模板故意不增加 translation_date 或 changedate，因为该 Job 导出没有这两个字段。
 根据项目是否分块及贡献来源，真实导出可能有额外的可选 prop。
+
+localcat_native_export_synthetic.tmx 是主要的 LocalCAT 对照模板，只有一条合成 TU。
+其 header、TU 标识形式及 speaker、前后文、来源、确认状态对应当前原生导出样式。
+该精简示例没有导入属性或 provenance，因而没有展示这些可选 prop；也没有翻译日期。
+
+localcat_compatible_fixture_synthetic.tmx 继续保留为独立的相似度测试示例，含两条合成 TU。
+它的 expected-similarity、variant、query-segment-source 属于测试元数据，
+不能用它代替原生导出模板，也不能把其数字当成 LocalCAT 评分器实际计算的结果。
+三个模板均为合成数据、无 DOCTYPE/ENTITY，分别说明 Job、原生导出和测试夹具。
 
 2. translation_date、creationdate、changedate
 
@@ -57,6 +66,7 @@ MyMemory compatible 原文件：因为外部 DOCTYPE，0 条记录，报 PARSER.
 用户的不同相似度夹具：3,010 条记录解析成功。
 新的合成 v4.1.7 模板：1 条记录解析成功。
 新的 LocalCAT 兼容夹具合成模板：2 条记录解析成功。
+补充的 LocalCAT 原生导出合成模板：1 条记录解析成功。
 
 以上说明：两种样式都能进行双语内容解析，带 DTD 的原 MyMemory 文件除外。
 但“支持解析内容”与“支持翻译日期”不同：
@@ -104,6 +114,9 @@ STATUS: VERIFIED
 CLAIM_TYPE: TASK
 CLAIM: 已生成纯合成结构模板；已核对字段映射和当前 codec 对日期属性的行为。
 EVIDENCE: verify_localcat_tmx_dates.py 运行退出码 0，六种输入的计数与拒绝结果均断言通过。
+EVIDENCE: 补充原生模板后，使用 save-details-fix/source 的同一 TmxLevel1Codec 重新检查三个合成模板，
+          Job / 原生 / 夹具分别输出 1 / 1 / 2 条记录，均无 ParseIssue；XML、语言对与无 DTD 检查通过。
+          parser_tmx_codec.py、resource_importer.py、tmx_context_interchange.py 与原验收快照逐字节一致。
 GAPS: 没有修改日期导入功能；没有证明 GUI/资源库已经保留或显示翻译时间。
 NOTES: localcat_tmx_date_checks.json 保存本轮解析层实验的完整摘要。
 
@@ -132,38 +145,48 @@ NOTES: localcat_tmx_date_checks.json 保存本轮解析层实验的完整摘要�
   tuv.creationdate 描述某个语言变体。它并不总是“整个资源文件的创建日期”。
   Matecat v4.1.7 Job 输出将 TU.creationdate 复用为项目译文记录时间，这是特定实现用法。
 
-9. 用户的相似度夹具与 Matecat Job 模板有何不同
+9. 三个模板的用途与差异
 
-二者的基础语法都是 TMX 1.4：header + body/tu + 两种语言的 tuv/seg。
-差别主要是可选属性和自定义 prop，并非两套互不兼容的 XML 语法。
+三者的基础语法都是 TMX 1.4：header + body/tu + 两种语言的 tuv/seg。
+差别主要是可选属性和自定义 prop。
 
-                         Matecat v4.1.7 Job               用户相似度夹具
-header.creationtool      Matecat-Cattool                  LocalCAT
-header.creationtoolversion v4.1.7                         feature5-ui-integration-fixture-v1
-header.o-tmf             Matecat                         LocalCAT
-TU 标识                  实际项目 segment ID             带 exact/fuzzy 含义的本地标识
-TU 日期                  creationdate                    无
-TU 其他属性              datatype/srclang                datatype/srclang/creationid
-项目元数据               job/segment/filename/status/chunk Sheet/Excel行/译文行/RPY定位/speaker
-上下文                   x-context-pre/post              当前夹具未写这两个字段
-测试期望                 不含此夹具的测试属性             variant、expected-similarity、可选 query-segment-source
+Matecat v4.1.7 Job：matecat_v4_1_7_job_synthetic.tmx
+  header 为 Matecat-Cattool / v4.1.7，o-tmf=Matecat。
+  TU 标识对应项目 segment ID，creationdate 来自该项目的 translation_date。
+  常见 prop 为 job、segment、filename、status、chunk 以及 x-context-pre/post。
+
+LocalCAT 原生导出：localcat_native_export_synthetic.tmx
+  header 为 LocalCAT / 1，o-tmf=LocalCAT，adminlang=en，datatype=PlainText。
+  TU 标识为 localcat- 加确定性摘要；当前生成器不主动写 TU/TUV 的日期属性。
+  原生 prop 包括可选 speaker、前后文、来源，以及 confirmed、可选 status 和 provenance。
+  此精简示例只展示一个已确认条目，没有导入 prop，不含相似度测试期望。
+
+LocalCAT 兼容相似度夹具：localcat_compatible_fixture_synthetic.tmx
+  header 为 LocalCAT / feature5-ui-integration-fixture-v1，o-tmf=LocalCAT。
+  TU 标识带 exact/fuzzy 含义，当前无日期，含 datatype/srclang/creationid。
+  prop 包含 Sheet、Excel 行、译文行、RPY 定位、speaker，以及测试用 variant、
+  expected-similarity 和可选 query-segment-source；当前夹具未写 x-context-pre/post。
 
 完整用户文件有 2,962 条 exact 和 48 条 fuzzy 变体，共 3,010 条。
 localcat_compatible_fixture_synthetic.tmx 仅保留 exact、fuzzy 各一条合成示意。
 示意的相似度数字不声称由真实评分器计算，更不会强迫检索引擎输出该分数。
 原文件来源链可由用户另行说明；这些差异描述的是当前文件实际结构，不推断其每个生成步骤。
 
-区分“能读双语内容”和“所有元数据语义都被解释”：
-  当前 LocalCAT 导入器把 prop 保留进 provenance；
-  它识别 x-localcat-speaker、x-localcat-context-prev/next、x-localcat-file-source 等本机语义字段，
-  并识别 x-MateCAT-status。未知 prop 的保留不等于它们控制运行行为。
-  TU/TUV 的日期属性目前没有进入这些 prop，也没有作为日期字段导入。
+相似度属性的边界：
+  原生导出不会主动生成 x-localcat-expected-similarity。
+  它描述某次测试的期望值，不是记忆条目的固有属性。
+  TMX 1.4b 没有统一定义匹配相似度字段；prop 可承载自定义数据，其含义由工具约定。
 
-另一个需要区分的概念：LocalCAT 自身的原生 TMX 导出 profile。
-  tmx_context_interchange.py 当前原生输出使用 creationtool=LocalCAT、creationtoolversion=1、
-  o-tmf=LocalCAT、adminlang=en、datatype=PlainText，并写本机 context/provenance 属性。
-  用户提供的相似度夹具是“LocalCAT兼容测试样式”，不是这套原生导出 profile 的逐字样板。
-  本包的 LocalCAT 合成模板特意对应用户给出的夹具，避免把二者混为一谈。
+区分“保留元数据”和“解释元数据”：
+  已识别的 x-localcat-speaker、x-localcat-context-prev/next、x-localcat-file-source 等字段
+  映射到相应内部语义字段；x-localcat-status / x-MateCAT-status 也有专门处理。
+  expected-similarity、variant、query-segment-source 作为未知 prop 保留进 provenance，
+  不控制实际评分或匹配类型。TU/TUV 日期属性当前尚未映射为翻译日期。
+  通过资源导入路径保留的未知 prop 可以在后续原生导出中再次出现；
+  这来自已有数据的传递，不表示原生生成器会主动计算这些字段。
+  导入映射见 resource_importer.py 的 _tmx_import_draft（第599行起），
+  原生拼装见 tmx_context_interchange.py 的 _localcat_props（第225行起），
+  后者在生成本机字段后追加 unit.imported_props。
 
 10. 网页查询的版本边界
 

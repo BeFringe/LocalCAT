@@ -36,13 +36,21 @@ LocalCAT
   本机其他相关模块：parser_contracts.py、tm_contracts.py、tm_engine.py、tmx_context_interchange.py。
   LocalCAT_local_source_excerpts.txt 给出本机这些模块的相关完整类/方法节选与原行号。
   节选供日期设计讨论，不等价于整个项目源码或可独立运行的程序。
+  补充原生模板时复核了 save-details-fix/source；其中 parser_tmx_codec.py、
+  resource_importer.py、tmx_context_interchange.py 与上述原验收快照逐字节一致。
+  原生字段与导入 prop 的边界：resource_importer.py 第599行起，
+  tmx_context_interchange.py 第225行起；生成器保留 imported_props，但不主动生成测试相似度期望。
 
 附件清单
   1. matecat_v4_1_7_job_synthetic.tmx：Matecat Job 样式，1条合成 TU。
-  2. localcat_compatible_fixture_synthetic.tmx：按用户相似度夹具形状，2条合成 TU。
-  3. TMX_translation_time_notes.txt：日期语义、导入/保存/导出区别和格式比较。
-  4. repositories_and_versions.txt：本文件。除了模板和说明，这是最需要补充的附件。
-  5. LocalCAT_local_source_excerpts.txt：当网页无法联网读取对应源码或需要本机版本证据时使用。
+  2. localcat_native_export_synthetic.tmx：LocalCAT 原生导出样式，1条合成 TU；主要 LocalCAT 对照模板。
+  3. localcat_compatible_fixture_synthetic.tmx：按用户相似度夹具形状，2条合成 TU；仅作测试元数据示例。
+  4. TMX_translation_time_notes.txt：日期语义、导入/保存/导出区别和三种样式比较。
+  5. repositories_and_versions.txt：本文件。除了模板和说明，这是最需要补充的附件。
+  6. LocalCAT_local_source_excerpts.txt：当网页无法联网读取对应源码或需要本机版本证据时使用。
+
+三个 TMX 并列保留，均为合成示例。正常导出结构请比较 Job 与原生模板；
+相似度夹具用于说明测试 prop，未知 prop 的往返保留不赋予其实际评分语义。
 
 讨论时需说明的需求（由用户决定，不预设已经接受）
   “翻译时间”指创建时间、最后保存/修改时间，还是编辑耗时？本讨论当前侧重最后保存/修改时间。
