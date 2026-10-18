@@ -96,6 +96,11 @@ class QtChunkManagerDialog(QDialog):
 
     def __init__(self, facade: object, view: ChunkApplicationProjectView, parent=None):
         super().__init__(parent)
+        self._feedback_timer = QTimer(self)
+        self._feedback_timer.setSingleShot(True)
+        self._feedback_timer.setInterval(7000)
+        self._feedback_timer.timeout.connect(self._restore_preview_hint)
+        self.finished.connect(self._clear_completion_feedback)
         self._theme_refresh_pending = False
         self._theme_refresh_in_progress = False
         self._theme_selection = ThemeSelection(self)
@@ -1091,6 +1096,7 @@ class QtChunkManagerDialog(QDialog):
     def _invalidate_preview(self, *_args):
         if self._refreshing:
             return
+        self._feedback_timer.stop()
         had_preview = self._preview is not None
         self._preview = None
         self.confirm_check.setChecked(False)
@@ -1103,6 +1109,8 @@ class QtChunkManagerDialog(QDialog):
                 "请重新生成预览后再确认发布。</div>"
             )
             self.preview_button.setText("重新生成预览")
+        else:
+            self._restore_preview_hint()
         self.preview_panel.style().unpolish(self.preview_panel)
         self.preview_panel.style().polish(self.preview_panel)
 
@@ -1254,7 +1262,18 @@ class QtChunkManagerDialog(QDialog):
             return f"<span class='quiet'>{escape(empty)}</span>"
         return "<br>".join(f"• {escape(value)}" for value in values)
 
+    def _clear_completion_feedback(self, _result):
+        if self._feedback_timer.isActive():
+            self._restore_preview_hint()
+        self._feedback_timer.stop()
+
+    def _restore_preview_hint(self):
+        self._feedback_timer.stop()
+        self.preview_panel.setText("选择范围并生成预览。")
+        self.preview_panel.setProperty("state", "idle")
+
     def _render_preview(self, preview):
+        self._feedback_timer.stop()
         classification = preview.classification or "常规发布"
         truncated = " · 计数已截断" if preview.truncated else ""
         self.preview_panel.setText(
@@ -1275,6 +1294,7 @@ class QtChunkManagerDialog(QDialog):
         self.preview_panel.style().polish(self.preview_panel)
 
     def _show_error(self, code):
+        self._feedback_timer.stop()
         self._preview = None
         self.confirm_check.setChecked(False)
         self.confirm_check.setEnabled(False)
@@ -1333,6 +1353,7 @@ class QtChunkManagerDialog(QDialog):
                 f"操作：{escape(published_label)}</div>"
             )
             self.preview_panel.setProperty("state", "success")
+            self._feedback_timer.start()
         else:
             self.preview_button.setEnabled(True)
         self.viewRefreshRequested.emit()

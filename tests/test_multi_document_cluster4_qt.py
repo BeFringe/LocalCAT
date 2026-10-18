@@ -849,7 +849,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             ),
             tuple(document.display_name for document in cold.documents),
         )
-        feedback = self.window.workspace_save_feedback.text()
+        feedback = self.window.statusBar().currentMessage()
         self.assertIn("LocalCAT项目包已保存", feedback)
         self.assertIn("源文件只读", feedback)
 
@@ -982,13 +982,15 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             self.controller.workspace_save_state.dirty_document_ids,
             (second_id,),
         )
-        document_feedback = self.window.workspace_save_feedback.text()
+        document_feedback = self.window.statusBar().currentMessage()
         self.assertIn("LocalCAT项目包已保存", document_feedback)
         self.assertIn("1", document_feedback)
         self.assertIn("源文件只读", document_feedback)
+        self.assertTrue(self.window._workspace_save_result_text)
+        document_feedback = self.window._workspace_save_result_text
         self.assertIn("Chapter A:saved", document_feedback)
         self.assertIn("Chapter B:unchanged", document_feedback)
-        self.assertIn("Chapter B:unchanged·仍未保存", document_feedback)
+        self.assertIn("Chapter B:unchanged·该次保存后仍未保存", document_feedback)
         actions = self._document_actions()
         self.assertNotIn("未保存", actions[0].text())
         self.assertIn("未保存", actions[1].text())
@@ -1002,7 +1004,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         self._events()
         self.assertEqual(self.controller.workspace_save_state.dirty_document_ids, ())
         self.assertFalse(self.controller.workspace_save_state.project_dirty)
-        package_feedback = self.window.workspace_save_feedback.text()
+        package_feedback = self.window.statusBar().currentMessage()
         self.assertIn("LocalCAT项目包已保存", package_feedback)
         self.assertIn("2", package_feedback)
         self.assertIn("源文件只读", package_feedback)
@@ -1076,6 +1078,9 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         self.assertIn("PROJECT.SAVE.COMMIT_FAILED", feedback)
         self.assertIn("rolled_back", feedback)
         self.assertNotIn("LocalCAT项目包已保存", feedback)
+        self.assertTrue(self.window._workspace_save_result_text)
+        self.assertIn("rolled_back", self.window._workspace_save_result_text)
+        self.assertIn("未完全保存", self.window._workspace_save_result_text)
 
     def test_real_publication_fault_projects_recovery_and_fresh_service_recovers(
         self,
@@ -1128,6 +1133,10 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         self.assertIn("恢复", feedback)
         self.assertNotIn("LocalCAT项目包已保存", feedback)
         self.assertNotIn("DO_NOT_RENDER_RECOVERY_FAULT_BODY", feedback)
+        self.assertTrue(self.window._workspace_save_result_text)
+        self.assertIn("需要恢复", self.window._workspace_save_result_text)
+        self.assertIn("PROJECT.SAVE.RECOVERY_REQUIRED", self.window._workspace_save_result_text)
+        self.assertNotIn("DO_NOT_RENDER_RECOVERY_FAULT_BODY", self.window._workspace_save_result_text)
         self.assertEqual(self.controller.project_session_id, before_session)
         self.assertEqual(self.controller.current_workspace_identity, before_identity)
         self.assertEqual(
@@ -1208,7 +1217,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             ProjectPackageService().open(self.package_path).workspace.project_id,
             foreign_project_id,
         )
-        feedback = self.window.workspace_save_feedback.text()
+        feedback = self.window.statusBar().currentMessage()
         self.assertIn("导入", feedback)
         self.assertIn("receipt", feedback.casefold())
         self.assertNotIn("DO_NOT_RENDER_FOREIGN_SOURCE_BODY", feedback)
@@ -1432,7 +1441,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
                     self.window.workspace_chapter_title.text(),
                 )
                 self.assertTrue(self.window.workspace_documents_button.isVisible())
-                self.assertTrue(self.window.workspace_save_feedback.isVisible())
+                self.assertTrue(self.window.workspace_save_feedback.isHidden())
                 self.assertFalse(
                     self.window.workspace_browse_chapter_title.isVisible()
                 )
@@ -1442,7 +1451,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
                     self.window.workspace_browse_chapter_title.text(),
                 )
                 self.assertTrue(
-                    self.window.workspace_browse_save_feedback.isVisible()
+                    self.window.workspace_browse_save_feedback.isHidden()
                 )
                 self.assertFalse(
                     self.window.workspace_chapter_title.isVisible()

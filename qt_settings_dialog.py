@@ -1005,7 +1005,17 @@ class QtSettingsDialog(QDialog):
         self.portability_worker: ResourcePortabilityWorker | None = None
         self._import_busy = False
         self._portability_busy = False
-        self._status_before_import: str | None = None
+        self._import_status = ""
+        self._status_feedback_timer = QTimer(self)
+        self._status_feedback_timer.setSingleShot(True)
+        self._status_feedback_timer.setInterval(7000)
+        self._status_feedback_timer.timeout.connect(self._restore_status_feedback)
+        self._import_feedback_timer = QTimer(self)
+        self._import_feedback_timer.setSingleShot(True)
+        self._import_feedback_timer.setInterval(7000)
+        self._import_feedback_timer.timeout.connect(
+            lambda: self._show_import_feedback("", failed=False))
+        self.finished.connect(self._clear_completion_feedback)
         self._import_target_kind: ResourceKind | None = None
         self.last_import_report: ImportReport | None = None
         self._tm_operation_id: str | None = None
@@ -1512,11 +1522,13 @@ class QtSettingsDialog(QDialog):
         finally:
             self.resource_tables_content.setUpdatesEnabled(True)
         self.resource_tables_content.update()
-        if operation is not None and not operation.completed:
-            self.status_label.setText("Canonical 操作正在进行；重复操作已禁用。")
+        if self._import_status:
+            self._set_status_feedback(self._import_status)
+        elif operation is not None and not operation.completed:
+            self._set_status_feedback("Canonical 操作正在进行；重复操作已禁用。")
         else:
-            self.status_label.setText(
-                f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源 · 配置已保存"
+            self._set_status_feedback(
+                f"{len(active)} 个活动资源 · {len(inactive)} 个非活动资源"
             )
 
     def _refresh_resource_recovery(
@@ -1603,7 +1615,7 @@ class QtSettingsDialog(QDialog):
         self.refresh_resources()
         self.resources_changed.emit()
         label = "恢复已完成" if result.receipt is not None else "未完成操作已清理"
-        self._show_import_feedback(label, failed=False)
+        self._show_import_feedback(label, failed=False, transient=True)
 
     def _refresh_resource_menu_tab_order(
         self,
@@ -1665,7 +1677,7 @@ class QtSettingsDialog(QDialog):
         try:
             status = self.controller.revalidate_tm_fuzzy()
         except EditorControllerError:
-            self.status_label.setText("Fuzzy 性能验证未能启动。")
+            self._set_status_feedback("Fuzzy 性能验证未能启动。")
             self._refresh_tm_threshold_entry()
             return
         self._refresh_tm_threshold_entry()
@@ -1684,12 +1696,12 @@ class QtSettingsDialog(QDialog):
             outcome = self.controller.update_tm_minimum_similarity(requested)
         except EditorControllerError:
             self._refresh_tm_threshold_entry()
-            self.status_label.setText(
+            self._set_status_feedback(
                 "Fuzzy 阈值未更新；当前值保持不变。"
             )
             return
         self.refresh_resources()
-        self.status_label.setText(tm_threshold_feedback(outcome))
+        self._set_status_feedback(tm_threshold_feedback(outcome), transient=outcome.succeeded)
         if outcome.preferences != previous:
             self.tm_threshold_changed.emit(outcome)
 
@@ -2162,7 +2174,7 @@ class QtSettingsDialog(QDialog):
         try:
             operation = self.controller.tm_activation_operation()
             if operation is not None and not operation.completed:
-                self.status_label.setText("Canonical 操作已在进行。")
+                self._set_status_feedback("Canonical 操作已在进行。")
                 self.refresh_resources()
                 return
             resource = next(
@@ -2198,8 +2210,8 @@ class QtSettingsDialog(QDialog):
                     },
                 )
                 if answer != QMessageBox.StandardButton.Yes:
-                    self.status_label.setText(
-                        f"已取消 {resource.name} 的 canonical 重新验证。"
+                    self._set_status_feedback(
+                        f"已取消 {resource.name} 的 canonical 重新验证。", transient=True,
                     )
                     return
                 started = self.controller.reattest_tm_resource(resource_id)
@@ -2231,8 +2243,8 @@ class QtSettingsDialog(QDialog):
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.controller.cancel_tm_activation(preflight)
-                    self.status_label.setText(
-                        f"已取消 {preflight.resource_name} 的 canonical 恢复。"
+                    self._set_status_feedback(
+                        f"已取消 {preflight.resource_name} 的 canonical 恢复。", transient=True,
                     )
                     return
                 started = self.controller.activate_tm_resource(preflight)
@@ -2260,8 +2272,8 @@ class QtSettingsDialog(QDialog):
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     self.controller.cancel_tm_activation(preflight)
-                    self.status_label.setText(
-                        f"已取消 {preflight.resource_name} 的 canonical 激活。"
+                    self._set_status_feedback(
+                        f"已取消 {preflight.resource_name} 的 canonical 激活。", transient=True,
                     )
                     return
                 started = self.controller.activate_tm_resource(preflight)
@@ -2288,14 +2300,14 @@ class QtSettingsDialog(QDialog):
                     },
                 )
                 if answer != QMessageBox.StandardButton.Yes:
-                    self.status_label.setText(
-                        f"已取消 {resource.name} 的 canonical 重建。"
+                    self._set_status_feedback(
+                        f"已取消 {resource.name} 的 canonical 重建。", transient=True,
                     )
                     return
                 started = self.controller.rebuild_tm_resource(resource_id)
                 action_name = "Canonical 重建"
             else:
-                self.status_label.setText("当前资源状态不允许启动 canonical 操作。")
+                self._set_status_feedback("当前资源状态不允许启动 canonical 操作。")
                 return
         except Exception as error:
             self._show_tm_action_error(error)
@@ -2304,7 +2316,7 @@ class QtSettingsDialog(QDialog):
         self._tm_operation_id = started.operation_id
         self._tm_operation_action = action_name
         self.refresh_resources()
-        self.status_label.setText(f"{action_name}已开始；重复操作已禁用。")
+        self._set_status_feedback(f"{action_name}已开始；重复操作已禁用。")
         if not self._tm_operation_timer.isActive():
             self._tm_operation_timer.start()
 
@@ -2333,7 +2345,7 @@ class QtSettingsDialog(QDialog):
             self._tm_operation_timer.stop()
             self._tm_operation_id = None
             self._tm_operation_action = None
-            self.status_label.setText("Canonical 操作状态无法确认。")
+            self._set_status_feedback("Canonical 操作状态无法确认。")
             return
         if not operation.completed:
             return
@@ -2344,10 +2356,10 @@ class QtSettingsDialog(QDialog):
         self._tm_operation_action = None
         self.refresh_resources()
         if operation.succeeded:
-            self.status_label.setText(f"{action_name}已完成。")
+            self._set_status_feedback(f"{action_name}已完成。", transient=True)
         else:
             reason = _tm_safe_reason(operation.safe_code)
-            self.status_label.setText(f"{action_name}失败：{reason}。")
+            self._set_status_feedback(f"{action_name}失败：{reason}。")
         self.resources_changed.emit()
 
     def _show_tm_action_error(self, error: Exception) -> None:
@@ -2363,7 +2375,7 @@ class QtSettingsDialog(QDialog):
             if code is not None
             else "内部状态无法安全确认"
         )
-        self.status_label.setText(f"Canonical 操作无法开始：{reason}。")
+        self._set_status_feedback(f"Canonical 操作无法开始：{reason}。")
 
     def _make_resource_name_edit(
         self,
@@ -2438,16 +2450,16 @@ class QtSettingsDialog(QDialog):
             )
             if current is not None and current.name == name:
                 self.resources_changed.emit()
-                self.status_label.setText(f"资源名称已保存，但运行时刷新失败：{exc}")
+                self._set_status_feedback(f"资源名称已保存，但运行时刷新失败：{exc}")
             else:
                 reason = "资源已不存在。" if isinstance(exc, StopIteration) else str(exc)
-                self.status_label.setText(f"资源名称未保存：{reason}")
+                self._set_status_feedback(f"资源名称未保存：{reason}")
             return
         if type(result) is not ResourceConfig:
             raise TypeError("resource update must return ResourceConfig")
         self._project_resource_name(result)
         self.resources_changed.emit()
-        self.status_label.setText("资源名称已保存，当前段建议已刷新。")
+        self._set_status_feedback("资源名称已保存，当前段建议已刷新。", transient=True)
 
     def _set_state(self, resource_id: str, field: str, checked: bool) -> None:
         try:
@@ -2474,7 +2486,7 @@ class QtSettingsDialog(QDialog):
         else:
             self._project_resource_flags(result)
         self.resources_changed.emit()
-        self.status_label.setText("资源配置已保存，当前段建议已刷新。")
+        self._set_status_feedback("资源配置已保存，当前段建议已刷新。", transient=True)
 
     def _project_resource_flags(self, resource: ResourceConfig) -> None:
         """Update one stable row without exposing a transient table rebuild."""
@@ -2522,7 +2534,7 @@ class QtSettingsDialog(QDialog):
         resource = self.controller.create_resource(name, kind)
         self.refresh_resources()
         self.resources_changed.emit()
-        self.status_label.setText(f"已创建：{resource.name}")
+        self._set_status_feedback(f"已创建：{resource.name}", transient=True)
         return resource
 
     def _confirm_delete_resource(self, resource: ResourceConfig) -> None:
@@ -2550,7 +2562,7 @@ class QtSettingsDialog(QDialog):
             return
         self.refresh_resources()
         self.resources_changed.emit()
-        self.status_label.setText(f"已删除：{resource.name}")
+        self._set_status_feedback(f"已删除：{resource.name}", transient=True)
 
     def _prompt_create_resource(self) -> None:
         prompt = QDialog(self)
@@ -2811,7 +2823,7 @@ class QtSettingsDialog(QDialog):
         label = "ResourcePackage" if package else "兼容快照"
         self._show_import_feedback(
             f"{label}已导出 · {receipt.record_count} 条记录。",
-            failed=False,
+            failed=False, transient=True,
         )
 
     def _prompt_resource_package_import(self) -> None:
@@ -2860,7 +2872,7 @@ class QtSettingsDialog(QDialog):
         )
         try:
             if options.exec() != QDialog.DialogCode.Accepted:
-                self._show_import_feedback("已取消资源包导入。", failed=False)
+                self._show_import_feedback("已取消资源包导入。", failed=False, transient=True)
                 return
             mode, destination_resource_id, new_resource_name = options.selection()
         finally:
@@ -2913,9 +2925,10 @@ class QtSettingsDialog(QDialog):
             if confirmation.exec() != QDialog.DialogCode.Accepted:
                 try:
                     self.controller.cancel_resource_package_import(preview)
-                except EditorControllerError:
-                    pass
-                self._show_import_feedback("已取消资源包导入。", failed=False)
+                except EditorControllerError as error:
+                    self._show_import_feedback(f"资源包取消未完成：{error}", failed=True)
+                    return
+                self._show_import_feedback("已取消资源包导入。", failed=False, transient=True)
                 return
         finally:
             confirmation.deleteLater()
@@ -2940,7 +2953,7 @@ class QtSettingsDialog(QDialog):
         self.resources_changed.emit()
         self._show_import_feedback(
             f"资源包已应用 · {result.receipt.record_count} 条记录。",
-            failed=False,
+            failed=False, transient=True,
         )
 
     def _start_portability_operation(
@@ -3114,7 +3127,7 @@ class QtSettingsDialog(QDialog):
         prompt = TermbaseColumnSelectionDialog(preview, self)
         try:
             if prompt.exec() != QDialog.DialogCode.Accepted:
-                self._finish_preview_without_import("已取消术语表导入。", failed=False)
+                self._finish_preview_without_import("已取消术语表导入。", failed=False, transient=True)
                 return
             try:
                 selection = prompt.selection()
@@ -3131,10 +3144,12 @@ class QtSettingsDialog(QDialog):
 
         self._launch_import(resource, request, busy_already=True)
 
-    def _finish_preview_without_import(self, message: str, *, failed: bool) -> None:
+    def _finish_preview_without_import(
+        self, message: str, *, failed: bool, transient: bool = False,
+    ) -> None:
         self._import_busy = False
         self._set_import_busy(False)
-        self._show_import_feedback(message, failed=failed)
+        self._show_import_feedback(message, failed=failed, transient=transient)
 
     def start_import(
         self,
@@ -3199,8 +3214,7 @@ class QtSettingsDialog(QDialog):
     def _set_import_busy(self, busy: bool, message: str = "") -> None:
         if busy:
             self._cancel_resource_name_edits()
-        if busy and self._status_before_import is None:
-            self._status_before_import = self.status_label.text()
+        self._import_status = message if busy else ""
         self.active_table.setEnabled(not busy)
         self.inactive_table.setEnabled(not busy)
         self.new_resource_button.setEnabled(not busy)
@@ -3208,11 +3222,9 @@ class QtSettingsDialog(QDialog):
         self.close_button.setEnabled(not busy)
         self.import_progress.setVisible(busy)
         if message:
-            self.status_label.setText(message)
-        elif not busy and self._status_before_import is not None:
-            self.status_label.setText(self._status_before_import)
-        if not busy:
-            self._status_before_import = None
+            self._set_status_feedback(message)
+        elif not busy:
+            self._restore_status_feedback()
 
     def _on_import_finished(self, report: ImportReport) -> None:
         self.last_import_report = report
@@ -3240,12 +3252,41 @@ class QtSettingsDialog(QDialog):
             self.resources_changed.emit()
         self.import_completed.emit(report)
 
-    def _show_import_feedback(self, message: str, *, failed: bool) -> None:
+    def _set_status_feedback(self, message: str, *, transient: bool = False) -> None:
+        self._status_feedback_timer.stop()
+        self.status_label.setText(message)
+        if transient and message:
+            self._status_feedback_timer.start()
+
+    def _restore_status_feedback(self) -> None:
+        if self._import_status:
+            self._set_status_feedback(self._import_status)
+        elif self._tm_operation_id is not None:
+            self._set_status_feedback("Canonical 操作正在进行；重复操作已禁用。")
+        else:
+            resources = self.controller.list_resources()
+            active = sum(resource.active for resource in resources)
+            self._set_status_feedback(
+                f"{active} 个活动资源 · {len(resources) - active} 个非活动资源")
+
+    def _clear_completion_feedback(self, _result: int) -> None:
+        self._status_feedback_timer.stop()
+        self._import_feedback_timer.stop()
+        self.status_label.clear()
+        self.import_feedback.clear()
+        self.import_feedback.hide()
+
+    def _show_import_feedback(
+        self, message: str, *, failed: bool, transient: bool = False,
+    ) -> None:
+        self._import_feedback_timer.stop()
         self.import_feedback.setText(message)
         self.import_feedback.setProperty("failed", failed)
         self.import_feedback.style().unpolish(self.import_feedback)
         self.import_feedback.style().polish(self.import_feedback)
-        self.import_feedback.show()
+        self.import_feedback.setVisible(bool(message))
+        if transient and message:
+            self._import_feedback_timer.start()
 
     def _release_worker(self, worker: ImportWorker) -> None:
         if self.import_worker is worker:

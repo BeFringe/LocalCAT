@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -116,6 +116,11 @@ class QtTermbaseDialog(QDialog):
             raise ValueError("term dialog resource id must not be empty")
         if type(resource_name) is not str or not resource_name.strip():
             raise ValueError("term dialog resource name must not be empty")
+        self._feedback_timer = QTimer(self)
+        self._feedback_timer.setSingleShot(True)
+        self._feedback_timer.setInterval(7000)
+        self._feedback_timer.timeout.connect(lambda: self._show_feedback("", failed=False))
+        self.finished.connect(lambda _result: self._show_feedback("", failed=False))
         self.controller = controller
         self.resource_id = resource_id
         self.resource_name = resource_name
@@ -274,6 +279,7 @@ class QtTermbaseDialog(QDialog):
             Qt.TextInteractionFlag.TextSelectableByKeyboard
             | Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        self.feedback_label.hide()
         root.addWidget(self.feedback_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -534,7 +540,7 @@ class QtTermbaseDialog(QDialog):
                 preferred_source=preferred_source,
                 preferred_row=preferred_row,
             )
-            self._show_feedback("术语变更已保存。", failed=False)
+            self._show_feedback("术语变更已保存。", failed=False, transient=True)
             self.terms_committed.emit()
             return
 
@@ -555,8 +561,12 @@ class QtTermbaseDialog(QDialog):
             details.append("原状态可用；根据上述指引后可重试。")
         self._show_feedback("\n".join(details), failed=True)
 
-    def _show_feedback(self, message: str, *, failed: bool) -> None:
+    def _show_feedback(self, message: str, *, failed: bool, transient: bool = False) -> None:
+        self._feedback_timer.stop()
         self.feedback_label.setText(message)
+        self.feedback_label.setVisible(bool(message))
+        if transient and message:
+            self._feedback_timer.start()
         self.feedback_label.setProperty("failed", failed)
         self.feedback_label.style().unpolish(self.feedback_label)
         self.feedback_label.style().polish(self.feedback_label)

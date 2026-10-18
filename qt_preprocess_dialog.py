@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -62,6 +62,11 @@ class QtPreprocessDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.setInterval(7000)
+        self._status_timer.timeout.connect(self._restore_status)
+        self.finished.connect(lambda _result: self._restore_status())
         self.controller = controller
         self._preview: PreprocessPreview | None = None
         self._updating_rules = False
@@ -390,23 +395,23 @@ class QtPreprocessDialog(QDialog):
             return False
         self._set_status(
             "已保存规则和段落状态筛选；未运行规则，项目未修改。",
-            error=False,
+            error=False, transient=True,
         )
         return True
 
-    def _invalidate_preview(self, message: str) -> None:
+    def _invalidate_preview(self, message: str, *, transient: bool = False) -> None:
         self._preview = None
         self.preview_table.setRowCount(0)
         self.preview_count_label.setText("尚未预览")
         self.preview_count_label.setAccessibleName("预处理预览状态：尚未预览")
         self.apply_button.setEnabled(False)
         self.cancel_preview_button.setEnabled(False)
-        self._set_status(message, error=False)
+        self._set_status(message, error=False, transient=transient)
 
     def cancel_preview(self) -> None:
         """Discard the dialog-owned immutable preview without mutation."""
 
-        self._invalidate_preview("已取消预览；项目未修改。")
+        self._invalidate_preview("已取消预览；项目未修改。", transient=True)
 
     def preview_rules(self) -> bool:
         """Request a fresh read-only preview from the Controller."""
@@ -461,7 +466,7 @@ class QtPreprocessDialog(QDialog):
             len(preview.changes),
             any(change.before_confirmed for change in preview.changes),
         ):
-            self._set_status("已取消应用；项目未修改。", error=False)
+            self._set_status("已取消应用；项目未修改。", error=False, transient=True)
             return False
         try:
             report = self.controller.apply_preprocessing(preview)
@@ -495,7 +500,7 @@ class QtPreprocessDialog(QDialog):
         self.preview_count_label.setText("尚未预览")
         self.apply_button.setEnabled(False)
         self.cancel_preview_button.setEnabled(False)
-        self._set_status(message, error=False)
+        self._set_status(message, error=False, transient=True)
         self._update_undo_button()
         self.mutation_committed.emit(report)
 
@@ -540,8 +545,16 @@ class QtPreprocessDialog(QDialog):
         code = str(error)
         return _ERROR_MESSAGES.get(code, f"操作失败：{code}")
 
-    def _set_status(self, message: str, *, error: bool) -> None:
+    def _restore_status(self) -> None:
+        message = ("预览已生成；项目内容和确认状态尚未改变。"
+                   if self._preview is not None else "预览不会修改项目。")
+        self._set_status(message, error=False)
+
+    def _set_status(self, message: str, *, error: bool, transient: bool = False) -> None:
+        self._status_timer.stop()
         self.status_label.setText(message)
+        if transient and message:
+            self._status_timer.start()
         self.status_label.setAccessibleName(f"预处理操作状态：{message}")
         self.status_label.setProperty("error", error)
         self.status_label.style().unpolish(self.status_label)

@@ -202,7 +202,7 @@ def _package_save(
         "dirty_after_save": save_state.project_dirty,
         "dirty_document_ids": list(save_state.dirty_document_ids),
         "artifact_digest": save_state.artifact_digest,
-        "feedback": window.workspace_save_feedback.text(),
+        "feedback": window.statusBar().currentMessage(),
         "recovery_pending": recovery_pending,
         "receipt": {
             "project_id": receipt.project_id,
@@ -243,7 +243,7 @@ def _package_open(source: Path, appdata: Path, result_path: Path) -> int:
         "artifact_digest": save_state.artifact_digest,
         "workspace_content_digest": opened.validation.workspace_content_digest,
         "recovery_pending": recovery_pending,
-        "feedback": window.workspace_save_feedback.text(),
+        "feedback": window.statusBar().currentMessage(),
     }
     _close(window)
     payload["closed"] = not controller.has_active_project

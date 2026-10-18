@@ -143,7 +143,7 @@ class QtDirectoryNavigationTests(unittest.TestCase):
         self.window.target_editor.setPlainText('Edited northern chapter')
         self.assertEqual(self.window._dirty_workspace_display_names(), expected[1])
         self.assertTrue(self.window.save_workspace_current_document(), self.errors)
-        self.assertIn(expected[1] + ':saved', self.window.workspace_save_feedback.text())
+        self.assertIn(expected[1] + ':saved', self.window._workspace_save_result_text)
 
     def test_keyboard_leaf_current_dirty_and_chunk_pruning(self):
         self.package(self.refs)
@@ -210,7 +210,7 @@ class QtDirectoryNavigationTests(unittest.TestCase):
         self.window.target_editor.setPlainText('Single chapter edit')
         self.assertEqual(self.window._dirty_workspace_display_names(), expected)
         self.assertTrue(self.window.save_workspace_current_document(), self.errors)
-        self.assertIn(expected + ':saved', self.window.workspace_save_feedback.text())
+        self.assertIn(expected + ':saved', self.window._workspace_save_result_text)
 
     def test_maximum_portable_ref_depth_builds_and_prunes_without_recursion(self):
         self.package((self.refs[0],))

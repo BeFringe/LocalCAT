@@ -958,6 +958,7 @@ class QtEditorWindow(QMainWindow):
         self.open_workspace_package_action: QAction
         self.import_workspace_package_action: QAction
         self.save_workspace_document_action: QAction
+        self.workspace_save_result_button: QToolButton
         self.recent_projects_menu: QMenu
         self.speaker_inventory_action: QAction
         self.preprocess_action: QAction
@@ -978,6 +979,11 @@ class QtEditorWindow(QMainWindow):
         self.workspace_chapter_title: QLabel
         self.workspace_browse_chapter_title: QLabel
         self.chapter_progress_label: QLabel
+        self._workspace_feedback_timeout_ms = 7000
+        self._workspace_success_message = ""
+        self._workspace_feedback_session = None
+        self._workspace_save_result_session = None
+        self._workspace_save_result_text = ""
         self.workspace_save_feedback: QLabel
         self.workspace_browse_save_feedback: QLabel
         self.browse_hint: QLabel
@@ -1225,6 +1231,16 @@ class QtEditorWindow(QMainWindow):
         status.setObjectName("editorStatusBar")
         status.setSizeGripEnabled(False)
         self.setStatusBar(status)
+        self.workspace_save_result_button = QToolButton(status)
+        self.workspace_save_result_button.setObjectName("workspaceSaveResultButton")
+        self.workspace_save_result_button.setText("保存详情")
+        self.workspace_save_result_button.setToolTip("查看该次保存的逐章节结果")
+        self.workspace_save_result_button.setAccessibleName("查看上次保存详情")
+        self.workspace_save_result_button.setAutoRaise(True)
+        self.workspace_save_result_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.workspace_save_result_button.clicked.connect(self._show_workspace_save_result)
+        status.addWidget(self.workspace_save_result_button)
+        self.workspace_save_result_button.hide()
         self._apply_system_theme()
 
     def _apply_system_theme(self, *_args: object) -> None:
@@ -2644,11 +2660,24 @@ class QtEditorWindow(QMainWindow):
         current = view.current_segment.document
         return next(item for item in view.documents if item.identity is current)
 
-    def _set_workspace_save_feedback(self, text: str) -> None:
+    def _set_workspace_save_feedback(self, text: str, *, transient: bool = False) -> None:
         """Keep the edit and browse feedback projections identical."""
 
-        self.workspace_save_feedback.setText(text)
-        self.workspace_browse_save_feedback.setText(text)
+        self._clear_workspace_success_message()
+        self._workspace_feedback_session = self.controller.project_session_id
+        persistent_text = "" if transient else text
+        for label in (self.workspace_save_feedback, self.workspace_browse_save_feedback):
+            label.setText(persistent_text)
+            label.setVisible(bool(persistent_text) and self.controller.has_workspace)
+        if transient and text:
+            self._workspace_success_message = text
+            self.statusBar().showMessage(text, self._workspace_feedback_timeout_ms)
+
+    def _clear_workspace_success_message(self) -> None:
+        if (self._workspace_success_message
+                and self.statusBar().currentMessage() == self._workspace_success_message):
+            self.statusBar().clearMessage()
+        self._workspace_success_message = ""
 
     @staticmethod
     def _workspace_error_text(error: EditorControllerError | OSError) -> str:
@@ -2673,6 +2702,8 @@ class QtEditorWindow(QMainWindow):
         return "本地 I/O 操作失败；为保护项目正文，未显示底层错误内容"
 
     def _show_empty_state(self) -> None:
+        self._set_workspace_save_feedback("")
+        self._clear_workspace_save_result()
         self._set_project_search_expanded(False)
         self.pages.setCurrentIndex(0)
         self.save_button.setEnabled(False)
@@ -2792,12 +2823,7 @@ class QtEditorWindow(QMainWindow):
         self.refresh_recent_projects()
         self._set_workspace_save_feedback(
             f"LocalCAT项目包已保存 · {result.receipt.document_count} 个章节 · "
-            "源文件只读。"
-        )
-        self.statusBar().showMessage(
-            f"已创建 ProjectPackage · {result.receipt.document_count} 个章节 · "
-            f"{result.receipt.segment_count} 个段落。",
-            7000,
+            "源文件只读。", transient=True,
         )
         return True
 
@@ -2831,11 +2857,7 @@ class QtEditorWindow(QMainWindow):
         self.refresh_recent_projects()
         self._set_workspace_save_feedback(
             f"LocalCAT项目包已保存 · {result.receipt.document_count} 个章节 · "
-            "源文件只读。"
-        )
-        self.statusBar().showMessage(
-            f"已创建 ProjectPackage · {result.receipt.document_count} 个章节。",
-            7000,
+            "源文件只读。", transient=True,
         )
         return True
 
@@ -2953,11 +2975,7 @@ class QtEditorWindow(QMainWindow):
         self._workspace_package_preview_text = "导入已应用；如需继续请重新预览。"
         self._set_workspace_save_feedback(
             f"ProjectPackage 导入 receipt 已持久化 · "
-            f"{result.receipt.document_count} 个文档 · 源文件只读。"
-        )
-        self.statusBar().showMessage(
-            "ProjectPackage 已验证、发布并冷重开。",
-            7000,
+            f"{result.receipt.document_count} 个文档 · 源文件只读。", transient=True,
         )
         return True
 
@@ -3165,8 +3183,7 @@ class QtEditorWindow(QMainWindow):
                 self._render_project()
                 self.refresh_recent_projects()
                 self._file_last_success = True
-                self._set_workspace_save_feedback("项目包已建立 · 原文件只读。")
-                self.statusBar().showMessage(f"项目包已建立：{outcome.path}", 7000)
+                self._set_workspace_save_feedback("项目包已建立 · 原文件只读。", transient=True)
             elif result is not None:
                 if result.receipt is not None and result.receipt.durable:
                     reason = '无法进入编辑' if outcome.safe_code else '打开已取消或过期'
@@ -3190,8 +3207,10 @@ class QtEditorWindow(QMainWindow):
                 self._set_workspace_save_feedback(
                     "尚未保存项目包 · 原始 TL 只读。"
                     if self.controller.workspace_save_state.package_path is None
-                    else "项目包已打开 · 无需原始 TL 路径。")
-                self.statusBar().showMessage(f"已打开：{outcome.path}", 5000)
+                    else "项目包已打开 · 无需原始 TL 路径。",
+                    transient=self.controller.workspace_save_state.package_path is not None)
+                if self.controller.workspace_save_state.package_path is None:
+                    self.statusBar().showMessage(f"已打开：{outcome.path}", 5000)
             else:
                 self.statusBar().showMessage("打开已取消或已过期；当前项目保持不变。", 7000)
         elif outcome.result is not None:
@@ -3256,6 +3275,58 @@ class QtEditorWindow(QMainWindow):
         )
         return "、".join(names) or "项目级元数据"
 
+    def _clear_workspace_save_result(self) -> None:
+        self._workspace_save_result_text = ""
+        self._workspace_save_result_session = None
+        self.workspace_save_result_button.hide()
+
+    def _remember_workspace_save_result(self, result, document_lines: tuple[str, ...]) -> None:
+        report = result.save_report
+        if report.recovery_required:
+            outcome = "需要恢复"
+        elif report.retryable or report.safe_code is not None or report.failed_count or report.rolled_back_count:
+            outcome = "未完全保存"
+        elif result.receipt is None or not result.receipt.durable:
+            outcome = "未取得持久化确认"
+        else:
+            outcome = "已保存"
+        lines = [
+            "这是该次保存结束时的记录；之后的编辑状态以当前章节标记为准。",
+            f"结果：{outcome} · 请求 {report.requested_count} 个章节",
+            f"已保存 {report.saved_count} · 未变 {report.unchanged_count} · "
+            f"失败 {report.failed_count} · 已回退 {report.rolled_back_count}",
+        ]
+        if report.safe_code is not None:
+            lines.append(report.safe_code)
+        lines.extend(("", "逐章节结果：", *document_lines))
+        self._workspace_save_result_text = "\n".join(lines)
+        self._workspace_save_result_session = self.controller.project_session_id
+        self.workspace_save_result_button.show()
+
+    def _show_workspace_save_result(self) -> None:
+        if self._workspace_save_result_session != self.controller.project_session_id:
+            self._clear_workspace_save_result()
+        if not self._workspace_save_result_text:
+            return
+        dialog = QDialog(self)
+        dialog.setObjectName("workspaceSaveResultDialog")
+        dialog.setWindowTitle("上次保存结果")
+        dialog.resize(680, 420)
+        layout = QVBoxLayout(dialog)
+        details = QTextBrowser(dialog)
+        details.setObjectName("workspaceSaveResultText")
+        details.setAccessibleName("上次保存的逐章节结果")
+        details.setPlainText(self._workspace_save_result_text)
+        layout.addWidget(details)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
+
     def _finish_workspace_save(self, result: object) -> bool:
         report = result.save_report
         document_names = {
@@ -3263,13 +3334,15 @@ class QtEditorWindow(QMainWindow):
             for document in self.controller.workspace_view.documents
         }
         dirty_ids = set(self.controller.workspace_save_state.dirty_document_ids)
-        document_summary = "、".join(
+        document_lines = tuple(
             f"{document_names.get(item.document_id, item.document_id)}:"
             f"{item.status.value}"
             + (f"({item.safe_code})" if item.safe_code is not None else "")
-            + ("·仍未保存" if item.document_id in dirty_ids else "")
+            + ("·该次保存后仍未保存" if item.document_id in dirty_ids else "")
             for item in report.document_results
         )
+        document_summary = "、".join(document_lines)
+        self._remember_workspace_save_result(result, document_lines)
         if report.recovery_required:
             code = report.safe_code or "PROJECT.SAVE.RECOVERY_REQUIRED"
             self._set_workspace_save_feedback(
@@ -3309,11 +3382,7 @@ class QtEditorWindow(QMainWindow):
         self.refresh_recent_projects()
         self._set_workspace_save_feedback(
             f"LocalCAT项目包已保存 · {report.requested_count} 个章节 · "
-            f"源文件只读。{document_summary}"
-        )
-        self.statusBar().showMessage(
-            f"ProjectPackage 已保存 · {report.requested_count} 个请求章节。",
-            7000,
+            "源文件只读。", transient=True,
         )
         return True
 
@@ -3626,6 +3695,10 @@ class QtEditorWindow(QMainWindow):
         return bool(selected) and self.save_project_path(Path(selected))
 
     def _render_project(self) -> None:
+        if self._workspace_save_result_session != self.controller.project_session_id:
+            self._clear_workspace_save_result()
+        if self._workspace_feedback_session != self.controller.project_session_id:
+            self._set_workspace_save_feedback("")
         self._set_project_search_expanded(False)
         self.pages.setCurrentIndex(1)
         self.save_button.setEnabled(True)
@@ -3795,8 +3868,8 @@ class QtEditorWindow(QMainWindow):
         multiple = len(view.documents) > 1
         self.chapter_progress_label.setVisible(multiple)
         self.workspace_browse_chapter_title.setVisible(multiple)
-        self.workspace_save_feedback.setVisible(True)
-        self.workspace_browse_save_feedback.setVisible(True)
+        self.workspace_save_feedback.setVisible(bool(self.workspace_save_feedback.text()))
+        self.workspace_browse_save_feedback.setVisible(bool(self.workspace_browse_save_feedback.text()))
 
     def _workspace_document_display_name(self, document) -> str:
         if len(self.controller.workspace_view.documents) == 1:
@@ -6339,7 +6412,7 @@ class QtEditorWindow(QMainWindow):
             self._fuzzy_validation_timer.start()
             dialog = self.settings_dialog
             if dialog is not None and dialog.isVisible():
-                dialog.status_label.setText("Fuzzy 性能验证中。")
+                dialog._set_status_feedback("Fuzzy 性能验证中。")
             self.statusBar().showMessage("Fuzzy 性能验证中。", 5000)
         self._poll_fuzzy_validation()
 
@@ -6365,10 +6438,11 @@ class QtEditorWindow(QMainWindow):
             and dialog.isVisible()
             and status.state is not FuzzyValidationState.IDLE
         ):
-            dialog.status_label.setText(
+            dialog._set_status_feedback(
                 f"Fuzzy 性能验证已完成。{dialog.tm_threshold_state.text()}。"
                 if status.state is FuzzyValidationState.SUCCEEDED
-                else f"{dialog.tm_threshold_state.text()}。"
+                else f"{dialog.tm_threshold_state.text()}。",
+                transient=status.state is FuzzyValidationState.SUCCEEDED,
             )
 
     @staticmethod
@@ -6798,6 +6872,8 @@ class QtEditorWindow(QMainWindow):
             can_close = (not self.controller.active_project_dirty
                          if self.controller.tl_export_publish_running else self._confirm_unsaved())
         if can_close:
+            self._set_workspace_save_feedback("")
+            self._clear_workspace_save_result()
             self._file_operations_closed = True
             if self._tl_export_dialog is not None:
                 self._tl_export_dialog.shutdown()
@@ -7542,11 +7618,26 @@ QTabBar::tab:selected {
 QSplitter::handle {
     background: #eef2f7;
 }
+QToolButton#workspaceSaveResultButton {
+    color: #607287;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+}
+QToolButton#workspaceSaveResultButton:hover,
+QToolButton#workspaceSaveResultButton:focus {
+    border-color: #08a0c9;
+}
 QStatusBar#editorStatusBar {
     color: #607287;
     background: #f7f9fc;
     border-top: 1px solid #d8e1ea;
     font-size: 11px;
+}
+QStatusBar#editorStatusBar::item {
+    border: none;
 }
 """
 
@@ -7865,6 +7956,7 @@ QPushButton#addTermButton:focus {
 QSplitter::handle {
     background: #17191c;
 }
+QToolButton#workspaceSaveResultButton { color: #aeb8c2; }
 QStatusBar#editorStatusBar {
     color: #aeb8c2;
     background: #1d2024;
