@@ -289,6 +289,28 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Boundary: Governance / downstream integration closure_
   - _Depends: 5.10_
 
+## 6. 入口体验增量
+
+- [ ] 6.1 使目录预览按自然顺序排列
+  - 对目录组件和文件名使用一致的数字顺序，保留确定性次序、原始名称、root 与 source_ref。
+  - 完成时，包含 1、2、10 和前导零的合成嵌套目录初始顺序可预期；用户重排、后续勾选及包冷重开保持明确选择的顺序。
+  - _Requirements: 13.2, 13.4, 13.5_
+  - _Boundary: Project directory discovery / selection_
+
+- [ ] 6.2 将首页单目录拖入接到现有预览
+  - 区分单个本地目录与原文件输入，调用同一异步目录勾选流程，不自动收录文件；混合文件/目录和多目录给出明确提示。
+  - 完成时，单目录拖入与菜单选根具有相同预览、勾选和取消行为，原单文件、多文件及项目包拖入行为保持；关窗或换项目后不接纳旧结果。
+  - _Requirements: 11.9, 13.1, 13.3, 13.4_
+  - _Boundary: Qt / Controller directory-entry integration_
+
+- [ ] 6.3 在文件多选 review 中筛选格式并显示跳过原因
+  - 复用本机 codec 能力与可用性判断，提供保留／跳过／阻断结果；原严格 intake 完整验证确认后的集合。
+  - review 显示数量与可展开的跳过项，零项不可确认，一项仍按原 root 建立单文档包；项目包混选须单独打开。
+  - 完成时，rpy 与 rpyc 混选可以明确确认支持项，原顺序/root 保持；禁用 codec、保留项失效与正文错误仍阻止提交，取消保留旧项目。
+  - 验证普通文件与项目包单选路径未被过滤接管；通过保存／冷重开核对筛选后零、一、多文件的真实结果。
+  - _Requirements: 3.7, 3.8, 11.9, 11.14, 12.1, 12.8, 13.4_
+  - _Boundary: Project selection / Controller-Qt review 显式集成_
+
 ## 相邻规格边界
 
 - 恢复/确认 `language-resource-portability` brief 后，提升独立 R/D/T，拥有 TM JSONL 与术语 CSV/v1 ResourcePackage、报告和冷重开；sync 分别消费ProjectPackage/ResourcePackage，不复制 live SQLite、journal、sidecar 或 staging residue。

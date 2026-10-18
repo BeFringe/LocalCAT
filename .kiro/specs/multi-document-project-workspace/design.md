@@ -376,6 +376,18 @@ SHA256(
 
 这个 intake 只建立 carrier-neutral `StagedSelectedProjectDocuments(durable=False, source_write_back_authorized=False)`。只有 C2C ProjectPackage 成功发布并 cold reopen 后，它才成为 durable 多文档项目；失败时原 source bytes与当前session均不变。`revalidate_staged_selected_documents()` 只对同一 exact binding 重开新 sealed snapshots 供 preview/apply 比对，不发布或修改原 staged workspace。
 
+### 文件多选的格式预分类与 review
+
+此步骤位于 Controller/Application 的原文件多选 review 入口，先于严格 intake。消费用户原始有序路径、最初 root 和本机配置能力，返回不可变的保留项、跳过项和阻断诊断，供 Qt 同一次 review 展示。格式预分类仅使用路径与 codec 能力；保留项交给原 intake 检查路径、读取正文并验证，已发现的无效输入作为错误呈现。
+
+先区分项目包入口：原始单选项目包保持既有打开流程；多选含 `.localcat-project` 或现有包入口接受的 `.zip` 时，提示需单独打开，不作为章节或跳过项。原始单选 JSON/TXT/RPY 等同样保持既有路径。
+
+文档格式选择消费配置后的 Parser surface 与已有 provider availability 投影，复用 RPY adapter 的已知格式不可用诊断。只有确实无适用 project_document codec 的格式才列为跳过；`AMBIGUOUS`、已知 provider 缺失／禁用／不兼容和配置失败阻断。格式可选不代表正文通过，保留项仍由原 intake 完整验证，任一实际解析失败不发布部分项目。底层 intake 继续严格拒绝调用者传入的未知格式，不承担 UI 容错。
+
+review 显示“将导入 N 个，跳过 M 个”，跳过明细可展开；零项只显示原因，禁止确认。过滤后剩一项仍经 review 与 `explicit-single-file-v1` 保存，不重新路由到 legacy 打开；多个使用原多文档 profile。筛选保留原顺序与筛选前确定的 root，不因删除后缀项重算路径或自然排序用户的直接文件选择。确认使用当前 review 选择，取消或过期结果沿用既有生命周期规则。
+
+文件计划：在 `editor_controller.py` 与现有 `project_workspace_intake.py` 的应用层选择接缝增加预分类及不可变结果，消费 `project_codec_settings.py`／`rpy_project_adapter.py` 的能力信息；`qt_editor_window.py` 的既有 `QtWorkspaceCreationDialog` 显示 review 和取消反馈。
+
 ### 聚合与扁平导航
 
 `ProjectWorkspaceService` 接收已经完整验证的 ProjectDocument tuple：
@@ -471,10 +483,10 @@ Project 的 `DirectorySelectionPreview` 含 issued preview ID、generation、roo
 
 ### 根目录发现与确认流
 
-1. 用户从既有“打开本地项目”流程选择“选择文件”或“选择文件夹”，根目录动作不占用常驻顶栏。直接文件选择/拖入仍按原有规则分流；目录拖入首版不自动处理。现有文件夹按钮只导航。
+1. 用户从既有“打开本地项目”流程选择“选择文件”或“选择文件夹”，根目录动作不占用常驻顶栏。直接文件选择/拖入按原单选或文件多选 review 分流；首页拖入恰好一个本地目录时调用同一根目录流程，文件与目录混选或多个目录明确提示。Qt 只识别本地 URL 的入口类别，不递归枚举，不在 drop 回调里同步运行目录工作。现有文件夹按钮只导航。
 2. 用户选定根后平台 bind，Project 有界递归只读 metadata。最多深度 32、10,000 个总条目（含目录/不可选文件）、同时至多 33 个目录 handle；沿深度优先遍历及时释放非祖先 handle。继承更小的平台路径限制。到深度/条目/资源上限或读取目录失败时，标记预览不完整并禁止确认，提示选更小的根重试，不把截断当完整结果。
 3. 普通文件根据配置能力可选；默认未勾选。链接/reparse、非 regular、非法 portable ref 均显示不可选且不跟随；所选 hardlink alias、大小写/规范化碰撞在确认时拒绝。目录本身不作为 Document：目录复选框只递归勾选/取消其可选后代文件，按后代显示全部/部分/未选状态，没有可选后代的目录不提供复选框。提供“全选支持的格式”和“清空选择”，只操作当前预览的可选 entry IDs；不完整或过期时禁用选择。未知/不可选格式可显示但不打开正文；用户取消不发布候选。最长 source_ref 和路径组件继续沿用 owner 限额，不把“二级”写成硬性深度。
-4. 候选以规范化相对路径的 Unicode code-point 顺序稳定显示；所选列表初始采用该顺序，用户在 review 中显式调整成为 manifest order。后续批量勾选保留仍被选择的手调顺序，新选文件按预览顺序追加；取消勾选只移除对应文件。未选内容不读取/parse、不自动加入新发现文件。刷新/换根撤销旧 preview 和确认状态，重新勾选；不后台刷新后静默改变集合。
+4. 候选以规范化相对路径的自然顺序稳定显示：按路径组件比较，把连续 ASCII 数字按数值、其他文字按 Unicode code-point 比较；数字等值时以组件原文作确定性次序，故 `2` 与 `02` 不合并。`project_workspace_discovery.py` 的下钻与最终 preview 共用排序规则；不依赖系统区域设置、不改文件名/source_ref。所选列表初始采用该顺序，用户在 review 中显式调整成为 manifest order；旧包重开不重新排序。后续批量勾选保留仍被选择的手调顺序，新选文件按预览顺序追加；取消勾选只移除对应文件。未选内容不读取/parse、不自动加入新发现文件。刷新/换根撤销旧 preview 和确认状态，重新勾选；不后台刷新后静默改变集合。
 5. 确认携带 preview ID、generation 和有序 entry IDs。Project 复证 retained root 与所选文件身份，使用原根生成 source_ref；任一选择失效全部拒绝。确认前的 metadata 不替代 verified terminal。首包发布继续保持绑定并消费原 intake 原子候选/保存结果。取消、关窗、换项目或新请求均撤销 generation，晚到结果丢弃并释放 handle；错误不切换当前项目。
 
 ### 单文件 profile 与持久化
@@ -493,7 +505,9 @@ Controller 从 manifest source_ref 生成目录组件，Qt 在既有文件夹菜
 
 | 需求 | 设计 | 验证 |
 | --- | --- | --- |
-| 13.1, 13.2 | retained-root discovery、issued selection、确定顺序 | 二层及更深目录、同名文件、未勾选零内容读取、根不重算 |
+| 13.1, 13.2 | retained-root discovery、issued selection、自然排序 | 数字文件/目录、前导零、同名文件、未勾选零内容读取、根不重算、手调顺序 |
+| 11.9, 13.1 | 首页单目录拖入接入原目录流程 | 单目录与菜单等价；混合/多个目录提示；取消保持当前项目 |
+| 11.14 | 应用层格式预分类与原文件 review/intake | 支持项夹杂 rpyc、零/一/多剩余项、禁用 codec、正文失败、包需单独打开 |
 | 13.3 | 平台 no-follow/drift、上限、generation | 超限/不可读目录、取消/晚到、root/所选文件替换、alias |
 | 13.4 | 单文件 profile、原 intake 与 package | 零/一/多文件、非 legacy、无原根冷重开、既有 profile 负向 |
 | 13.5 | manifest 章节树投影 | 交错目录顺序、键盘/current/dirty/Chunk、离线导航 |

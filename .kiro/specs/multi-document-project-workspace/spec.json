@@ -1,7 +1,7 @@
 {
   "feature_name": "multi-document-project-workspace",
   "created_at": "2026-08-22T03:04:32+08:00",
-  "updated_at": "2026-10-05T09:30:00+00:00",
+  "updated_at": "2026-10-18",
   "language": "zh-CN",
   "phase": "tasks-approved",
   "approvals": {
@@ -38,6 +38,14 @@
       ],
       "scope": "Requirements 3、4.9、8.11–8.12、13；Design「显式根目录选择与单文件项目」「Opaque codec_private_member」「受限整包 artifact」。",
       "approved": true
+    },
+    "intake_usability": {
+      "scope": "Requirements 11.9、11.14、13.1–13.2，入口体验设计、Tasks 6.1–6.3：自然排序、单目录拖入、文件多选格式筛选。",
+      "requirements": true,
+      "design": true,
+      "tasks": true,
+      "approved": true,
+      "ready_for_implementation": true
     }
   }
 }

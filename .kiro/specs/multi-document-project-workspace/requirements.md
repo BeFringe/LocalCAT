@@ -17,6 +17,7 @@ LocalCAT 当前将一个翻译项目表达为一个绝对路径和一组扁平�
 - **Owning spec**：本规格拥有 Project/Document/Segment、ProjectPackage、source reconciliation、目录选择和章节导航；Parser 仍为单输入契约，不聚合项目。
 - **范围差异**：ProjectPackage-first 保持单/多文件的 canonical 持久面。ADR-030 增加显式根目录 metadata 预览和 `explicit-single-file-v1`，RPY 手工包闭环先于 Sync；workbook profile、PO/POT writer 与后台扫描不在范围内。
 - **相邻合同**：配置 codec 只在 verified terminal 后交付中立 records/source/opaque private member；ADR-031 的同步只消费受限整包 artifact，再交回本 owner 导入。ProjectPackage 与 ResourcePackage 保持独立 authority。
+- **入口体验增量**：Requirements 11.9、11.14、13.1/13.2 定义自然排序、首页单目录拖入及文件多选筛选反馈；Design「根目录发现与确认流」定义相应接线。
 - **依赖**：Chunk 消费完整项目聚合、保存/恢复和手工包闭环后的稳定 segment identity；单独身份类型不足以提供此能力。
 
 ### Windows Compatibility Amendment WA-03（current R2）
@@ -209,11 +210,12 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 6. When 导出或导入完整成功时, the Qt 编辑器 shall 提供不含 source/target 正文的结构化数量摘要和 receipt 状态。
 7. The Qt 编辑器 shall 只消费 Controller 的 frozen projection，不得直接读写 manifest、member、Parser codec、source snapshot 或 recovery journal。
 8. When 浏览/校对的当前 segment 行变化时, the Qt 编辑器 shall 同步 Controller current Segment_Identity、当前文档标题与文件夹菜单选中态，不得保留上一文档的投影。
-9. When 用户通过首页、项目主按钮、项目菜单或 `Ctrl+O` 打开或拖入本地文件时, the Qt 编辑器 shall 使用同一入口按单选/多选分流；单选直接打开，Shift 多选进入有序显式选择 review，不得显示独立“单文档/多文档”控件、独立菜单项或可见 drop-zone 控件。
+9. When 用户通过首页、项目主按钮、项目菜单或 `Ctrl+O` 打开或拖入本地文件时, the Qt 编辑器 shall 使用同一入口按单选/多选分流；原始单选沿用原打开方式，文件多选进入有序显式选择 review。When 用户向首页拖入恰好一个本地目录, the Qt 编辑器 shall 进入同一根目录预览与勾选流程，不自动导入内容；文件与目录混选或多个目录给出明确提示并保留当前项目。入口不增加独立“单文档/多文档”控件、独立菜单项或可见 drop-zone 控件。
 10. Where 文件夹菜单、编辑左栏或浏览表显示 Document 分隔, the Qt 编辑器 shall 使用应用自有、在浅色背景上可辨认的高对比文件图标，不得依赖平台返回的纯白图标。
 11. When 当前单个 Document 的段落数按设备本地分组设置超过组数阈值 **或** 段数阈值且分组已启用时, Browse/Review shall 在主页表格左侧显示当前文件的可垂直滚动分组轮次导航，并压缩表格的“段落”列；压缩后的列仍须按实际字体与最大文档内编号完整显示段落编号，不得用省略号截断。用户可选择默认的“自动收起式”窄轮次指示条或“固定式”预览列表，两者必须共享同一 current group 与跳转状态。标题行可保留一个“轮次 n / N”按钮，但其弹窗只包含显示方式与分组设置。默认每组 20 段、超过 5 组或 100 段显示；每组只能以 10 段递增调整为 20–200 段；当前文档变化时，轮次导航立即重建为新文档的分组与当前组。
 12. Where 分组轮次显示预览, each group shall 只投影该组首段：自动收起式在轮次标记 hover/focus 时浮出预览，固定式在主页列表中显示预览；已有 target 时 source 一行超长省略且 target 最多三行超长省略，target 未填写时 source 可占满四行。选择组只能通过该组首段的 Controller-issued identity 跳转，不得新建文档、保存、TM 或协作 identity。
 13. The Qt UI shall 对多文档导入、Fuzzy 阈值、资源、术语、文字预处理、speaker 盘点和错误弹窗的标准按钮显式设置中文文案，不得泄漏平台默认 `Cancel`/`OK`/`Yes`/`Close`。
+14. When 用户多选的本地文件中夹有不支持的项目格式, the LocalCAT shall 在确认前列出将导入的文件与跳过项及原因，保留可导入项的原选择顺序和最初根目录；剩一个文件仍经 review 建立单文档项目包，零文件时说明无可导入文件且不创建项目。If 已知格式不可用、保留项失效或可导入文件解析失败, the LocalCAT shall 保留具体诊断与当前项目，不把它们当无关文件略过；入口已发现的无效输入不得报告为格式跳过。If 多选包含项目包, the LocalCAT shall 提示项目包需单独打开，不将其当章节或静默跳过。
 
 ### Requirement 12：兼容性、本地性与边界验收
 
@@ -240,8 +242,8 @@ WA-03 `R2`依据ADR-025完整取代`R1`；`R1`只保留在dispatch ledger历史�
 
 #### 验收标准
 
-1. When 用户在统一打开流程中选择根目录, the LocalCAT shall 有界递归预览该根下候选树，显示相对目录、可选择文件和不可用原因，提供单文件勾选、文件夹递归勾选、全选当前配置支持的格式及清空选择；目录显示全部/部分/未选状态。默认不勾选，待用户确认后才读取/解析所选内容；格式可选不代表正文已通过验证，不启动后台监控。
-2. When 预览含两层及更深子目录或不同目录同名文件, the LocalCAT shall 保持最初选择的 portable root 与 source_ref，按确定顺序显示候选并允许 review 调整所选文档顺序，不因取消勾选或单选而重新计算根目录。
+1. When 用户在统一打开流程中选择根目录或向首页拖入单个本地目录, the LocalCAT shall 有界递归预览该根下候选树，显示相对目录、可选择文件和不可用原因，提供单文件勾选、文件夹递归勾选、全选当前配置支持的格式及清空选择；目录显示全部/部分/未选状态。默认不勾选，待用户确认后才读取/解析所选内容；格式可选不代表正文已通过验证，不启动后台监控。
+2. When 预览含两层及更深子目录或不同目录同名文件, the LocalCAT shall 保持最初选择的 portable root 与 source_ref，按相对路径的自然顺序显示候选（数字按数值比较，如 `2` 在 `10` 前）并允许 review 调整所选文档顺序；仅改变初始展示与选择顺序，不改文件名或已保存的文档顺序，不因取消勾选或单选而重新计算根目录。
 3. If 根/所选文件身份变化、存在路径逸出/alias、枚举失败/超限或用户取消, the LocalCAT shall 阻止未验证候选提交、保留现有项目与源文件，并显示可重选/重试原因；metadata 预览不得授予 source writer 权限。
 4. When 用户确认选择, the LocalCAT shall 拒绝零文件，一个文件使用非 legacy 的 single_file/explicit-single-file-v1，多个文件使用 directory/explicit-selected-files-v1，并经完整 intake 验证保存 ProjectPackage；单选嵌套文件仍保留原根下相对路径。
 5. When 用户打开顶栏文件夹导航, the LocalCAT shall 按已保存 source_ref 的目录组件展示可键盘操作的章节树，叶项使用原 Document identity；平面章节标题与分隔在存在父目录时显示父目录以区分同名文件，并提供完整相对路径提示。目录分组及显示标签不得改写 manifest 顺序、连续阅读、搜索、dirty 或 Chunk 权限投影，也不得读取源目录。
