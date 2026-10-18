@@ -8,7 +8,8 @@ from threading import Event, Thread
 import unittest
 from unittest import mock
 
-from PySide6.QtCore import QEventLoop, QTimer, Qt, QCoreApplication, QEvent
+from PySide6.QtCore import QEventLoop, QTimer, Qt, QCoreApplication, QEvent, QMimeData, QPoint, QPointF, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QFileDialog, QMessageBox
 from editor_controller import EditorControllerError
 from qt_editor import _compose_editor_controller
@@ -81,6 +82,89 @@ class QtDirectoryOpenTests(unittest.TestCase):
         return self.controller.begin_directory_publish(
             review, self.ids(review, refs), self.destination,
             name='目录项目', source_locale='en', target_locale='zh-CN')
+
+    def drop_paths(self, paths):
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(path)) for path in paths])
+        drag = QDragEnterEvent(QPoint(10, 10), Qt.DropAction.CopyAction,
+            mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(self.window.empty_page, drag)
+        self.assertTrue(drag.isAccepted(), '首页应接受本地路径以继续预览或给出选择提示')
+        drop = QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction,
+            mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(self.window.empty_page, drop)
+        self.assertTrue(drop.isAccepted())
+
+    def test_directory_drop_queues_existing_async_preview_without_scanning_in_drop(self):
+        with mock.patch.object(self.window, 'open_directory_async', return_value=True) as open_directory, \
+             mock.patch.object(ProjectDirectoryDiscoveryService, 'preview',
+                               side_effect=AssertionError('drop 不得扫描目录')):
+            self.drop_paths((self.root,))
+            open_directory.assert_not_called()
+            self.app.processEvents()
+            open_directory.assert_called_once_with(self.root)
+
+    def test_directory_drop_rejects_mixed_or_multiple_roots_with_feedback(self):
+        for paths in ((self.root, self.root / 'a' / 'same.txt'),
+                      (self.root / 'a', self.root / 'b')):
+            with self.subTest(paths=paths), \
+                 mock.patch.object(self.window, 'open_directory_async') as open_directory, \
+                 mock.patch.object(self.window, 'open_project_path') as open_file, \
+                 mock.patch.object(self.window, '_review_and_create_workspace_from_selected_paths') as review:
+                before_session = self.controller.project_session_id
+                self.drop_paths(paths)
+                self.app.processEvents()
+                self.assertIn('文件夹', self.window.statusBar().currentMessage())
+                self.assertIn('一个', self.window.statusBar().currentMessage())
+                open_directory.assert_not_called()
+                open_file.assert_not_called()
+                review.assert_not_called()
+                self.assertEqual(self.controller.project_session_id, before_session)
+
+    def test_directory_drop_cancel_keeps_home_and_sources(self):
+        sources = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        before_session = self.controller.project_session_id
+        with mock.patch.object(QtDirectoryOpenDialog, 'exec', return_value=QDialog.DialogCode.Rejected) as review, \
+             mock.patch.object(QFileDialog, 'getSaveFileName', side_effect=AssertionError('取消不得保存')):
+            self.drop_paths((self.root,))
+            self.wait_until(lambda: review.called and not self.window.file_operation_running)
+        self.assertEqual(self.controller.project_session_id, before_session)
+        self.assertFalse(self.controller.has_workspace)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual({path: path.read_bytes() for path in sources}, sources)
+
+    def test_queued_directory_drop_is_discarded_after_session_switch_or_close(self):
+        for action in ('session', 'close'):
+            with self.subTest(action=action), \
+                 mock.patch.object(self.window, 'open_directory_async') as open_directory:
+                self.drop_paths((self.root,))
+                if action == 'session':
+                    self.controller.load_sample()
+                    self.controller.close_project()
+                else:
+                    self.window.close()
+                self.app.processEvents()
+                open_directory.assert_not_called()
+
+    def test_directory_drop_real_preview_selection_package_and_cold_open(self):
+        refs = ('b/deep/same.txt',)
+        def choose(dialog):
+            self.assertEqual(dialog.ordered_entry_ids, ())
+            self.assertFalse(dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled())
+            dialog.entry_items[self.ids(dialog.review, refs)[0]].setCheckState(0, Qt.CheckState.Checked)
+            return QDialog.DialogCode.Accepted
+        with mock.patch.object(QtDirectoryOpenDialog, 'exec', choose), \
+             mock.patch.object(QFileDialog, 'getSaveFileName', return_value=(str(self.destination), '')):
+            self.drop_paths((self.root,))
+            self.wait_until(lambda: self.controller.has_workspace and not self.window.file_operation_running)
+        workspace = self.controller._workspace_service.workspace
+        self.assertEqual(tuple(doc.source_ref for doc in workspace.documents), refs)
+        self.assertEqual(self.controller._workspace_service.origin_binding.absolute_root, str(self.root))
+        self.assertEqual(self.errors, [])
+        self.assertFalse(self.controller.active_project_dirty)
+        self.controller.close_project()
+        opened = ProjectPackageService().open(self.destination)
+        self.assertEqual(opened.workspace, workspace)
 
     def test_real_nested_single_and_multiple_clean_package_and_cold_open(self):
         for refs in (('b/deep/same.txt',), ('b/deep/same.txt', 'a/same.txt')):

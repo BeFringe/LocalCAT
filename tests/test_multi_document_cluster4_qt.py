@@ -23,8 +23,8 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QCoreApplication, QEventLoop, QMimeData, Qt, QUrl
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QCoreApplication, QEventLoop, QMimeData, QPoint, QPointF, Qt, QUrl
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -564,10 +564,22 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         adjacent.write_text("must remain untouched", encoding="utf-8")
         selected = (second, first)
 
+        def drop(paths):
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(path)) for path in paths])
+            enter = QDragEnterEvent(QPoint(10, 10), Qt.DropAction.CopyAction,
+                mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            QApplication.sendEvent(self.window.empty_page, enter)
+            self.assertTrue(enter.isAccepted())
+            event = QDropEvent(QPointF(10, 10), Qt.DropAction.CopyAction,
+                mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+            QApplication.sendEvent(self.window.empty_page, event)
+            self.assertTrue(event.isAccepted())
+
         mime_data = QMimeData()
         mime_data.setUrls([QUrl.fromLocalFile(str(path)) for path in selected])
         self.assertEqual(
-            self.window.empty_page.explicit_local_file_paths(mime_data),
+            self.window.empty_page.explicit_local_paths(mime_data),
             selected,
         )
 
@@ -576,7 +588,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             "_review_and_create_workspace_from_selected_paths",
             return_value=True,
         ) as review:
-            self.window.empty_page.explicitFilesDropped.emit(selected)
+            drop(selected)
             self._events()
         review.assert_called_once_with(selected)
         self.assertEqual(
@@ -587,7 +599,7 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
         single_mime = QMimeData()
         single_mime.setUrls([QUrl.fromLocalFile(str(first))])
         self.assertEqual(
-            self.window.empty_page.explicit_local_file_paths(single_mime),
+            self.window.empty_page.explicit_local_paths(single_mime),
             (first,),
         )
         with mock.patch.object(
@@ -595,25 +607,30 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
             "open_project_path",
             return_value=True,
         ) as open_single:
-            self.window.empty_page.explicitFilesDropped.emit((first,))
+            drop((first,))
             self._events()
         open_single.assert_called_once_with(first)
 
-        invalid_selections = ((first, first), (first, drop_root))
+        with mock.patch.object(self.window, "open_project_path", return_value=True) as open_package:
+            drop((self.package_path,))
+            self._events()
+        open_package.assert_called_once_with(self.package_path)
+
+        invalid_selections = ((first, first),)
         for invalid in invalid_selections:
             invalid_mime = QMimeData()
             invalid_mime.setUrls(
                 [QUrl.fromLocalFile(str(path)) for path in invalid]
             )
             self.assertIsNone(
-                self.window.empty_page.explicit_local_file_paths(invalid_mime)
+                self.window.empty_page.explicit_local_paths(invalid_mime)
             )
         remote_mime = QMimeData()
         remote_mime.setUrls(
             [QUrl("https://example.invalid/a.txt"), QUrl.fromLocalFile(str(first))]
         )
         self.assertIsNone(
-            self.window.empty_page.explicit_local_file_paths(remote_mime)
+            self.window.empty_page.explicit_local_paths(remote_mime)
         )
 
     def test_home_open_is_one_control_for_single_and_shift_multi_selection(

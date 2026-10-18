@@ -417,16 +417,16 @@ class _InlineMenuButton(QToolButton):
 
 
 class _WorkspaceDropPage(QWidget):
-    """Accept only an explicit, ordered selection of local files."""
+    """Accept local paths for the existing file or directory open flow."""
 
-    explicitFilesDropped = Signal(object)
+    localPathsDropped = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(True)
 
     @staticmethod
-    def explicit_local_file_paths(
+    def explicit_local_paths(
         mime_data: QMimeData,
     ) -> tuple[Path, ...] | None:
         if not mime_data.hasUrls():
@@ -437,7 +437,7 @@ class _WorkspaceDropPage(QWidget):
             if not url.isLocalFile():
                 return None
             path = Path(url.toLocalFile()).expanduser()
-            if not path.is_absolute() or not path.is_file():
+            if not path.is_absolute() or not (path.is_file() or path.is_dir()):
                 return None
             identity = os.path.normcase(os.path.abspath(str(path)))
             if identity in identities:
@@ -452,7 +452,7 @@ class _WorkspaceDropPage(QWidget):
         self.style().polish(self)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self.explicit_local_file_paths(event.mimeData()) is None:
+        if self.explicit_local_paths(event.mimeData()) is None:
             event.ignore()
             return
         self._set_drag_active(True)
@@ -460,7 +460,7 @@ class _WorkspaceDropPage(QWidget):
         event.accept()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
-        if self.explicit_local_file_paths(event.mimeData()) is None:
+        if self.explicit_local_paths(event.mimeData()) is None:
             event.ignore()
             return
         event.setDropAction(Qt.DropAction.CopyAction)
@@ -471,14 +471,14 @@ class _WorkspaceDropPage(QWidget):
         event.accept()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        paths = self.explicit_local_file_paths(event.mimeData())
+        paths = self.explicit_local_paths(event.mimeData())
         self._set_drag_active(False)
         if paths is None:
             event.ignore()
             return
         event.setDropAction(Qt.DropAction.CopyAction)
         event.accept()
-        self.explicitFilesDropped.emit(paths)
+        self.localPathsDropped.emit(paths)
 
 
 class QtWorkspaceCreationDialog(QDialog):
@@ -1433,8 +1433,8 @@ class QtEditorWindow(QMainWindow):
     def _build_empty_page(self) -> QWidget:
         page = _WorkspaceDropPage()
         page.setObjectName("emptyPage")
-        page.setAccessibleName("多文档项目文件拖放区")
-        page.explicitFilesDropped.connect(self._queue_workspace_drop_selection)
+        page.setAccessibleName("本地文件或文件夹拖放区")
+        page.localPathsDropped.connect(self._queue_workspace_drop_selection)
         self.empty_page = page
         layout = QVBoxLayout(page)
         layout.setContentsMargins(80, 60, 80, 80)
@@ -1455,7 +1455,7 @@ class QtEditorWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint = QLabel(
             "打开或拖入本地文件；按住 Shift 可多选。\n"
-            "也可选择文件夹，递归预览后勾选文档建立项目。"
+            "也可选择或拖入一个文件夹，预览后勾选文档建立项目。"
         )
         hint.setObjectName("emptyHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3409,27 +3409,39 @@ class QtEditorWindow(QMainWindow):
         )
 
     def _queue_workspace_drop_selection(self, selected: object) -> None:
-        """Leave the native drop event before opening or reviewing files."""
+        """Leave the native drop event before starting an open workflow."""
 
-        if self._has_active_project() or type(selected) is not tuple:
+        if (self._file_operations_closed or self._has_active_project()
+                or type(selected) is not tuple):
             return
         selected_paths = tuple(
             path for path in selected if isinstance(path, Path)
         )
         if len(selected_paths) != len(selected):
             return
-        QTimer.singleShot(
-            0,
-            lambda paths=selected_paths: self._open_or_review_home_selection(
-                paths
-            ),
-        )
+        session_id = self.controller.project_session_id
+
+        def open_if_current() -> None:
+            if (self._file_operations_closed
+                    or self.controller.project_session_id != session_id):
+                return
+            self._open_or_review_home_selection(selected_paths)
+
+        QTimer.singleShot(0, open_if_current)
 
     def _open_or_review_home_selection(
         self,
         selected_paths: tuple[Path, ...],
     ) -> bool:
-        if self._has_active_project() or not selected_paths:
+        if (self._file_operations_closed or self._has_active_project()
+                or not selected_paths):
+            return False
+        if any(path.is_dir() for path in selected_paths):
+            if len(selected_paths) == 1:
+                return self.open_directory_async(selected_paths[0])
+            self.statusBar().showMessage(
+                "请每次只拖入一个文件夹；文件夹不能与文件一起导入。", 7000
+            )
             return False
         if len(selected_paths) == 1:
             return self.open_project_path(selected_paths[0])
