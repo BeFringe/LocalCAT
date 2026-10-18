@@ -1,0 +1,55 @@
+网页提问用：仓库、版本与核验范围
+
+核对日期：2026-10-18。
+
+Matecat
+  公开仓库：https://github.com/matecat/MateCat
+  本问题限定版本：v4.1.7
+  已核实的 commit：d65d75f5fd695400bbac2d02042b462b4f6928fc
+  导入私有 TM：
+    lib/Controller/API/App/TMXFileController.php，第31–51行
+    lib/Utils/TMS/TMSService.php，第136–173行
+    lib/Utils/Engines/MyMemory.php，第748–757行
+  保存项目译文时间：
+    lib/Controller/API/App/SetTranslationController.php，第295–304行
+  导出项目 Job TMX：
+    lib/Utils/TMS/TMSService.php，第484–518行
+  链接示例：
+    https://github.com/matecat/MateCat/blob/v4.1.7/lib/Controller/API/App/TMXFileController.php#L31-L51
+    https://github.com/matecat/MateCat/blob/v4.1.7/lib/Controller/API/App/SetTranslationController.php#L295-L304
+    https://github.com/matecat/MateCat/blob/v4.1.7/lib/Utils/TMS/TMSService.php#L484-L518
+  边界：MyMemory 是独立记忆服务；这几段 Matecat 代码未展示该服务内部如何处理导入日期。
+
+LocalCAT
+  公开仓库：https://github.com/BeFringe/LocalCAT
+  请勿仅检查 main：本轮 main 的树只有 LICENSE、README.md。
+  可读源码分支：reassessment
+  本轮公开 reassessment commit：0b71bb3eb5de1db679601b2fc061fe481c41b16e
+  已读取的公开源码：
+    https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/parser_tmx_codec.py
+    https://github.com/BeFringe/LocalCAT/blob/0b71bb3eb5de1db679601b2fc061fe481c41b16e/resource_importer.py
+  本机验收源码 HEAD：7ff199fa4cf589c2049701afea9f81c780ea8570
+  GitHub API 本轮无法找到这个本机 commit；不要声称在线仓库已经包含该完整版本。
+  但已逐文件比对 Git blob SHA，以下两个公开模块与本机字节一致：
+    parser_tmx_codec.py：373a0dc8775bec15f775a636bb7a8797b73f271e
+    resource_importer.py：042081d252643bb3cec6d4c08d62ecc0d5e2b028
+  本机其他相关模块：parser_contracts.py、tm_contracts.py、tm_engine.py、tmx_context_interchange.py。
+  LocalCAT_local_source_excerpts.txt 给出本机这些模块的相关完整类/方法节选与原行号。
+  节选供日期设计讨论，不等价于整个项目源码或可独立运行的程序。
+
+附件清单
+  1. matecat_v4_1_7_job_synthetic.tmx：Matecat Job 样式，1条合成 TU。
+  2. localcat_compatible_fixture_synthetic.tmx：按用户相似度夹具形状，2条合成 TU。
+  3. TMX_translation_time_notes.txt：日期语义、导入/保存/导出区别和格式比较。
+  4. repositories_and_versions.txt：本文件。除了模板和说明，这是最需要补充的附件。
+  5. LocalCAT_local_source_excerpts.txt：当网页无法联网读取对应源码或需要本机版本证据时使用。
+
+讨论时需说明的需求（由用户决定，不预设已经接受）
+  “翻译时间”指创建时间、最后保存/修改时间，还是编辑耗时？本讨论当前侧重最后保存/修改时间。
+  时间只展示，还是参与排序/同分打破？默认不应因补日期而改变现有相似度测试结论。
+  缺失日期保持未知；合成测试日期须标明 synthetic；导入时间与翻译时间分开。
+
+可选补充
+  若要分析 UI 的展示位置，可另附一张候选列表截图或相关 UI 模块。
+  若要实施代码变更，需提供所修改模块的完整源码及必要依赖，不能只凭本包节选声称实现完成。
+  当前仅讨论格式和日期语义时，不需要真实整卷 TMX、Excel、记忆库数据库或整个仓库压缩包。

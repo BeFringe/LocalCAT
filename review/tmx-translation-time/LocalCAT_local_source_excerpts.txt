@@ -1,0 +1,537 @@
+LocalCAT 本机源码节选（供日期语义和接入位置讨论）
+本机 HEAD：7ff199fa4cf589c2049701afea9f81c780ea8570
+文件未修改；以下保留原始行号。文件 SHA-256 指完整本机文件字节。
+不是整个项目源码，不构成可独立运行的实现。
+公开 reassessment 与本机 parser_tmx_codec.py、resource_importer.py 的 Git blob SHA 已核对一致。
+
+parser_tmx_codec.py
+SHA-256: 23414d2d75d8a62e80f6c888e203617df1a7fe9469569f21f4b7b3476aa52e42
+
+_UnitState（148–158行）
+148: @dataclass(slots=True)
+149: class _UnitState:
+150:     ordinal: int
+151:     depth: int
+152:     source_choice: _LocaleChoice
+153:     target_choice: _LocaleChoice
+154:     props: list[tuple[str, str, str, str]] = field(default_factory=list)
+155:     metadata_entries: int = 0
+156:     metadata_chars: int = 0
+157:     inline_xml: bool = False
+158:     segment_oversized: bool = False
+
+_start_element（335–407行）
+335:     def _start_element(self, name: str, attributes: dict[str, str]) -> None:
+336:         self.depth += 1
+337:         if self.depth > self.profile.max_structure_depth:
+338:             raise _TmxAbort(
+339:                 _CODE_DEPTH,
+340:                 "TMX XML structure exceeds the active depth limit",
+341:             )
+342: 
+343:         local = _local_name(name)
+344:         if self.prop is not None:
+345:             if self.depth > self.prop.depth:
+346:                 assert self.unit is not None
+347:                 self.unit.inline_xml = True
+348:             return
+349:         if self.tuv is not None and self.tuv.segment_depth is not None:
+350:             if self.depth > self.tuv.segment_depth:
+351:                 assert self.unit is not None
+352:                 self.unit.inline_xml = True
+353:                 return
+354: 
+355:         if local == "tu" and self.unit is None:
+356:             self.physical_units += 1
+357:             if self.physical_units > self.profile.max_records:
+358:                 raise _TmxAbort(
+359:                     "PARSER.LIMIT.RECORD",
+360:                     "TMX translation-unit count exceeds the active record limit",
+361:                 )
+362:             self.unit = _UnitState(
+363:                 ordinal=self.physical_units,
+364:                 depth=self.depth,
+365:                 source_choice=_LocaleChoice(self.source_locale),
+366:                 target_choice=_LocaleChoice(self.target_locale),
+367:             )
+368:             return
+369: 
+370:         unit = self.unit
+371:         if unit is None:
+372:             return
+373:         if local == "prop" and self.prop is None:
+374:             tuv = self.tuv
+375:             is_tu_prop = self.depth == unit.depth + 1 and tuv is None
+376:             is_tuv_prop = tuv is not None and self.depth == tuv.depth + 1
+377:             if is_tu_prop or is_tuv_prop:
+378:                 if unit.metadata_entries >= self.profile.max_metadata_entries_per_container:
+379:                     raise _TmxAbort(
+380:                         "PARSER.LIMIT.METADATA",
+381:                         "TMX unit metadata exceeds the active entry limit",
+382:                     )
+383:                 raw_locale = attributes.get(_XML_LANG) or attributes.get("lang") or ""
+384:                 normalized_locale = _normalize_locale(raw_locale) if raw_locale else ""
+385:                 self.prop = _PropState(
+386:                     depth=self.depth,
+387:                     scope="tu" if tuv is None else "tuv",
+388:                     prop_type=attributes.get("type", ""),
+389:                     language=normalized_locale or "",
+390:                 )
+391:                 return
+392:         if local == "tuv" and self.depth == unit.depth + 1 and self.tuv is None:
+393:             raw_locale = attributes.get(_XML_LANG) or attributes.get("lang")
+394:             self.tuv = _TuvState(
+395:                 depth=self.depth,
+396:                 locale=_normalize_locale(raw_locale) if raw_locale is not None else None,
+397:             )
+398:             return
+399:         tuv = self.tuv
+400:         if (
+401:             tuv is not None
+402:             and local == "seg"
+403:             and self.depth == tuv.depth + 1
+404:             and not tuv.segment_seen
+405:         ):
+406:             tuv.segment_seen = True
+407:             tuv.segment_depth = self.depth
+
+_finish_unit（506–565行）
+506:     def _finish_unit(self, unit: _UnitState) -> None:
+507:         if unit.segment_oversized:
+508:             self.events.append(
+509:                 _warning(
+510:                     _CODE_SEGMENT_LIMIT,
+511:                     "TMX unit segment exceeds the active decoded-character limit",
+512:                     unit.ordinal,
+513:                 )
+514:             )
+515:             return
+516:         if unit.inline_xml:
+517:             self.events.append(
+518:                 _warning(
+519:                     _CODE_INLINE,
+520:                     "TMX unit contains unsupported inline XML",
+521:                     unit.ordinal,
+522:                 )
+523:             )
+524:             return
+525:         source, source_result, source_props = unit.source_choice.select()
+526:         target, target_result, target_props = unit.target_choice.select()
+527:         if source_result == "ambiguous" or target_result == "ambiguous":
+528:             self.events.append(
+529:                 _warning(
+530:                     _CODE_AMBIGUOUS,
+531:                     "TMX unit has an ambiguous base-language fallback",
+532:                     unit.ordinal,
+533:                 )
+534:             )
+535:             return
+536:         if source is None or target is None:
+537:             self.events.append(
+538:                 _warning(
+539:                     _CODE_MISSING_PAIR,
+540:                     "TMX unit has no usable source and target locale pair",
+541:                     unit.ordinal,
+542:                 )
+543:             )
+544:             return
+545:         metadata_props = tuple(unit.props) + tuple(
+546:             ("source_tuv", prop_type, language, value)
+547:             for prop_type, language, value in source_props
+548:         ) + tuple(
+549:             ("target_tuv", prop_type, language, value)
+550:             for prop_type, language, value in target_props
+551:         )
+552:         self.events.append(
+553:             ResourceRecord(
+554:                 local_id=f"tu-{unit.ordinal}",
+555:                 source=source,
+556:                 target=target,
+557:                 speaker=RawSpeaker(""),
+558:                 format_metadata=(
+559:                     MetadataEntry(
+560:                         key="tmx.props",
+561:                         value=metadata_props,
+562:                     ),
+563:                 ) if metadata_props else (),
+564:             )
+565:         )
+
+parser_contracts.py
+SHA-256: 7c8c012beccbeeaa189d2e2dbc1dd30e1b5e21364e67dc402e2d4de94741760b
+
+ResourceRecord（1404–1417行）
+1404: @dataclass(frozen=True, slots=True)
+1405: class ResourceRecord:
+1406:     local_id: str
+1407:     source: str
+1408:     target: str
+1409:     speaker: RawSpeaker
+1410:     format_metadata: tuple[MetadataEntry, ...]
+1411: 
+1412:     def __post_init__(self) -> None:
+1413:         _require_nonempty_text(self.local_id, field_name="ResourceRecord.local_id")
+1414:         _require_nonempty_text(self.source, field_name="ResourceRecord.source")
+1415:         _require_nonempty_text(self.target, field_name="ResourceRecord.target")
+1416:         _require_exact_instance(self.speaker, RawSpeaker, "ResourceRecord.speaker")
+1417:         _validate_metadata_entries(self.format_metadata, field_name="ResourceRecord.format_metadata")
+
+resource_importer.py
+SHA-256: 6fe7fff187ffb06b0b9cd9b4512a4de0ae4c593e62b43688e46d5983880b71c8
+
+_tmx_import_draft（599–658行）
+599: def _tmx_import_draft(
+600:     record: ResourceRecord,
+601:     file_name: str,
+602: ) -> TMRecordDraft:
+603:     """One exact import draft with lossless TMX prop provenance.
+604: 
+605:     Parser owns XML safety and the ordered prop grammar.  This adapter only
+606:     recognizes LocalCAT-owned semantic props plus the verified MateCAT status
+607:     prop; every prop is also retained in canonical JSON form so unknown and
+608:     duplicate properties survive a later TMX export.
+609:     """
+610: 
+611:     speaker: str | None = None
+612:     context_prev: str | None = None
+613:     context_next: str | None = None
+614:     file_source: str | None = file_name
+615:     provenance: list[tuple[str, str]] = [
+616:         ("source", "tmx-import"),
+617:         ("file", file_name),
+618:     ]
+619:     for scope, prop_type, language, value in _tmx_record_props(record):
+620:         raw_prop = json.dumps(
+621:             (scope, prop_type, language, value),
+622:             ensure_ascii=False,
+623:             allow_nan=False,
+624:             separators=(",", ":"),
+625:         )
+626:         provenance.append(("tmx.prop", raw_prop))
+627:         normalized_type = prop_type.casefold()
+628:         if scope == "tu" and normalized_type == "x-localcat-context-prev":
+629:             context_prev = value or None
+630:         elif scope == "tu" and normalized_type == "x-localcat-context-next":
+631:             context_next = value or None
+632:         elif scope == "tu" and normalized_type == "x-localcat-speaker":
+633:             speaker = value or None
+634:         elif scope == "tu" and normalized_type == "x-localcat-file-source":
+635:             file_source = value or None
+636:         elif normalized_type in {"x-localcat-status", "x-matecat-status"}:
+637:             provenance.append(("tmx.status", value))
+638:         elif scope == "tu" and normalized_type == "x-localcat-provenance":
+639:             try:
+640:                 decoded = json.loads(value)
+641:             except (TypeError, ValueError, json.JSONDecodeError):
+642:                 decoded = None
+643:             if (
+644:                 type(decoded) is list
+645:                 and len(decoded) == 2
+646:                 and all(type(item) is str and item for item in decoded)
+647:             ):
+648:                 provenance.append((decoded[0], decoded[1]))
+649: 
+650:     return TMRecordDraft(
+651:         source_raw=record.source,
+652:         target_raw=record.target,
+653:         speaker_raw=speaker,
+654:         context_prev_raw=context_prev,
+655:         context_next_raw=context_next,
+656:         file_source=file_source,
+657:         provenance=tuple(provenance),
+658:     )
+
+_tmx_record_props（661–677行）
+661: def _tmx_record_props(record: ResourceRecord) -> tuple[tuple[str, str, str, str], ...]:
+662:     for metadata in record.format_metadata:
+663:         if metadata.key != "tmx.props":
+664:             continue
+665:         if type(metadata.value) is not tuple:
+666:             raise ImportFailure("TMX property metadata has an invalid shape")
+667:         props: list[tuple[str, str, str, str]] = []
+668:         for item in metadata.value:
+669:             if (
+670:                 type(item) is not tuple
+671:                 or len(item) != 4
+672:                 or any(type(part) is not str for part in item)
+673:             ):
+674:                 raise ImportFailure("TMX property metadata has an invalid entry")
+675:             props.append((item[0], item[1], item[2], item[3]))
+676:         return tuple(props)
+677:     return ()
+
+tm_contracts.py
+SHA-256: 6a1f4b87cec1bf5b0cc06aaaebaadac07732ccb6f5f6b9425a1aa03f0b06dc54
+
+TMRecord（187–215行）
+187: @dataclass(frozen=True)
+188: class TMRecord:
+189:     """One canonical TM record with raw text, origin, and provenance."""
+190: 
+191:     record_id: int
+192:     source_raw: str
+193:     target_raw: str
+194:     speaker_raw: str | None
+195:     context_prev_raw: str | None
+196:     context_next_raw: str | None
+197:     file_source: str | None
+198:     provenance: tuple[tuple[str, str], ...]
+199:     legacy_line_no: int | None
+200:     origin_batch_id: str
+201:     origin_ordinal: int
+202: 
+203:     def __post_init__(self) -> None:
+204:         _require_int(self.record_id, "record id", minimum=1)
+205:         _require_raw_text(self.source_raw, "record source_raw")
+206:         _require_raw_text(self.target_raw, "record target_raw")
+207:         _require_optional_text(self.speaker_raw, "record speaker_raw")
+208:         _require_optional_text(self.context_prev_raw, "record context_prev_raw")
+209:         _require_optional_text(self.context_next_raw, "record context_next_raw")
+210:         _require_optional_text(self.file_source, "record file_source")
+211:         _require_provenance(self.provenance)
+212:         if self.legacy_line_no is not None:
+213:             _require_int(self.legacy_line_no, "legacy line number", minimum=1)
+214:         _require_identity(self.origin_batch_id, "origin batch id")
+215:         _require_int(self.origin_ordinal, "origin ordinal", minimum=0)
+
+TMRecordDraft（218–243行）
+218: @dataclass(frozen=True)
+219: class TMRecordDraft:
+220:     """A record body accepted by a future canonical store append port."""
+221: 
+222:     source_raw: str
+223:     target_raw: str
+224:     speaker_raw: str | None
+225:     context_prev_raw: str | None
+226:     context_next_raw: str | None
+227:     file_source: str | None
+228:     provenance: tuple[tuple[str, str], ...]
+229: 
+230:     def __post_init__(self) -> None:
+231:         _require_raw_text(self.source_raw, "record draft source_raw")
+232:         _require_raw_text(self.target_raw, "record draft target_raw")
+233:         _require_optional_text(self.speaker_raw, "record draft speaker_raw")
+234:         _require_optional_text(
+235:             self.context_prev_raw,
+236:             "record draft context_prev_raw",
+237:         )
+238:         _require_optional_text(
+239:             self.context_next_raw,
+240:             "record draft context_next_raw",
+241:         )
+242:         _require_optional_text(self.file_source, "record draft file_source")
+243:         _require_provenance(self.provenance)
+
+tm_engine.py
+SHA-256: a6f2c2b1e9e3a911c9b82eb41fe359fad818dc64fd523618adefaf64b9e4a3f3
+
+TMMatch（70–82行）
+70: @dataclass(frozen=True)
+71: class TMMatch:
+72:     """
+73:     Represents a translation memory match result.
+74:     Strictly follows Blueprint V1.
+75:     """
+76:     source: str             # Source text in TM
+77:     target: str             # Translation in TM
+78:     similarity: float       # Similarity score (0.0 - 1.0)
+79:     match_type: str         # "EXACT", "FUZZY", "CONTEXT"
+80:     tm_source: str          # Source TM filename
+81:     usage_count: int = 0
+82:     last_used: str = ""     # ISO timestamp
+
+tmx_context_interchange.py
+SHA-256: 2db45813f9e77bee77996b373c603d201f2bf2c6089de1f8a60b30b3ff789533
+
+_localcat_props（225–251行）
+225: def _localcat_props(unit: TmxExportUnit) -> tuple[TmxOrderedProp, ...]:
+226:     props: list[TmxOrderedProp] = []
+227:     for prop_type, value in (
+228:         ("x-localcat-speaker", unit.speaker),
+229:         ("x-localcat-context-prev", unit.context_prev),
+230:         ("x-localcat-context-next", unit.context_next),
+231:         ("x-localcat-file-source", unit.file_source),
+232:     ):
+233:         if value is not None:
+234:             props.append(TmxOrderedProp(prop_type, value))
+235:     props.append(TmxOrderedProp("x-localcat-confirmed", "true" if unit.confirmed else "false"))
+236:     if unit.status is not None:
+237:         props.append(TmxOrderedProp("x-localcat-status", unit.status))
+238:     for provenance in unit.provenance:
+239:         props.append(
+240:             TmxOrderedProp(
+241:                 "x-localcat-provenance",
+242:                 json.dumps(
+243:                     [provenance.key, provenance.value],
+244:                     ensure_ascii=False,
+245:                     allow_nan=False,
+246:                     separators=(",", ":"),
+247:                 ),
+248:             )
+249:         )
+250:     props.extend(unit.imported_props)
+251:     return tuple(props)
+
+prepare_tmx_payload（304–465行）
+304: def prepare_tmx_payload(
+305:     binding: TmxScopeBinding,
+306:     effective_locales: TmxEffectiveLocales,
+307:     units: tuple[TmxExportUnit, ...],
+308: ) -> TmxPreparedPayload:
+309:     """Apply loss policy and return deterministic bytes plus body-safe proof."""
+310: 
+311:     if type(binding) is not TmxScopeBinding:
+312:         raise TypeError("binding must be exact TmxScopeBinding")
+313:     if type(effective_locales) is not TmxEffectiveLocales:
+314:         raise TypeError("effective_locales must be exact TmxEffectiveLocales")
+315:     if type(units) is not tuple:
+316:         raise TypeError("units must be an exact tuple")
+317:     for unit in units:
+318:         if type(unit) is not TmxExportUnit:
+319:             raise TypeError("units entries must be exact TmxExportUnit")
+320:     if binding.unit_count != len(units):
+321:         raise TmxContextError("TMX.SCOPE_BINDING_STALE", "scope unit count no longer matches")
+322:     if binding.attached_count != sum(unit.attached for unit in units):
+323:         raise TmxContextError("TMX.SCOPE_BINDING_STALE", "scope attachment count no longer matches")
+324:     identities = tuple(unit.unit_identity for unit in units)
+325:     if len(units) > _MAX_RECORDS:
+326:         raise TmxContextError("TMX.RECORD_LIMIT", "TMX scope exceeds the profile record limit")
+327:     if len(set(identities)) != len(identities):
+328:         raise TmxContextError("TMX.SCOPE_IDENTITY_DUPLICATE", "scope unit identities are not unique")
+329: 
+330:     occurrences: list[tuple[str, TmxLossDisposition, int | None]] = []
+331:     included: list[tuple[TmxExportUnit, tuple[TmxOrderedProp, ...]]] = []
+332:     excluded = 0
+333:     for ordinal, unit in enumerate(units, 1):
+334:         if not unit.attached:
+335:             excluded += 1
+336:             occurrences.append(("detached_member", TmxLossDisposition.EXCLUDED, ordinal))
+337:             continue
+338:         if not unit.target.strip():
+339:             excluded += 1
+340:             occurrences.append(("empty_target", TmxLossDisposition.EXCLUDED, ordinal))
+341:             continue
+342:         props = _localcat_props(unit)
+343:         if unit.has_inline_xml:
+344:             occurrences.append(("inline_xml", TmxLossDisposition.BLOCKING, ordinal))
+345:         if not unit.source:
+346:             occurrences.append(("empty_source", TmxLossDisposition.BLOCKING, ordinal))
+347:         for text in (unit.source, unit.target):
+348:             if not _xml_text_representable(text, segment=True):
+349:                 occurrences.append(("segment_unrepresentable", TmxLossDisposition.BLOCKING, ordinal))
+350:                 break
+351:         previous_rank = -1
+352:         if len(props) > _MAX_PROPS_PER_UNIT:
+353:             occurrences.append(("metadata_limit", TmxLossDisposition.BLOCKING, ordinal))
+354:         metadata_chars = 0
+355:         for prop in props:
+356:             rank = _PROP_SCOPE_RANK[prop.scope]
+357:             if rank < previous_rank:
+358:                 occurrences.append(("prop_scope_order", TmxLossDisposition.BLOCKING, ordinal))
+359:                 break
+360:             previous_rank = rank
+361:             fields = (prop.type, prop.value) + ((prop.xml_lang,) if prop.xml_lang is not None else ())
+362:             if any(not _xml_text_representable(value, segment=False) for value in fields):
+363:                 occurrences.append(("metadata_unrepresentable", TmxLossDisposition.BLOCKING, ordinal))
+364:                 break
+365:             if prop.xml_lang is not None and (
+366:                 prop.xml_lang != prop.xml_lang.strip()
+367:                 or not all(piece and piece.isalnum() for piece in prop.xml_lang.replace("_", "-").split("-"))
+368:             ):
+369:                 occurrences.append(("metadata_unrepresentable", TmxLossDisposition.BLOCKING, ordinal))
+370:                 break
+371:             metadata_chars += len(prop.scope.value) + sum(len(value) for value in fields)
+372:         if metadata_chars > _MAX_METADATA_CHARS_PER_UNIT:
+373:             occurrences.append(("metadata_limit", TmxLossDisposition.BLOCKING, ordinal))
+374:         if len(unit.source) > _MAX_FIELD_CHARS or len(unit.target) > _MAX_FIELD_CHARS:
+375:             occurrences.append(("segment_limit", TmxLossDisposition.BLOCKING, ordinal))
+376:         if not unit.confirmed:
+377:             occurrences.append(("unconfirmed_target", TmxLossDisposition.WARNING, ordinal))
+378:         if unit.source == unit.target:
+379:             occurrences.append(("source_equals_target", TmxLossDisposition.WARNING, ordinal))
+380:         included.append((unit, props))
+381: 
+382:     report = _counted_report(len(included), excluded, occurrences)
+383:     if report.blocking_count:
+384:         raise TmxContextError(
+385:             "TMX.BLOCKING_LOSS",
+386:             "TMX payload contains facts the active profile cannot represent",
+387:             loss_report=report,
+388:         )
+389:     if not included:
+390:         raise TmxContextError(
+391:             "TMX.NO_INCLUDED_UNITS",
+392:             "TMX payload has no included translation units",
+393:             loss_report=report,
+394:         )
+395: 
+396:     source_locale = effective_locales.source_locale
+397:     target_locale = effective_locales.target_locale
+398:     lines = [
+399:         '<?xml version="1.0" encoding="UTF-8"?>',
+400:         '<tmx version="1.4">',
+401:         (
+402:             '  <header creationtool="LocalCAT" creationtoolversion="1" '
+403:             f'segtype="sentence" o-tmf="LocalCAT" adminlang="en" '
+404:             f'srclang={quoteattr(source_locale)} '
+405:             'datatype="PlainText"/>'
+406:         ),
+407:         "  <body>",
+408:     ]
+409:     parser_units: list[object] = []
+410:     prop_count = 0
+411:     metadata_chars_total = 0
+412:     for unit, props in included:
+413:         lines.append(f"    <tu tuid={quoteattr(_tu_id(binding, unit))}>")
+414:         for prop in props:
+415:             if prop.scope is TmxPropScope.TU:
+416:                 lines.append(_prop_xml(prop, indent="      "))
+417:         lines.append(f"      <tuv xml:lang={quoteattr(source_locale)}>")
+418:         for prop in props:
+419:             if prop.scope is TmxPropScope.SOURCE_TUV:
+420:                 lines.append(_prop_xml(prop, indent="        "))
+421:         lines.append(f"        <seg>{escape(unit.source)}</seg>")
+422:         lines.append("      </tuv>")
+423:         lines.append(f"      <tuv xml:lang={quoteattr(target_locale)}>")
+424:         for prop in props:
+425:             if prop.scope is TmxPropScope.TARGET_TUV:
+426:                 lines.append(_prop_xml(prop, indent="        "))
+427:         lines.append(f"        <seg>{escape(unit.target)}</seg>")
+428:         lines.append("      </tuv>")
+429:         lines.append("    </tu>")
+430:         parser_units.append(_parser_facts(unit.source, unit.target, props, effective_locales))
+431:         prop_count += len(props)
+432:         metadata_chars_total += sum(
+433:             len(prop.scope.value)
+434:             + len(prop.type)
+435:             + len(prop.value)
+436:             + (len(prop.xml_lang) if prop.xml_lang is not None else 0)
+437:             for prop in props
+438:         )
+439:     lines.extend(("  </body>", "</tmx>"))
+440:     data = ("\n".join(lines) + "\n").encode("utf-8")
+441:     if len(data) > _MAX_INPUT_BYTES or metadata_chars_total > _MAX_METADATA_CHARS_TOTAL:
+442:         limit_occurrences = occurrences + [
+443:             ("payload_limit", TmxLossDisposition.BLOCKING, None)
+444:         ]
+445:         raise TmxContextError(
+446:             "TMX.PAYLOAD_LIMIT",
+447:             "TMX payload exceeds the active profile limit",
+448:             loss_report=_counted_report(len(included), excluded, limit_occurrences),
+449:         )
+450:     proof = TmxPayloadProof(
+451:         profile_id=TMX_CONTEXT_PROFILE_ID,
+452:         effective_locales=effective_locales,
+453:         payload_digest=hashlib.sha256(data).hexdigest(),
+454:         parser_content_digest=_hash_fact_sequence(parser_units),
+455:         included_count=len(included),
+456:         prop_count=prop_count,
+457:         loss_report=report,
+458:     )
+459:     return TmxPreparedPayload(
+460:         data=data,
+461:         proof=proof,
+462:         scope_kind=binding.scope_kind,
+463:         scope_id=binding.scope_id,
+464:         binding_digest=binding.binding_digest,
+465:     )

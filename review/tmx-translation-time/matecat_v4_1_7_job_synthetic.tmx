@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Structural example only. All identifiers, dates and bilingual text are synthetic. -->
+<tmx version="1.4">
+  <header creationtool="Matecat-Cattool" creationtoolversion="v4.1.7"
+          o-tmf="Matecat" creationid="Matecat" datatype="plaintext"
+          segtype="sentence" adminlang="en-US" srclang="en-US" />
+  <body>
+    <tu tuid="1001" creationdate="20260101T020304Z" datatype="plaintext" srclang="en-US">
+      <prop type="x-MateCAT-id_job">9001</prop>
+      <prop type="x-MateCAT-id_segment">1001</prop>
+      <prop type="x-MateCAT-filename">example.txt</prop>
+      <prop type="x-MateCAT-status">TRANSLATED</prop>
+      <prop type="x-context-pre" />
+      <prop type="x-context-post" />
+      <prop type="x-MateCAT-id_chunk">1</prop>
+      <tuv xml:lang="en-US"><seg>guide "Hello."</seg></tuv>
+      <tuv xml:lang="zh-CN"><seg>guide "你好。"</seg></tuv>
+    </tu>
+  </body>
+</tmx>

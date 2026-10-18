@@ -1,0 +1,175 @@
+Matecat Job TMX 与翻译时间参考
+
+1. 合成模板
+
+matecat_v4_1_7_job_synthetic.tmx 只有一条合成 TU。
+编号、文本、文件名、日期都是示意数据，不包含用户的实际原文或译文。
+保留 v4.1.7 Job TMX 的 header、TU、语言对及常见 prop；无 DOCTYPE/ENTITY。
+模板故意不增加 translation_date 或 changedate，因为该 Job 导出没有这两个字段。
+根据项目是否分块及贡献来源，真实导出可能有额外的可选 prop。
+
+2. translation_date、creationdate、changedate
+
+translation_date
+  Matecat 数据库内部字段，不是 TMX 标准属性。
+  保存译文的控制器会将它设为当前时间，因此表示当前译文记录的保存/更新时间。
+  保存状态或重新确认也可能更新时间，不能仅据此认定译文文字发生了修正。
+  数据库存储形态类似 2026-01-01 02:03:04，字符串本身不带时区。
+
+creationdate
+  TMX 标准语义是元素创建日期。
+  但 Matecat v4.1.7 的 Job TMX 导出把 translation_date 写进 TU 的 creationdate。
+  因而有可靠 Job 导出来源时，该值可作为该译文最后保存/更新的时间。
+  导出器按 UTC 解读数据库值；数据库值为 null/不存在时会回退到当前时间。
+  已知日期会被保留，并非每次导出一律重置为导出时间。
+
+changedate
+  TMX 标准语义是元素最后修改日期，可出现在 header、TU 或 TUV。
+  已检查的 MyMemory 样式含 creationdate/changedate；v4.1.7 Job 样式未单独写出 changedate。
+  不能因为未出现 changedate 就判断文件没有日期，也不能把所有 creationdate 一概当成最后修订时间。
+
+日期示例（全部为合成时间）：
+  数据库 translation_date：2026-01-01 02:03:04（导出器按 UTC 解读）
+  TU creationdate：20260101T020304Z
+  UTC+8 显示：2026-01-01 10:03:04
+TMX 推荐格式为 YYYYMMDDThhmmssZ，Z 代表 UTC。
+新存储字段宜用带时区的 UTC 形式，例如 2026-01-01T02:03:04Z。
+
+注意：本会话之前由 CSV/TXT 包装器生成的草稿 TMX，日期来自打包时间。
+即使字段名称与 Job TMX 相同，也不能把它误称为真实人工翻译时间。
+日期是否可信需要看数据来源，不能只看一个声称是 Matecat 的 header。
+
+3. 当前指定文件
+
+当前被讨论的文件为用户指定目录内的 卷二_引_不同相似度.tmx。
+检查结果：3,010 条 TU；header 表明这是 LocalCAT 相似度测试夹具。
+所有 TU 均无 creationdate/changedate，目前没有可恢复的逐条翻译日期。
+原文件没有被修改。
+若以后要用此夹具测试日期显示，应在新副本加入明确标为“合成”的不同日期，
+保留原来的相似度、原译文与其他测试 prop，不冒充真实翻译记录。
+
+4. 两类 TMX 的当前支持情况
+
+本轮检查的是本机 2026-10-18 验收源码快照的 TmxLevel1Codec。
+Matecat export style：2,927 条双语记录解析成功。
+MyMemory compatible 原文件：因为外部 DOCTYPE，0 条记录，报 PARSER.TMX.UNSAFE_XML。
+相同 MyMemory 数据只在内存中移除外部 DOCTYPE：2,927 条双语记录解析成功。
+用户的不同相似度夹具：3,010 条记录解析成功。
+新的合成 v4.1.7 模板：1 条记录解析成功。
+新的 LocalCAT 兼容夹具合成模板：2 条记录解析成功。
+
+以上说明：两种样式都能进行双语内容解析，带 DTD 的原 MyMemory 文件除外。
+但“支持解析内容”与“支持翻译日期”不同：
+  当前 _UnitState 没有接收 TU 日期属性；ResourceRecord 仅输出 tmx.props 等现有信息。
+  实测含 creationdate/changedate 的文件，所有解析记录均没有这些日期元数据。
+  TMMatch.last_used 是记忆使用时间，不能代替译文保存/修改时间。
+因此，仅在文件中补 creationdate，并不会自动使当前候选显示翻译时间。
+本轮未进行 GUI 导入、资源数据库写入或 UI 日期显示验收。
+
+5. 供后续设计参考的日期归一规则（尚未实现）
+
+建议分开保留：
+  source_creationdate：TMX 原始创建日期，不强行解释成翻译时间。
+  source_changedate：TMX 原始修改日期。
+  translation_updated_at：能够确定语义的译文保存/更新时间，统一为 UTC。
+  date_origin：日期来自哪个属性及哪种可信来源，或为 synthetic/unknown。
+  imported_at：导入本机的时间，与翻译时间分开。
+
+可讨论的选择顺序：
+  1. 选定目标 TUV 的有效 changedate；
+  2. TU 的有效 changedate；
+  3. 已确认是真实 Matecat Job 导出时，TU.creationdate；
+  4. 其他来源仅有 creationdate 时，保留其创建日期语义，翻译更新时间维持未知。
+header 的日期只描述容器，不能直接替代每条译文日期。
+缺失或非法日期应记为未知并保留诊断，不用导入时间、文件修改时间或“现在”伪造。
+若加入日期排序，先保持现有相似度排序和测试预期，是否用时间打破同分由产品需求决定。
+
+6. 在线参考
+
+Matecat 官方导出操作指南（说明 Job TMX，未列出字段级模板）：
+https://guides.matecat.com/finalising-a-project
+
+Matecat v4.1.7 保存时间设置：
+https://github.com/matecat/MateCat/blob/v4.1.7/lib/Controller/API/App/SetTranslationController.php#L295-L304
+
+Matecat v4.1.7 Job TMX 字段生成：
+https://github.com/matecat/MateCat/blob/v4.1.7/lib/Utils/TMS/TMSService.php#L484-L518
+
+TMX 标准（日期语义、UTC 格式）：
+https://uri.etsi.org/lis/002/v1.4.2/gs_LIS002v010402p.pdf
+
+7. 本轮验证
+
+STATUS: VERIFIED
+CLAIM_TYPE: TASK
+CLAIM: 已生成纯合成结构模板；已核对字段映射和当前 codec 对日期属性的行为。
+EVIDENCE: verify_localcat_tmx_dates.py 运行退出码 0，六种输入的计数与拒绝结果均断言通过。
+GAPS: 没有修改日期导入功能；没有证明 GUI/资源库已经保留或显示翻译时间。
+NOTES: localcat_tmx_date_checks.json 保存本轮解析层实验的完整摘要。
+
+8. 澄清：导入、项目保存、导出是三个不同动作
+
+一次 TMX 导入
+  TMXFileController 把文件送给 TMSService.addTmxInMyMemory，再由 MyMemory.importMemory
+  上传到记忆服务。它不是让项目持续监视或同步本地 TMX。
+  这条私有 TM 导入流程没有把每个外部 TU.creationdate 直接写进项目的 translation_date。
+  MyMemory 服务内部如何保存原始 creationdate/changedate，是另一个层次；
+  仅凭 Matecat 的转发上传代码，不能承诺这些日期在记忆服务内的完整往返行为。
+
+在 Matecat 项目中保存译文
+  SetTranslationController 将该项目片段的 translation_date 设置为此次保存时间。
+  即使译文候选来自旧 TMX，当前项目这次保存的时间与原记忆的创建/修改时间仍是不同事实。
+
+导出 Job TMX
+  导出器读取每条项目记录已有的 translation_date，将它格式化为 TU.creationdate。
+  不会把所有正常记录的日期统一覆盖为导出时间。
+  时间缺失时存在“当前时间”的回退，因此来源不明确时不能把每个日期都当成已证实的编辑事件。
+  随后再次修改并保存某片段，再导出，该片段的 creationdate 可能改变。
+  已经下载到本地的旧 TMX 不会自动随项目修改而变化。
+
+特别注意 creationdate 的作用域：
+  TMX 标准中，header.creationdate 描述该容器，tu.creationdate 描述一条翻译单元，
+  tuv.creationdate 描述某个语言变体。它并不总是“整个资源文件的创建日期”。
+  Matecat v4.1.7 Job 输出将 TU.creationdate 复用为项目译文记录时间，这是特定实现用法。
+
+9. 用户的相似度夹具与 Matecat Job 模板有何不同
+
+二者的基础语法都是 TMX 1.4：header + body/tu + 两种语言的 tuv/seg。
+差别主要是可选属性和自定义 prop，并非两套互不兼容的 XML 语法。
+
+                         Matecat v4.1.7 Job               用户相似度夹具
+header.creationtool      Matecat-Cattool                  LocalCAT
+header.creationtoolversion v4.1.7                         feature5-ui-integration-fixture-v1
+header.o-tmf             Matecat                         LocalCAT
+TU 标识                  实际项目 segment ID             带 exact/fuzzy 含义的本地标识
+TU 日期                  creationdate                    无
+TU 其他属性              datatype/srclang                datatype/srclang/creationid
+项目元数据               job/segment/filename/status/chunk Sheet/Excel行/译文行/RPY定位/speaker
+上下文                   x-context-pre/post              当前夹具未写这两个字段
+测试期望                 不含此夹具的测试属性             variant、expected-similarity、可选 query-segment-source
+
+完整用户文件有 2,962 条 exact 和 48 条 fuzzy 变体，共 3,010 条。
+localcat_compatible_fixture_synthetic.tmx 仅保留 exact、fuzzy 各一条合成示意。
+示意的相似度数字不声称由真实评分器计算，更不会强迫检索引擎输出该分数。
+原文件来源链可由用户另行说明；这些差异描述的是当前文件实际结构，不推断其每个生成步骤。
+
+区分“能读双语内容”和“所有元数据语义都被解释”：
+  当前 LocalCAT 导入器把 prop 保留进 provenance；
+  它识别 x-localcat-speaker、x-localcat-context-prev/next、x-localcat-file-source 等本机语义字段，
+  并识别 x-MateCAT-status。未知 prop 的保留不等于它们控制运行行为。
+  TU/TUV 的日期属性目前没有进入这些 prop，也没有作为日期字段导入。
+
+另一个需要区分的概念：LocalCAT 自身的原生 TMX 导出 profile。
+  tmx_context_interchange.py 当前原生输出使用 creationtool=LocalCAT、creationtoolversion=1、
+  o-tmf=LocalCAT、adminlang=en、datatype=PlainText，并写本机 context/provenance 属性。
+  用户提供的相似度夹具是“LocalCAT兼容测试样式”，不是这套原生导出 profile 的逐字样板。
+  本包的 LocalCAT 合成模板特意对应用户给出的夹具，避免把二者混为一谈。
+
+10. 网页查询的版本边界
+
+两个仓库都公开，但必须带分支和版本。
+Matecat 请用 v4.1.7。
+LocalCAT 的 main 本轮只有 LICENSE、README.md；应从 reassessment 分支查相关源码。
+本机完整 HEAD 在 GitHub 本轮查不到；公开 reassessment 的 parser_tmx_codec.py、
+resource_importer.py 已与本机逐文件 Git blob SHA 比对一致。
+具体 commit、链接和可选源码节选见 repositories_and_versions.txt。
