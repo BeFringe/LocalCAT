@@ -1,6 +1,7 @@
 """Project discovery policy; platform syscall matrices live in platform tests."""
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import tempfile
@@ -123,6 +124,50 @@ class ProjectWorkspaceDiscoveryTests(unittest.TestCase):
                 self.assertEqual(service.revalidate(one).files[0].source_ref, "act1/scenes/chapter.txt")
                 self.assertRejected(DirectoryRejectionCode.STALE, retained.reprove)
             service.close()
+
+    def test_native_numeric_paths_use_natural_components_and_preserve_spelling(self):
+        refs = (
+            "10/2.txt", "2/10.txt", "2/2.txt", "02/10.txt", "02/2.txt",
+            "1/10.txt", "1/02.txt", "1/2.txt", "1/1.txt", "1.txt", "10.txt",
+            "2.txt", "Z.txt", "a.txt", "章１０.txt", "章2.txt", "章10.txt",
+        )
+        expected = (
+            "1", "1/1.txt", "1/02.txt", "1/2.txt", "1/10.txt", "1.txt",
+            "02", "02/2.txt", "02/10.txt", "2", "2/2.txt", "2/10.txt", "2.txt",
+            "10", "10/2.txt", "10.txt", "Z.txt", "a.txt", "章2.txt", "章10.txt", "章１０.txt",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for ref in refs:
+                path = root / ref
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"not read by preview")
+            backend = compose_platform_file_backend(root)
+            with closing(self.service(backend)) as service, _forbid_content_and_mutation(backend):
+                preview = service.preview(root)
+                self.assertTrue(preview.complete)
+                self.assertEqual(tuple(entry.source_ref for entry in preview.entries), expected)
+                chosen = service.select(self.request(preview, "2/10.txt", "02/2.txt"))
+                retained = service.revalidate(chosen)
+                self.assertEqual(retained.root_path, root)
+                self.assertEqual(tuple(item.source_ref for item in retained.files),
+                                 ("2/10.txt", "02/2.txt"))
+                self.assertEqual(tuple(item.raw_components for item in retained.files),
+                                 (("2", "10.txt"), ("02", "2.txt")))
+
+    def test_numeric_directory_descent_uses_the_same_order_as_preview(self):
+        names = ("10", "2", "02", "1")
+        port = _ObservationPort({
+            (): tuple(_entry(name, kind=fs.DirectoryEntryKind.DIRECTORY) for name in names),
+            **{(name,): (_entry("10.txt"), _entry("2.txt")) for name in names},
+        })
+        preview = self.service(port).preview(Path.cwd() / "chosen")
+        self.assertTrue(preview.complete)
+        self.assertEqual(tuple(handle.path for handle in port.handles),
+                         ((), ("1",), ("02",), ("2",), ("10",)))
+        self.assertEqual(tuple(entry.source_ref for entry in preview.entries),
+                         tuple(ref for name in ("1", "02", "2", "10")
+                               for ref in (name, name + "/2.txt", name + "/10.txt")))
 
     def test_configured_registry_filters_disabled_and_nonreadable_project_codecs(self):
         for enabled in (False, True):

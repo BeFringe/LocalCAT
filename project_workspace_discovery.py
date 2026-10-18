@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+import re
 import threading
 from typing import Protocol
 from uuid import uuid4
@@ -29,6 +30,24 @@ from project_directory_contracts import (
 from project_workspace_identity import (
     ProjectWorkspaceError, normalize_portable_ref_v1, validate_portable_ref_collection,
 )
+
+
+def _natural_component_key(component: str) -> tuple:
+    tokens = []
+    for index, part in enumerate(re.split(r"([0-9]+)", component)):
+        if index % 2:
+            # ASCII digit runs occupy their usual code-point range, compared
+            # numerically; every other character keeps its code-point order.
+            tokens.append((ord("0"), int(part)))
+        else:
+            tokens.extend((ord(character),) for character in part)
+    return tuple(tokens), component
+
+
+def _preview_entry_order(item: tuple) -> tuple:
+    entry, raw_components = item[:2]
+    components = entry.source_ref.split("/") if entry.source_ref else raw_components
+    return tuple(_natural_component_key(component) for component in components), raw_components
 
 
 class _ParserSelectionSurface(Protocol):
@@ -315,7 +334,7 @@ class ProjectDirectoryDiscoveryService:
                                     entry.entry_id, entry.source_ref, raw, metadata.snapshot,
                                 )
                             children.append((entry, raw, metadata))
-                        for entry, raw, metadata in sorted(children, key=lambda item: (item[0].source_ref or "/".join(item[1]), item[1])):
+                        for entry, raw, metadata in sorted(children, key=_preview_entry_order):
                             self._current(run)
                             if entry.unavailable_reason is DirectoryEntryUnavailableReason.DIRECTORY:
                                 with self._observation.retain_observed_directory(
@@ -340,7 +359,7 @@ class ProjectDirectoryDiscoveryService:
                         run.root.close()
                         run.root = None
                     run.files.clear()
-                ordered = tuple(item[0] for item in sorted(entries, key=lambda item: (item[0].source_ref or "/".join(item[1]), item[1])))
+                ordered = tuple(item[0] for item in sorted(entries, key=_preview_entry_order))
                 preview = DirectorySelectionPreview(uuid4().hex, run.generation, uuid4().hex,
                                                     ordered, rejection is None, rejection)
                 with self._state_lock:

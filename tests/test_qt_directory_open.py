@@ -103,6 +103,54 @@ class QtDirectoryOpenTests(unittest.TestCase):
                 opened = ProjectPackageService().open(self.destination)
                 self.assertEqual(opened.workspace, workspace)
 
+    def test_natural_preview_and_manual_order_survive_bulk_selection_and_cold_open(self):
+        natural_refs = (
+            'chapters/1/1.txt', 'chapters/1/2.txt', 'chapters/1/10.txt',
+            'chapters/02/2.txt', 'chapters/2/2.txt', 'chapters/10/2.txt',
+        )
+        for ref in reversed(natural_refs):
+            path = self.root / ref
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Source ' + ref + '\n')
+        expected = (
+            'chapters/10/2.txt', 'chapters/2/2.txt', 'chapters/1/1.txt',
+            'chapters/1/10.txt', 'chapters/02/2.txt', 'chapters/1/2.txt',
+        )
+
+        def choose(dialog):
+            items = {entry.source_ref: dialog.entry_items[entry.entry_id]
+                     for entry in dialog.review.preview.entries}
+            items['chapters'].setCheckState(0, Qt.CheckState.Checked)
+            self.assertEqual(dialog.ordered_entry_ids, self.ids(dialog.review, natural_refs))
+            dialog.clear_selection_button.click()
+            items['chapters/2'].setCheckState(0, Qt.CheckState.Checked)
+            items['chapters/10'].setCheckState(0, Qt.CheckState.Checked)
+            dialog.selected_files.setCurrentRow(1)
+            dialog.move_selected(-1)
+            items['chapters'].setCheckState(0, Qt.CheckState.Checked)
+            self.assertEqual(dialog.ordered_entry_ids, self.ids(dialog.review,
+                ('chapters/10/2.txt', 'chapters/2/2.txt') + natural_refs[:4]))
+            items['chapters/1/2.txt'].setCheckState(0, Qt.CheckState.Unchecked)
+            items['chapters/1'].setCheckState(0, Qt.CheckState.Checked)
+            self.assertEqual(dialog.ordered_entry_ids, self.ids(dialog.review, expected))
+            return QDialog.DialogCode.Accepted
+
+        with mock.patch.object(QtDirectoryOpenDialog, 'exec', choose), \
+             mock.patch.object(QFileDialog, 'getSaveFileName', return_value=(str(self.destination), '')):
+            self.assertTrue(self.window.open_directory_async(self.root, wait=True), self.errors)
+        workspace = self.controller._workspace_service.workspace
+        self.assertEqual(tuple(doc.source_ref for doc in workspace.documents), expected)
+        self.assertEqual(self.controller._workspace_service.origin_binding.absolute_root, str(self.root))
+        identities = tuple(doc.document_id for doc in workspace.documents)
+        self.controller.close_project()
+        offline = self.base / 'offline.localcat-project'
+        self.destination.rename(offline)
+        self.root.rename(self.base / 'original-source-offline')
+        opened = ProjectPackageService().open(offline)
+        self.assertEqual(tuple(doc.source_ref for doc in opened.workspace.documents), expected)
+        self.assertEqual(tuple(doc.document_id for doc in opened.workspace.documents), identities)
+        self.assertEqual(opened.workspace, workspace)
+
     def test_tree_defaults_none_unavailable_reasons_order_and_incomplete_disabled(self):
         review = self.preview()
         dialog = QtDirectoryOpenDialog(review)
