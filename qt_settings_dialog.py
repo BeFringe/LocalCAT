@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QKeyEvent,
+    QFocusEvent,
     QHideEvent,
     QPaintEvent,
     QPainter,
@@ -390,6 +391,61 @@ def _ask_localized_question(
         if button is not None:
             button.setText(label)
     return QMessageBox.StandardButton(prompt.exec())
+
+
+class _ResourceNameEdit(QLineEdit):
+    """A name draft commits only through an explicit key or user focus loss."""
+
+    commit_requested = Signal(str)
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.set_saved_name(name)
+        self.setStyleSheet("""
+            QLineEdit {
+                min-height: 20px; padding: 0 2px;
+                border: 1px solid transparent; border-radius: 3px;
+                background: transparent;
+            }
+            QLineEdit:hover { border-color: palette(mid); }
+            QLineEdit:focus { border-color: palette(highlight); }
+        """)
+
+    def set_saved_name(self, name: str) -> None:
+        self._saved_name = name
+        self.setText(name)
+        self.setToolTip("编辑资源名称；Enter 或移开焦点保存，Esc 取消")
+        self.setAccessibleName(f"资源名称：{name}")
+
+    def cancel_edit(self) -> None:
+        self.setText(self._saved_name)
+        self.setModified(False)
+
+    def _commit(self) -> None:
+        if not self.isEnabled():
+            return
+        name = self.text().strip()
+        self.setText(name)
+        if name == self._saved_name:
+            return
+        # A subsequent focus event must not submit the same request again.
+        self._saved_name = name
+        self.commit_requested.emit(name)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancel_edit()
+            event.accept()
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._commit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        super().focusOutEvent(event)
+        self._commit()
 
 
 class _ResourceMoreButton(QToolButton):
@@ -1347,6 +1403,8 @@ class QtSettingsDialog(QDialog):
         table.verticalHeader().setVisible(False)
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # Tab follows the real row controls, rather than readonly table indexes.
+        table.setTabKeyNavigation(False)
         table.setAlternatingRowColors(True)
         table.setShowGrid(False)
         table.setWordWrap(False)
@@ -1409,6 +1467,7 @@ class QtSettingsDialog(QDialog):
     ) -> None:
         """Render one already-collected resource presentation snapshot."""
 
+        self._cancel_resource_name_edits()
         status_by_resource_id = {
             status.resource_id: status
             for status in statuses
@@ -1658,7 +1717,7 @@ class QtSettingsDialog(QDialog):
                     "more_",
                 )
             ):
-                if isinstance(widget, (QPushButton, QToolButton)):
+                if isinstance(widget, (QPushButton, QToolButton, _ResourceNameEdit)):
                     widget.setEnabled(False)
                 widget.setObjectName("")
         for action in table.findChildren(QAction):
@@ -1702,7 +1761,9 @@ class QtSettingsDialog(QDialog):
                     ),
                 )
             else:
-                table.setItem(row, 3, QTableWidgetItem(resource.name))
+                table.setCellWidget(
+                    row, 3, self._make_resource_name_edit(resource, operation=operation)
+                )
             kind_label = (
                 "翻译记忆库"
                 if resource.kind is ResourceKind.TRANSLATION_MEMORY
@@ -1731,7 +1792,9 @@ class QtSettingsDialog(QDialog):
             import_button.setProperty("resource_id", resource.id)
             import_button.setMinimumWidth(112)
             import_button.clicked.connect(
-                lambda _checked=False, configured=resource: self._prompt_import(configured)
+                lambda _checked=False, resource_id=resource.id: self._prompt_import(
+                    self._configured_resource(resource_id)
+                )
             )
             table.setCellWidget(row, 6, import_button)
             more_button = _ResourceMoreButton()
@@ -1770,8 +1833,8 @@ class QtSettingsDialog(QDialog):
                 manage_action.setStatusTip(manage_action.toolTip())
                 manage_action.setEnabled(resource.active and resource.update)
                 manage_action.triggered.connect(
-                    lambda _checked=False, configured=resource: self._open_termbase_dialog(
-                        configured
+                    lambda _checked=False, resource_id=resource.id: self._open_termbase_dialog(
+                        self._configured_resource(resource_id)
                     )
                 )
                 menu.addSeparator()
@@ -1783,8 +1846,8 @@ class QtSettingsDialog(QDialog):
             direct_export_action.setObjectName(f"exportDirect_{resource.id}")
             direct_export_action.setToolTip("导出此资源的完整兼容快照")
             direct_export_action.triggered.connect(
-                lambda _checked=False, configured=resource: self._prompt_export_direct(
-                    configured
+                lambda _checked=False, resource_id=resource.id: self._prompt_export_direct(
+                    self._configured_resource(resource_id)
                 )
             )
             if resource.kind is ResourceKind.TRANSLATION_MEMORY:
@@ -1802,8 +1865,8 @@ class QtSettingsDialog(QDialog):
                     self.tmx_export_service is not None and tmx_ready
                 )
                 tmx_export_action.triggered.connect(
-                    lambda _checked=False, configured=resource: self._prompt_export_tmx(
-                        configured
+                    lambda _checked=False, resource_id=resource.id: self._prompt_export_tmx(
+                        self._configured_resource(resource_id)
                     )
                 )
             package_export_action = menu.addAction("导出资源包")
@@ -1819,16 +1882,16 @@ class QtSettingsDialog(QDialog):
             if resource.kind is ResourceKind.TRANSLATION_MEMORY:
                 package_export_action.setEnabled(tmx_ready)
             package_export_action.triggered.connect(
-                lambda _checked=False, configured=resource: self._prompt_export_package(
-                    configured
+                lambda _checked=False, resource_id=resource.id: self._prompt_export_package(
+                    self._configured_resource(resource_id)
                 )
             )
             menu.addSeparator()
             delete_action = menu.addAction("删除资源")
             delete_action.setObjectName(f"delete_{resource.id}")
             delete_action.triggered.connect(
-                lambda _checked=False, configured=resource: self._confirm_delete_resource(
-                    configured
+                lambda _checked=False, resource_id=resource.id: self._confirm_delete_resource(
+                    self._configured_resource(resource_id)
                 )
             )
             more_button.setMenu(menu)
@@ -2044,8 +2107,7 @@ class QtSettingsDialog(QDialog):
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(3)
 
-        name = QLabel(resource.name)
-        name.setObjectName(f"resourceName_{resource.id}")
+        name = self._make_resource_name_edit(resource, operation=operation)
         layout.addWidget(name)
 
         status_label = QLabel()
@@ -2087,8 +2149,8 @@ class QtSettingsDialog(QDialog):
         )
         holder.setAccessibleName(status_accessible_name)
         holder.setToolTip(status_accessible_name)
-        name.setAccessibleName(status_accessible_name)
-        name.setToolTip(status_accessible_name)
+        name.setAccessibleName(f"资源名称：{status_accessible_name}")
+        name.setToolTip(f"{name.toolTip()}\n{status_accessible_name}")
         status_label.setAccessibleName(status_accessible_name)
         status_label.setToolTip(status_accessible_name)
 
@@ -2302,6 +2364,90 @@ class QtSettingsDialog(QDialog):
             else "内部状态无法安全确认"
         )
         self.status_label.setText(f"Canonical 操作无法开始：{reason}。")
+
+    def _make_resource_name_edit(
+        self,
+        resource: ResourceConfig,
+        *,
+        operation: TMActivationOperationView | None,
+    ) -> _ResourceNameEdit:
+        editor = _ResourceNameEdit(resource.name)
+        editor.setObjectName(f"resourceName_{resource.id}")
+        editor.setEnabled(
+            not (operation is not None and not operation.completed)
+        )
+        editor.commit_requested.connect(
+            lambda name, resource_id=resource.id: self._set_resource_name(resource_id, name)
+        )
+        return editor
+
+    def _cancel_resource_name_edits(self) -> None:
+        for editor in self.findChildren(_ResourceNameEdit):
+            editor.cancel_edit()
+
+    def _configured_resource(self, resource_id: str) -> ResourceConfig:
+        return next(
+            configured for configured in self.controller.list_resources()
+            if configured.id == resource_id
+        )
+
+    def _project_resource_name(self, resource: ResourceConfig) -> None:
+        """Keep row controls and the user's next focus target alive after a save."""
+
+        editor = self.findChild(_ResourceNameEdit, f"resourceName_{resource.id}")
+        if editor is None:
+            raise ValueError("resource name is missing from the current projection")
+        editor.set_saved_name(resource.name)
+        more = self.findChild(QToolButton, f"more_{resource.id}")
+        if more is not None:
+            more.setToolTip(f"{resource.name} 的更多操作")
+            more.setAccessibleName(more.toolTip())
+            more.menu().setAccessibleName(f"{resource.name} 的更多操作菜单")
+        manage = self.findChild(QAction, f"manageTerms_{resource.id}")
+        if manage is not None:
+            manage.setToolTip(f"打开 {resource.name} 的术语管理")
+            manage.setStatusTip(manage.toolTip())
+        status = self.findChild(QLabel, f"tmStatus_{resource.id}")
+        capabilities = self.findChild(QLabel, f"tmCapabilities_{resource.id}")
+        holder = self.findChild(QWidget, f"tmResource_{resource.id}")
+        if status is not None and capabilities is not None and holder is not None:
+            description = (
+                f"{resource.name}：{status.text()}；"
+                f"{capabilities.text().replace(' · ', '；')}"
+            )
+            for widget in (holder, status):
+                widget.setAccessibleName(description)
+                widget.setToolTip(description)
+            editor.setAccessibleName(f"资源名称：{description}")
+            editor.setToolTip(f"{editor.toolTip()}\n{description}")
+
+    def _set_resource_name(self, resource_id: str, name: str) -> None:
+        try:
+            resource = self._configured_resource(resource_id)
+            if not name:
+                raise ValueError("资源名称不能为空。")
+            if name == resource.name:
+                return
+            result = self.controller.update_resource(replace(resource, name=name))
+        except (StopIteration, EditorControllerError, ValueError) as exc:
+            self._render_cached_resources()
+            current = next(
+                (configured for configured in self.controller.list_resources()
+                 if configured.id == resource_id),
+                None,
+            )
+            if current is not None and current.name == name:
+                self.resources_changed.emit()
+                self.status_label.setText(f"资源名称已保存，但运行时刷新失败：{exc}")
+            else:
+                reason = "资源已不存在。" if isinstance(exc, StopIteration) else str(exc)
+                self.status_label.setText(f"资源名称未保存：{reason}")
+            return
+        if type(result) is not ResourceConfig:
+            raise TypeError("resource update must return ResourceConfig")
+        self._project_resource_name(result)
+        self.resources_changed.emit()
+        self.status_label.setText("资源名称已保存，当前段建议已刷新。")
 
     def _set_state(self, resource_id: str, field: str, checked: bool) -> None:
         try:
@@ -3051,6 +3197,8 @@ class QtSettingsDialog(QDialog):
         worker.start()
 
     def _set_import_busy(self, busy: bool, message: str = "") -> None:
+        if busy:
+            self._cancel_resource_name_edits()
         if busy and self._status_before_import is None:
             self._status_before_import = self.status_label.text()
         self.active_table.setEnabled(not busy)

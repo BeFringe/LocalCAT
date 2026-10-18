@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -622,7 +623,7 @@ assert completed.succeeded, completed
                 if table.cellWidget(row, 3) is not None
                 and table.cellWidget(row, 3).objectName() == f"tmResource_{resource_id}"
             )
-            name = dialog.findChild(QLabel, f"resourceName_{resource_id}")
+            name = dialog.findChild(QLineEdit, f"resourceName_{resource_id}")
             status = self._status(dialog, resource_id)
             state = self._kind_state(dialog, resource_id)
             assert name is not None
@@ -942,7 +943,7 @@ assert completed.succeeded, completed
                     holder = dialog.active_table.cellWidget(row, 3)
                     self.assertIsNotNone(holder)
                     assert holder is not None
-                    name = dialog.findChild(QLabel, f"resourceName_{resource_id}")
+                    name = dialog.findChild(QLineEdit, f"resourceName_{resource_id}")
                     self.assertIsNotNone(name)
                     assert name is not None
                     self.assertFalse(name.geometry().intersects(status.geometry()))

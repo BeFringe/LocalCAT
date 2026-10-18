@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -74,11 +75,11 @@ class QtSettingsDialogTest(unittest.TestCase):
 
             self.assertEqual(dialog.active_table.rowCount(), 1)
             self.assertEqual(dialog.inactive_table.rowCount(), 1)
-            active_name = dialog.active_table.item(0, 3)
-            inactive_name = dialog.inactive_table.item(0, 3)
+            inactive = next(item for item in controller.list_resources() if not item.active)
+            inactive_name = dialog.findChild(QLineEdit, f"resourceName_{inactive.id}")
             assert inactive_name is not None
-            self.assertIsNone(active_name)
-            tm_name = dialog.findChild(QLabel, f"resourceName_{active.id}")
+            self.assertIsNone(dialog.active_table.item(0, 3))
+            tm_name = dialog.findChild(QLineEdit, f"resourceName_{active.id}")
             self.assertIsNotNone(tm_name)
             assert tm_name is not None
             self.assertEqual(tm_name.text(), "Primary TM")
