@@ -80,6 +80,14 @@ class RpyRoundTripTests(unittest.TestCase):
         self.assertEqual(result.payload, raw.replace(b"'Old'", b"'a\\'b\"c\\\\\\n    python:\\n        secret()'"))
         self.assertEqual(codec.parse_tl(result.payload).records[0].target, target)
 
+    def test_language_declaration_bytes_survive_noop_and_target_only_edit(self):
+        raw = (b'\xef\xbb\xbfdefine config.language="other#language" # "note"\r\n' +
+               dialogue(target="'Old'").replace(b'\n', b'\r\n') +
+               b"define  config.language = 'chi\\'nese' # trailing")
+        self.assertEqual(self.prepare(raw).payload, raw)
+        self.assertEqual(self.prepare(raw, "New 'target'").payload,
+                         raw.replace(b"'Old'", b"'New \\'target\\''"))
+
     def test_quoted_speaker_roundtrip_changes_only_second_literal_interior(self):
         raw = ('\ufefftranslate zh_Hans unit:\r\n'
                '    # "[character]" -sad @ happy "Source" with dissolve\r\n'

@@ -140,6 +140,59 @@ class RpyLexicalTests(unittest.TestCase):
         self.assertEqual(document.slots[0].target.literal.text, 'Target # text')
         self.assertIs(document.raw, raw)
 
+    def test_language_declarations_at_each_block_boundary_preserve_only_tl_slots(self):
+        declarations = (b'define config.language="other#language" # "note"\n',
+                        b"define  config.language = 'chinese'\n",
+                        b'define config.language = "[not_evaluated()]"')
+        raw = (declarations[0] + dialogue() + declarations[1] +
+               b'translate zh_Hans strings:\n    old "Open"\n    new ""\n' +
+               declarations[2])
+        with mock.patch('builtins.eval', side_effect=AssertionError('must not evaluate')):
+            parsed = parse_tl(raw)
+        self.assertEqual(parsed.lexical.language, 'zh_Hans')
+        self.assertIs(parsed.lexical.raw, raw)
+        self.assertEqual([(item.source, item.target) for item in parsed.records],
+                         [('Source', 'Target'), ('Open', '')])
+        self.assertEqual(parsed.records[0].local_id, parse_tl(dialogue()).records[0].local_id)
+
+    def test_language_declaration_closes_and_clears_previous_block(self):
+        declaration = b'define config.language = "chinese"\n'
+        for incomplete in (b'translate zh_Hans unit:\n    # "Source"\n',
+                           b'translate zh_Hans strings:\n    old "Source"\n'):
+            with self.subTest(incomplete=incomplete):
+                error = self.assert_rejected(incomplete + declaration, 'ambiguous-slot')
+                self.assertEqual(error.issue.line_number, 1)
+        for orphan in (b'    "Target"\n', b'    nvl clear\n',
+                       b'    # "Another"\n    "Target"\n'):
+            with self.subTest(orphan=orphan):
+                error = self.assert_rejected(dialogue() + declaration + orphan,
+                                             'unsupported-syntax')
+                self.assertGreater(error.issue.line_number, 4)
+
+    def test_language_declaration_is_finite_literal_syntax_not_general_code(self):
+        invalid = (b'define other.language = "chinese"',
+                   b'define config.language = None',
+                   b'define config.language = choose_language()',
+                   b'define config.language = "a" + "b"',
+                   b'define config.language = "a" "b"',
+                   b'define config.language = "a" with fade',
+                   b'define config.language == "a"',
+                   b'define config.language = """a"""',
+                   b'define config.language = "a\nb"',
+                   b'    define config.language = "chinese"')
+        for line in invalid:
+            with self.subTest(line=line):
+                self.assert_rejected(dialogue() + line + b'\n', 'unsupported-syntax')
+        self.assert_rejected(b'define config.language = "chinese"\n', 'unsupported-syntax')
+        self.assert_rejected(b'define config.language = "chinese"\n' +
+                             dialogue(extra='    "Supplement"\n'), 'ambiguous-slot')
+        self.assert_rejected(b'define config.language = "chinese"\n' + dialogue() +
+                             dialogue().replace(b'zh_Hans', b'japanese'), 'mixed-language')
+        self.assert_rejected(b'define config.language = "long"\n' + dialogue('"S"', '"T"'),
+                             'limit-exceeded', limits=RpyLexicalLimits(max_string_bytes=3))
+        self.assert_rejected(b'define config.language = "\\u1234"\n' + dialogue(),
+                             'invalid-escape')
+
     def test_unicode_identifier_and_mixed_newline_offsets(self):
         raw = ('\ufefftranslate 中文 片段:\r\n    # 向导 高兴 "雪"\n'
                '    向导 "Snow"\r\n').encode('utf-8')

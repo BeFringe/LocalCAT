@@ -69,6 +69,19 @@ class RpyPrivatePayloadTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             codec.build_private_payload(self.raw, target='changed', confirmed=True)
 
+    def test_language_declaration_uses_existing_private_schema_and_template_digest(self):
+        old = self.document()
+        raw = b'define config.language = "different" # note\n' + self.raw
+        payload = codec.build_private_payload(raw)
+        current = json.loads(payload)
+        self.assertEqual(set(current), set(old))
+        for key in ('version', 'codec_identity', 'profile', 'language'):
+            self.assertEqual(current[key], old[key])
+        self.assertEqual(set(current['slots']), set(old['slots']))
+        self.assertNotEqual(current['source_sha256'], old['source_sha256'])
+        self.assertEqual(codec.validate_private_payload(raw, payload), codec.parse_tl(raw))
+        self.assert_rejected(payload, raw=self.raw)
+
     def test_source_tokens_share_nested_bracket_quote_and_escape_recognition(self):
         raw = dialogue(r'''"[[literal {{literal [mapping['key]']!t] [items[index[0]]] {b}{i}x{/i}{/b} {custom=a}"''')
         row = next(iter(self.document(raw)['slots'].values()))

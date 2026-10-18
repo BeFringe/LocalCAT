@@ -1,7 +1,11 @@
 """Real RPY provider and ProjectPackage single-document journeys."""
 
-from contextlib import ExitStack
+from contextlib import closing, ExitStack
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -20,6 +24,7 @@ from rpy_project_adapter import RpyProjectAdapter, RpyProjectUnavailableError
 from tests.test_project_single_file_profile import _PACKAGE_PORT
 from tests.test_rpy_provider import FIXTURES
 from parser_rpy_codec import build_private_payload, RPY_CODEC_IDENTITY
+from rpy_project_export import RpyExportContext
 
 
 class RpyProjectTests(unittest.TestCase):
@@ -124,6 +129,68 @@ class RpyProjectTests(unittest.TestCase):
         self.assertTrue(resaved.receipt.durable)
         self.assertFalse(cold.save_service.project_dirty)
         self.assertEqual(self.members(cold.open_saved_package()), (self.raw, build_private_payload(self.raw)))
+
+    def test_language_declaration_single_and_multi_packages_cold_export_without_sources(self):
+        for multiple in (False, True):
+            with self.subTest(multiple=multiple):
+                root = self.base / ('multi' if multiple else 'single')
+                raw = (b'\xef\xbb\xbfdefine config.language="other#language" # note\r\n'
+                       b'translate zh_Hans unit:\r\n    # "Source"\r\n    "Target"\r\n'
+                       b"define config.language = 'chinese' # trailing")
+                originals = {'a/intro.rpy': raw}
+                if multiple:
+                    originals['b/intro.rpy'] = (b'define config.language = "another"\n'
+                        b'translate zh_Hans strings:\n    old "Open"\n    new ""\n')
+                for ref, content in originals.items():
+                    path = root / ref
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+                paths = tuple(root / ref for ref in originals)
+                package = root / 'work.localcat-project'
+                session = (self.adapter.prepare_selected(root, paths, self.request, session_id='declared')
+                           if multiple else self.adapter.prepare_single(
+                               root, paths[0], self.request, session_id='declared'))
+                with session:
+                    self.assertTrue(session.save(package).receipt.durable)
+                    output = root / ('noop' if multiple else 'noop.rpy')
+                    if multiple:
+                        for ref in originals:
+                            (output / ref).parent.mkdir(parents=True, exist_ok=True)
+                    with closing(self.adapter.prepare_export(session.workspace_service,
+                            session.persistence_binding, output, config_dir=self.config)) as preview:
+                        context = RpyExportContext(session.workspace_service,
+                                                  session.persistence_binding, self.runtime, 0)
+                        self.assertEqual(preview.publish(context, output).outcome, 'published')
+                    for ref, content in originals.items():
+                        self.assertEqual((output / ref if multiple else output).read_bytes(), content)
+                    self.edit(session, 0, 'New target', True)
+                    self.assertTrue(session.save().receipt.durable)
+                for path in paths:
+                    path.unlink()
+                cold_output = root / ('cold' if multiple else 'cold.rpy')
+                helper = ('tests.test_rpy_multi_file_journey import _cold_batch as run' if multiple
+                          else 'tests.test_rpy_single_file_journey import _cold_export as run')
+                process = subprocess.run([sys.executable, '-B', '-c',
+                    'import json, sys; from pathlib import Path; from ' + helper + '; '
+                    'print(json.dumps(run(*(Path(p) for p in sys.argv[1:]))))',
+                    str(package), str(root / 'cold-data'), str(cold_output)],
+                    cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                    text=True, encoding='utf-8', timeout=60)
+                self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+                cold = json.loads(process.stdout)
+                self.assertNotEqual(cold['pid'], os.getpid())
+                self.assertEqual(cold['segments'][0]['target'], 'New target')
+                self.assertTrue(cold['segments'][0]['confirmed'])
+                for index, (ref, content) in enumerate(originals.items()):
+                    expected = content.replace(b'"Target"', b'"New target"') if index == 0 else content
+                    self.assertEqual((cold_output / ref if multiple else cold_output).read_bytes(), expected)
+
+    def test_language_declaration_only_does_not_create_project(self):
+        self.source.write_bytes(b'define config.language = "chinese"\n')
+        with self.assertRaises(SelectedProjectDocumentsError) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.parser_code, 'PARSER.RPY.UNSUPPORTED_SYNTAX')
+        self.assertFalse(self.destination.exists())
 
     def test_disabled_and_missing_codec_keep_package_editable_and_private_exact(self):
         session = self.prepare()

@@ -7,12 +7,14 @@ from unittest import mock
 
 from parser_rpy_codec import build_private_payload, RPY_CODEC_IDENTITY
 from parser_source import CancellationToken
+from editor_source_update import source_update_review
 from project_codec_settings import compose_project_codec_runtime
 from project_package import ProjectPackageService
 from project_workspace import ReconciliationDecision, ReconciliationDisposition
 from project_workspace_contracts import ProjectWorkspaceError, SourcePresence
 from project_workspace_intake import SelectedProjectDocumentsRequest, OriginRenameMapping
 from rpy_project_adapter import RpyProjectAdapter, RpyProjectSession, RpyProjectSelectionError
+from rpy_project_export import RpyExportContext
 from tests.test_rpy_codec import dialogue
 
 
@@ -91,6 +93,42 @@ class RpySourceUpdateTests(unittest.TestCase):
         with opened.open_member(entry.codec_private_member.path, codec_identity=RPY_CODEC_IDENTITY) as stream:
             self.assertEqual(stream.read(), build_private_payload(raw))
         self.assertTrue(prepared.closed)
+
+    def test_language_declaration_only_update_preserves_identity_edit_and_confirmation(self):
+        identity = self.service.flat_segments[0].identity
+        for declaration in (b'define config.language = "chinese" # first\n',
+                            b'define config.language = "other" # changed\n'):
+            with self.subTest(declaration=declaration):
+                raw = declaration + self.raw
+                self.path.write_bytes(raw)
+                prepared = self.prepare()
+                preview = self.stage(prepared)
+                self.assertEqual(preview.unchanged_identities, (identity,))
+                self.assertFalse(preview.source_changed_identities or preview.new_identities or
+                                 preview.removed_identities)
+                review = source_update_review(preview, self.service.workspace,
+                                              prepared.staged.workspace)
+                self.assertFalse(review.templates_identical)
+                self.assertEqual(review.blocks, ())
+                self.apply(prepared, preview)
+                segment = self.service.flat_segments[0].segment
+                self.assertEqual((segment.source, segment.target, segment.confirmed),
+                                 ('Source', '译文', True))
+                saved = prepared.save_reconciled_workspace(self.package, self.session.save_service,
+                    self.destination, persistence_binding=self.session.persistence_binding)
+                self.assertTrue(saved.receipt.durable)
+                self.session.close()
+                self.session = self.adapter.open_package(self.destination, session_id='cold')
+                self.addCleanup(self.session.close)
+                self.service = self.session.workspace_service
+                self.assertEqual(self.service.flat_segments[0].identity, identity)
+                target = self.base / 'declared-output.rpy'
+                with self.adapter.prepare_export(self.service,
+                        self.session.persistence_binding, target, config_dir=self.base / 'config') as output:
+                    context = RpyExportContext(self.service,
+                                              self.session.persistence_binding, self.adapter.runtime, 0)
+                    self.assertEqual(output.publish(context, target).outcome, 'published')
+                self.assertEqual(target.read_bytes(), raw.replace(b'"Target"', '"译文"'.encode()))
 
     def test_label_change_is_new_removed_and_detached_is_absent_from_private(self):
         raw = self.raw.replace(b' unit:', b' replacement:')

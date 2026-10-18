@@ -357,6 +357,15 @@ def scan_tl(raw: bytes, *, limits: RpyLexicalLimits = RpyLexicalLimits(),
                 offset, number = end, number + 1
                 continue
         elif indent == 0:
+            prefix, assignment, value = data.partition(b'=')
+            if assignment and _words(prefix) == (b'define', b'config.language'):
+                finish()
+                block = None
+                literal_at = len(prefix) + 1 + len(value) - len(value.lstrip(b' '))
+                _, literal_end = _literal(line, literal_at, limits, checkpoint)
+                _suffix(line, literal_end, allow_transition=False)
+                offset, number = end, number + 1
+                continue
             header = data.split(b'#', 1)[0].rstrip(b' ')
             words = _words(header[:-1]) if header.endswith(b':') else ()
             if (len(words) != 3 or words[0] != b'translate' or

@@ -52,7 +52,7 @@ LocalCAT 从 **Trie 术语 + JSONL 精确 TM → Excel 无状态工作流 → Qt
 - **分工与交换**：按稳定段落划分/分配本地协作任务；TMX 可从托管资源、项目或选定分工导出。TMX ResourcePackage 当前仅支持导出与验证，不支持导入应用。
 - **Excel 兼容入口**：保留 xlwings/openpyxl 的既有无状态工作流；Qt 不依赖 Microsoft Excel 或 xlwings。
 
-RPY 当前只支持有限的 TL 语法，不是任意游戏脚本编辑器；`define config.language` 和同一原文下连续多条译句尚不支持。XLIFF 项目、多 Sheet workbook、后台自动发现、机器翻译、QA、账户、云端同步和实时多人协作仍属后续范围。TMX/CSV/XLSX 的语言资源支持不等于相同格式可作为编辑项目打开。
+RPY 支持有限的 TL 语法；当前源码可原样保留 `define config.language` 字符串声明。同一原文下连续多条译句仍待支持。XLIFF 项目、多 Sheet workbook、后台自动发现、机器翻译、QA、账户、云端同步和实时多人协作仍属后续范围。TMX/CSV/XLSX 的语言资源支持不等于相同格式可作为编辑项目打开。
 
 ## 从源码运行（Windows）
 
