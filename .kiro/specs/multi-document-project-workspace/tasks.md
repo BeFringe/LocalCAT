@@ -303,7 +303,7 @@ Requirement 13 的目录选择消费平台观察端口并向 Qt 投影；RPY 格
   - _Requirements: 11.9, 13.1, 13.3, 13.4_
   - _Boundary: Qt / Controller directory-entry integration_
 
-- [ ] 6.3 在文件多选 review 中筛选格式并显示跳过原因
+- [x] 6.3 在文件多选 review 中筛选格式并显示跳过原因
   - 复用本机 codec 能力与可用性判断，提供保留／跳过／阻断结果；原严格 intake 完整验证确认后的集合。
   - review 显示数量与可展开的跳过项，零项不可确认，一项仍按原 root 建立单文档包；项目包混选须单独打开。
   - 完成时，rpy 与 rpyc 混选可以明确确认支持项，原顺序/root 保持；禁用 codec、保留项失效与正文错误仍阻止提交，取消保留旧项目。

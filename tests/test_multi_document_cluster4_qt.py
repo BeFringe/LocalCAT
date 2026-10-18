@@ -505,9 +505,12 @@ class Cluster4QtAcceptanceTests(unittest.TestCase):
     ) -> None:
         root = self.root / "neutral-picker-root"
         selected = (
-            root / "first.custom-format",
-            root / "second.no-known-suffix",
+            root / "second.txt",
+            root / "first.txt",
         )
+        root.mkdir()
+        for path in selected:
+            path.write_text("Selected body\n", encoding="utf-8")
         destination = self.root / "neutral.localcat-project"
         review = mock.Mock()
         review.exec.return_value = QDialog.DialogCode.Accepted

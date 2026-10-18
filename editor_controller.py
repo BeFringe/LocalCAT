@@ -6,6 +6,8 @@ import hashlib
 import json
 import logging
 import math
+import os
+import stat
 from time import monotonic
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -15,6 +17,8 @@ from uuid import uuid4
 
 from capability_host import MatcherHandoffSnapshot
 from configured_term_adapter import ConfiguredTermAdapter
+from parser_contracts import (CodecDescriptor, EffectivePurpose, SelectionFailure,
+                              SelectionHints, SelectionRequest)
 from project_codec_settings import ProjectCodecRuntime, compose_project_codec_runtime
 from editor_file_jobs import (ControllerFileJob, ControllerFileOutcome, FileOpenCandidate,
                               FileImportPublication, SingleTLImportReview,
@@ -178,6 +182,20 @@ from project_workspace_intake import (
     stage_selected_project_documents,
     stage_workspace_rebind,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectFileSelectionSkipped:
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectFileSelectionReview:
+    root: Path
+    selected_paths: tuple[Path, ...]
+    skipped: tuple[ProjectFileSelectionSkipped, ...] = ()
+    blocking_reasons: tuple[str, ...] = ()
 
 
 LOGGER = logging.getLogger(__name__)
@@ -2678,6 +2696,56 @@ class EditorController:
         self._issued_file_jobs[id(job)] = job
         return job
 
+    def review_selected_project_files(
+        self, selected_paths: tuple[Path, ...],
+    ) -> ProjectFileSelectionReview:
+        """Classify an explicit multi-selection without opening file bodies."""
+        if (type(selected_paths) is not tuple or len(selected_paths) < 2
+                or any(not isinstance(path, Path) for path in selected_paths)):
+            raise EditorControllerError("文件多选无效。")
+        paths = tuple(path.expanduser().absolute() for path in selected_paths)
+        try:
+            root = Path(os.path.commonpath(tuple(str(path.parent) for path in paths)))
+        except ValueError:
+            raise EditorControllerError("请选择同一根目录下的文件。") from None
+        if len({os.path.normcase(str(path)) for path in paths}) != len(paths):
+            return ProjectFileSelectionReview(root, (), blocking_reasons=("选择不能包含重复文件。",))
+        if any(path.suffix.lower() in {'.localcat-project', '.zip'} for path in paths):
+            return ProjectFileSelectionReview(root, (), blocking_reasons=("项目包需单独打开，请勿与章节文件一起选择。",))
+        runtime = compose_project_codec_runtime(self.repository.config_dir)
+        adapter = RpyProjectAdapter(runtime)
+        selected, skipped, blocked = [], [], []
+        for path in paths:
+            source_ref = path.relative_to(root).as_posix()
+            try:
+                regular = stat.S_ISREG(path.lstat().st_mode)
+            except OSError:
+                regular = False
+            if not regular:
+                blocked.append(f"{source_ref} · PROJECT.INTAKE.INPUT_INVALID · 文件不存在、不可访问或不是普通文件。")
+                continue
+            suffix = path.suffix.lower()
+            try:
+                # The adapter owns known RPY availability; the configured
+                # surface owns which project-document format applies.
+                adapter.validate_selected_refs((path.name,))
+                descriptor = runtime.surface.select(SelectionRequest(
+                    EffectivePurpose.PROJECT_DOCUMENT,
+                    hints=SelectionHints(extensions=(suffix,)),
+                )) if suffix else None
+            except Exception as error:
+                blocked.append(f"{source_ref} · {self._file_error_text(error)}")
+                continue
+            if type(descriptor) is CodecDescriptor:
+                selected.append(path)
+            elif descriptor is None or (type(descriptor) is SelectionFailure
+                    and descriptor.code == 'PARSER.SELECTION.UNSUPPORTED'):
+                skipped.append(ProjectFileSelectionSkipped(path, "不支持的项目文档格式。"))
+            else:
+                code = descriptor.code if type(descriptor) is SelectionFailure else 'PARSER.SELECTION.CONFIGURATION_INVALID'
+                blocked.append(f"{source_ref} · {code} · 无法确定项目文档格式。")
+        return ProjectFileSelectionReview(root, tuple(selected), tuple(skipped), tuple(blocked))
+
     def selected_files_use_tl(self, selected_paths: tuple[Path, ...]) -> bool:
         """Resolve configured formats without reading selected file bodies."""
         try:
@@ -2855,6 +2923,7 @@ class EditorController:
                 "PARSER.SELECTION.PROVIDER_MISSING": "Ren’Py TL 格式支持缺失。",
                 "PARSER.SELECTION.PROVIDER_INCOMPATIBLE": "Ren’Py TL 格式支持版本不兼容。",
                 "PARSER.SELECTION.CONFIGURATION_INVALID": "本机格式配置无效。",
+                "PARSER.SELECTION.PROVIDER_CONFIGURATION_INVALID": "本机格式配置无效。",
             }
             return availability.code + " · " + reasons.get(availability.code, availability.safe_summary)
         diagnostics = getattr(error, "diagnostics", ())

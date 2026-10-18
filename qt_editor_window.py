@@ -118,7 +118,8 @@ from editor_contracts import (
     WorkspaceSearchRequest,
     WorkspaceMode,
 )
-from editor_controller import EditorController, EditorControllerError, WorkspaceDirectoryView
+from editor_controller import (EditorController, EditorControllerError,
+                               ProjectFileSelectionReview, WorkspaceDirectoryView)
 from chunk_controller_contracts import (
     ChunkApplicationMode,
     ChunkApplicationProjectView,
@@ -490,15 +491,19 @@ class QtWorkspaceCreationDialog(QDialog):
         *,
         default_name: str,
         single_document: bool = False,
+        selection_review: ProjectFileSelectionReview | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        if type(selected_paths) is not tuple or len(selected_paths) < (1 if single_document else 2):
+        if (type(selected_paths) is not tuple
+                or (selection_review is None and len(selected_paths) < (1 if single_document else 2))):
             raise ValueError("workspace creation requires an explicit file selection")
         if any(not isinstance(path, Path) for path in selected_paths):
             raise TypeError("workspace creation selection must contain Paths")
+        self._can_import = bool(selected_paths) and not (selection_review and selection_review.blocking_reasons)
+        one_file = len(selected_paths) == 1
         self.setObjectName("workspaceCreationDialog")
-        self.setWindowTitle("建立单文件项目包" if single_document else "确认多文档项目")
+        self.setWindowTitle("建立单文件项目包" if one_file else "确认项目文档")
         self.resize(680, 480)
         layout = QVBoxLayout(self)
 
@@ -512,6 +517,38 @@ class QtWorkspaceCreationDialog(QDialog):
         hint.setTextFormat(Qt.TextFormat.PlainText)
         hint.setWordWrap(True)
         layout.addWidget(hint)
+        if selection_review is not None:
+            hint.setText(
+                f"将导入 {len(selected_paths)} 个，跳过 {len(selection_review.skipped)} 个。"
+                + ("列表顺序将成为初始章节顺序。" if selected_paths else "没有可导入的文件。")
+            )
+            if selection_review.blocking_reasons:
+                blocking = QLabel("\n".join(selection_review.blocking_reasons))
+                blocking.setObjectName("workspaceSelectionBlockingReasons")
+                blocking.setTextFormat(Qt.TextFormat.PlainText)
+                blocking.setWordWrap(True)
+                blocking.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                layout.addWidget(blocking)
+            if selection_review.skipped:
+                details_button = QToolButton()
+                details_button.setObjectName("workspaceSkippedDetailsToggle")
+                details_button.setText("查看跳过的文件及原因")
+                details_button.setCheckable(True)
+                details_button.setArrowType(Qt.ArrowType.RightArrow)
+                details_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+                details = QListWidget()
+                details.setObjectName("workspaceSkippedFiles")
+                details.setMaximumHeight(120)
+                for skipped in selection_review.skipped:
+                    item = QListWidgetItem(f"{skipped.path.relative_to(selection_review.root)} · {skipped.reason}")
+                    item.setToolTip(item.text())
+                    details.addItem(item)
+                details.hide()
+                details_button.toggled.connect(details.setVisible)
+                details_button.toggled.connect(lambda opened: details_button.setArrowType(
+                    Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow))
+                layout.addWidget(details_button)
+                layout.addWidget(details)
 
         self.selected_files = QListWidget()
         self.selected_files.setObjectName("workspaceSelectedFiles")
@@ -525,6 +562,7 @@ class QtWorkspaceCreationDialog(QDialog):
             self.selected_files.addItem(item)
         self.selected_files.setCurrentRow(0)
         layout.addWidget(self.selected_files, 1)
+        self.selected_files.setVisible(bool(selected_paths))
 
         order_row = QHBoxLayout()
         self.move_up_button = QPushButton("上移")
@@ -537,8 +575,8 @@ class QtWorkspaceCreationDialog(QDialog):
         order_row.addWidget(self.move_down_button)
         order_row.addStretch()
         layout.addLayout(order_row)
-        self.move_up_button.setVisible(not single_document)
-        self.move_down_button.setVisible(not single_document)
+        self.move_up_button.setVisible(len(selected_paths) > 1)
+        self.move_down_button.setVisible(len(selected_paths) > 1)
 
         metadata = QHBoxLayout()
         metadata.addWidget(QLabel("项目名"))
@@ -555,7 +593,10 @@ class QtWorkspaceCreationDialog(QDialog):
         self.target_locale_input.setObjectName("workspaceTargetLocale")
         self.target_locale_input.setPlaceholderText("默认 zh-CN")
         metadata.addWidget(self.target_locale_input)
-        layout.addLayout(metadata)
+        metadata_widget = QWidget()
+        metadata_widget.setLayout(metadata)
+        metadata_widget.setVisible(bool(selected_paths))
+        layout.addWidget(metadata_widget)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel
@@ -563,11 +604,13 @@ class QtWorkspaceCreationDialog(QDialog):
         )
         self.buttons.setObjectName("workspaceCreationButtons")
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
-            "建立项目包" if single_document else "开始导入"
+            "建立项目包" if one_file else "开始导入"
         )
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(
             "取消"
         )
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(self._can_import)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
         self.buttons.accepted.connect(self._accept_if_valid)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -591,7 +634,7 @@ class QtWorkspaceCreationDialog(QDialog):
         )
 
     def _accept_if_valid(self) -> None:
-        if self.project_name_input.text().strip():
+        if self._can_import and self.project_name_input.text().strip():
             self.accept()
 
     @property
@@ -3463,24 +3506,22 @@ class QtEditorWindow(QMainWindow):
         ):
             self.statusBar().showMessage("多文档选择无效。", 6000)
             return False
-        path_identities = tuple(
-            os.path.normcase(os.path.abspath(str(path)))
-            for path in selected_paths
-        )
-        if len(set(path_identities)) != len(path_identities):
-            self.statusBar().showMessage("多文档选择不能包含重复文件。", 6000)
+        try:
+            selection = self.controller.review_selected_project_files(selected_paths)
+        except EditorControllerError as error:
+            self._show_error("无法确认项目文档", str(error))
             return False
-        root = Path(
-            os.path.commonpath(
-                tuple(str(path.parent) for path in selected_paths)
-            )
-        )
+        root = selection.root
+        session_id = self.controller.project_session_id
         review = QtWorkspaceCreationDialog(
-            selected_paths,
+            selection.selected_paths,
             default_name="project",
+            selection_review=selection,
             parent=self,
         )
-        if review.exec() != QDialog.DialogCode.Accepted:
+        if (review.exec() != QDialog.DialogCode.Accepted or not selection.selected_paths
+                or selection.blocking_reasons or self._file_operations_closed
+                or self.controller.project_session_id != session_id):
             return False
         project_name = review.project_name_input.text().strip()
         destination, _ = QFileDialog.getSaveFileName(
@@ -3489,7 +3530,8 @@ class QtEditorWindow(QMainWindow):
             str(root / f"{project_name}.localcat-project"),
             "LocalCAT ProjectPackage (*.localcat-project)",
         )
-        if not destination:
+        if (not destination or self._file_operations_closed
+                or self.controller.project_session_id != session_id):
             return False
         target = Path(destination)
         return self.create_workspace_from_selected_files(
